@@ -15,9 +15,17 @@ River:
 Tidal:
     TidalProcessor - Tidal constituents (bctides.in generation)
 
+Nudging:
+    NudgingProcessor - T/S interior nudging (TEM_nu.nc, SAL_nu.nc)
+
 Model Config:
     ParamNmlProcessor - Generate/patch SCHISM param.nml
     HotstartProcessor - Find and validate restart files
+    PartitionProcessor - Generate partition.prop for MPI decomposition
+
+UFS-Coastal:
+    ESMFMeshProcessor - ESMF mesh file for DATM coupling
+    BlenderProcessor  - HRRR+GFS Delaunay blending for DATM
 
 Writers:
     SfluxWriter    - SCHISM sflux NetCDF output (nws=2)
@@ -31,8 +39,12 @@ from .gefs import GEFSProcessor
 from .rtofs import RTOFSProcessor
 from .nwm import NWMProcessor, RiverConfig
 from .tidal import TidalProcessor, compute_nodal_corrections
+from .nudging import NudgingProcessor
 from .param_nml import ParamNmlProcessor
 from .hotstart import HotstartProcessor, HotstartInfo
+from .partition import PartitionProcessor
+from .esmf_mesh import ESMFMeshProcessor
+from .blender import BlenderProcessor
 from .sflux_writer import SfluxWriter
 from .datm_writer import DATMWriter
 
@@ -51,10 +63,16 @@ __all__ = [
     # Tidal
     "TidalProcessor",
     "compute_nodal_corrections",
+    # Nudging
+    "NudgingProcessor",
     # Model config
     "ParamNmlProcessor",
     "HotstartProcessor",
     "HotstartInfo",
+    "PartitionProcessor",
+    # UFS-Coastal
+    "ESMFMeshProcessor",
+    "BlenderProcessor",
     # Writers
     "SfluxWriter",
     "DATMWriter",
