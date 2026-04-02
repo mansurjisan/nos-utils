@@ -30,9 +30,10 @@ def cmd_prep(args):
         else:
             config = ForcingConfig.for_secofs(pdy=args.pdy, cyc=args.cyc)
     elif args.ofs == "stofs_3d_atl":
-        config = ForcingConfig.for_stofs_3d_atl(pdy=args.pdy, cyc=args.cyc)
         if args.ufs:
-            config.nws = 4
+            config = ForcingConfig.for_stofs_3d_atl_ufs(pdy=args.pdy, cyc=args.cyc)
+        else:
+            config = ForcingConfig.for_stofs_3d_atl(pdy=args.pdy, cyc=args.cyc)
     else:
         print(f"Unknown OFS: {args.ofs}. Use --yaml for custom configs.")
         sys.exit(1)

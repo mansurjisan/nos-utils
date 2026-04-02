@@ -148,6 +148,22 @@ class ForcingConfig:
         return cls(**defaults)
 
     @classmethod
+    def for_stofs_3d_atl_ufs(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
+        """Factory with STOFS-3D-ATL UFS-Coastal defaults (nws=4, DATM coupling)."""
+        defaults = dict(
+            lon_min=-98.5035, lon_max=-52.4867,
+            lat_min=7.347, lat_max=52.5904,
+            pdy=pdy, cyc=cyc,
+            nowcast_hours=24, forecast_hours=108,
+            met_num=2, nws=4, n_levels=51,
+            nudging_enabled=True,
+            nudging_timescale_seconds=86400.0,
+            obc_ssh_offset=0.04,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
     def for_ensemble(
         cls, pdy: str, cyc: int,
         member: int = 0, n_members: int = 6,
