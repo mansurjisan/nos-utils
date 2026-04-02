@@ -224,8 +224,11 @@ class HRRRProcessor(ForcingProcessor):
 
         domain = self.config.domain
         lon_min, lon_max, lat_min, lat_max = domain
-        target_lons = np.arange(lon_min, lon_max + self.regrid_dx, self.regrid_dx)
-        target_lats = np.arange(lat_min, lat_max + self.regrid_dx, self.regrid_dx)
+        # Compute nx/ny exactly as wgrib2 -new_grid does: nx = round((max-min)/dx) + 1
+        nx = int(round((lon_max - lon_min) / self.regrid_dx)) + 1
+        ny = int(round((lat_max - lat_min) / self.regrid_dx)) + 1
+        target_lons = np.linspace(lon_min, lon_min + (nx - 1) * self.regrid_dx, nx)
+        target_lats = np.linspace(lat_min, lat_min + (ny - 1) * self.regrid_dx, ny)
         result["lons"] = target_lons
         result["lats"] = target_lats
 
@@ -241,10 +244,19 @@ class HRRRProcessor(ForcingProcessor):
                 if valid_time is None:
                     continue
 
-                # Try wgrib2 -new_grid first
+                # Try wgrib2 -new_grid first (needs IPOLATES; U+V must be together)
                 regridded = tmpdir / f"regrid_{hrrr_file.stem}.grb2"
+                # Build match pattern that includes all vars WITH levels (so U+V pair works)
+                match_parts = []
+                for var in self.variables:
+                    if var in self.GRIB2_VARIABLES:
+                        grib_var, level = self.GRIB2_VARIABLES[var]
+                        match_parts.append(f"{grib_var}:{level}")
+                match_pattern = ":(" + "|".join(match_parts) + "):"
+
                 regridded_path = self.extractor.regrid_to_latlon(
-                    hrrr_file, domain, self.regrid_dx, regridded
+                    hrrr_file, domain, self.regrid_dx, regridded,
+                    match_pattern=match_pattern,
                 )
 
                 if regridded_path is not None:

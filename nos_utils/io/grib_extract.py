@@ -93,12 +93,47 @@ class Wgrib2Extractor(GRIBExtractor):
 
     wgrib2 handles all grid projections, variable matching, and domain subsetting
     natively. This is the preferred backend for operational use.
+
+    Auto-detects wgrib2 with IPOLATES support (needed for -new_grid regridding).
+    Prefers spack-stack wgrib2 over system wgrib2 when available.
     """
 
+    # Known paths where wgrib2 with IPOLATES may exist
+    WGRIB2_SEARCH_PATHS = [
+        # spack-stack builds (typically have IPOLATES)
+        "/opt/spack-stack/spack-stack-1.9.2/envs/ufs-wm-env/install/gcc/13.3.1/wgrib2-3.6.0-yu365ku/bin/wgrib2",
+        "/opt/spack-stack/*/envs/*/install/*/wgrib2-*/bin/wgrib2",
+    ]
+
     def __init__(self, wgrib2_path: str = "wgrib2"):
-        self.wgrib2 = wgrib2_path
-        if not shutil.which(self.wgrib2):
-            raise FileNotFoundError(f"wgrib2 not found: {self.wgrib2}")
+        # Try to find wgrib2 with IPOLATES first
+        self.wgrib2 = self._find_best_wgrib2(wgrib2_path)
+        if not self.wgrib2:
+            raise FileNotFoundError(f"wgrib2 not found: {wgrib2_path}")
+
+    @classmethod
+    def _find_best_wgrib2(cls, default: str) -> Optional[str]:
+        """Find wgrib2 binary, preferring one with IPOLATES support."""
+        import glob as glob_mod
+
+        # Check spack-stack paths first (likely have IPOLATES)
+        for pattern in cls.WGRIB2_SEARCH_PATHS:
+            if "*" in pattern:
+                matches = glob_mod.glob(pattern)
+                for m in matches:
+                    if Path(m).exists():
+                        log.info(f"Found spack wgrib2: {m}")
+                        return m
+            elif Path(pattern).exists():
+                log.info(f"Found spack wgrib2: {pattern}")
+                return pattern
+
+        # Fall back to PATH
+        found = shutil.which(default)
+        if found:
+            return found
+
+        return None
 
     def extract(
         self,
@@ -195,29 +230,45 @@ class Wgrib2Extractor(GRIBExtractor):
         domain: Tuple[float, float, float, float],
         dx: float,
         output_path: Path,
+        match_pattern: Optional[str] = None,
     ) -> Optional[Path]:
         """
         Regrid GRIB2 from native projection (e.g., Lambert Conformal) to regular lat/lon.
 
         Uses: wgrib2 -new_grid_winds earth -new_grid latlon lon0:nx:dx lat0:ny:dy
         The -new_grid_winds earth flag correctly rotates grid-relative winds.
+
+        For wind rotation to work, U and V must be processed together in the same
+        command (wgrib2 pairs them automatically when both are present).
+
+        Args:
+            grib_file: Input GRIB2 file
+            domain: (lon_min, lon_max, lat_min, lat_max)
+            dx: Target resolution in degrees
+            output_path: Path for regridded output
+            match_pattern: Optional wgrib2 -match regex to select variables.
+                For HRRR, use a pattern that includes BOTH UGRD and VGRD:
+                ":(UGRD:10 m|VGRD:10 m|TMP:2 m|SPFH:2 m|MSLMA|PRATE|DSWRF|DLWRF):"
         """
         lon_min, lon_max, lat_min, lat_max = domain
         nx = int(round((lon_max - lon_min) / dx)) + 1
         ny = int(round((lat_max - lat_min) / dx)) + 1
 
         output_path = Path(output_path)
-        grid_spec = f"latlon {lon_min}:{nx}:{dx} {lat_min}:{ny}:{dx}"
 
-        cmd = [
-            self.wgrib2, str(grib_file),
+        cmd = [self.wgrib2, str(grib_file)]
+        if match_pattern:
+            cmd.extend(["-match", match_pattern])
+        cmd.extend([
             "-new_grid_winds", "earth",
-            "-new_grid", *grid_spec.split(),
+            "-new_grid", "latlon",
+            f"{lon_min}:{nx}:{dx}",
+            f"{lat_min}:{ny}:{dx}",
             str(output_path),
-        ]
+        ])
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode == 0 and output_path.exists():
+        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
             return output_path
 
         log.error(f"Regrid failed: {result.stderr[:300]}")
