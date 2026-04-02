@@ -299,3 +299,102 @@ class PrepOrchestrator:
             output_files=output_files,
             warnings=warnings,
         )
+
+    def archive_to_comout(self, result: PrepResult, comout: Path) -> List[Path]:
+        """
+        Archive prep outputs to COMOUT with NCO naming convention.
+
+        Creates tars for sflux and OBC, copies individual files for
+        param.nml, bctides.in, source_sink.in, etc.
+
+        Args:
+            result: PrepResult from run()
+            comout: COMOUT directory path
+
+        Returns:
+            List of archived file paths
+        """
+        import shutil
+        import subprocess
+
+        comout = Path(comout)
+        comout.mkdir(parents=True, exist_ok=True)
+
+        archived = []
+        prefix = self.run_name
+        cycle = f"t{self.config.cyc:02d}z"
+        pdy = self.config.pdy
+        phase = result.phase
+
+        work_dir = self.paths["output"]
+        if isinstance(work_dir, str):
+            work_dir = Path(work_dir)
+
+        log.info(f"Archiving to {comout}")
+
+        # Tar sflux files
+        sflux_dir = work_dir / "sflux"
+        if sflux_dir.exists() and list(sflux_dir.glob("sflux_*.nc")):
+            tar_name = f"{prefix}.{cycle}.{pdy}.met.{phase}.tar"
+            tar_path = comout / tar_name
+            try:
+                subprocess.run(
+                    ["tar", "-cf", str(tar_path), "-C", str(sflux_dir), "."],
+                    check=True, capture_output=True,
+                )
+                archived.append(tar_path)
+                log.info(f"  Archived sflux -> {tar_name}")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                log.warning(f"  Failed to tar sflux: {e}")
+
+        # Tar OBC files
+        obc_files = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]
+        existing_obc = [work_dir / f for f in obc_files if (work_dir / f).exists()]
+        if existing_obc:
+            tar_name = f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar"
+            tar_path = comout / tar_name
+            try:
+                file_list = [f.name for f in existing_obc]
+                subprocess.run(
+                    ["tar", "-cf", str(tar_path), "-C", str(work_dir)] + file_list,
+                    check=True, capture_output=True,
+                )
+                archived.append(tar_path)
+                log.info(f"  Archived OBC -> {tar_name}")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                log.warning(f"  Failed to tar OBC: {e}")
+
+        # Copy individual files
+        copy_map = {
+            "param.nml": f"{prefix}_schism_{phase}.in",
+            "bctides.in": f"{prefix}.bctides.in",
+            "source_sink.in": f"{prefix}.source_sink.in",
+            "vsource.th": f"{prefix}.{cycle}.{pdy}.river.vsource.th",
+            "msource.th": f"{prefix}.{cycle}.{pdy}.river.msource.th",
+            "sflux_inputs.txt": "sflux_inputs.txt",
+            "datm_forcing.nc": f"{prefix}.{cycle}.datm_forcing.nc",
+            "esmf_mesh.nc": f"{prefix}.{cycle}.esmf_mesh.nc",
+            "partition.prop": "partition.prop",
+        }
+
+        for src_name, dst_name in copy_map.items():
+            # Check both work_dir and sflux subdir
+            src = work_dir / src_name
+            if not src.exists():
+                src = work_dir / "sflux" / src_name
+            if src.exists():
+                dst = comout / dst_name
+                shutil.copy2(src, dst)
+                archived.append(dst)
+                log.info(f"  Copied {src_name} -> {dst_name}")
+
+        # Nudging files
+        for nu_file in ["TEM_nu.nc", "SAL_nu.nc"]:
+            src = work_dir / nu_file
+            if src.exists():
+                dst = comout / f"{prefix}.{cycle}.{nu_file}"
+                shutil.copy2(src, dst)
+                archived.append(dst)
+
+        log.info(f"Archived {len(archived)} files to {comout}")
+        return archived
