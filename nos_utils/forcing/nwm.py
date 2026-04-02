@@ -137,10 +137,17 @@ class NWMProcessor(ForcingProcessor):
     def river_config(self) -> Optional[RiverConfig]:
         if self._river_config is None and self.config.river_config_file:
             path = Path(self.config.river_config_file)
-            if path.suffix == ".json":
-                self._river_config = RiverConfig.from_json(path)
-            else:
-                self._river_config = RiverConfig.from_text(path)
+            if not path.exists():
+                log.warning(f"River config file not found: {path}")
+                return None
+            try:
+                if path.suffix == ".json":
+                    self._river_config = RiverConfig.from_json(path)
+                else:
+                    self._river_config = RiverConfig.from_text(path)
+            except Exception as e:
+                log.warning(f"Failed to load river config: {e}")
+                return None
         return self._river_config
 
     def process(self) -> ForcingResult:

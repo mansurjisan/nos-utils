@@ -101,6 +101,28 @@ def config_from_env(
     if "output" not in paths:
         paths["output"] = os.environ.get("DATAROOT", "/tmp") + "/nos_prep"
 
+    # Resolve relative file paths in config against FIXofs
+    fix_dir = paths.get("fix", "")
+    if fix_dir:
+        fix_path = Path(fix_dir)
+        # River config file
+        if config.river_config_file and not Path(config.river_config_file).is_absolute():
+            resolved = fix_path / config.river_config_file
+            if resolved.exists():
+                config.river_config_file = resolved
+                log.info(f"Resolved river_config_file: {resolved}")
+        # Bctides template
+        if config.bctides_template and not Path(config.bctides_template).is_absolute():
+            resolved = fix_path / config.bctides_template
+            if resolved.exists():
+                config.bctides_template = resolved
+                log.info(f"Resolved bctides_template: {resolved}")
+        # Grid file
+        if config.grid_file and not Path(config.grid_file).is_absolute():
+            resolved = fix_path / config.grid_file
+            if resolved.exists():
+                config.grid_file = resolved
+
     return config, paths
 
 
