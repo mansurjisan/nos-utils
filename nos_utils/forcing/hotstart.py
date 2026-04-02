@@ -176,7 +176,13 @@ class HotstartProcessor(ForcingProcessor):
                 if not dir_pattern.exists():
                     continue
 
-                for file_pattern in ["hotstart*.nc", f"{self.run_name}*hotstart*.nc"]:
+                for file_pattern in [
+                    "hotstart*.nc",
+                    f"{self.run_name}*hotstart*.nc",
+                    f"{self.run_name}*.rst.nowcast.nc",   # COMF restart naming
+                    f"{self.run_name}*.init.nowcast.nc",   # COMF init naming
+                    f"{self.run_name}*restart*.nc",
+                ]:
                     candidates.extend(sorted(dir_pattern.glob(file_pattern)))
 
         return candidates

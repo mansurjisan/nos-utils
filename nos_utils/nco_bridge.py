@@ -89,13 +89,22 @@ def config_from_env(
         "fix": "FIXofs",
         "output": "DATA",
         "comout": "COMOUT",
-        "restart": "COMIN",
     }
 
     for key, env_var in env_to_path.items():
         val = os.environ.get(env_var, "")
         if val:
             paths[key] = val
+
+    # Hotstart search: use COMOUT parent (contains previous cycle dirs)
+    # e.g., COMOUT=/ptmp/com/nosofs/v3.7/secofs.20260402
+    #        → restart dir = /ptmp/com/nosofs/v3.7/ (parent, has secofs.20260401/)
+    comout = os.environ.get("COMOUT", "")
+    if comout:
+        paths["restart"] = str(Path(comout).parent)
+        log.info(f"Hotstart search dir: {paths['restart']}")
+    elif os.environ.get("COMIN"):
+        paths["restart"] = os.environ["COMIN"]
 
     # Ensure output dir exists
     if "output" not in paths:
