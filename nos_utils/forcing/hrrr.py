@@ -261,12 +261,16 @@ class HRRRProcessor(ForcingProcessor):
 
                 if regridded_path is not None:
                     # wgrib2 regrid worked — extract from regridded file
+                    # skip_subset=True: file already has exact target grid dimensions,
+                    # re-subsetting would trim rows due to float boundary matching
                     result["times"].append(valid_time)
                     for var in self.variables:
                         if var not in self.GRIB2_VARIABLES:
                             continue
                         grib_var, level = self.GRIB2_VARIABLES[var]
-                        data = self.extractor.extract(regridded_path, grib_var, level, domain)
+                        data = self.extractor.extract(
+                            regridded_path, grib_var, level, domain, skip_subset=True
+                        )
                         if data is not None:
                             result["data"][var].append(data)
                         else:

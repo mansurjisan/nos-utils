@@ -141,7 +141,16 @@ class Wgrib2Extractor(GRIBExtractor):
         variable: str,
         level: str,
         domain: Tuple[float, float, float, float],
+        skip_subset: bool = False,
     ) -> Optional[np.ndarray]:
+        """
+        Extract a variable from GRIB2 file.
+
+        Args:
+            skip_subset: If True, skip -small_grib domain subsetting.
+                Use when the file is already regridded to the target domain
+                (avoids off-by-one trimming from floating-point boundary matching).
+        """
         grib_file = Path(grib_file)
         lon_min, lon_max, lat_min, lat_max = domain
 
@@ -150,16 +159,23 @@ class Wgrib2Extractor(GRIBExtractor):
             subset_file = tmpdir / "subset.grb2"
             bin_file = tmpdir / "data.bin"
 
-            # Step 1: Match variable+level, subset to domain
+            # Step 1: Match variable+level, optionally subset to domain
             match_str = f":{variable}:{level}:"
-            cmd = [
-                self.wgrib2, str(grib_file),
-                "-match", match_str,
-                "-small_grib",
-                f"{lon_min}:{lon_max}",
-                f"{lat_min}:{lat_max}",
-                str(subset_file),
-            ]
+            if skip_subset:
+                cmd = [
+                    self.wgrib2, str(grib_file),
+                    "-match", match_str,
+                    "-grib", str(subset_file),
+                ]
+            else:
+                cmd = [
+                    self.wgrib2, str(grib_file),
+                    "-match", match_str,
+                    "-small_grib",
+                    f"{lon_min}:{lon_max}",
+                    f"{lat_min}:{lat_max}",
+                    str(subset_file),
+                ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if result.returncode != 0 or not subset_file.exists():
                 log.debug(f"wgrib2 match failed for {variable}:{level}: {result.stderr[:200]}")
