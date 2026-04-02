@@ -232,6 +232,9 @@ class ForcingConfig:
         atm = forcing.get("atmospheric", {})
         ocean = forcing.get("ocean", {})
         nudge = ocean.get("nudging", {}) if isinstance(ocean, dict) else {}
+        river = forcing.get("river", {})
+        tidal = forcing.get("tidal", {})
+        runtime = model.get("runtime", {})
 
         # Infer met_num: 2 if secondary/HRRR is configured, else 1
         met_num = int(atm.get("met_num", 1))
@@ -241,6 +244,23 @@ class ForcingConfig:
         # Vertical levels
         vert = model.get("vertical", {})
         n_levels = int(vert.get("nvrt", grid.get("n_levels", 51)))
+
+        # NWS: check model.physics.nws
+        physics = model.get("physics", {})
+        nws = int(physics.get("nws", 2))
+
+        # River config file
+        river_files = river.get("files", {}) if isinstance(river, dict) else {}
+        river_config_file = river_files.get("nwm_reach") or river_files.get("ctl_file")
+
+        # Tidal template
+        tidal_files = tidal.get("files", {}) if isinstance(tidal, dict) else {}
+        bctides_template = tidal_files.get("harmonic_constants_ofs") or \
+                          tidal_files.get("harmonic_constants_obc")
+
+        # OBC SSH offset
+        obc = ocean.get("obc", {}) if isinstance(ocean, dict) else {}
+        obc_ssh_offset = float(obc.get("ssh_offset", 0.0))
 
         kwargs = dict(
             lon_min=domain.get("lon_min", -180.0),
@@ -253,13 +273,22 @@ class ForcingConfig:
             forecast_hours=int(run.get("forecast_hours", float(run.get("forecast_days", 5.0)) * 24)),
             igrd_met=int(grid.get("igrd_met", 0)),
             met_num=met_num,
+            nws=nws,
             scale_hflux=float(atm.get("scale_hflux", 1.0)),
             n_levels=n_levels,
             nudging_enabled=nudge.get("enabled", False) if isinstance(nudge, dict) else False,
             nudging_timescale_seconds=float(
                 nudge.get("timescale_seconds", nudge.get("timescale_days", 1.0) * 86400)
             ) if isinstance(nudge, dict) else 86400.0,
+            obc_ssh_offset=obc_ssh_offset,
         )
+
+        # Optional Path fields — only set if value is non-empty
+        if river_config_file:
+            kwargs["river_config_file"] = Path(river_config_file)
+        if bctides_template:
+            kwargs["bctides_template"] = Path(bctides_template)
+
         kwargs.update(overrides)
         return cls(**kwargs)
 
