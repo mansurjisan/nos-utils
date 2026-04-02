@@ -188,10 +188,18 @@ class HotstartProcessor(ForcingProcessor):
         return candidates
 
     def _find_hotstart(self) -> Optional[Path]:
-        """Find the most recent valid hotstart file."""
+        """
+        Find the correct hotstart file for the current cycle.
+
+        For a 00z cycle, the hotstart should be from the previous cycle's
+        nowcast (e.g., t18z yesterday). Selects by matching cycle time
+        in filename, not by filesystem modification time.
+
+        COMF naming: secofs.t{cyc}z.YYYYMMDD.rst.nowcast.nc
+        """
         candidates = self.find_input_files()
 
-        # Filter by size and sort by modification time (newest first)
+        # Filter by size
         valid = []
         for f in candidates:
             try:
@@ -203,11 +211,50 @@ class HotstartProcessor(ForcingProcessor):
         if not valid:
             return None
 
-        # Sort by mtime, newest first
+        # Parse cycle time from filenames and find the one just before current cycle
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+
+        scored = []
+        for f in valid:
+            file_dt = self._parse_file_datetime(f)
+            if file_dt and file_dt < cycle_dt:
+                # Prefer most recent file that's BEFORE current cycle
+                scored.append((file_dt, f))
+
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=True)  # newest valid first
+            best = scored[0][1]
+            log.info(f"Selected hotstart by cycle time: {best.name} "
+                     f"(valid {scored[0][0]}, current cycle {cycle_dt})")
+            return best
+
+        # Fallback: sort by mtime if no cycle time could be parsed
         valid.sort(key=lambda f: f.stat().st_mtime, reverse=True)
 
         log.info(f"Found {len(valid)} hotstart candidates, using newest: {valid[0].name}")
         return valid[0]
+
+    def _parse_file_datetime(self, filepath: Path) -> Optional[datetime]:
+        """
+        Parse datetime from COMF restart filename.
+
+        Patterns:
+          secofs.t00z.20260402.rst.nowcast.nc → 2026-04-02 00:00
+          secofs.t18z.20260401.rst.nowcast.nc → 2026-04-01 18:00
+        """
+        import re
+        name = filepath.name
+        # Match: {ofs}.t{HH}z.{YYYYMMDD}.rst or .init
+        m = re.search(r"\.t(\d{2})z\.(\d{8})\.", name)
+        if m:
+            cyc_hour = int(m.group(1))
+            date_str = m.group(2)
+            try:
+                return datetime.strptime(date_str, "%Y%m%d") + timedelta(hours=cyc_hour)
+            except ValueError:
+                pass
+        return None
 
     def _read_hotstart(self, filepath: Path) -> Optional[HotstartInfo]:
         """Read timing and grid info from hotstart.nc."""
