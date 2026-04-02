@@ -1,6 +1,6 @@
 # nos-utils
 
-Python forcing generation utilities for NOAA NOS-OFS (National Ocean Service Operational Forecast Systems).
+Python forcing generation utilities for NOS Operational Forecast Systems.
 
 Standalone package that generates atmospheric, ocean boundary, river, and tidal forcing files for SCHISM-based ocean forecast systems (SECOFS, STOFS-3D-ATL, CREOFS, etc.).
 
