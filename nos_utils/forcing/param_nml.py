@@ -65,14 +65,24 @@ class ParamNmlProcessor(ForcingProcessor):
         log.info(f"param.nml processor: phase={self.phase}")
         self.create_output_dir()
 
-        # Find template
+        # Find template — try multiple naming conventions
         template_path = self.input_path / self.template_name
         if not template_path.exists():
-            # Try common alternative names
-            for alt in [f"{self.template_name}_template", "param.nml.template"]:
+            # Common alternative names: {ofs}.param.nml, {ofs}_param.nml, etc.
+            alternatives = [
+                f"{self.template_name}_template",
+                "param.nml.template",
+            ]
+            # Also glob for any file containing "param.nml" or "param_nml"
+            found = sorted(self.input_path.glob("*param.nml*")) + \
+                    sorted(self.input_path.glob("*param_nml*"))
+            alternatives.extend([f.name for f in found])
+
+            for alt in alternatives:
                 alt_path = self.input_path / alt
                 if alt_path.exists():
                     template_path = alt_path
+                    log.info(f"Using template: {alt_path.name}")
                     break
             else:
                 return ForcingResult(

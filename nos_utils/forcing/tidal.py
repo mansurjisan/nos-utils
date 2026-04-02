@@ -81,6 +81,12 @@ class TidalProcessor(ForcingProcessor):
 
         # Mode 1: Template-based
         template = self.config.bctides_template
+        # Auto-discover template if not explicitly set
+        if not template or not Path(template).exists():
+            for f in sorted(self.input_path.glob("*bctides*template*")):
+                template = f
+                log.info(f"Auto-discovered bctides template: {f.name}")
+                break
         if template and Path(template).exists():
             log.info(f"Using template: {template}")
             result = self._process_template(Path(template), output_file)
@@ -91,8 +97,12 @@ class TidalProcessor(ForcingProcessor):
                     metadata={"mode": "template"},
                 )
 
-        # Mode 2: Copy from input_path
-        for name in ["bctides.in", f"{self.config.pdy}_bctides.in"]:
+        # Mode 2: Copy from input_path (try multiple naming patterns)
+        search_names = ["bctides.in", f"{self.config.pdy}_bctides.in"]
+        # Also glob for {ofs}.bctides.in patterns
+        search_names.extend([f.name for f in sorted(self.input_path.glob("*bctides.in"))
+                             if "template" not in f.name])
+        for name in search_names:
             src = self.input_path / name
             if src.exists():
                 shutil.copy2(src, output_file)
