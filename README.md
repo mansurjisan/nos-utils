@@ -1,56 +1,47 @@
 # nos-utils
 
-Python forcing generation utilities for NOS Operational Forecast Systems.
-
-Standalone package that generates atmospheric, ocean boundary, river, and tidal forcing files for SCHISM-based ocean forecast systems (SECOFS, STOFS-3D-ATL, CREOFS, etc.).
-
-## Processors
-
-| Processor | Source | Resolution | Output |
-|-----------|--------|------------|--------|
-| **GFSProcessor** | GFS 0.25° | Hourly | sflux or DATM |
-| **HRRRProcessor** | HRRR 3km CONUS | Hourly | sflux (secondary) |
-| **GEFSProcessor** | GEFS ensemble | 3-hourly | sflux per member |
-| **RTOFSProcessor** | RTOFS global ocean | 6-hourly | elev2D/TEM_3D/SAL_3D/uv3D |
-| **NWMProcessor** | National Water Model | Hourly | vsource/msource/source_sink |
-| **TidalProcessor** | TPXO9 harmonics | Static | bctides.in |
+Python forcing generators for NOAA NOS-OFS ocean forecast systems.
 
 ## Install
 
 ```bash
-pip install -e .            # Core (numpy only)
-pip install -e ".[full]"    # With netCDF4, scipy, cfgrib
-pip install -e ".[dev]"     # With pytest
+pip install -e ".[full]"    # numpy, netCDF4, scipy
 ```
 
 ## Usage
 
 ```python
 from nos_utils.config import ForcingConfig
-from nos_utils.forcing import GFSProcessor, HRRRProcessor
+from nos_utils.forcing import GFSProcessor
 
-# SECOFS: 6h nowcast + 48h forecast
 config = ForcingConfig.for_secofs(pdy="20260324", cyc=12)
-
-# GFS (primary atmospheric)
 gfs = GFSProcessor(config, input_path="/data/gfs/v16.3", output_path="/data/sflux")
 result = gfs.process()
-print(result.output_files)  # [sflux_air_1.1.nc, sflux_rad_1.1.nc, ...]
-
-# HRRR (secondary, optional)
-hrrr = HRRRProcessor(config, input_path="/data/hrrr/v4.1", output_path="/data/sflux")
-hrrr.process()  # Non-fatal if unavailable
 ```
+
+CLI:
+```bash
+nos-utils prep --ofs secofs --pdy 20260324 --cyc 12 --gfs /data/gfs --output /work/
+```
+
+## Processors
+
+| Processor | Input | Output |
+|-----------|-------|--------|
+| GFSProcessor | GFS 0.25° GRIB2 | sflux or DATM |
+| HRRRProcessor | HRRR 3km GRIB2 | sflux (secondary) |
+| GEFSProcessor | GEFS ensemble GRIB2 | sflux per member |
+| RTOFSProcessor | RTOFS NetCDF | elev2D, TEM/SAL_3D, uv3D |
+| NWMProcessor | NWM channel_rt | vsource.th, msource.th |
+| TidalProcessor | TPXO9 template | bctides.in |
+| ParamNmlProcessor | param.nml template | param.nml |
+| HotstartProcessor | restart archive | hotstart.nc |
+| PartitionProcessor | hgrid.gr3 | partition.prop |
+| ESMFMeshProcessor | forcing grid | esmf_mesh.nc |
+| BlenderProcessor | GFS+HRRR sflux | datm_forcing.nc |
 
 ## Test
 
 ```bash
-pytest -v                    # Unit tests (no data needed)
-pytest tests/test_integration_gfs.py  # Integration (requires GFS GRIB2 data + wgrib2)
+pytest -v    # 124 unit tests, no data needed
 ```
-
-## GRIB2 Backends
-
-- **wgrib2** (production): Fast, handles all projections. Required for HRRR LCC regrid.
-- **cfgrib** (development): No external binary needed. `pip install cfgrib xarray`.
-- Auto-detected at runtime — prefers wgrib2 if available.
