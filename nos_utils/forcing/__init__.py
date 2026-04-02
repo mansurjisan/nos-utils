@@ -15,6 +15,10 @@ River:
 Tidal:
     TidalProcessor - Tidal constituents (bctides.in generation)
 
+Model Config:
+    ParamNmlProcessor - Generate/patch SCHISM param.nml
+    HotstartProcessor - Find and validate restart files
+
 Writers:
     SfluxWriter    - SCHISM sflux NetCDF output (nws=2)
     DATMWriter     - UFS-Coastal DATM NetCDF output (nws=4)
@@ -27,6 +31,8 @@ from .gefs import GEFSProcessor
 from .rtofs import RTOFSProcessor
 from .nwm import NWMProcessor, RiverConfig
 from .tidal import TidalProcessor, compute_nodal_corrections
+from .param_nml import ParamNmlProcessor
+from .hotstart import HotstartProcessor, HotstartInfo
 from .sflux_writer import SfluxWriter
 from .datm_writer import DATMWriter
 
@@ -45,6 +51,10 @@ __all__ = [
     # Tidal
     "TidalProcessor",
     "compute_nodal_corrections",
+    # Model config
+    "ParamNmlProcessor",
+    "HotstartProcessor",
+    "HotstartInfo",
     # Writers
     "SfluxWriter",
     "DATMWriter",
