@@ -119,6 +119,19 @@ class ForcingConfig:
         return cls(**defaults)
 
     @classmethod
+    def for_secofs_ufs(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
+        """Factory with SECOFS UFS-Coastal defaults (nws=4, DATM coupling)."""
+        defaults = dict(
+            lon_min=-88.0, lon_max=-63.0,
+            lat_min=17.0, lat_max=40.0,
+            pdy=pdy, cyc=cyc,
+            nowcast_hours=6, forecast_hours=48,
+            met_num=2, nws=4,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
     def for_stofs_3d_atl(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
         """Factory with STOFS-3D-ATL defaults (Atlantic Storm Surge)."""
         defaults = dict(
@@ -126,7 +139,44 @@ class ForcingConfig:
             lat_min=7.347, lat_max=52.5904,
             pdy=pdy, cyc=cyc,
             nowcast_hours=24, forecast_hours=108,
-            met_num=2,
+            met_num=2, n_levels=51,
+            nudging_enabled=True,
+            nudging_timescale_seconds=86400.0,
+            obc_ssh_offset=0.04,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
+    def for_ensemble(
+        cls, pdy: str, cyc: int,
+        member: int = 0, n_members: int = 6,
+        base_ofs: str = "stofs_3d_atl",
+        **overrides,
+    ) -> "ForcingConfig":
+        """
+        Factory for ensemble member forcing.
+
+        Args:
+            member: Member index (0=control, 1-N=perturbation)
+            n_members: Total ensemble size
+            base_ofs: Base OFS to inherit domain/timing from
+        """
+        if base_ofs == "secofs":
+            cfg = cls.for_secofs(pdy, cyc)
+        else:
+            cfg = cls.for_stofs_3d_atl(pdy, cyc)
+
+        # Ensemble uses met_num=1 for perturbation members (GEFS, not GFS+HRRR)
+        # Control (member 0) can use GFS+HRRR blend
+        defaults = dict(
+            lon_min=cfg.lon_min, lon_max=cfg.lon_max,
+            lat_min=cfg.lat_min, lat_max=cfg.lat_max,
+            pdy=pdy, cyc=cyc,
+            nowcast_hours=cfg.nowcast_hours,
+            forecast_hours=cfg.forecast_hours,
+            met_num=2 if member == 0 else 1,
+            n_levels=cfg.n_levels,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -161,9 +211,20 @@ class ForcingConfig:
         grid = data.get("grid", {})
         domain = grid.get("domain", {})
         model = data.get("model", {})
-        run = model.get("run", {})
+        run = model.get("run", model)
         forcing = data.get("forcing", {})
         atm = forcing.get("atmospheric", {})
+        ocean = forcing.get("ocean", {})
+        nudge = ocean.get("nudging", {}) if isinstance(ocean, dict) else {}
+
+        # Infer met_num: 2 if secondary/HRRR is configured, else 1
+        met_num = int(atm.get("met_num", 1))
+        if met_num == 1 and (atm.get("secondary") or atm.get("forecast_source2")):
+            met_num = 2
+
+        # Vertical levels
+        vert = model.get("vertical", {})
+        n_levels = int(vert.get("nvrt", grid.get("n_levels", 51)))
 
         kwargs = dict(
             lon_min=domain.get("lon_min", -180.0),
@@ -175,8 +236,13 @@ class ForcingConfig:
             nowcast_hours=int(run.get("nowcast_hours", float(run.get("hindcast_days", 0.25)) * 24)),
             forecast_hours=int(run.get("forecast_hours", float(run.get("forecast_days", 5.0)) * 24)),
             igrd_met=int(grid.get("igrd_met", 0)),
-            met_num=int(atm.get("met_num", 1)),
+            met_num=met_num,
             scale_hflux=float(atm.get("scale_hflux", 1.0)),
+            n_levels=n_levels,
+            nudging_enabled=nudge.get("enabled", False) if isinstance(nudge, dict) else False,
+            nudging_timescale_seconds=float(
+                nudge.get("timescale_seconds", nudge.get("timescale_days", 1.0) * 86400)
+            ) if isinstance(nudge, dict) else 86400.0,
         )
         kwargs.update(overrides)
         return cls(**kwargs)

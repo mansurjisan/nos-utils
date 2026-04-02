@@ -258,12 +258,44 @@ class PrepOrchestrator:
         return proc.process()
 
     def _run_datm(self, output_dir: Path) -> ForcingResult:
-        """Step 8: DATM forcing for UFS-Coastal."""
-        from .forcing.datm_writer import DATMWriter
+        """Step 8: DATM blending + ESMF mesh for UFS-Coastal."""
+        output_files = []
+        warnings = []
 
-        # DATM output is already handled by GFSProcessor when nws=4
-        # This step is for blending GFS+HRRR if both are available
+        # 8a: Blend GFS+HRRR sflux into datm_forcing.nc (if sflux dir has both sources)
+        sflux_dir = output_dir / "sflux"
+        if sflux_dir.exists():
+            gfs_sflux = list(sflux_dir.glob("sflux_air_1.*.nc"))
+            hrrr_sflux = list(sflux_dir.glob("sflux_air_2.*.nc"))
+
+            if gfs_sflux:
+                from .forcing.blender import BlenderProcessor
+                blender = BlenderProcessor(self.config, sflux_dir, output_dir)
+                blend_result = blender.process()
+                if blend_result.success:
+                    output_files.extend(blend_result.output_files)
+                    log.info(f"DATM blending: {len(blend_result.output_files)} files")
+                else:
+                    warnings.extend(blend_result.errors)
+
+        # 8b: Generate ESMF mesh from the datm_forcing.nc
+        datm_file = output_dir / "datm_forcing.nc"
+        if datm_file.exists():
+            from .forcing.esmf_mesh import ESMFMeshProcessor
+            mesh_proc = ESMFMeshProcessor(
+                self.config, output_dir, output_dir,
+                forcing_file=datm_file,
+            )
+            mesh_result = mesh_proc.process()
+            if mesh_result.success:
+                output_files.extend(mesh_result.output_files)
+            else:
+                warnings.extend(mesh_result.errors)
+        else:
+            warnings.append("datm_forcing.nc not found — ESMF mesh not generated")
+
         return ForcingResult(
             success=True, source="DATM",
-            warnings=["DATM blending not yet implemented — using GFS-only DATM"],
+            output_files=output_files,
+            warnings=warnings,
         )
