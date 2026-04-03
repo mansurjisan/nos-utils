@@ -180,6 +180,9 @@ class PrepOrchestrator:
         if self.config.nws == 4:
             results.append(self._run_datm(output_dir))
 
+        # Step 9: Write time marker files (matches ORG behavior)
+        self._write_time_markers(output_dir, phase, time_hotstart)
+
         elapsed = time.time() - t0
 
         # Determine overall success (all critical steps must succeed)
@@ -257,6 +260,33 @@ class PrepOrchestrator:
             self.config, fix_dir, output_dir,
         )
         return proc.process()
+
+    def _write_time_markers(self, output_dir: Path, phase: str,
+                            time_hotstart=None) -> None:
+        """Write time marker files to COMOUT (matches ORG behavior)."""
+        from datetime import timedelta
+
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+        nowcast_end = cycle_dt
+        forecast_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
+
+        fmt = "%Y%m%d%H"
+        cycle_tag = f"t{self.config.cyc:02d}z"
+
+        markers = {
+            f"time_nowcastend.{cycle_tag}": nowcast_end.strftime(fmt),
+            f"time_forecastend.{cycle_tag}": forecast_end.strftime(fmt),
+        }
+
+        if time_hotstart:
+            markers[f"time_hotstart.{cycle_tag}"] = time_hotstart.strftime(fmt)
+            markers[f"base_date.{cycle_tag}"] = time_hotstart.strftime(fmt)
+
+        for filename, value in markers.items():
+            (output_dir / filename).write_text(value + "\n")
+
+        log.info(f"Wrote time markers: {list(markers.keys())}")
 
     def _run_param_nml(self, output_dir: Path, phase: str,
                        time_hotstart=None) -> ForcingResult:
@@ -345,23 +375,45 @@ class PrepOrchestrator:
 
         log.info(f"Archiving to {comout}")
 
-        # Tar sflux files
+        # Tar sflux files — separate GFS (stack 1) and HRRR (stack 2) like ORG
         sflux_dir = work_dir / "sflux"
-        if sflux_dir.exists() and list(sflux_dir.glob("sflux_*.nc")):
-            tar_name = f"{prefix}.{cycle}.{pdy}.met.{phase}.tar"
-            tar_path = comout / tar_name
-            try:
-                subprocess.run(
-                    ["tar", "-cf", str(tar_path), "-C", str(sflux_dir), "."],
-                    check=True, capture_output=True,
-                )
-                archived.append(tar_path)
-                log.info(f"  Archived sflux -> {tar_name}")
-            except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                log.warning(f"  Failed to tar sflux: {e}")
+        if sflux_dir.exists():
+            # GFS (primary): sflux_*_1.*.nc → met.{phase}.nc.tar
+            gfs_files = sorted(sflux_dir.glob("sflux_*_1.*.nc"))
+            if gfs_files:
+                tar_name = f"{prefix}.{cycle}.{pdy}.met.{phase}.nc.tar"
+                tar_path = comout / tar_name
+                try:
+                    file_list = [f.name for f in gfs_files]
+                    subprocess.run(
+                        ["tar", "-cf", str(tar_path), "-C", str(sflux_dir)] + file_list,
+                        check=True, capture_output=True,
+                    )
+                    archived.append(tar_path)
+                    log.info(f"  Archived GFS sflux -> {tar_name}")
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    log.warning(f"  Failed to tar GFS sflux: {e}")
+
+            # HRRR (secondary): sflux_*_2.*.nc → met.{phase}.nc.2.tar
+            hrrr_files = sorted(sflux_dir.glob("sflux_*_2.*.nc"))
+            if hrrr_files:
+                tar_name = f"{prefix}.{cycle}.{pdy}.met.{phase}.nc.2.tar"
+                tar_path = comout / tar_name
+                try:
+                    file_list = [f.name for f in hrrr_files]
+                    subprocess.run(
+                        ["tar", "-cf", str(tar_path), "-C", str(sflux_dir)] + file_list,
+                        check=True, capture_output=True,
+                    )
+                    archived.append(tar_path)
+                    log.info(f"  Archived HRRR sflux -> {tar_name}")
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    log.warning(f"  Failed to tar HRRR sflux: {e}")
 
         # Tar OBC files
-        obc_files = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]
+        # ORG includes nudging files in the OBC tar
+        obc_files = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc",
+                     "TEM_nu.nc", "SAL_nu.nc"]
         existing_obc = [work_dir / f for f in obc_files if (work_dir / f).exists()]
         if existing_obc:
             tar_name = f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar"
@@ -379,8 +431,8 @@ class PrepOrchestrator:
 
         # Copy individual files
         copy_map = {
-            "param.nml": f"{prefix}_schism_{phase}.in",
-            "bctides.in": f"{prefix}.bctides.in",
+            "param.nml": f"{prefix}.{cycle}.{pdy}.{phase}.in",
+            "bctides.in": f"{prefix}.{cycle}.{pdy}.bctides.in.{phase}",
             "source_sink.in": f"{prefix}.source_sink.in",
             "vsource.th": f"{prefix}.{cycle}.{pdy}.river.vsource.th",
             "msource.th": f"{prefix}.{cycle}.{pdy}.river.msource.th",
@@ -401,11 +453,12 @@ class PrepOrchestrator:
                 archived.append(dst)
                 log.info(f"  Copied {src_name} -> {dst_name}")
 
-        # Nudging files
-        for nu_file in ["TEM_nu.nc", "SAL_nu.nc"]:
-            src = work_dir / nu_file
+        # Time marker files
+        for marker in [f"time_hotstart.{cycle}", f"time_nowcastend.{cycle}",
+                       f"time_forecastend.{cycle}", f"base_date.{cycle}"]:
+            src = work_dir / marker
             if src.exists():
-                dst = comout / f"{prefix}.{cycle}.{nu_file}"
+                dst = comout / marker
                 shutil.copy2(src, dst)
                 archived.append(dst)
 
