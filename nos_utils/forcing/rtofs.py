@@ -297,30 +297,50 @@ class RTOFSProcessor(ForcingProcessor):
 
                 ds.close()
 
-            # Write boundary files
+            # Write boundary files — filter to consistent shapes before stacking
             time_step = 21600.0  # 6 hours in seconds (RTOFS output interval)
+
+            def _stack_consistent(arrays, label):
+                """Stack arrays, filtering out shape mismatches."""
+                if not arrays:
+                    return None
+                # Find most common shape
+                from collections import Counter
+                shapes = Counter(a.shape for a in arrays)
+                target_shape = shapes.most_common(1)[0][0]
+                consistent = [a for a in arrays if a.shape == target_shape]
+                n_dropped = len(arrays) - len(consistent)
+                if n_dropped:
+                    log.warning(f"{label}: dropped {n_dropped}/{len(arrays)} arrays "
+                                f"with inconsistent shapes (target: {target_shape})")
+                if not consistent:
+                    return None
+                return np.stack(consistent, axis=0)
 
             if all_temp:
                 fpath = self.output_path / "TEM_3D.th.nc"
-                merged = np.stack(all_temp, axis=0) if len(all_temp) > 1 else all_temp[0][np.newaxis, :]
-                self._write_3d_th(fpath, merged, "temperature", "degC", time_step)
-                output_files.append(fpath)
-                log.info(f"Created TEM_3D.th.nc: shape={merged.shape}")
+                merged = _stack_consistent(all_temp, "TEM_3D")
+                if merged is not None:
+                    self._write_3d_th(fpath, merged, "temperature", "degC", time_step)
+                    output_files.append(fpath)
+                    log.info(f"Created TEM_3D.th.nc: shape={merged.shape}")
 
             if all_salt:
                 fpath = self.output_path / "SAL_3D.th.nc"
-                merged = np.stack(all_salt, axis=0) if len(all_salt) > 1 else all_salt[0][np.newaxis, :]
-                self._write_3d_th(fpath, merged, "salinity", "PSU", time_step)
-                output_files.append(fpath)
-                log.info(f"Created SAL_3D.th.nc: shape={merged.shape}")
+                merged = _stack_consistent(all_salt, "SAL_3D")
+                if merged is not None:
+                    self._write_3d_th(fpath, merged, "salinity", "PSU", time_step)
+                    output_files.append(fpath)
+                    log.info(f"Created SAL_3D.th.nc: shape={merged.shape}")
 
             if all_u and all_v:
                 fpath = self.output_path / "uv3D.th.nc"
-                u_merged = np.stack(all_u, axis=0) if len(all_u) > 1 else all_u[0][np.newaxis, :]
-                v_merged = np.stack(all_v, axis=0) if len(all_v) > 1 else all_v[0][np.newaxis, :]
-                self._write_uv3d_th(fpath, u_merged, v_merged, time_step)
-                output_files.append(fpath)
-                log.info(f"Created uv3D.th.nc: shape u={u_merged.shape}")
+                u_merged = _stack_consistent(all_u, "uv3D_u")
+                v_merged = _stack_consistent(all_v, "uv3D_v")
+                if u_merged is not None and v_merged is not None:
+                    self._write_uv3d_th(fpath, u_merged, v_merged, time_step)
+                    output_files.append(fpath)
+                    log.info(f"Created uv3D.th.nc: shape u={u_merged.shape}")
 
         except Exception as e:
             log.error(f"Failed to process RTOFS 3D: {e}")
