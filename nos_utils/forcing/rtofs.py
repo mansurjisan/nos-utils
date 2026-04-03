@@ -198,8 +198,59 @@ class RTOFSProcessor(ForcingProcessor):
 
         return files_2d, files_3d
 
+    def _compute_roi_from_domain(self, ds: "Dataset") -> Optional[dict]:
+        """
+        Compute ROI indices from config domain bounds and RTOFS grid coordinates.
+
+        Adds a buffer of 2° around the domain for interpolation.
+        """
+        lon_min, lon_max, lat_min, lat_max = self.config.domain
+        buffer = 2.0  # degrees buffer around domain
+
+        # Read coordinates
+        lon_var = ds.variables.get("Longitude") or ds.variables.get("lon")
+        lat_var = ds.variables.get("Latitude") or ds.variables.get("lat")
+        if lon_var is None or lat_var is None:
+            return None
+
+        lons = lon_var[:]
+        lats = lat_var[:]
+
+        # RTOFS uses 0-360 longitude
+        target_lon_min = lon_min + 360 if lon_min < 0 else lon_min
+        target_lon_max = lon_max + 360 if lon_max < 0 else lon_max
+
+        if lons.ndim == 2:
+            # 2D coordinate arrays — find bounding box indices
+            lon_1d = lons[0, :]  # assume regular in x
+            lat_1d = lats[:, 0]  # assume regular in y
+        elif lons.ndim == 1:
+            lon_1d = lons[:]
+            lat_1d = lats[:]
+        else:
+            return None
+
+        x_mask = (lon_1d >= target_lon_min - buffer) & (lon_1d <= target_lon_max + buffer)
+        y_mask = (lat_1d >= lat_min - buffer) & (lat_1d <= lat_max + buffer)
+
+        x_idx = np.where(x_mask)[0]
+        y_idx = np.where(y_mask)[0]
+
+        if len(x_idx) == 0 or len(y_idx) == 0:
+            return None
+
+        roi = {
+            "x1": int(x_idx[0]), "x2": int(x_idx[-1] + 1),
+            "y1": int(y_idx[0]), "y2": int(y_idx[-1] + 1),
+        }
+        log.info(f"Auto-computed RTOFS ROI: x=[{roi['x1']}:{roi['x2']}], "
+                 f"y=[{roi['y1']}:{roi['y2']}] "
+                 f"({roi['x2']-roi['x1']}x{roi['y2']-roi['y1']} from "
+                 f"{len(lon_1d)}x{len(lat_1d)} global)")
+        return roi
+
     def _process_2d(self, files_2d: List[Path]) -> Optional[Path]:
-        """Extract SSH from RTOFS 2D files and create elev2D.th.nc."""
+        """Extract SSH from RTOFS 2D files, subsetted to domain."""
         output_file = self.output_path / "elev2D.th.nc"
         roi = self.config.obc_roi_2d
 
@@ -207,9 +258,14 @@ class RTOFSProcessor(ForcingProcessor):
             all_times = []
             all_ssh = []
 
-            for f in files_2d:
+            for i, f in enumerate(files_2d):
                 ds = Dataset(str(f))
-                # Extract SSH with optional ROI
+
+                # Auto-compute ROI from domain on first file if not configured
+                if roi is None and i == 0:
+                    roi = self._compute_roi_from_domain(ds)
+
+                # Extract SSH with ROI
                 if roi:
                     ssh = ds.variables["ssh"][
                         :, roi["y1"]:roi["y2"], roi["x1"]:roi["x2"]
@@ -266,8 +322,12 @@ class RTOFSProcessor(ForcingProcessor):
 
             roi = self.config.obc_roi_3d
 
-            for f in files_3d:
+            for i, f in enumerate(files_3d):
                 ds = Dataset(str(f))
+
+                # Auto-compute ROI on first file if not configured
+                if roi is None and i == 0:
+                    roi = self._compute_roi_from_domain(ds)
 
                 if roi:
                     sl = (slice(None), slice(None),
