@@ -135,7 +135,11 @@ def config_from_env(
     return config, paths
 
 
-def run_prep(phase: str = "nowcast", ofs: Optional[str] = None) -> bool:
+def run_prep(
+    phase: str = "nowcast",
+    ofs: Optional[str] = None,
+    skip_legacy: bool = True,
+) -> bool:
     """
     Run the prep orchestrator using NCO environment variables.
 
@@ -144,6 +148,8 @@ def run_prep(phase: str = "nowcast", ofs: Optional[str] = None) -> bool:
     Args:
         phase: "nowcast", "forecast", or "full"
         ofs: OFS name override
+        skip_legacy: If True (default), skip OBC/river (handled by legacy shell).
+            Set False to run all steps including Python OBC/river.
 
     Returns:
         True if successful
@@ -153,7 +159,8 @@ def run_prep(phase: str = "nowcast", ofs: Optional[str] = None) -> bool:
     config, paths = config_from_env(ofs_override=ofs)
     run_name = ofs or os.environ.get("RUN", "secofs")
 
-    orch = PrepOrchestrator(config, paths, run_name=run_name)
+    orch = PrepOrchestrator(config, paths, run_name=run_name,
+                           skip_legacy=skip_legacy)
     result = orch.run(phase=phase)
 
     print(result.summary())

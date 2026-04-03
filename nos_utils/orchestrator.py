@@ -97,11 +97,16 @@ class PrepOrchestrator:
     8. (UFS only) DATM blending + ESMF mesh generation
     """
 
+    # Steps that can be handled by Python vs legacy shell
+    PYTHON_STEPS = {"hotstart", "gfs", "hrrr", "tidal", "param_nml", "datm"}
+    LEGACY_STEPS = {"nwm", "rtofs", "nudging"}  # Need Fortran/shell for production
+
     def __init__(
         self,
         config: ForcingConfig,
         paths: Dict[str, str],
         run_name: str = "secofs",
+        skip_legacy: bool = True,
     ):
         """
         Args:
@@ -116,10 +121,13 @@ class PrepOrchestrator:
                 comout: Output archive directory (optional)
                 restart: Directory to search for hotstart files (optional)
             run_name: OFS name (e.g., "secofs", "stofs_3d_atl")
+            skip_legacy: If True (default), skip OBC/river/nudging steps
+                (handled by legacy shell scripts). Set False to run all steps.
         """
         self.config = config
         self.paths = {k: Path(v) for k, v in paths.items()}
         self.run_name = run_name
+        self.skip_legacy = skip_legacy
 
     def run(self, phase: str = "nowcast") -> PrepResult:
         """
@@ -161,13 +169,17 @@ class PrepOrchestrator:
         if "hrrr" in self.paths and self.config.met_num >= 2:
             results.append(self._run_hrrr(output_dir, phase))
 
-        # Step 4: NWM river (optional)
-        if "nwm" in self.paths:
+        # Step 4: NWM river (skip in hybrid mode — legacy shell handles it)
+        if "nwm" in self.paths and not self.skip_legacy:
             results.append(self._run_nwm(output_dir))
+        elif self.skip_legacy:
+            log.info("Skipping NWM river (handled by legacy shell)")
 
-        # Step 5: RTOFS OBC (optional)
-        if "rtofs" in self.paths:
+        # Step 5: RTOFS OBC (skip in hybrid mode — needs Fortran gen_3Dth_from_hycom)
+        if "rtofs" in self.paths and not self.skip_legacy:
             results.append(self._run_rtofs(output_dir))
+        elif self.skip_legacy:
+            log.info("Skipping RTOFS OBC (handled by legacy shell)")
 
         # Step 6: Tidal
         results.append(self._run_tidal(output_dir))
