@@ -59,8 +59,16 @@ class RiverConfig:
     def from_text(cls, filepath: Path) -> "RiverConfig":
         """Load river config from text file.
 
-        Expected format (space-separated):
-            feature_id  node_index  river_name  clim_flow  [clim_temp  clim_salt]
+        Supports two formats:
+
+        Format 1 (NWM reach file — secofs.nwm.reach.dat):
+            REACH_ID FLAG (header)
+            2                     (count)
+            20104159 1            (feature_id flag)
+            9643431  1
+
+        Format 2 (full river config):
+            feature_id  node_index  river_name  clim_flow
         """
         feature_ids = []
         node_indices = []
@@ -68,16 +76,60 @@ class RiverConfig:
         names = []
 
         with open(filepath) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or line.startswith("!"):
-                    continue
-                parts = line.split()
+            lines = f.readlines()
+
+        # Detect format: if first non-comment line has non-numeric text, it's a header
+        data_lines = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("!"):
+                continue
+            data_lines.append(line)
+
+        if not data_lines:
+            return cls([], [], [], [])
+
+        # Check if first line is a header (first field is non-numeric)
+        first_field = data_lines[0].split()[0]
+        try:
+            int(first_field)
+        except ValueError:
+            data_lines = data_lines[1:]  # Skip header (e.g., "REACH_ID FLAG ...")
+
+        # Check if first remaining line is just a count
+        if data_lines and len(data_lines[0].split()) == 1:
+            try:
+                int(data_lines[0])
+                data_lines = data_lines[1:]  # Skip count line
+            except ValueError:
+                pass
+
+        for i, line in enumerate(data_lines):
+            parts = line.split()
+            try:
                 if len(parts) >= 4:
+                    # Full format: feature_id node_index name clim_flow
                     feature_ids.append(int(parts[0]))
                     node_indices.append(int(parts[1]))
                     names.append(parts[2])
                     clim_flows.append(float(parts[3]))
+                elif len(parts) >= 2:
+                    # NWM reach format: feature_id flag
+                    fid = int(parts[0])
+                    flag = int(parts[1])
+                    if flag == 1:  # Only include reaches in NWM domain
+                        feature_ids.append(fid)
+                        node_indices.append(i + 1)  # Sequential node index
+                        names.append(f"reach_{fid}")
+                        clim_flows.append(50.0)  # Default climatology
+                elif len(parts) == 1:
+                    # Just a feature_id
+                    feature_ids.append(int(parts[0]))
+                    node_indices.append(i + 1)
+                    names.append(f"reach_{parts[0]}")
+                    clim_flows.append(50.0)
+            except ValueError:
+                continue
 
         return cls(feature_ids, node_indices, clim_flows, names)
 

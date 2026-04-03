@@ -286,7 +286,10 @@ class RTOFSProcessor(ForcingProcessor):
                         data = ds.variables[var_name][sl]
                         data = np.ma.filled(data, fill_value=-30000.0)
                         data[data > 10000] = -30000.0
-                        target_list.append(data.squeeze())
+                        # Take first time step if multiple, ensure 3D (depth, y, x)
+                        if data.ndim == 4:
+                            data = data[0]  # (1, depth, y, x) → (depth, y, x)
+                        target_list.append(data)
 
                 time_var = ds.variables.get("MT") or ds.variables.get("time")
                 if time_var is not None:
