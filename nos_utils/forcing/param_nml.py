@@ -108,7 +108,7 @@ class ParamNmlProcessor(ForcingProcessor):
         output_file.write_text(patched)
 
         log.info(f"Created param.nml: rnday={subs['rnday_value']}, "
-                 f"ihot={subs.get('ihot', 1)}, start={subs['start_year_value']}-"
+                 f"ihot={subs['ihot_value']}, start={subs['start_year_value']}-"
                  f"{subs['start_month_value']}-{subs['start_day_value']} "
                  f"{subs['start_hour_value']}:00")
 
@@ -120,7 +120,7 @@ class ParamNmlProcessor(ForcingProcessor):
                 "rnday": subs["rnday_value"],
                 "start_time": f"{subs['start_year_value']}-{subs['start_month_value']:>02s}-"
                               f"{subs['start_day_value']:>02s}T{subs['start_hour_value']}:00",
-                "ihot": subs.get("ihot", 1),
+                "ihot": int(subs["ihot_value"]),
                 "template": str(template_path),
             },
         )
