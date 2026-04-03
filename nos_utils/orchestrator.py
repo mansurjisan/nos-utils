@@ -140,7 +140,18 @@ class PrepOrchestrator:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Step 1: Hotstart
-        results.append(self._run_hotstart(output_dir))
+        hotstart_result = self._run_hotstart(output_dir)
+        results.append(hotstart_result)
+
+        # Extract time_hotstart for param.nml
+        time_hotstart = None
+        hs_info = hotstart_result.metadata.get("hotstart_info")
+        if hs_info and hasattr(hs_info, "filepath"):
+            # Parse datetime from the hotstart filename
+            from .forcing.hotstart import HotstartProcessor
+            proc = HotstartProcessor(self.config, Path(self.paths.get("restart", "")),
+                                     output_dir, run_name=self.run_name)
+            time_hotstart = proc._parse_file_datetime(hs_info.filepath)
 
         # Step 2: GFS atmospheric
         if "gfs" in self.paths:
@@ -161,9 +172,9 @@ class PrepOrchestrator:
         # Step 6: Tidal
         results.append(self._run_tidal(output_dir))
 
-        # Step 7: param.nml
+        # Step 7: param.nml (pass time_hotstart for correct rnday/start/ihot)
         if "fix" in self.paths:
-            results.append(self._run_param_nml(output_dir, phase))
+            results.append(self._run_param_nml(output_dir, phase, time_hotstart))
 
         # Step 8: UFS-specific (DATM)
         if self.config.nws == 4:
@@ -247,13 +258,15 @@ class PrepOrchestrator:
         )
         return proc.process()
 
-    def _run_param_nml(self, output_dir: Path, phase: str) -> ForcingResult:
+    def _run_param_nml(self, output_dir: Path, phase: str,
+                       time_hotstart=None) -> ForcingResult:
         """Step 7: Generate param.nml."""
         from .forcing.param_nml import ParamNmlProcessor
 
         proc = ParamNmlProcessor(
             self.config, self.paths["fix"], output_dir,
             phase=phase,
+            time_hotstart=time_hotstart,
         )
         return proc.process()
 

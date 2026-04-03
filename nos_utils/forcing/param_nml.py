@@ -47,6 +47,7 @@ class ParamNmlProcessor(ForcingProcessor):
         output_path: Path,
         template_name: str = "param.nml",
         phase: str = "nowcast",
+        time_hotstart: Optional[datetime] = None,
     ):
         """
         Args:
@@ -55,10 +56,15 @@ class ParamNmlProcessor(ForcingProcessor):
             output_path: Directory to write generated param.nml
             template_name: Template filename (default: param.nml)
             phase: "nowcast" or "forecast" — determines rnday and start time
+            time_hotstart: Hotstart datetime from restart file. If provided,
+                nowcast starts from this time (not cycle-nowcast_hours).
+                This matches the legacy shell behavior where rnday spans
+                from time_hotstart to nowcastend.
         """
         super().__init__(config, input_path, output_path)
         self.template_name = template_name
         self.phase = phase
+        self.time_hotstart = time_hotstart
 
     def process(self) -> ForcingResult:
         """Generate param.nml from template."""
@@ -124,32 +130,50 @@ class ParamNmlProcessor(ForcingProcessor):
         return [template] if template.exists() else []
 
     def _compute_substitutions(self) -> Dict[str, str]:
-        """Compute parameter values based on config and phase."""
+        """
+        Compute parameter values based on config, phase, and hotstart time.
+
+        Legacy shell behavior:
+          Nowcast:  start=time_hotstart, rnday=(nowcastend-hotstart)/24, ihot=1
+          Forecast: start=nowcastend,    rnday=forecast_hours/24,        ihot=2
+        """
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                    timedelta(hours=self.config.cyc)
+        nowcast_end = cycle_dt  # nowcastend = PDY + cyc
 
         if self.phase == "nowcast":
-            start_dt = cycle_dt - timedelta(hours=self.config.nowcast_hours)
-            end_dt = cycle_dt
-            run_hours = self.config.nowcast_hours
+            # Start from hotstart time if available, otherwise cycle - nowcast_hours
+            if self.time_hotstart:
+                start_dt = self.time_hotstart
+            else:
+                start_dt = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            end_dt = nowcast_end
+            run_hours = (end_dt - start_dt).total_seconds() / 3600.0
+            ihot = 1
         elif self.phase == "forecast":
-            start_dt = cycle_dt
-            end_dt = cycle_dt + timedelta(hours=self.config.forecast_hours)
+            start_dt = nowcast_end
+            end_dt = nowcast_end + timedelta(hours=self.config.forecast_hours)
             run_hours = self.config.forecast_hours
+            ihot = 2  # Forecast continues from nowcast hotstart (don't reset clock)
         else:
             # Full run (nowcast + forecast)
-            start_dt = cycle_dt - timedelta(hours=self.config.nowcast_hours)
-            end_dt = cycle_dt + timedelta(hours=self.config.forecast_hours)
-            run_hours = self.config.nowcast_hours + self.config.forecast_hours
+            if self.time_hotstart:
+                start_dt = self.time_hotstart
+            else:
+                start_dt = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            end_dt = nowcast_end + timedelta(hours=self.config.forecast_hours)
+            run_hours = (end_dt - start_dt).total_seconds() / 3600.0
+            ihot = 1
 
         rnday = run_hours / 24.0
 
         return {
             "rnday_value": f"{rnday:.4f}",
             "start_year_value": str(start_dt.year),
-            "start_month_value": str(start_dt.month),
-            "start_day_value": str(start_dt.day),
+            "start_month_value": f"{start_dt.month:02d}",
+            "start_day_value": f"{start_dt.day:02d}",
             "start_hour_value": f"{start_dt.hour:.1f}",
+            "ihot_value": str(ihot),
         }
 
     def _apply_substitutions(self, content: str, subs: Dict[str, str]) -> str:

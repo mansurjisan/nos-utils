@@ -45,8 +45,8 @@ class TestParamNmlProcessor:
         assert "0.2500" in content
         # Start time: 2026-04-01 12z - 6h = 06z
         assert "start_year = 2026" in content
-        assert "start_month = 4" in content
-        assert "start_day = 1" in content
+        assert "start_month = 04" in content
+        assert "start_day = 01" in content
         assert "start_hour = 6.0" in content
         # Placeholders should be gone
         assert "rnday_value" not in content
