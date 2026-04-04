@@ -107,7 +107,7 @@ class TestTidalProcessor:
         lines = (out_dir / "bctides.in").read_text().strip().split("\n")
 
         # Line 0: date
-        assert "/" in lines[0]  # DD/MM/YYYY format
+        assert "/" in lines[0]  # MM/DD/YYYY format
 
         # Line 1: ntip tip_dp
         assert lines[1].strip().startswith("0")

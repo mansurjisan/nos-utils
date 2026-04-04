@@ -181,8 +181,8 @@ class PrepOrchestrator:
         elif self.skip_legacy:
             log.info("Skipping RTOFS OBC (handled by legacy shell)")
 
-        # Step 6: Tidal
-        results.append(self._run_tidal(output_dir))
+        # Step 6: Tidal (phase-aware start time + nodal corrections)
+        results.append(self._run_tidal(output_dir, phase, time_hotstart))
 
         # Step 7: param.nml (pass time_hotstart for correct rnday/start/ihot)
         if "fix" in self.paths:
@@ -267,13 +267,15 @@ class PrepOrchestrator:
         )
         return proc.process()
 
-    def _run_tidal(self, output_dir: Path) -> ForcingResult:
+    def _run_tidal(self, output_dir: Path, phase: str = "nowcast",
+                   time_hotstart=None) -> ForcingResult:
         """Step 6: Tidal forcing."""
         from .forcing.tidal import TidalProcessor
 
         fix_dir = self.paths.get("fix", self.paths.get("output", output_dir))
         proc = TidalProcessor(
             self.config, fix_dir, output_dir,
+            phase=phase, time_hotstart=time_hotstart,
         )
         return proc.process()
 

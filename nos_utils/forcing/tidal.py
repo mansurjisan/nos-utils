@@ -62,8 +62,20 @@ class TidalProcessor(ForcingProcessor):
         config: ForcingConfig,
         input_path: Path,
         output_path: Path,
+        phase: str = "nowcast",
+        time_hotstart: Optional[datetime] = None,
     ):
+        """
+        Args:
+            config: ForcingConfig
+            input_path: FIX directory with bctides template
+            output_path: Output directory
+            phase: "nowcast" or "forecast" — determines start time for nodal corrections
+            time_hotstart: Hotstart datetime (nowcast starts from here)
+        """
         super().__init__(config, input_path, output_path)
+        self.phase = phase
+        self.time_hotstart = time_hotstart
 
     def process(self) -> ForcingResult:
         """
@@ -139,48 +151,88 @@ class TidalProcessor(ForcingProcessor):
 
         return files
 
+    def _compute_start_time(self) -> datetime:
+        """Compute the model start time for this phase."""
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+
+        if self.phase == "nowcast":
+            if self.time_hotstart:
+                return self.time_hotstart
+            return cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        elif self.phase == "forecast":
+            return cycle_dt
+        else:
+            if self.time_hotstart:
+                return self.time_hotstart
+            return cycle_dt - timedelta(hours=self.config.nowcast_hours)
+
     def _process_template(self, template_path: Path, output_path: Path) -> bool:
         """
-        Update a bctides.in_template with nodal corrections for the current start time.
+        Update a bctides.in_template with start time and nodal corrections.
 
-        The template contains harmonic constants (amplitude, phase) at each boundary node.
-        We update the nodal factors (f) and equilibrium arguments (u) for the model start time.
+        The template contains tidal potential and boundary forcing sections.
+        We update:
+          1. Line 1: start time in MM/DD/YYYY HH:MM:SS UTC format
+          2. Nodal factor (f) and equilibrium argument for each constituent
+             in the tidal potential section (lines after constituent names)
         """
-        start_time = datetime.strptime(self.config.pdy, "%Y%m%d") + \
-                     timedelta(hours=self.config.cyc) - \
-                     timedelta(hours=self.config.nowcast_hours)
+        start_time = self._compute_start_time()
 
         try:
             lines = template_path.read_text().splitlines()
 
-            # Update the start time on line 1
-            lines[0] = start_time.strftime("%d/%m/%Y %H:%M:%S")
+            # Update line 1: start time in MM/DD/YYYY format (matching ORG Fortran)
+            lines[0] = start_time.strftime("%m/%d/%Y %H:%M:%S") + " UTC"
 
-            # Find and update nodal factors for each constituent
+            # Compute nodal corrections for this start time
             nodal = compute_nodal_corrections(start_time, self.config.tidal_constituents)
+
+            # Update nodal factors in the tidal potential section
+            # Format: after each constituent name line, the next line has:
+            #   n_doodson amplitude omega nodal_factor equilibrium_arg
+            # We update nodal_factor and equilibrium_arg
+            i = 2  # Start after line 0 (date) and line 1 (ntip tip_dp)
+            while i < len(lines) - 1:
+                line = lines[i].strip()
+                # Check if this line is a constituent name
+                if line in nodal:
+                    # Next line has the nodal parameters
+                    i += 1
+                    parts = lines[i].split()
+                    if len(parts) >= 4:
+                        # Update nodal factor (index 2) and eq arg (index 3)
+                        f_val = nodal[line]["f"]
+                        u_val = nodal[line]["u"]
+                        # Compute equilibrium argument = V0 + u
+                        # The template has V0+u combined; we recompute
+                        parts[2] = f"{f_val:.5f}"
+                        parts[3] = f"{u_val:.5f}"
+                        lines[i] = " ".join(parts)
+                i += 1
 
             # Write updated file
             output_path.write_text("\n".join(lines) + "\n")
-            log.info(f"Updated template with start time: {start_time}")
+            log.info(f"Updated template: phase={self.phase}, start={start_time}, "
+                     f"nodal corrections applied for {len(nodal)} constituents")
             return True
 
         except Exception as e:
             log.error(f"Failed to process template: {e}")
+            import traceback
+            log.error(traceback.format_exc())
             return False
 
     def _generate_python(self, output_path: Path) -> None:
         """Generate a minimal bctides.in from scratch using Python."""
-        start_time = datetime.strptime(self.config.pdy, "%Y%m%d") + \
-                     timedelta(hours=self.config.cyc) - \
-                     timedelta(hours=self.config.nowcast_hours)
+        start_time = self._compute_start_time()
 
         constituents = self.config.tidal_constituents
         nodal = compute_nodal_corrections(start_time, constituents)
-        run_days = (self.config.nowcast_hours + self.config.forecast_hours) / 24.0
 
         with open(output_path, "w") as f:
-            # Line 1: start time
-            f.write(f"{start_time.strftime('%d/%m/%Y %H:%M:%S')}\n")
+            # Line 1: start time in MM/DD/YYYY format
+            f.write(f"{start_time.strftime('%m/%d/%Y %H:%M:%S')} UTC\n")
 
             # Line 2: ntip tip_dp (no tidal potential body force)
             f.write("0 1.0\n")
