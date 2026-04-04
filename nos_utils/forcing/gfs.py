@@ -75,6 +75,8 @@ class GFSProcessor(ForcingProcessor):
         variables: Optional[List[str]] = None,
         resolution: str = "0p25",
         extractor: Optional[GRIBExtractor] = None,
+        phase: str = "nowcast",
+        time_hotstart: Optional[datetime] = None,
     ):
         """
         Args:
@@ -84,11 +86,15 @@ class GFSProcessor(ForcingProcessor):
             variables: Variables to extract (default: 8 core sflux vars)
             resolution: GFS resolution ("0p25" or "0p50")
             extractor: GRIB2 extractor (auto-detected if None)
+            phase: "nowcast" or "forecast" — determines time window
+            time_hotstart: Hotstart datetime (nowcast starts from here)
         """
         super().__init__(config, input_path, output_path)
         self.variables = variables or (config.variables if config.variables else self.DEFAULT_VARIABLES)
         self.resolution = resolution
         self._extractor = extractor
+        self.phase = phase
+        self.time_hotstart = time_hotstart
 
     @property
     def extractor(self) -> GRIBExtractor:
@@ -96,14 +102,73 @@ class GFSProcessor(ForcingProcessor):
             self._extractor = get_extractor()
         return self._extractor
 
+    def _get_time_window(self) -> Tuple[datetime, datetime]:
+        """
+        Compute the time window for this phase.
+
+        Nowcast:  time_hotstart (or cycle-nowcast_hours) → cycle + 3h buffer
+        Forecast: cycle - 3h buffer → cycle + forecast_hours + 3h buffer
+
+        The 3h buffer ensures overlap between nowcast and forecast,
+        matching ORG Fortran behavior.
+        """
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+
+        if self.phase == "nowcast":
+            if self.time_hotstart:
+                t_start = self.time_hotstart - timedelta(hours=3)  # buffer before hotstart
+            else:
+                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=3)
+            t_end = cycle_dt + timedelta(hours=3)  # buffer past nowcast end
+        elif self.phase == "forecast":
+            t_start = cycle_dt - timedelta(hours=3)  # buffer before forecast start
+            t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=3)
+        else:
+            # Full
+            if self.time_hotstart:
+                t_start = self.time_hotstart - timedelta(hours=3)
+            else:
+                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=3)
+            t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=3)
+
+        return t_start, t_end
+
+    def _filter_to_time_window(self, extracted: dict) -> dict:
+        """Filter extracted data to the phase-specific time window."""
+        t_start, t_end = self._get_time_window()
+        times = extracted["times"]
+
+        # Find indices within window
+        keep = [i for i, t in enumerate(times) if t_start <= t <= t_end]
+
+        if len(keep) == len(times):
+            log.info(f"Time window [{t_start} to {t_end}]: all {len(times)} steps kept")
+            return extracted
+
+        n_dropped = len(times) - len(keep)
+        log.info(f"Time window [{t_start} to {t_end}]: kept {len(keep)}/{len(times)} "
+                 f"(dropped {n_dropped} outside window)")
+
+        filtered = {
+            "times": [times[i] for i in keep],
+            "lons": extracted["lons"],
+            "lats": extracted["lats"],
+            "data": {},
+        }
+        for var, arrays in extracted["data"].items():
+            filtered["data"][var] = [arrays[i] for i in keep if i < len(arrays)]
+
+        return filtered
+
     def process(self) -> ForcingResult:
         """
         Process GFS forcing data.
 
-        Pipeline: discover files -> extract GRIB2 -> write sflux or DATM
+        Pipeline: discover files -> extract GRIB2 -> filter to time window -> write sflux or DATM
         """
         log.info(f"GFS processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z "
-                 f"domain={self.config.domain} res={self.resolution}")
+                 f"phase={self.phase} domain={self.config.domain} res={self.resolution}")
 
         self.create_output_dir()
 
@@ -124,7 +189,10 @@ class GFSProcessor(ForcingProcessor):
                 errors=["Failed to extract data from GFS files"],
             )
 
-        # Step 3: Write output
+        # Step 3: Filter to phase-specific time window
+        extracted = self._filter_to_time_window(extracted)
+
+        # Step 4: Write output
         output_files = []
         warnings = []
 

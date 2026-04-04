@@ -163,11 +163,11 @@ class PrepOrchestrator:
 
         # Step 2: GFS atmospheric
         if "gfs" in self.paths:
-            results.append(self._run_gfs(output_dir, phase))
+            results.append(self._run_gfs(output_dir, phase, time_hotstart))
 
         # Step 3: HRRR secondary (optional, non-fatal)
         if "hrrr" in self.paths and self.config.met_num >= 2:
-            results.append(self._run_hrrr(output_dir, phase))
+            results.append(self._run_hrrr(output_dir, phase, time_hotstart))
 
         # Step 4: NWM river (skip in hybrid mode — legacy shell handles it)
         if "nwm" in self.paths and not self.skip_legacy:
@@ -225,23 +225,27 @@ class PrepOrchestrator:
         )
         return proc.process()
 
-    def _run_gfs(self, output_dir: Path, phase: str) -> ForcingResult:
+    def _run_gfs(self, output_dir: Path, phase: str,
+                 time_hotstart=None) -> ForcingResult:
         """Step 2: GFS atmospheric forcing."""
         from .forcing.gfs import GFSProcessor
 
         sflux_dir = output_dir / "sflux" if self.config.nws == 2 else output_dir
         proc = GFSProcessor(
             self.config, self.paths["gfs"], sflux_dir,
+            phase=phase, time_hotstart=time_hotstart,
         )
         return proc.process()
 
-    def _run_hrrr(self, output_dir: Path, phase: str) -> ForcingResult:
+    def _run_hrrr(self, output_dir: Path, phase: str,
+                  time_hotstart=None) -> ForcingResult:
         """Step 3: HRRR secondary atmospheric (optional)."""
         from .forcing.hrrr import HRRRProcessor
 
         sflux_dir = output_dir / "sflux" if self.config.nws == 2 else output_dir
         proc = HRRRProcessor(
             self.config, self.paths["hrrr"], sflux_dir,
+            phase=phase, time_hotstart=time_hotstart,
         )
         return proc.process()
 

@@ -22,7 +22,7 @@ Output:
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -68,6 +68,8 @@ class HRRRProcessor(ForcingProcessor):
         variables: Optional[List[str]] = None,
         regrid_dx: float = 0.03,
         extractor: Optional[GRIBExtractor] = None,
+        phase: str = "nowcast",
+        time_hotstart: Optional[datetime] = None,
     ):
         """
         Args:
@@ -77,11 +79,15 @@ class HRRRProcessor(ForcingProcessor):
             variables: Variables to extract (default: 8 core sflux vars)
             regrid_dx: Target resolution after LCC->latlon regrid (degrees, ~3.3km)
             extractor: GRIB2 extractor (auto-detected if None)
+            phase: "nowcast" or "forecast"
+            time_hotstart: Hotstart datetime
         """
         super().__init__(config, input_path, output_path)
         self.variables = variables or self.DEFAULT_VARIABLES
         self.regrid_dx = regrid_dx
         self._extractor = extractor
+        self.phase = phase
+        self.time_hotstart = time_hotstart
 
     @property
     def extractor(self) -> GRIBExtractor:
@@ -95,7 +101,7 @@ class HRRRProcessor(ForcingProcessor):
 
         HRRR is optional — all failures return success=True with warnings.
         """
-        log.info(f"HRRR processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z")
+        log.info(f"HRRR processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z phase={self.phase}")
 
         if not self.input_path.exists():
             return ForcingResult(
@@ -123,7 +129,10 @@ class HRRRProcessor(ForcingProcessor):
                     warnings=["Could not extract HRRR data"],
                 )
 
-            # Step 3: Write sflux (source_index=2 for secondary)
+            # Step 3: Filter to phase-specific time window
+            extracted = self._filter_to_time_window(extracted)
+
+            # Step 4: Write sflux (source_index=2 for secondary)
             writer = SfluxWriter(self.output_path, source_index=2)
             base_date = self._compute_base_date()
             files = writer.write_all(
@@ -440,6 +449,53 @@ class HRRRProcessor(ForcingProcessor):
         except (ValueError, IndexError):
             log.warning(f"Cannot parse time from {hrrr_file.name}")
             return None
+
+    def _get_time_window(self) -> Tuple[datetime, datetime]:
+        """Compute time window for this phase (same logic as GFS)."""
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+
+        if self.phase == "nowcast":
+            if self.time_hotstart:
+                t_start = self.time_hotstart - timedelta(hours=3)
+            else:
+                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=3)
+            t_end = cycle_dt + timedelta(hours=3)
+        elif self.phase == "forecast":
+            t_start = cycle_dt - timedelta(hours=3)
+            t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=3)
+        else:
+            if self.time_hotstart:
+                t_start = self.time_hotstart - timedelta(hours=3)
+            else:
+                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=3)
+            t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=3)
+
+        return t_start, t_end
+
+    def _filter_to_time_window(self, extracted: dict) -> dict:
+        """Filter extracted data to phase-specific time window."""
+        t_start, t_end = self._get_time_window()
+        times = extracted["times"]
+
+        keep = [i for i, t in enumerate(times) if t_start <= t <= t_end]
+
+        if len(keep) == len(times):
+            return extracted
+
+        n_dropped = len(times) - len(keep)
+        log.info(f"Time window [{t_start} to {t_end}]: kept {len(keep)}/{len(times)}")
+
+        filtered = {
+            "times": [times[i] for i in keep],
+            "lons": extracted["lons"],
+            "lats": extracted["lats"],
+            "data": {},
+        }
+        for var, arrays in extracted["data"].items():
+            filtered["data"][var] = [arrays[i] for i in keep if i < len(arrays)]
+
+        return filtered
 
     def _compute_base_date(self) -> datetime:
         """Compute sflux base date (start of nowcast period)."""
