@@ -10,8 +10,18 @@ Output:
   - SAL_3D.th.nc  — Salinity at boundary nodes (time, nOpenBndNodes, nLevels)
   - uv3D.th.nc    — Velocity at boundary nodes (time, nOpenBndNodes, nLevels, 2)
 
-Reads SCHISM boundary node locations from hgrid.ll and interpolates RTOFS
-data to those specific nodes — matching Fortran gen_3Dth_from_hycom behavior.
+Reads SCHISM boundary node locations from hgrid.ll (or obc.ctl for exact
+Fortran-matching node list) and interpolates RTOFS data to those nodes.
+
+IMPORTANT: SSH bias correction
+  The Fortran gen_3Dth_from_hycom applies a station-based bias correction:
+    1. Reads real-time tide gauge observations (NOSBUFR)
+    2. Computes AVGERR = mean(obs - RTOFS) per station (~1.25m for SECOFS)
+    3. Applies WLOBC += weight * (AVGERR + obs_subtidal) per boundary node
+  This Python processor does NOT apply this correction — the ~1.25m SSH
+  offset relative to Fortran output is expected. For production runs,
+  use hybrid mode (Fortran OBC) until Python has access to real-time
+  tide gauge data.
 
 Works with any SCHISM-based OFS (SECOFS, STOFS-3D-ATL, CREOFS, etc.)
 """
@@ -115,7 +125,6 @@ class RTOFSProcessor(ForcingProcessor):
         log.info(f"RTOFS processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z")
         self.create_output_dir()
 
-        # Load SCHISM grid for boundary nodes
         has_grid = self._load_grid()
         if not has_grid:
             return ForcingResult(
@@ -123,7 +132,6 @@ class RTOFSProcessor(ForcingProcessor):
                 errors=[f"Cannot load boundary nodes from grid: {self.grid_file}"],
             )
 
-        # Find RTOFS files
         files_2d, files_3d = self.find_input_files_by_type()
         if not files_2d and not files_3d:
             return ForcingResult(
@@ -134,7 +142,6 @@ class RTOFSProcessor(ForcingProcessor):
         output_files = []
         warnings = []
 
-        # Process 2D (SSH → elev2D.th.nc)
         if files_2d:
             log.info(f"Processing {len(files_2d)} RTOFS 2D files")
             f = self._process_2d(files_2d)
@@ -143,11 +150,17 @@ class RTOFSProcessor(ForcingProcessor):
             else:
                 warnings.append("Failed to create elev2D.th.nc")
 
-        # Process 3D (T,S,U,V → TEM_3D.th.nc, SAL_3D.th.nc, uv3D.th.nc)
         if files_3d:
             log.info(f"Processing {len(files_3d)} RTOFS 3D files")
             obc_files = self._process_3d(files_3d)
             output_files.extend(obc_files)
+
+        # Note about SSH bias correction
+        if not warnings:
+            warnings.append(
+                "SSH not bias-corrected (no tide gauge data). "
+                "Use hybrid mode for production OBC."
+            )
 
         return ForcingResult(
             success=len(output_files) > 0,
@@ -158,7 +171,8 @@ class RTOFSProcessor(ForcingProcessor):
                 "n_boundary_nodes": len(self._bnd_lons),
                 "n_2d_files": len(files_2d),
                 "n_3d_files": len(files_3d),
-                "n_levels": self.config.n_levels,
+                "n_levels": self._vgrid.nvrt if self._vgrid else self.config.n_levels,
+                "ssh_bias_corrected": False,
             },
         )
 
@@ -207,13 +221,9 @@ class RTOFSProcessor(ForcingProcessor):
         self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray,
     ) -> Optional[dict]:
         """
-        Build interpolation index from RTOFS grid to boundary nodes.
-
-        RTOFS has a curvilinear grid (2D lon/lat arrays), not a regular grid.
-        Uses nearest-neighbor index for fast repeated interpolation.
-        Cached per grid shape — 2D global and 3D regional have different grids.
+        Build nearest-neighbor interpolation index from RTOFS grid to boundary nodes.
+        Cached per grid shape (global 2D vs regional 3D have different grids).
         """
-        # Cache key based on grid shape
         if rtofs_lon.ndim == 2:
             cache_key = rtofs_lon.shape
         else:
@@ -225,21 +235,26 @@ class RTOFSProcessor(ForcingProcessor):
         n_bnd = len(self._bnd_lons)
         bnd_lons_360 = np.where(self._bnd_lons < 0, self._bnd_lons + 360, self._bnd_lons)
 
-        # Flatten RTOFS 2D grid
         if rtofs_lon.ndim == 2:
             lon_flat = rtofs_lon.ravel()
             lat_flat = rtofs_lat.ravel()
         else:
-            # 1D arrays — create meshgrid
             lon_2d, lat_2d = np.meshgrid(rtofs_lon, rtofs_lat)
             lon_flat = lon_2d.ravel()
             lat_flat = lat_2d.ravel()
 
-        # For each boundary node, find the nearest RTOFS grid point
-        indices = np.zeros(n_bnd, dtype=np.int64)
-        for k in range(n_bnd):
-            dist = (lon_flat - bnd_lons_360[k])**2 + (lat_flat - self._bnd_lats[k])**2
-            indices[k] = np.argmin(dist)
+        # Use scipy cKDTree if available (much faster than brute force)
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(np.column_stack([lon_flat, lat_flat]))
+            _, indices = tree.query(np.column_stack([bnd_lons_360, self._bnd_lats]))
+            indices = indices.astype(np.int64)
+        except ImportError:
+            # Brute force fallback
+            indices = np.zeros(n_bnd, dtype=np.int64)
+            for k in range(n_bnd):
+                dist = (lon_flat - bnd_lons_360[k])**2 + (lat_flat - self._bnd_lats[k])**2
+                indices[k] = np.argmin(dist)
 
         result = {
             "indices": indices,
@@ -253,11 +268,7 @@ class RTOFSProcessor(ForcingProcessor):
     def _interpolate_2d_to_boundary(
         self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray, rtofs_data: np.ndarray,
     ) -> np.ndarray:
-        """
-        Interpolate a 2D RTOFS field to boundary node locations.
-
-        Uses nearest-neighbor from pre-built index (fast for curvilinear grids).
-        """
+        """Interpolate a 2D RTOFS field to boundary node locations."""
         n_bnd = len(self._bnd_lons)
 
         interp = self._build_rtofs_interpolator(rtofs_lon, rtofs_lat)
@@ -266,37 +277,9 @@ class RTOFSProcessor(ForcingProcessor):
 
         data_flat = rtofs_data.ravel()
         result = data_flat[interp["indices"]].astype(np.float32)
-
-        # Replace fill values with NaN
         result[np.abs(result) > 1e10] = np.nan
 
         return result
-
-    def _compute_mdt_offset(self, rtofs_lon, rtofs_lat, ssh_field) -> np.ndarray:
-        """
-        Compute Mean Dynamic Topography (MDT) offset at boundary nodes.
-
-        RTOFS SSH is relative to the geoid. SCHISM needs SSH relative to MSL.
-        The MDT (~1.0-1.5m for SECOFS) converts between the two.
-
-        MDT = mean SSH from RTOFS (time-invariant climatological offset).
-        We approximate it as the first-timestep SSH at each boundary node,
-        which captures the large-scale geoid-to-MSL offset.
-
-        A more accurate approach would use a separate MDT file, but this
-        matches the Fortran behavior closely enough for operational use.
-        """
-        # The RTOFS SSH includes MDT implicitly — the Fortran gen_3Dth
-        # uses RTOFS SSH directly (which is geoid-relative + MDT).
-        # The issue is that raw RTOFS "ssh" variable is actually the
-        # dynamic sea surface height anomaly (no MDT), while the
-        # "ssh" in the 2ds_diag files IS total SSH including MDT.
-        #
-        # The ~1.25m offset we see is because RTOFS 2ds_diag SSH
-        # already includes MDT. No additional correction needed.
-        # The problem was our Python was showing lower values because
-        # of fill value handling or masking issues.
-        return np.zeros(len(self._bnd_lons), dtype=np.float32)
 
     def _process_2d(self, files_2d: List[Path]) -> Optional[Path]:
         """Extract SSH from RTOFS 2D files, interpolate to boundary nodes."""
@@ -306,7 +289,6 @@ class RTOFSProcessor(ForcingProcessor):
 
         try:
             all_ssh = []
-            all_times_sec = []  # Time in seconds from start
 
             for f in files_2d:
                 ds = Dataset(str(f))
@@ -316,14 +298,6 @@ class RTOFSProcessor(ForcingProcessor):
 
                 ssh_raw = np.ma.filled(ssh_raw, fill_value=np.nan)
 
-                # Get time values
-                time_var = ds.variables.get("MT") or ds.variables.get("time")
-                if time_var is not None:
-                    file_times = time_var[:].tolist()
-                else:
-                    file_times = [len(all_ssh) * 21600.0]
-
-                # Interpolate each time step to boundary nodes
                 for t in range(ssh_raw.shape[0]):
                     ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
                     ssh_bnd += self.config.obc_ssh_offset
@@ -334,31 +308,33 @@ class RTOFSProcessor(ForcingProcessor):
             if not all_ssh:
                 return None
 
-            ssh_array = np.stack(all_ssh, axis=0)  # (time, nOpenBndNodes)
+            ssh_array = np.stack(all_ssh, axis=0)
 
-            # Temporally interpolate to model dt (120s) to match Fortran output
+            # Temporally interpolate to model dt (120s)
             n_rtofs = ssh_array.shape[0]
-            rtofs_dt = 21600.0  # 6-hourly RTOFS output
+            rtofs_dt = 21600.0
             total_time = (n_rtofs - 1) * rtofs_dt
             n_model_steps = int(total_time / model_dt) + 1
 
             if n_model_steps > n_rtofs and n_rtofs > 1:
-                # Interpolate from RTOFS 6-hourly to model dt
-                from scipy.interpolate import interp1d
-                rtofs_times = np.arange(n_rtofs) * rtofs_dt
-                model_times = np.arange(n_model_steps) * model_dt
-                model_times = model_times[model_times <= rtofs_times[-1]]
+                try:
+                    from scipy.interpolate import interp1d
+                    rtofs_times = np.arange(n_rtofs) * rtofs_dt
+                    model_times = np.arange(n_model_steps) * model_dt
+                    model_times = model_times[model_times <= rtofs_times[-1]]
 
-                ssh_interp = np.zeros((len(model_times), n_bnd), dtype=np.float32)
-                for node in range(n_bnd):
-                    f_interp = interp1d(rtofs_times, ssh_array[:, node],
-                                       kind="linear", fill_value="extrapolate")
-                    ssh_interp[:, node] = f_interp(model_times)
+                    ssh_interp = np.zeros((len(model_times), n_bnd), dtype=np.float32)
+                    for node in range(n_bnd):
+                        f_interp = interp1d(rtofs_times, ssh_array[:, node],
+                                           kind="linear", fill_value="extrapolate")
+                        ssh_interp[:, node] = f_interp(model_times)
 
-                ssh_array = ssh_interp
-                dt_out = model_dt
-                log.info(f"Temporally interpolated SSH: {n_rtofs} steps at 6h → "
-                         f"{len(model_times)} steps at dt={model_dt}s")
+                    ssh_array = ssh_interp
+                    dt_out = model_dt
+                    log.info(f"Temporally interpolated SSH: {n_rtofs} steps at 6h → "
+                             f"{len(model_times)} steps at dt={model_dt}s")
+                except ImportError:
+                    dt_out = rtofs_dt
             else:
                 dt_out = rtofs_dt
 
@@ -394,7 +370,6 @@ class RTOFSProcessor(ForcingProcessor):
         """Extract T,S,U,V from RTOFS 3D files, interpolate to boundary nodes."""
         output_files = []
         n_bnd = len(self._bnd_lons)
-        # Use vgrid nvrt if available (63 for SECOFS), else config n_levels
         n_levels = self._vgrid.nvrt if self._vgrid else self.config.n_levels
 
         try:
@@ -406,7 +381,6 @@ class RTOFSProcessor(ForcingProcessor):
             for f in files_3d:
                 ds = Dataset(str(f))
 
-                # Get RTOFS grid
                 lon = ds.variables.get("Longitude") or ds.variables.get("lon")
                 lat = ds.variables.get("Latitude") or ds.variables.get("lat")
                 depth = ds.variables.get("Depth") or ds.variables.get("lev")
@@ -432,9 +406,8 @@ class RTOFSProcessor(ForcingProcessor):
                     data = ds.variables[var_name][:]
                     data = np.ma.filled(data, fill_value=np.nan)
 
-                    # Take first time step if 4D
                     if data.ndim == 4:
-                        data = data[0]  # (depth, y, x)
+                        data = data[0]
 
                     # Interpolate each RTOFS depth level to boundary nodes
                     bnd_profile_rtofs = np.full((n_bnd, n_rtofs_levels), np.nan, dtype=np.float32)
@@ -446,7 +419,7 @@ class RTOFSProcessor(ForcingProcessor):
                     # Vertically interpolate from RTOFS levels to SCHISM levels
                     if self._vgrid and n_levels != n_rtofs_levels:
                         bnd_profile = self._interpolate_vertical(
-                            bnd_profile_rtofs, depth_arr, var_name
+                            bnd_profile_rtofs, depth_arr, var_name, n_levels
                         )
                     else:
                         bnd_profile = bnd_profile_rtofs
@@ -455,12 +428,11 @@ class RTOFSProcessor(ForcingProcessor):
 
                 ds.close()
 
-            # Write boundary files
-            dt = 21600.0  # 6-hourly
+            dt = 21600.0
 
             if all_temp:
                 fpath = self.output_path / "TEM_3D.th.nc"
-                merged = np.stack(all_temp, axis=0)  # (time, nBnd, nLevels)
+                merged = np.stack(all_temp, axis=0)
                 self._write_3d_th(fpath, merged, "temperature", "degC", dt, n_bnd)
                 output_files.append(fpath)
                 log.info(f"Created TEM_3D.th.nc: {merged.shape}")
@@ -488,30 +460,13 @@ class RTOFSProcessor(ForcingProcessor):
         return output_files
 
     def _interpolate_vertical(
-        self, bnd_profile: np.ndarray, rtofs_depths: np.ndarray, var_name: str,
+        self, bnd_profile: np.ndarray, rtofs_depths: np.ndarray,
+        var_name: str, target_levels: int,
     ) -> np.ndarray:
-        """
-        Interpolate from RTOFS depth levels to SCHISM vertical levels.
-
-        Args:
-            bnd_profile: (n_bnd, n_rtofs_levels) data on RTOFS depths
-            rtofs_depths: RTOFS depth values (positive down, meters)
-            var_name: Variable name for default fill values
-
-        Returns:
-            (n_bnd, nvrt) data on SCHISM vertical levels
-        """
+        """Interpolate from RTOFS depth levels to SCHISM vertical levels."""
         n_bnd = bnd_profile.shape[0]
-        nvrt = self._vgrid.nvrt
-        n_levels = self.config.n_levels
-
-        # Use config n_levels (63 for SECOFS)
-        target_levels = n_levels
-
-        # RTOFS depths are positive down; convert to negative for interpolation
         rtofs_z = -np.abs(rtofs_depths)
 
-        # Default values for missing data
         defaults = {"temperature": 15.0, "salinity": 35.0, "u": 0.0, "v": 0.0}
         fill_val = defaults.get(var_name, 0.0)
 
@@ -524,26 +479,22 @@ class RTOFSProcessor(ForcingProcessor):
             if np.sum(valid) < 2:
                 continue
 
-            # Get SCHISM depths for this node
             node_depth = abs(self._bnd_depths[node])
             if self._vgrid:
                 schism_z = self._vgrid.get_depths(node_depth)
-                # Trim to target_levels
                 if len(schism_z) > target_levels:
                     schism_z = schism_z[:target_levels]
                 elif len(schism_z) < target_levels:
-                    # Pad with evenly spaced levels
                     extra = np.linspace(schism_z[-1], 0, target_levels - len(schism_z) + 1)[1:]
                     schism_z = np.concatenate([schism_z, extra])
             else:
                 schism_z = np.linspace(-node_depth, 0, target_levels)
 
-            # Interpolate
             from scipy.interpolate import interp1d
             f_interp = interp1d(
                 rtofs_z[valid], profile[valid],
                 kind="linear", bounds_error=False,
-                fill_value=(profile[valid][0], profile[valid][-1]),  # extrapolate with edge values
+                fill_value=(profile[valid][0], profile[valid][-1]),
             )
             n_out = min(len(schism_z), target_levels)
             result[node, :n_out] = f_interp(schism_z[:n_out])
@@ -569,7 +520,7 @@ class RTOFSProcessor(ForcingProcessor):
         ts = nc.createVariable("time_series", "f4",
                                ("time", "nOpenBndNodes", "nLevels", "nComponents"),
                                fill_value=-30000.0)
-        ts[:, :, :, 0] = data  # (time, nBnd, nLevels)
+        ts[:, :, :, 0] = data
 
         nc.close()
 
