@@ -353,8 +353,8 @@ class RTOFSProcessor(ForcingProcessor):
                     ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
                     # Geoid-to-MSL datum offset (config-driven, per OFS):
                     #   SECOFS: +1.25m (nos_ofs_create_forcing_obc_schism.f line 3133)
-                    #   STOFS-3D-ATL: +0.04m
-                    #   GOMOFS: +0.62m
+                    #   STOFS-3D-ATL: 0.0 (uses ADT blending, not constant offset)
+                    #   Other OFS: verify offset from Fortran source before setting
                     ssh_bnd += self.config.obc_ssh_offset
                     all_ssh.append(ssh_bnd)
 

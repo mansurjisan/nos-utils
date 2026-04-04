@@ -68,6 +68,8 @@ class ForcingConfig:
     # RTOFS ROI indices for 3D (T,S,U,V) extraction
     obc_roi_3d: Optional[dict] = None  # {x1, x2, y1, y2}
     # SSH offset applied to boundary elevation (meters)
+    # Geoid-to-MSL datum offset (meters). OFS-specific — verify from Fortran source.
+    # SECOFS: 1.25 (confirmed). Other OFS: 0.0 until verified.
     obc_ssh_offset: float = 0.0
     # Nudging enabled and timescale
     nudging_enabled: bool = False
@@ -144,7 +146,7 @@ class ForcingConfig:
             met_num=2, n_levels=51,
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
-            obc_ssh_offset=0.04,
+            obc_ssh_offset=0.0,  # STOFS uses ADT blending, not a constant offset
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -160,7 +162,7 @@ class ForcingConfig:
             met_num=2, nws=4, n_levels=51,
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
-            obc_ssh_offset=0.04,
+            obc_ssh_offset=0.0,  # STOFS uses ADT blending, not a constant offset
         )
         defaults.update(overrides)
         return cls(**defaults)

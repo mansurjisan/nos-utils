@@ -14,7 +14,7 @@ class TestSTOFSConfig:
         assert cfg.met_num == 2
         assert cfg.n_levels == 51
         assert cfg.nudging_enabled is True
-        assert cfg.obc_ssh_offset == 0.04
+        assert cfg.obc_ssh_offset == 0.0  # STOFS uses ADT blending, not constant offset
 
     def test_stofs_override(self):
         cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260324", cyc=12, forecast_hours=72)
