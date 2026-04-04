@@ -13,3 +13,7 @@ htmlcov/
 *.bin
 .env
 TESTING_ROADMAP.md
+*.pptx
+~$*
+PREPROCESSING_FLOWCHART.md
+PRESENTATION.md
