@@ -67,7 +67,7 @@ class RTOFSProcessor(ForcingProcessor):
         self._bnd_lons = None
         self._bnd_lats = None
         self._bnd_depths = None
-        self._interp_cache = None  # Cached nearest-neighbor index for RTOFS grid
+        self._interp_cache = {}  # Cached nearest-neighbor indices keyed by grid shape
 
     def _load_grid(self) -> bool:
         """Load SCHISM grid and extract boundary node coordinates."""
@@ -191,10 +191,16 @@ class RTOFSProcessor(ForcingProcessor):
 
         RTOFS has a curvilinear grid (2D lon/lat arrays), not a regular grid.
         Uses nearest-neighbor index for fast repeated interpolation.
-        Built once and cached for all timesteps/variables.
+        Cached per grid shape — 2D global and 3D regional have different grids.
         """
-        if self._interp_cache is not None:
-            return self._interp_cache
+        # Cache key based on grid shape
+        if rtofs_lon.ndim == 2:
+            cache_key = rtofs_lon.shape
+        else:
+            cache_key = (len(rtofs_lat), len(rtofs_lon))
+
+        if cache_key in self._interp_cache:
+            return self._interp_cache[cache_key]
 
         n_bnd = len(self._bnd_lons)
         bnd_lons_360 = np.where(self._bnd_lons < 0, self._bnd_lons + 360, self._bnd_lons)
@@ -203,27 +209,26 @@ class RTOFSProcessor(ForcingProcessor):
         if rtofs_lon.ndim == 2:
             lon_flat = rtofs_lon.ravel()
             lat_flat = rtofs_lat.ravel()
-            ny, nx = rtofs_lon.shape
         else:
-            lon_flat = rtofs_lon
-            lat_flat = rtofs_lat
-            nx = len(rtofs_lon)
-            ny = len(rtofs_lat)
+            # 1D arrays — create meshgrid
+            lon_2d, lat_2d = np.meshgrid(rtofs_lon, rtofs_lat)
+            lon_flat = lon_2d.ravel()
+            lat_flat = lat_2d.ravel()
 
         # For each boundary node, find the nearest RTOFS grid point
-        # and its 4 neighbors for bilinear interpolation
         indices = np.zeros(n_bnd, dtype=np.int64)
         for k in range(n_bnd):
             dist = (lon_flat - bnd_lons_360[k])**2 + (lat_flat - self._bnd_lats[k])**2
             indices[k] = np.argmin(dist)
 
-        self._interp_cache = {
+        result = {
             "indices": indices,
-            "ny": ny,
-            "nx": nx,
+            "n_points": len(lon_flat),
         }
-        log.info(f"Built RTOFS interpolation index for {n_bnd} boundary nodes")
-        return self._interp_cache
+        self._interp_cache[cache_key] = result
+        log.info(f"Built RTOFS interpolation index for {n_bnd} boundary nodes "
+                 f"(grid {cache_key}, {len(lon_flat)} points)")
+        return result
 
     def _interpolate_2d_to_boundary(
         self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray, rtofs_data: np.ndarray,
