@@ -67,6 +67,7 @@ class RTOFSProcessor(ForcingProcessor):
         self._bnd_lons = None
         self._bnd_lats = None
         self._bnd_depths = None
+        self._interp_cache = None  # Cached nearest-neighbor index for RTOFS grid
 
     def _load_grid(self) -> bool:
         """Load SCHISM grid and extract boundary node coordinates."""
@@ -182,70 +183,69 @@ class RTOFSProcessor(ForcingProcessor):
 
         return files_2d, files_3d
 
+    def _build_rtofs_interpolator(
+        self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray,
+    ) -> Optional[dict]:
+        """
+        Build interpolation index from RTOFS grid to boundary nodes.
+
+        RTOFS has a curvilinear grid (2D lon/lat arrays), not a regular grid.
+        Uses nearest-neighbor index for fast repeated interpolation.
+        Built once and cached for all timesteps/variables.
+        """
+        if self._interp_cache is not None:
+            return self._interp_cache
+
+        n_bnd = len(self._bnd_lons)
+        bnd_lons_360 = np.where(self._bnd_lons < 0, self._bnd_lons + 360, self._bnd_lons)
+
+        # Flatten RTOFS 2D grid
+        if rtofs_lon.ndim == 2:
+            lon_flat = rtofs_lon.ravel()
+            lat_flat = rtofs_lat.ravel()
+            ny, nx = rtofs_lon.shape
+        else:
+            lon_flat = rtofs_lon
+            lat_flat = rtofs_lat
+            nx = len(rtofs_lon)
+            ny = len(rtofs_lat)
+
+        # For each boundary node, find the nearest RTOFS grid point
+        # and its 4 neighbors for bilinear interpolation
+        indices = np.zeros(n_bnd, dtype=np.int64)
+        for k in range(n_bnd):
+            dist = (lon_flat - bnd_lons_360[k])**2 + (lat_flat - self._bnd_lats[k])**2
+            indices[k] = np.argmin(dist)
+
+        self._interp_cache = {
+            "indices": indices,
+            "ny": ny,
+            "nx": nx,
+        }
+        log.info(f"Built RTOFS interpolation index for {n_bnd} boundary nodes")
+        return self._interp_cache
+
     def _interpolate_2d_to_boundary(
         self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray, rtofs_data: np.ndarray,
     ) -> np.ndarray:
         """
         Interpolate a 2D RTOFS field to boundary node locations.
 
-        Uses scipy RegularGridInterpolator for speed on regular grids,
-        falls back to nearest-neighbor if scipy unavailable.
+        Uses nearest-neighbor from pre-built index (fast for curvilinear grids).
         """
         n_bnd = len(self._bnd_lons)
 
-        # RTOFS uses 0-360 longitude; boundary nodes use -180 to 180
-        bnd_lons_360 = np.where(self._bnd_lons < 0, self._bnd_lons + 360, self._bnd_lons)
+        interp = self._build_rtofs_interpolator(rtofs_lon, rtofs_lat)
+        if interp is None:
+            return np.full(n_bnd, np.nan, dtype=np.float32)
 
-        try:
-            from scipy.interpolate import RegularGridInterpolator
+        data_flat = rtofs_data.ravel()
+        result = data_flat[interp["indices"]].astype(np.float32)
 
-            # Extract 1D axes (assume regular grid)
-            if rtofs_lon.ndim == 2:
-                lon_1d = rtofs_lon[0, :]
-                lat_1d = rtofs_lat[:, 0]
-            else:
-                lon_1d = rtofs_lon
-                lat_1d = rtofs_lat
+        # Replace fill values with NaN
+        result[np.abs(result) > 1e10] = np.nan
 
-            interp = RegularGridInterpolator(
-                (lat_1d, lon_1d), rtofs_data,
-                method="linear", bounds_error=False, fill_value=np.nan,
-            )
-
-            points = np.column_stack([self._bnd_lats, bnd_lons_360])
-            result = interp(points).astype(np.float32)
-
-            # Fill NaN with nearest valid value
-            nan_mask = np.isnan(result)
-            if np.any(nan_mask):
-                from scipy.interpolate import NearestNDInterpolator
-                valid = ~np.isnan(rtofs_data)
-                if np.any(valid):
-                    lat_grid, lon_grid = np.meshgrid(lat_1d, lon_1d, indexing="ij")
-                    nn = NearestNDInterpolator(
-                        np.column_stack([lat_grid[valid], lon_grid[valid]]),
-                        rtofs_data[valid],
-                    )
-                    result[nan_mask] = nn(points[nan_mask])
-
-            return result
-
-        except ImportError:
-            # Nearest-neighbor fallback
-            result = np.zeros(n_bnd, dtype=np.float32)
-            if rtofs_lon.ndim == 2:
-                lon_1d = rtofs_lon[0, :]
-                lat_1d = rtofs_lat[:, 0]
-            else:
-                lon_1d = rtofs_lon
-                lat_1d = rtofs_lat
-
-            for k in range(n_bnd):
-                j = np.argmin(np.abs(lat_1d - self._bnd_lats[k]))
-                i = np.argmin(np.abs(lon_1d - bnd_lons_360[k]))
-                result[k] = rtofs_data[j, i]
-
-            return result
+        return result
 
     def _process_2d(self, files_2d: List[Path]) -> Optional[Path]:
         """Extract SSH from RTOFS 2D files, interpolate to boundary nodes."""
