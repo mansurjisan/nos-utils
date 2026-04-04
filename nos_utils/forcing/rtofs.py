@@ -394,7 +394,8 @@ class RTOFSProcessor(ForcingProcessor):
         """Extract T,S,U,V from RTOFS 3D files, interpolate to boundary nodes."""
         output_files = []
         n_bnd = len(self._bnd_lons)
-        n_levels = self.config.n_levels
+        # Use vgrid nvrt if available (63 for SECOFS), else config n_levels
+        n_levels = self._vgrid.nvrt if self._vgrid else self.config.n_levels
 
         try:
             all_temp = []
