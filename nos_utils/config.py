@@ -114,6 +114,7 @@ class ForcingConfig:
             pdy=pdy, cyc=cyc,
             nowcast_hours=6, forecast_hours=48,
             met_num=2,
+            obc_ssh_offset=1.25,  # Geoid-to-MSL datum offset for SECOFS
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -127,6 +128,7 @@ class ForcingConfig:
             pdy=pdy, cyc=cyc,
             nowcast_hours=6, forecast_hours=48,
             met_num=2, nws=4,
+            obc_ssh_offset=1.25,
         )
         defaults.update(overrides)
         return cls(**defaults)
