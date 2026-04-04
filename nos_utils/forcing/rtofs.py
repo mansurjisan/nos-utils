@@ -351,6 +351,9 @@ class RTOFSProcessor(ForcingProcessor):
 
                 for t in range(ssh_raw.shape[0]):
                     ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
+                    # Fortran adds +0.25m to RTOFS SSH for all OFS except GOMOFS (+0.62)
+                    # (line 3452: "nontidal WL is about 25 cm lower")
+                    ssh_bnd += 0.25
                     ssh_bnd += self.config.obc_ssh_offset
                     all_ssh.append(ssh_bnd)
 
