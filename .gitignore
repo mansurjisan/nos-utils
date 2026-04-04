@@ -12,3 +12,4 @@ htmlcov/
 *.grb2
 *.bin
 .env
+TESTING_ROADMAP.md
