@@ -262,8 +262,25 @@ class PrepOrchestrator:
         """Step 5: RTOFS ocean boundary conditions."""
         from .forcing.rtofs import RTOFSProcessor
 
+        fix_dir = Path(self.paths.get("fix", ""))
+
+        # Find obc.ctl and vgrid.in in FIX directory
+        obc_ctl = None
+        vgrid = None
+        if fix_dir.exists():
+            for f in fix_dir.glob("*.obc.ctl"):
+                obc_ctl = f
+                break
+            for f in fix_dir.glob("*.vgrid.in"):
+                # Prefer the small one (68 lines, not 1.6GB LSC2)
+                if f.stat().st_size < 100000:
+                    vgrid = f
+                    break
+
         proc = RTOFSProcessor(
             self.config, self.paths["rtofs"], output_dir,
+            obc_ctl_file=obc_ctl,
+            vgrid_file=vgrid,
         )
         return proc.process()
 

@@ -181,6 +181,55 @@ class SchismGrid:
 
         return all_lons, all_lats, all_depths, all_ids
 
+    def obc_nodes_from_ctl(self, ctl_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
+        """
+        Read boundary node IDs from obc.ctl file (exact match with Fortran).
+
+        The obc.ctl has the precise 1,488 nodes used by gen_3Dth_from_hycom,
+        which may differ slightly from hgrid.ll boundary section.
+
+        Args:
+            ctl_path: Path to {ofs}.obc.ctl
+
+        Returns:
+            (lons, lats, depths, node_ids) — from obc.ctl SECTION 2
+        """
+        ctl_path = Path(ctl_path)
+        node_ids = []
+
+        with open(ctl_path) as f:
+            lines = f.readlines()
+
+        # Find SECTION 2
+        sec2_start = None
+        for i, line in enumerate(lines):
+            if "SECTION 2" in line:
+                sec2_start = i
+                break
+
+        if sec2_start is None:
+            log.warning(f"SECTION 2 not found in {ctl_path}")
+            return self.open_boundary_nodes()
+
+        # Parse NODE_ID from column 1 (0-indexed), skip header line
+        for i in range(sec2_start + 2, len(lines)):
+            parts = lines[i].split()
+            if len(parts) >= 2:
+                try:
+                    node_id = int(parts[1])
+                    node_ids.append(node_id)
+                except ValueError:
+                    break
+
+        # Look up coordinates (node_ids are 1-based)
+        indices = [nid - 1 for nid in node_ids]
+        lons = self.node_lons[indices]
+        lats = self.node_lats[indices]
+        depths = self.node_depths[indices]
+
+        log.info(f"Read {len(node_ids)} boundary nodes from {ctl_path.name}")
+        return lons, lats, depths, node_ids
+
     def __repr__(self):
         return (f"SchismGrid(nodes={self.n_nodes:,}, elements={self.n_elements:,}, "
                 f"open_bnd={len(self.open_boundaries)}, "
