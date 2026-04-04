@@ -97,8 +97,8 @@ class ForcingConfig:
             raise ValueError(f"lon_min ({self.lon_min}) must be < lon_max ({self.lon_max})")
         if self.lat_min >= self.lat_max:
             raise ValueError(f"lat_min ({self.lat_min}) must be < lat_max ({self.lat_max})")
-        if self.igrd_met > 0 and self.grid_file is None:
-            raise ValueError("grid_file required when igrd_met > 0")
+        # grid_file is needed for igrd_met > 0 (met interpolation) or RTOFS OBC
+        # Don't raise error here — it's resolved later by nco_bridge from FIXofs
 
     @property
     def domain(self):
@@ -258,6 +258,10 @@ class ForcingConfig:
         bctides_template = tidal_files.get("harmonic_constants_ofs") or \
                           tidal_files.get("harmonic_constants_obc")
 
+        # Grid file (hgrid.ll for boundary node extraction)
+        grid_files = grid.get("files", {})
+        grid_file = grid_files.get("horizontal_ll") or grid_files.get("horizontal")
+
         # OBC SSH offset
         obc = ocean.get("obc", {}) if isinstance(ocean, dict) else {}
         obc_ssh_offset = float(obc.get("ssh_offset", 0.0))
@@ -288,6 +292,8 @@ class ForcingConfig:
             kwargs["river_config_file"] = Path(river_config_file)
         if bctides_template:
             kwargs["bctides_template"] = Path(bctides_template)
+        if grid_file:
+            kwargs["grid_file"] = Path(grid_file)
 
         kwargs.update(overrides)
         return cls(**kwargs)

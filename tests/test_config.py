@@ -46,10 +46,11 @@ class TestForcingConfig:
             ForcingConfig(lon_min=-80, lon_max=-70, lat_min=35, lat_max=25,
                          pdy="20260401", cyc=12)
 
-    def test_igrd_requires_grid_file(self):
-        with pytest.raises(ValueError, match="grid_file"):
-            ForcingConfig(lon_min=-80, lon_max=-70, lat_min=25, lat_max=35,
-                         pdy="20260401", cyc=12, igrd_met=1)
+    def test_grid_file_optional(self):
+        """grid_file can be None — resolved later by nco_bridge from FIXofs."""
+        cfg = ForcingConfig(lon_min=-80, lon_max=-70, lat_min=25, lat_max=35,
+                           pdy="20260401", cyc=12, igrd_met=1)
+        assert cfg.grid_file is None
 
     def test_defaults(self):
         cfg = ForcingConfig(lon_min=-80, lon_max=-70, lat_min=25, lat_max=35,
