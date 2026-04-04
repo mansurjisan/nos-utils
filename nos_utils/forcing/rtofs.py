@@ -268,7 +268,13 @@ class RTOFSProcessor(ForcingProcessor):
     def _interpolate_2d_to_boundary(
         self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray, rtofs_data: np.ndarray,
     ) -> np.ndarray:
-        """Interpolate a 2D RTOFS field to boundary node locations."""
+        """
+        Interpolate a 2D RTOFS field to boundary node locations.
+
+        Handles land masking: if the nearest RTOFS point is land (fill value),
+        searches outward for the nearest valid ocean point. This is critical
+        for coastal boundary nodes that fall on land in the RTOFS global grid.
+        """
         n_bnd = len(self._bnd_lons)
 
         interp = self._build_rtofs_interpolator(rtofs_lon, rtofs_lat)
@@ -277,7 +283,52 @@ class RTOFSProcessor(ForcingProcessor):
 
         data_flat = rtofs_data.ravel()
         result = data_flat[interp["indices"]].astype(np.float32)
-        result[np.abs(result) > 1e10] = np.nan
+
+        # Mark fill values as NaN
+        fill_mask = np.abs(result) > 1e10
+        result[fill_mask] = np.nan
+
+        # Extrapolate land points from nearest ocean values
+        n_land = np.sum(fill_mask)
+        if n_land > 0 and n_land < n_bnd:
+            # Build ocean-only KDTree for land point extrapolation
+            ocean_mask = np.abs(data_flat) < 1e10
+            if np.any(ocean_mask):
+                cache_key_ocean = ("ocean", rtofs_lon.shape if rtofs_lon.ndim == 2
+                                   else (len(rtofs_lon),))
+
+                if cache_key_ocean not in self._interp_cache:
+                    bnd_lons_360 = np.where(self._bnd_lons < 0,
+                                            self._bnd_lons + 360, self._bnd_lons)
+                    if rtofs_lon.ndim == 2:
+                        lon_flat = rtofs_lon.ravel()
+                        lat_flat = rtofs_lat.ravel()
+                    else:
+                        lon_2d, lat_2d = np.meshgrid(rtofs_lon, rtofs_lat)
+                        lon_flat = lon_2d.ravel()
+                        lat_flat = lat_2d.ravel()
+
+                    ocean_lon = lon_flat[ocean_mask]
+                    ocean_lat = lat_flat[ocean_mask]
+                    ocean_idx = np.where(ocean_mask)[0]
+
+                    try:
+                        from scipy.spatial import cKDTree
+                        tree = cKDTree(np.column_stack([ocean_lon, ocean_lat]))
+                        _, nn_idx = tree.query(
+                            np.column_stack([bnd_lons_360, self._bnd_lats])
+                        )
+                        self._interp_cache[cache_key_ocean] = {
+                            "ocean_indices": ocean_idx[nn_idx],
+                        }
+                    except ImportError:
+                        self._interp_cache[cache_key_ocean] = None
+
+                ocean_interp = self._interp_cache.get(cache_key_ocean)
+                if ocean_interp is not None:
+                    ocean_vals = data_flat[ocean_interp["ocean_indices"]].astype(np.float32)
+                    result[fill_mask] = ocean_vals[fill_mask]
+                    log.debug(f"Extrapolated {n_land} land boundary nodes from nearest ocean")
 
         return result
 
