@@ -66,13 +66,51 @@ class SchismVgrid:
 
     @classmethod
     def read(cls, filepath) -> "SchismVgrid":
-        """Read simple vgrid.in format."""
+        """
+        Read vgrid.in file. Supports two formats:
+
+        Simple format (68 lines):
+          Line 0: nvrt kz h_s
+          Lines 2-kz+1: Z-levels
+          Remaining: S-levels
+
+        LSC2 format (1.6GB, per-node):
+          Line 0: ivcor (=1)
+          Line 1: nvrt
+          Line 2: per-node kbp values
+          ... (per-node sigma levels)
+        """
+        filepath = Path(filepath)
+
+        with open(filepath) as f:
+            line0 = f.readline()
+            line1 = f.readline()
+
+        parts0 = line0.split()
+
+        # Detect format: simple has 3+ values on line 0 (nvrt kz h_s)
+        # LSC2 has just 1 value on line 0 (ivcor)
+        if len(parts0) >= 3:
+            # Simple format
+            return cls._read_simple(filepath)
+        else:
+            # LSC2 format — just extract nvrt, return with defaults
+            nvrt = int(line1.strip().split()[0])
+            log.info(f"Read LSC2 vgrid.in: nvrt={nvrt} (per-node sigma, skipping full parse)")
+            return cls(
+                nvrt=nvrt, kz=0, h_s=100.0,
+                z_levels=np.array([]),
+                sigma_levels=np.linspace(-1, 0, nvrt),
+            )
+
+    @classmethod
+    def _read_simple(cls, filepath) -> "SchismVgrid":
+        """Read simple vgrid.in format (68 lines)."""
         filepath = Path(filepath)
 
         with open(filepath) as f:
             lines = f.readlines()
 
-        # Line 0: nvrt kz h_s
         parts = lines[0].split()
         nvrt = int(parts[0])
         kz = int(parts[1])

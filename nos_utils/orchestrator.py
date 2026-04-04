@@ -272,10 +272,16 @@ class PrepOrchestrator:
                 obc_ctl = f
                 break
             for f in fix_dir.glob("*.vgrid.in"):
-                # Prefer the small one (68 lines, not 1.6GB LSC2)
-                if f.stat().st_size < 100000:
+                sz = f.stat().st_size
+                if sz < 100000:
+                    # Simple format (68 lines) — preferred
                     vgrid = f
                     break
+                elif sz > 1000000:
+                    # LSC2 per-node format (1.6GB) — try to read anyway
+                    # SchismVgrid.read() handles the simple header
+                    vgrid = f
+                    # Keep looking for a smaller one
 
         proc = RTOFSProcessor(
             self.config, self.paths["rtofs"], output_dir,
