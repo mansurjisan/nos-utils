@@ -310,15 +310,15 @@ class RTOFSProcessor(ForcingProcessor):
 
     def _interpolate_2d_to_boundary(
         self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray, rtofs_data: np.ndarray,
-        use_linear: bool = True,
     ) -> np.ndarray:
         """
         Interpolate a 2D RTOFS field to boundary node locations.
 
-        Args:
-            use_linear: If True (default), use Delaunay triangulation (cached).
-                Set False for 3D depth levels where the ocean mask changes
-                per level — nearest-neighbor is faster and avoids rebuilding.
+        Uses cached Delaunay triangulation built from the first call's ocean
+        mask (typically surface level with most ocean points). Subsequent calls
+        reuse the same triangulation — deep levels with fewer ocean points get
+        their land values filled from nearest valid ocean before interpolation.
+        This matches Fortran INTERP_REMESH behavior.
 
         For 3D fields where the ocean mask changes per depth level, a separate
         interpolator is built per unique mask.
@@ -349,47 +349,45 @@ class RTOFSProcessor(ForcingProcessor):
         ocean_pts = np.column_stack([lon_flat[ocean_mask], lat_flat[ocean_mask]])
         ocean_val = data_flat[ocean_mask].astype(np.float32)
 
-        # Fast path: nearest-neighbor (for 3D depth levels with varying masks)
-        if not use_linear:
-            try:
-                from scipy.spatial import cKDTree
-                # Cache tree per grid shape (mask-independent — query all, filter later)
-                nn_key = ("nn", rtofs_lon.shape)
-                if nn_key not in self._nn_tree:
-                    all_pts = np.column_stack([lon_flat, lat_flat])
-                    self._nn_tree[nn_key] = cKDTree(all_pts)
-                    log.info(f"Built NN tree: {len(lon_flat)} pts (grid {rtofs_lon.shape})")
-                _, nn_idx = self._nn_tree[nn_key].query(target_pts)
-                result = data_flat[nn_idx].astype(np.float32)
-                # Replace fill values with nearest ocean point
-                fill = np.abs(result) > 1e10
-                if np.any(fill):
-                    ocean_tree = cKDTree(ocean_pts)
-                    _, oidx = ocean_tree.query(target_pts[fill])
-                    result[fill] = ocean_val[oidx]
-                return result
-            except ImportError:
-                pass  # Fall through to brute force below
-
-        # Delaunay path: cached triangulation for 2D SSH
-        cache_key = (rtofs_lon.shape, n_ocean)
+        # Cache key: grid shape only (NOT n_ocean) — reuse surface triangulation
+        # for deeper levels where ocean mask shrinks. Fill values at land points
+        # get interpolated from surrounding ocean, matching Fortran remesh behavior.
+        cache_key = rtofs_lon.shape
 
         try:
             from scipy.interpolate import LinearNDInterpolator
             from scipy.spatial import cKDTree
 
             if cache_key not in self._lin_interp:
+                # First call builds the triangulation from ocean points
                 self._lin_interp[cache_key] = LinearNDInterpolator(
                     ocean_pts, ocean_val,
                 )
                 self._nn_tree[cache_key] = cKDTree(ocean_pts)
+                # Store ocean mask indices for value updates
+                self._lin_interp[("mask", cache_key)] = np.where(ocean_mask)[0]
                 log.info(f"Built Delaunay interpolator: {n_ocean} ocean pts "
                          f"(grid {rtofs_lon.shape})")
+                result = self._lin_interp[cache_key](target_pts).astype(np.float32)
             else:
-                # Reuse triangulation, update values only
-                self._lin_interp[cache_key].values[:, 0] = ocean_val
-
-            result = self._lin_interp[cache_key](target_pts).astype(np.float32)
+                # Reuse triangulation — update values at original ocean indices
+                orig_idx = self._lin_interp[("mask", cache_key)]
+                # Map current data to original ocean points (fill becomes NaN)
+                vals = np.full(len(orig_idx), np.nan, dtype=np.float32)
+                for i, idx in enumerate(orig_idx):
+                    v = data_flat[idx]
+                    if abs(v) < 1e10:
+                        vals[i] = v
+                # Fill NaN (land at this depth) from nearest valid
+                nan_v = np.isnan(vals)
+                if np.any(nan_v) and not np.all(nan_v):
+                    valid_v = ~nan_v
+                    from scipy.spatial import cKDTree as _cKDTree
+                    valid_tree = _cKDTree(ocean_pts[valid_v])
+                    _, nn = valid_tree.query(ocean_pts[nan_v])
+                    vals[nan_v] = vals[valid_v][nn]
+                self._lin_interp[cache_key].values[:, 0] = vals
+                result = self._lin_interp[cache_key](target_pts).astype(np.float32)
 
             # Fill NaN (outside convex hull) with nearest-neighbor
             nan_mask = np.isnan(result)
@@ -558,11 +556,10 @@ class RTOFSProcessor(ForcingProcessor):
                         data_t = data[t]
 
                         # Interpolate each RTOFS depth level to boundary nodes
-                        # use_linear=False: nearest-neighbor for 3D (ocean mask varies per level)
                         bnd_profile_rtofs = np.full((n_bnd, n_rtofs_levels), np.nan, dtype=np.float32)
                         for lev in range(min(n_rtofs_levels, data_t.shape[0])):
                             bnd_profile_rtofs[:, lev] = self._interpolate_2d_to_boundary(
-                                lon_arr, lat_arr, data_t[lev], use_linear=False
+                                lon_arr, lat_arr, data_t[lev]
                             )
 
                         # Vertically interpolate from RTOFS levels to SCHISM levels
