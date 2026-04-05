@@ -113,6 +113,10 @@ class RTOFSProcessor(ForcingProcessor):
             from ..io.schism_vgrid import SchismVgrid
             self._vgrid = SchismVgrid.read(self.vgrid_file)
 
+            # Load per-node sigma values for boundary nodes (LSC2)
+            if self._vgrid._filepath is not None:
+                self._vgrid.load_boundary_sigma(self._bnd_ids)
+
         return len(self._bnd_lons) > 0
 
     def process(self) -> ForcingResult:
@@ -518,9 +522,16 @@ class RTOFSProcessor(ForcingProcessor):
         self, bnd_profile: np.ndarray, rtofs_depths: np.ndarray,
         var_name: str, target_levels: int,
     ) -> np.ndarray:
-        """Interpolate from RTOFS depth levels to SCHISM vertical levels."""
+        """
+        Interpolate from RTOFS depth levels to SCHISM vertical levels.
+
+        Uses per-node sigma values from LSC2 vgrid when available,
+        giving node-specific vertical structure that matches the Fortran output.
+        """
+        from scipy.interpolate import interp1d
+
         n_bnd = bnd_profile.shape[0]
-        rtofs_z = -np.abs(rtofs_depths)
+        rtofs_z = -np.abs(rtofs_depths)  # negative down
 
         defaults = {"temperature": 15.0, "salinity": 35.0, "u": 0.0, "v": 0.0}
         fill_val = defaults.get(var_name, 0.0)
@@ -535,24 +546,34 @@ class RTOFSProcessor(ForcingProcessor):
                 continue
 
             node_depth = abs(self._bnd_depths[node])
-            if self._vgrid:
+            if node_depth < 0.1:
+                continue  # Skip dry nodes
+
+            # Get SCHISM target depths for this node
+            if self._vgrid and self._vgrid.node_sigma is not None:
+                # Per-node sigma from LSC2 (best match to Fortran)
+                schism_z = self._vgrid.get_node_depths(node, node_depth)
+            elif self._vgrid:
                 schism_z = self._vgrid.get_depths(node_depth)
-                if len(schism_z) > target_levels:
-                    schism_z = schism_z[:target_levels]
-                elif len(schism_z) < target_levels:
-                    extra = np.linspace(schism_z[-1], 0, target_levels - len(schism_z) + 1)[1:]
-                    schism_z = np.concatenate([schism_z, extra])
             else:
                 schism_z = np.linspace(-node_depth, 0, target_levels)
 
-            from scipy.interpolate import interp1d
+            # Pad or trim to target_levels
+            if len(schism_z) > target_levels:
+                schism_z = schism_z[-target_levels:]  # Keep surface levels
+            elif len(schism_z) < target_levels:
+                # Pad deep levels
+                n_pad = target_levels - len(schism_z)
+                pad_z = np.full(n_pad, schism_z[0])
+                schism_z = np.concatenate([pad_z, schism_z])
+
+            # Interpolate from RTOFS depths to SCHISM depths
             f_interp = interp1d(
                 rtofs_z[valid], profile[valid],
                 kind="linear", bounds_error=False,
                 fill_value=(profile[valid][0], profile[valid][-1]),
             )
-            n_out = min(len(schism_z), target_levels)
-            result[node, :n_out] = f_interp(schism_z[:n_out])
+            result[node, :] = f_interp(schism_z[:target_levels])
 
         return result
 

@@ -13,9 +13,9 @@ Format:
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -30,6 +30,75 @@ class SchismVgrid:
     h_s: float              # Depth of S-Z transition (meters)
     z_levels: np.ndarray    # Z-level depths (meters, negative down)
     sigma_levels: np.ndarray  # Sigma values (-1 = bottom, 0 = surface)
+    node_sigma: Optional[np.ndarray] = None  # (nvrt, n_boundary_nodes) per-node sigma
+    node_kbp: Optional[np.ndarray] = None    # Bottom level index per boundary node
+    _filepath: Optional[str] = None          # For lazy loading
+
+    def load_boundary_sigma(self, boundary_node_ids: List[int]) -> None:
+        """
+        Load per-node sigma values for boundary nodes from LSC2 vgrid.in.
+
+        This reads the full file but only extracts columns for boundary nodes.
+        Takes ~60-80 seconds for 1.68M nodes × 63 levels.
+
+        Args:
+            boundary_node_ids: List of 1-based node IDs
+        """
+        if self._filepath is None or self.node_sigma is not None:
+            return
+
+        filepath = Path(self._filepath)
+        if not filepath.exists():
+            return
+
+        bnd_indices = [nid - 1 for nid in boundary_node_ids]  # 0-based
+        n_bnd = len(bnd_indices)
+
+        log.info(f"Loading per-node sigma for {n_bnd} boundary nodes from {filepath.name}...")
+
+        with open(filepath) as f:
+            f.readline()  # ivcor
+            f.readline()  # nvrt
+
+            # kbp line
+            kbp_line = f.readline()
+            kbp_all = kbp_line.split()
+            self.node_kbp = np.array([int(kbp_all[i]) for i in bnd_indices])
+
+            # Read level lines, extract boundary columns
+            self.node_sigma = np.full((self.nvrt, n_bnd), -9.0, dtype=np.float64)
+            for lev in range(self.nvrt):
+                line = f.readline()
+                parts = line.split()
+                level_idx = int(parts[0]) - 1
+                for k, ni in enumerate(bnd_indices):
+                    self.node_sigma[level_idx, k] = float(parts[ni + 1])
+
+        log.info(f"Loaded boundary sigma: kbp range [{self.node_kbp.min()}, {self.node_kbp.max()}]")
+
+    def get_node_depths(self, node_idx: int, bottom_depth: float) -> np.ndarray:
+        """
+        Get actual depths for a specific node using per-node sigma values.
+
+        For LSC2 format where each node has its own sigma distribution.
+        Returns depths in meters (negative = below surface).
+
+        Args:
+            node_idx: Index into the boundary node sigma array (0-based)
+            bottom_depth: Positive bottom depth in meters
+
+        Returns:
+            Array of depth values for valid levels (sigma > -8)
+        """
+        if self.node_sigma is not None and node_idx < self.node_sigma.shape[1]:
+            sigma_col = self.node_sigma[:, node_idx]
+            valid = sigma_col > -8.0  # -9 means below bottom / invalid
+            valid_sigma = sigma_col[valid]
+            # sigma: -1 = bottom, 0 = surface
+            # depth = bottom_depth * sigma
+            return bottom_depth * valid_sigma
+        else:
+            return self.get_depths(bottom_depth)
 
     def get_depths(self, bottom_depth: float) -> np.ndarray:
         """
@@ -94,13 +163,14 @@ class SchismVgrid:
             # Simple format
             return cls._read_simple(filepath)
         else:
-            # LSC2 format — just extract nvrt, return with defaults
+            # LSC2 format — extract nvrt, store filepath for lazy boundary sigma loading
             nvrt = int(line1.strip().split()[0])
-            log.info(f"Read LSC2 vgrid.in: nvrt={nvrt} (per-node sigma, skipping full parse)")
+            log.info(f"Read LSC2 vgrid.in: nvrt={nvrt} (per-node sigma available via load_boundary_sigma)")
             return cls(
                 nvrt=nvrt, kz=0, h_s=100.0,
                 z_levels=np.array([]),
                 sigma_levels=np.linspace(-1, 0, nvrt),
+                _filepath=str(filepath),
             )
 
     @classmethod
