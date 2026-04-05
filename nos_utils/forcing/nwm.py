@@ -59,7 +59,7 @@ class RiverConfig:
     def from_text(cls, filepath: Path) -> "RiverConfig":
         """Load river config from text file.
 
-        Supports two formats:
+        Supports three formats:
 
         Format 1 (NWM reach file — secofs.nwm.reach.dat):
             REACH_ID FLAG (header)
@@ -69,18 +69,122 @@ class RiverConfig:
 
         Format 2 (full river config):
             feature_id  node_index  river_name  clim_flow
+
+        Format 3 (Fortran river.ctl — secofs.river.ctl):
+            Section 1: USGS station info (Q_mean per station)
+            Section 2: Grid node mappings (NODE_ID, Q_Scale, RiverID)
         """
+        with open(filepath) as f:
+            text = f.read()
+
+        # Detect Fortran river.ctl format by "Section 1:" marker
+        if "Section 1:" in text and "Section 2:" in text:
+            return cls._parse_river_ctl(text)
+
+        return cls._parse_simple(text)
+
+    @classmethod
+    def _parse_river_ctl(cls, text: str) -> "RiverConfig":
+        """Parse Fortran river.ctl format (secofs.river.ctl).
+
+        Section 1 defines USGS stations with Q_mean.
+        Section 2 defines SCHISM grid nodes with Q_Scale and RiverID linkage.
+        Each grid node gets: clim_flow = station.Q_mean * node.Q_Scale
+        """
+        lines = text.splitlines()
+
+        # Parse Section 1: USGS stations
+        stations = {}  # river_id -> {q_mean, t_mean, name}
+        in_section1 = False
+        sec1_header = None
+        nij = 0
+
+        for line in lines:
+            stripped = line.strip()
+            if "Section 1:" in line:
+                in_section1 = True
+                continue
+            if "Section 2:" in line:
+                in_section1 = False
+                continue
+            if not in_section1 or not stripped:
+                continue
+
+            parts = stripped.split()
+            # Header line: NIJ NRIVERS DELT
+            if parts[0].isdigit() and "!!" in stripped:
+                nij = int(parts[0])
+                continue
+            # Column header line
+            if parts[0] in ("RiverID", "GRID_ID"):
+                continue
+            # Station data line: RiverID STATION_ID NWS_ID AGENCY Q_min Q_max Q_mean T_min T_max T_mean ...
+            try:
+                rid = int(parts[0])
+                q_mean = float(parts[6])
+                t_mean = float(parts[9]) if len(parts) > 9 else 15.0
+                # Extract quoted name
+                name = stripped.split('"')[1] if '"' in stripped else f"station_{parts[1]}"
+                stations[rid] = {"q_mean": q_mean, "t_mean": t_mean, "name": name}
+            except (ValueError, IndexError):
+                continue
+
+        # Parse Section 2: grid node mappings
+        feature_ids = []
+        node_indices = []
+        clim_flows = []
+        names = []
+        in_section2 = False
+
+        for line in lines:
+            stripped = line.strip()
+            if "Section 2:" in line:
+                in_section2 = True
+                continue
+            if "PARAMETER DEFINITION:" in line:
+                break
+            if not in_section2 or not stripped:
+                continue
+
+            parts = stripped.split()
+            if parts[0] in ("GRID_ID",):
+                continue
+
+            # Grid data: GRID_ID NODE_ID ELE_ID DIR FLAG RiverID_Q Q_Scale RiverID_T T_Scale "Name"
+            try:
+                grid_id = int(parts[0])
+                node_id = int(parts[1])
+                river_id_q = int(parts[5])
+                q_scale = float(parts[6])
+                name = stripped.split('"')[1] if '"' in stripped else f"river_{grid_id}"
+
+                # Compute climatological flow for this node
+                if river_id_q in stations:
+                    clim_flow = stations[river_id_q]["q_mean"] * q_scale
+                else:
+                    clim_flow = 50.0 * q_scale
+
+                feature_ids.append(grid_id)
+                node_indices.append(node_id)
+                clim_flows.append(clim_flow)
+                names.append(name.strip())
+            except (ValueError, IndexError):
+                continue
+
+        log.info(f"Parsed river.ctl: {len(stations)} USGS stations, "
+                 f"{len(feature_ids)} grid nodes")
+        return cls(feature_ids, node_indices, clim_flows, names)
+
+    @classmethod
+    def _parse_simple(cls, text: str) -> "RiverConfig":
+        """Parse simple NWM reach or feature_id format."""
         feature_ids = []
         node_indices = []
         clim_flows = []
         names = []
 
-        with open(filepath) as f:
-            lines = f.readlines()
-
-        # Detect format: if first non-comment line has non-numeric text, it's a header
         data_lines = []
-        for line in lines:
+        for line in text.splitlines():
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("!"):
                 continue
@@ -89,18 +193,16 @@ class RiverConfig:
         if not data_lines:
             return cls([], [], [], [])
 
-        # Check if first line is a header (first field is non-numeric)
         first_field = data_lines[0].split()[0]
         try:
             int(first_field)
         except ValueError:
-            data_lines = data_lines[1:]  # Skip header (e.g., "REACH_ID FLAG ...")
+            data_lines = data_lines[1:]
 
-        # Check if first remaining line is just a count
         if data_lines and len(data_lines[0].split()) == 1:
             try:
                 int(data_lines[0])
-                data_lines = data_lines[1:]  # Skip count line
+                data_lines = data_lines[1:]
             except ValueError:
                 pass
 
@@ -108,22 +210,19 @@ class RiverConfig:
             parts = line.split()
             try:
                 if len(parts) >= 4:
-                    # Full format: feature_id node_index name clim_flow
                     feature_ids.append(int(parts[0]))
                     node_indices.append(int(parts[1]))
                     names.append(parts[2])
                     clim_flows.append(float(parts[3]))
                 elif len(parts) >= 2:
-                    # NWM reach format: feature_id flag
                     fid = int(parts[0])
                     flag = int(parts[1])
-                    if flag == 1:  # Only include reaches in NWM domain
+                    if flag == 1:
                         feature_ids.append(fid)
-                        node_indices.append(i + 1)  # Sequential node index
+                        node_indices.append(i + 1)
                         names.append(f"reach_{fid}")
-                        clim_flows.append(50.0)  # Default climatology
+                        clim_flows.append(50.0)
                 elif len(parts) == 1:
-                    # Just a feature_id
                     feature_ids.append(int(parts[0]))
                     node_indices.append(i + 1)
                     names.append(f"reach_{parts[0]}")

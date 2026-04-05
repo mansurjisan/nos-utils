@@ -255,7 +255,7 @@ class ForcingConfig:
 
         # River config file
         river_files = river.get("files", {}) if isinstance(river, dict) else {}
-        river_config_file = river_files.get("nwm_reach") or river_files.get("ctl_file")
+        river_config_file = river_files.get("ctl_file") or river_files.get("nwm_reach")
 
         # Tidal template
         tidal_files = tidal.get("files", {}) if isinstance(tidal, dict) else {}
