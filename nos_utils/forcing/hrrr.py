@@ -281,6 +281,8 @@ class HRRRProcessor(ForcingProcessor):
                             regridded_path, grib_var, level, domain, skip_subset=True
                         )
                         if data is not None:
+                            # Mask wgrib2 undefined values (9.999e20) as NaN
+                            data = np.where(np.abs(data) > 1e10, np.nan, data)
                             result["data"][var].append(data)
                         else:
                             ny, nx = len(target_lats), len(target_lons)

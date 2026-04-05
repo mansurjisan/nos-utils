@@ -114,7 +114,7 @@ class ForcingConfig:
             lon_min=-88.0, lon_max=-63.0,
             lat_min=17.0, lat_max=40.0,
             pdy=pdy, cyc=cyc,
-            nowcast_hours=6, forecast_hours=48,
+            nowcast_hours=12, forecast_hours=48,
             met_num=2,
             obc_ssh_offset=1.25,  # Geoid-to-MSL datum offset for SECOFS
         )
@@ -128,7 +128,7 @@ class ForcingConfig:
             lon_min=-88.0, lon_max=-63.0,
             lat_min=17.0, lat_max=40.0,
             pdy=pdy, cyc=cyc,
-            nowcast_hours=6, forecast_hours=48,
+            nowcast_hours=12, forecast_hours=48,
             met_num=2, nws=4,
             obc_ssh_offset=1.25,
         )

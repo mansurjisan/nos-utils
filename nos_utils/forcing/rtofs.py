@@ -93,26 +93,20 @@ class RTOFSProcessor(ForcingProcessor):
         self._vgrid = None
 
     def _get_time_window(self) -> Tuple[datetime, datetime]:
-        """Compute the time window for RTOFS file filtering based on phase."""
+        """Compute the time window for RTOFS file filtering.
+
+        OBC files cover the full simulation (nowcast + forecast), so the
+        window always spans from nowcast start to forecast end, regardless
+        of the current phase. A 6h buffer is added on each side.
+        """
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                    timedelta(hours=self.config.cyc)
 
-        if self.phase == "nowcast":
-            if self.time_hotstart:
-                t_start = self.time_hotstart - timedelta(hours=6)
-            else:
-                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=6)
-            t_end = cycle_dt + timedelta(hours=6)
-        elif self.phase == "forecast":
-            t_start = cycle_dt - timedelta(hours=6)
-            t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=6)
+        if self.time_hotstart:
+            t_start = self.time_hotstart - timedelta(hours=6)
         else:
-            # Full or unset — return wide window
-            if self.time_hotstart:
-                t_start = self.time_hotstart - timedelta(hours=6)
-            else:
-                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=6)
-            t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=6)
+            t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=6)
+        t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=6)
 
         return t_start, t_end
 
