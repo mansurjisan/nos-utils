@@ -96,15 +96,27 @@ def config_from_env(
         if val:
             paths[key] = val
 
-    # Hotstart search: use COMOUT parent (contains previous cycle dirs)
-    # e.g., COMOUT=/ptmp/com/nosofs/v3.7/secofs.20260402
-    #        → restart dir = /ptmp/com/nosofs/v3.7/ (parent, has secofs.20260401/)
+    # Hotstart search directory.
+    # Priority: RESTART_DIR (explicit) > COMIN (previous cycle) > COMOUT parent (heuristic)
+    restart_dir = os.environ.get("RESTART_DIR", "")
     comout = os.environ.get("COMOUT", "")
-    if comout:
-        paths["restart"] = str(Path(comout).parent)
-        log.info(f"Hotstart search dir: {paths['restart']}")
-    elif os.environ.get("COMIN"):
-        paths["restart"] = os.environ["COMIN"]
+    comin = os.environ.get("COMIN", "")
+    if restart_dir:
+        paths["restart"] = restart_dir
+        log.info(f"Hotstart search dir (RESTART_DIR): {restart_dir}")
+    elif comin:
+        paths["restart"] = comin
+        log.info(f"Hotstart search dir (COMIN): {comin}")
+    elif comout:
+        # Heuristic: COMOUT parent contains previous cycle dirs
+        # e.g., COMOUT=/ptmp/com/nosofs/v3.7/secofs.20260402
+        #        → parent = /ptmp/com/nosofs/v3.7/ (has secofs.20260401/)
+        parent = str(Path(comout).parent)
+        paths["restart"] = parent
+        if not Path(parent).is_dir():
+            log.warning(f"COMOUT parent {parent} does not exist, hotstart search may fail")
+        else:
+            log.info(f"Hotstart search dir (COMOUT parent): {parent}")
 
     # Ensure output dir exists
     if "output" not in paths:

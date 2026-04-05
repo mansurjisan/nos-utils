@@ -65,6 +65,8 @@ class RTOFSProcessor(ForcingProcessor):
         grid_file: Optional[Path] = None,
         obc_ctl_file: Optional[Path] = None,
         vgrid_file: Optional[Path] = None,
+        phase: Optional[str] = None,
+        time_hotstart: Optional[datetime] = None,
     ):
         """
         Args:
@@ -74,17 +76,45 @@ class RTOFSProcessor(ForcingProcessor):
             grid_file: SCHISM grid file (hgrid.ll) for boundary node extraction
             obc_ctl_file: OBC control file ({ofs}.obc.ctl) for exact node list
             vgrid_file: Vertical grid file (vgrid.in) for depth interpolation
+            phase: "nowcast" or "forecast" — determines time window filter
+            time_hotstart: Hotstart datetime (nowcast starts from here)
         """
         super().__init__(config, input_path, output_path)
         self.grid_file = grid_file or config.grid_file
         self.obc_ctl_file = obc_ctl_file
         self.vgrid_file = vgrid_file
+        self.phase = phase
+        self.time_hotstart = time_hotstart
         self._grid = None
         self._bnd_lons = None
         self._bnd_lats = None
         self._bnd_depths = None
         self._interp_cache = {}
         self._vgrid = None
+
+    def _get_time_window(self) -> Tuple[datetime, datetime]:
+        """Compute the time window for RTOFS file filtering based on phase."""
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+
+        if self.phase == "nowcast":
+            if self.time_hotstart:
+                t_start = self.time_hotstart - timedelta(hours=6)
+            else:
+                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=6)
+            t_end = cycle_dt + timedelta(hours=6)
+        elif self.phase == "forecast":
+            t_start = cycle_dt - timedelta(hours=6)
+            t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=6)
+        else:
+            # Full or unset — return wide window
+            if self.time_hotstart:
+                t_start = self.time_hotstart - timedelta(hours=6)
+            else:
+                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=6)
+            t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=6)
+
+        return t_start, t_end
 
     def _load_grid(self) -> bool:
         """Load SCHISM grid and extract boundary node coordinates."""
@@ -184,11 +214,64 @@ class RTOFSProcessor(ForcingProcessor):
         files_2d, files_3d = self.find_input_files_by_type()
         return files_2d + files_3d
 
+    @staticmethod
+    def _parse_rtofs_hour(filepath: Path) -> Tuple[int, bool]:
+        """Parse hour offset and nowcast/forecast flag from RTOFS filename.
+
+        Returns (hour_offset, is_nowcast).
+        Examples:
+            rtofs_glo_2ds_n024_diag.nc -> (24, True)
+            rtofs_glo_3dz_f048_6hrly_hvr_US_east.nc -> (48, False)
+        """
+        import re
+        match = re.search(r'_([nf])(\d{3})[_.]', filepath.name)
+        if match:
+            return int(match.group(2)), match.group(1) == 'n'
+        return 0, False
+
+    def _sort_and_dedup(self, files: List[Path], cycle_date: datetime) -> List[Path]:
+        """Sort RTOFS files by valid time and dedup n/f overlap.
+
+        When nowcast (n) and forecast (f) files have the same valid time,
+        prefer the nowcast file (analysis-based).
+        """
+        # Parse valid times
+        file_info = []
+        for f in files:
+            hour, is_nowcast = self._parse_rtofs_hour(f)
+            valid_time = cycle_date + timedelta(hours=hour)
+            file_info.append((valid_time, is_nowcast, f))
+
+        # Sort by valid time; for ties, nowcast first (True > False)
+        file_info.sort(key=lambda x: (x[0], not x[1]))
+
+        # Dedup: keep first per valid time (nowcast preferred due to sort)
+        seen = {}
+        for vt, is_nc, f in file_info:
+            if vt not in seen:
+                seen[vt] = f
+
+        # Filter by phase time window if set
+        if self.phase is not None:
+            t_start, t_end = self._get_time_window()
+            seen = {vt: f for vt, f in seen.items()
+                    if t_start <= vt <= t_end}
+
+        result = [f for _, f in sorted(seen.items())]
+
+        n_removed = len(files) - len(result)
+        if n_removed > 0:
+            log.info(f"RTOFS dedup: {len(files)} -> {len(result)} files "
+                     f"({n_removed} duplicates/out-of-window removed)")
+
+        return result
+
     def find_input_files_by_type(self) -> Tuple[List[Path], List[Path]]:
-        """Find RTOFS 2D and 3D files."""
+        """Find RTOFS 2D and 3D files, sorted by valid time and deduplicated."""
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
         files_2d = []
         files_3d = []
+        rtofs_cycle_date = None
 
         for date in [base_date, base_date - timedelta(days=1)]:
             date_str = date.strftime("%Y%m%d")
@@ -213,11 +296,20 @@ class RTOFSProcessor(ForcingProcessor):
                         files_3d.append(f)
 
                 if files_2d or files_3d:
+                    rtofs_cycle_date = date
                     log.info(f"Found RTOFS files in {rtofs_dir}: {len(files_2d)} 2D, {len(files_3d)} 3D")
                     break
 
             if files_2d or files_3d:
                 break
+
+        # Sort by valid time and deduplicate n/f overlap
+        if rtofs_cycle_date is None:
+            rtofs_cycle_date = base_date
+        if files_2d:
+            files_2d = self._sort_and_dedup(files_2d, rtofs_cycle_date)
+        if files_3d:
+            files_3d = self._sort_and_dedup(files_3d, rtofs_cycle_date)
 
         return files_2d, files_3d
 
@@ -294,7 +386,18 @@ class RTOFSProcessor(ForcingProcessor):
 
         # Extrapolate land points from nearest ocean values
         n_land = np.sum(fill_mask)
-        if n_land > 0 and n_land < n_bnd:
+        if n_land == n_bnd:
+            # ALL boundary nodes are on land — fill with domain-mean SSH
+            ocean_mask = np.abs(data_flat) < 1e10
+            if np.any(ocean_mask):
+                domain_mean = np.nanmean(data_flat[ocean_mask].astype(np.float32))
+                result[:] = domain_mean
+                log.warning(f"All {n_bnd} boundary nodes on land, filled with "
+                            f"domain mean = {domain_mean:.4f}")
+            else:
+                log.warning(f"All {n_bnd} boundary nodes on land and no ocean data — "
+                            f"leaving NaN")
+        elif n_land > 0:
             # Build ocean-only KDTree for this specific field's ocean mask
             # NOT cached — ocean mask differs between 2D/3D and between depth levels
             ocean_mask = np.abs(data_flat) < 1e10
@@ -459,25 +562,32 @@ class RTOFSProcessor(ForcingProcessor):
                     data = ds.variables[var_name][:]
                     data = np.ma.filled(data, fill_value=np.nan)
 
+                    # Handle time dimension: iterate over all time steps
                     if data.ndim == 4:
-                        data = data[0]
-
-                    # Interpolate each RTOFS depth level to boundary nodes
-                    bnd_profile_rtofs = np.full((n_bnd, n_rtofs_levels), np.nan, dtype=np.float32)
-                    for lev in range(min(n_rtofs_levels, data.shape[0])):
-                        bnd_profile_rtofs[:, lev] = self._interpolate_2d_to_boundary(
-                            lon_arr, lat_arr, data[lev]
-                        )
-
-                    # Vertically interpolate from RTOFS levels to SCHISM levels
-                    if self._vgrid and n_levels != n_rtofs_levels:
-                        bnd_profile = self._interpolate_vertical(
-                            bnd_profile_rtofs, depth_arr, var_name, n_levels
-                        )
+                        n_times = data.shape[0]
                     else:
-                        bnd_profile = bnd_profile_rtofs
+                        n_times = 1
+                        data = data[np.newaxis, ...]
 
-                    target_list.append(bnd_profile)
+                    for t in range(n_times):
+                        data_t = data[t]
+
+                        # Interpolate each RTOFS depth level to boundary nodes
+                        bnd_profile_rtofs = np.full((n_bnd, n_rtofs_levels), np.nan, dtype=np.float32)
+                        for lev in range(min(n_rtofs_levels, data_t.shape[0])):
+                            bnd_profile_rtofs[:, lev] = self._interpolate_2d_to_boundary(
+                                lon_arr, lat_arr, data_t[lev]
+                            )
+
+                        # Vertically interpolate from RTOFS levels to SCHISM levels
+                        if self._vgrid and n_levels != n_rtofs_levels:
+                            bnd_profile = self._interpolate_vertical(
+                                bnd_profile_rtofs, depth_arr, var_name, n_levels
+                            )
+                        else:
+                            bnd_profile = bnd_profile_rtofs
+
+                        target_list.append(bnd_profile)
 
                 ds.close()
 

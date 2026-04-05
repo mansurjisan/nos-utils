@@ -157,6 +157,9 @@ class GFSProcessor(ForcingProcessor):
             "data": {},
         }
         for var, arrays in extracted["data"].items():
+            if len(arrays) != len(times):
+                log.warning(f"Filter: {var} has {len(arrays)} entries but "
+                            f"expected {len(times)}")
             filtered["data"][var] = [arrays[i] for i in keep if i < len(arrays)]
 
         return filtered
@@ -442,12 +445,24 @@ class GFSProcessor(ForcingProcessor):
                 log.info(f"Removed {n_dups} duplicate valid times from multi-cycle overlap")
                 result["times"] = [result["times"][i] for i in unique_idx]
                 for var in result["data"]:
-                    if result["data"][var] and len(result["data"][var]) > max(unique_idx):
-                        result["data"][var] = [result["data"][var][i] for i in unique_idx]
+                    if result["data"][var]:
+                        n_data = len(result["data"][var])
+                        if n_data < max(unique_idx) + 1:
+                            log.warning(f"Dedup: {var} has {n_data} entries but "
+                                        f"max index is {max(unique_idx)}, truncating")
+                        result["data"][var] = [result["data"][var][i]
+                                               for i in unique_idx if i < n_data]
 
         return result
 
     def _compute_base_date(self) -> datetime:
-        """Compute sflux base date (start of nowcast period)."""
+        """Compute sflux base date (start of model simulation).
+
+        Uses time_hotstart if available, otherwise cycle - nowcast_hours.
+        Phase-independent: sflux uses a continuous time axis across
+        nowcast and forecast, so both must share the same base_date.
+        """
+        if self.time_hotstart:
+            return self.time_hotstart
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + timedelta(hours=self.config.cyc)
         return cycle_dt - timedelta(hours=self.config.nowcast_hours)

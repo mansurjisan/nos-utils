@@ -293,8 +293,12 @@ class GEFSProcessor(ForcingProcessor):
             result["times"] = [result["times"][i] for i in sorted_idx]
             for var in result["data"]:
                 if result["data"][var]:
+                    n_data = len(result["data"][var])
+                    if n_data != len(sorted_idx):
+                        log.warning(f"Sort: {var} has {n_data} entries but "
+                                    f"expected {len(sorted_idx)}")
                     result["data"][var] = [result["data"][var][i] for i in sorted_idx
-                                           if i < len(result["data"][var])]
+                                           if i < n_data]
 
         return result
 

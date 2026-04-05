@@ -174,6 +174,8 @@ class NWMProcessor(ForcingProcessor):
         input_path: Path,
         output_path: Path,
         river_config: Optional[RiverConfig] = None,
+        phase: Optional[str] = None,
+        time_hotstart: Optional[datetime] = None,
     ):
         """
         Args:
@@ -181,9 +183,13 @@ class NWMProcessor(ForcingProcessor):
             input_path: Root NWM data directory (COMINnwm)
             output_path: Output directory for river forcing files
             river_config: Pre-loaded river configuration (or loaded from config.river_config_file)
+            phase: "nowcast" or "forecast" — determines time window for NWM files
+            time_hotstart: Hotstart datetime (nowcast starts from here)
         """
         super().__init__(config, input_path, output_path)
         self._river_config = river_config
+        self.phase = phase
+        self.time_hotstart = time_hotstart
 
     @property
     def river_config(self) -> Optional[RiverConfig]:

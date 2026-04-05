@@ -114,6 +114,9 @@ class SfluxWriter:
             day_times = [times[i] for i in indices]
             day_data = {}
             for var_name, var_arrays in data.items():
+                if len(var_arrays) < len(times):
+                    log.warning(f"write_all: {var_name} has {len(var_arrays)} arrays "
+                                f"but {len(times)} time steps")
                 day_data[var_name] = [var_arrays[i] for i in indices if i < len(var_arrays)]
 
             files = self.write_day(day_data, day_times, lons, lats, base_date, day_num)

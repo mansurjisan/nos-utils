@@ -313,8 +313,12 @@ class HRRRProcessor(ForcingProcessor):
             result["times"] = [result["times"][i] for i in sorted_idx]
             for var in result["data"]:
                 if result["data"][var]:
+                    n_data = len(result["data"][var])
+                    if n_data != len(sorted_idx):
+                        log.warning(f"Sort: {var} has {n_data} entries but "
+                                    f"expected {len(sorted_idx)}")
                     result["data"][var] = [result["data"][var][i] for i in sorted_idx
-                                           if i < len(result["data"][var])]
+                                           if i < n_data]
 
         return result
 
@@ -493,11 +497,21 @@ class HRRRProcessor(ForcingProcessor):
             "data": {},
         }
         for var, arrays in extracted["data"].items():
+            if len(arrays) != len(times):
+                log.warning(f"Filter: {var} has {len(arrays)} entries but "
+                            f"expected {len(times)}")
             filtered["data"][var] = [arrays[i] for i in keep if i < len(arrays)]
 
         return filtered
 
     def _compute_base_date(self) -> datetime:
-        """Compute sflux base date (start of nowcast period)."""
+        """Compute sflux base date (start of model simulation).
+
+        Uses time_hotstart if available, otherwise cycle - nowcast_hours.
+        Phase-independent: sflux uses a continuous time axis across
+        nowcast and forecast, so both must share the same base_date.
+        """
+        if self.time_hotstart:
+            return self.time_hotstart
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + timedelta(hours=self.config.cyc)
         return cycle_dt - timedelta(hours=self.config.nowcast_hours)

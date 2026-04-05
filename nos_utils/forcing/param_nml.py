@@ -172,7 +172,7 @@ class ParamNmlProcessor(ForcingProcessor):
             "start_year_value": str(start_dt.year),
             "start_month_value": f"{start_dt.month:02d}",
             "start_day_value": f"{start_dt.day:02d}",
-            "start_hour_value": f"{start_dt.hour:.1f}",
+            "start_hour_value": str(start_dt.hour),
             "ihot_value": str(ihot),
         }
 

@@ -201,13 +201,10 @@ class TidalProcessor(ForcingProcessor):
                     i += 1
                     parts = lines[i].split()
                     if len(parts) >= 4:
-                        # Update nodal factor (index 2) and eq arg (index 3)
                         f_val = nodal[line]["f"]
-                        u_val = nodal[line]["u"]
-                        # Compute equilibrium argument = V0 + u
-                        # The template has V0+u combined; we recompute
+                        v0_plus_u = (nodal[line]["v0"] + nodal[line]["u"]) % 360.0
                         parts[2] = f"{f_val:.5f}"
-                        parts[3] = f"{u_val:.5f}"
+                        parts[3] = f"{v0_plus_u:.5f}"
                         lines[i] = " ".join(parts)
                 i += 1
 
@@ -246,7 +243,7 @@ class TidalProcessor(ForcingProcessor):
                 props = TIDAL_CONSTITUENTS.get(const_name, {})
                 omega = props.get("speed", 28.984) * math.pi / 180.0 / 3600.0  # deg/hr -> rad/s
                 nf = nodal[const_name]["f"]
-                eq_arg = nodal[const_name]["u"]
+                eq_arg = (nodal[const_name]["v0"] + nodal[const_name]["u"]) % 360.0
 
                 f.write(f"{const_name}\n")
                 f.write(f"{omega:.10e} {nf:.6f} {eq_arg:.6f}\n")
@@ -264,31 +261,55 @@ def compute_nodal_corrections(
     constituents: List[str],
 ) -> Dict[str, Dict[str, float]]:
     """
-    Compute tidal nodal corrections (f, u) for a given time.
+    Compute tidal nodal corrections (f, u) and astronomical argument V0.
 
-    The nodal factor f and astronomical argument u account for the
-    18.6-year modulation of the lunar orbit.
+    The nodal factor f and argument u account for the 18.6-year modulation
+    of the lunar orbit. V0 is the equilibrium tide argument at the given time.
 
     Args:
         start_time: Model start datetime
         constituents: List of constituent names
 
     Returns:
-        Dict mapping constituent name -> {"f": nodal_factor, "u": eq_argument_deg}
+        Dict mapping constituent name -> {"f": nodal_factor, "u": deg, "v0": deg}
     """
-    # Compute lunar node longitude N (degrees)
-    # N = 259.157 - 19.328 * T, where T = years since J2000.0
+    # Julian centuries from J2000.0
     j2000 = datetime(2000, 1, 1, 12, 0, 0)
     T = (start_time - j2000).total_seconds() / (365.25 * 86400.0)
+    T_century = T / 100.0  # Julian centuries
+
     N = math.radians(259.157 - 19.328 * T)
 
-    # Compute p (lunar perigee longitude)
+    # Compute p (lunar perigee longitude) for nodal corrections
     p = math.radians(83.3535 + 40.6693 * T)
+
+    # Astronomical longitudes for V0 (degrees, Schureman conventions)
+    s_deg = (218.3165 + 481267.8813 * T_century) % 360.0   # Moon mean longitude
+    h_deg = (280.4662 + 36000.7698 * T_century) % 360.0    # Sun mean longitude
+    p_deg = (83.3535 + 4069.0137 * T_century) % 360.0      # Lunar perigee
+    N_deg = (125.0445 - 1934.1363 * T_century) % 360.0     # Ascending node
+    pp_deg = (282.9384 + 1.7195 * T_century) % 360.0       # Solar perihelion
+
+    # Mean lunar time (tau): hour angle of mean Moon + 180°
+    hour = start_time.hour + start_time.minute / 60.0 + start_time.second / 3600.0
+    tau_deg = (15.0 * hour + h_deg - s_deg + 180.0) % 360.0
+
+    # Astronomical arguments: (tau, s, h, p, N', p1)
+    astro_args = [tau_deg, s_deg, h_deg, p_deg, -N_deg, pp_deg]
 
     result = {}
     for const in constituents:
         f, u = _nodal_fu(const, N, p)
-        result[const] = {"f": f, "u": u}
+
+        # Compute V0 from Doodson numbers
+        props = TIDAL_CONSTITUENTS.get(const)
+        if props and "doodson" in props:
+            doodson = props["doodson"]
+            v0 = sum(d * a for d, a in zip(doodson, astro_args)) % 360.0
+        else:
+            v0 = 0.0
+
+        result[const] = {"f": f, "u": u, "v0": v0}
 
     return result
 

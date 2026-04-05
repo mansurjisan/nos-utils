@@ -47,7 +47,7 @@ class TestParamNmlProcessor:
         assert "start_year = 2026" in content
         assert "start_month = 04" in content
         assert "start_day = 01" in content
-        assert "start_hour = 6.0" in content
+        assert "start_hour = 6" in content
         # Placeholders should be gone
         assert "rnday_value" not in content
         assert "start_year_value" not in content
@@ -65,7 +65,7 @@ class TestParamNmlProcessor:
         # 48h forecast -> rnday = 2.0
         assert "2.0000" in content
         # Start time: 2026-04-01 12z
-        assert "start_hour = 12.0" in content
+        assert "start_hour = 12" in content
 
     def test_missing_template(self, mock_config, tmp_path):
         proc = ParamNmlProcessor(

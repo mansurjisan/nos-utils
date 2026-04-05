@@ -171,13 +171,13 @@ class PrepOrchestrator:
 
         # Step 4: NWM river (skip in hybrid mode — legacy shell handles it)
         if "nwm" in self.paths and not self.skip_legacy:
-            results.append(self._run_nwm(output_dir))
+            results.append(self._run_nwm(output_dir, phase, time_hotstart))
         elif self.skip_legacy:
             log.info("Skipping NWM river (handled by legacy shell)")
 
         # Step 5: RTOFS OBC (skip in hybrid mode — needs Fortran gen_3Dth_from_hycom)
         if "rtofs" in self.paths and not self.skip_legacy:
-            results.append(self._run_rtofs(output_dir))
+            results.append(self._run_rtofs(output_dir, phase, time_hotstart))
         elif self.skip_legacy:
             log.info("Skipping RTOFS OBC (handled by legacy shell)")
 
@@ -198,7 +198,7 @@ class PrepOrchestrator:
         elapsed = time.time() - t0
 
         # Determine overall success (all critical steps must succeed)
-        critical_sources = {"GFS", "PARAM_NML"}
+        critical_sources = {"GFS", "PARAM_NML", "TIDAL"}
         success = all(
             r.success for r in results
             if r.source in critical_sources
@@ -249,16 +249,19 @@ class PrepOrchestrator:
         )
         return proc.process()
 
-    def _run_nwm(self, output_dir: Path) -> ForcingResult:
+    def _run_nwm(self, output_dir: Path, phase: str = "nowcast",
+                 time_hotstart=None) -> ForcingResult:
         """Step 4: NWM river forcing."""
         from .forcing.nwm import NWMProcessor
 
         proc = NWMProcessor(
             self.config, self.paths["nwm"], output_dir,
+            phase=phase, time_hotstart=time_hotstart,
         )
         return proc.process()
 
-    def _run_rtofs(self, output_dir: Path) -> ForcingResult:
+    def _run_rtofs(self, output_dir: Path, phase: str = "nowcast",
+                   time_hotstart=None) -> ForcingResult:
         """Step 5: RTOFS ocean boundary conditions."""
         from .forcing.rtofs import RTOFSProcessor
 
@@ -299,6 +302,8 @@ class PrepOrchestrator:
             grid_file=grid_file,
             obc_ctl_file=obc_ctl,
             vgrid_file=vgrid,
+            phase=phase,
+            time_hotstart=time_hotstart,
         )
         return proc.process()
 

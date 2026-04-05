@@ -11,6 +11,7 @@ from nos_utils.forcing.tidal import (
     TidalProcessor,
     compute_nodal_corrections,
     TIDAL_CONSTITUENTS,
+    _nodal_fu,
 )
 
 
@@ -41,7 +42,16 @@ class TestNodalCorrections:
         for c in consts:
             assert c in nodal
             assert 0.5 < nodal[c]["f"] < 2.0  # Reasonable range
-            assert -30 < nodal[c]["u"] < 30  # Degrees
+            assert -30 < nodal[c]["u"] < 30  # Nodal correction (degrees)
+            assert 0 <= nodal[c]["v0"] < 360  # Astronomical argument
+
+    def test_v0_computed_for_all(self):
+        """V0 should be non-zero for non-trivial constituents."""
+        nodal = compute_nodal_corrections(datetime(2026, 4, 1, 12), ["M2", "S2", "K1"])
+        # M2 V0 depends on tau — should be non-zero at noon
+        assert nodal["M2"]["v0"] != 0.0
+        # S2: V0 = 2*tau + 2*s - 2*h, varies with time
+        assert "v0" in nodal["S2"]
 
     def test_different_dates_give_different_results(self):
         """Nodal corrections should change over the 18.6-year cycle."""
