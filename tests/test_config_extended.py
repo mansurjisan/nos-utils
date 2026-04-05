@@ -40,7 +40,7 @@ class TestEnsembleConfig:
 
     def test_secofs_base(self):
         cfg = ForcingConfig.for_ensemble(pdy="20260324", cyc=12, base_ofs="secofs")
-        assert cfg.nowcast_hours == 12
+        assert cfg.nowcast_hours == 6
         assert cfg.forecast_hours == 48
 
 
@@ -54,7 +54,7 @@ class TestFromYAML:
 
         assert cfg.lon_min == -88.0
         assert cfg.lon_max == -63.0
-        assert cfg.nowcast_hours == 12
+        assert cfg.nowcast_hours == 6
         assert cfg.forecast_hours == 48  # from base schism.yaml: forecast_days=5 (but secofs override missing)
         assert cfg.met_num == 2  # inferred from secondary: HRRR
 

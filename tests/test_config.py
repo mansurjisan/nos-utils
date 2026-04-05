@@ -23,7 +23,7 @@ class TestForcingConfig:
         assert cfg.lat_min == 17.0
         assert cfg.lat_max == 40.0
         assert cfg.met_num == 2
-        assert cfg.nowcast_hours == 12
+        assert cfg.nowcast_hours == 6
         assert cfg.forecast_hours == 48
 
     def test_stofs_factory(self):
