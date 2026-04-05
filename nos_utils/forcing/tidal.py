@@ -200,7 +200,14 @@ class TidalProcessor(ForcingProcessor):
                     # Next line has the nodal parameters
                     i += 1
                     parts = lines[i].split()
-                    if len(parts) >= 4:
+                    if len(parts) >= 5:
+                        # parts: species amplitude frequency nodefactor equil_arg
+                        f_val = nodal[line]["f"]
+                        v0_plus_u = nodal[line]["v0_plus_u"]
+                        parts[3] = f"{f_val:.5f}"
+                        parts[4] = f"{v0_plus_u:.5f}"
+                    elif len(parts) >= 4:
+                        # Shorter format without frequency column
                         f_val = nodal[line]["f"]
                         v0_plus_u = nodal[line]["v0_plus_u"]
                         parts[2] = f"{f_val:.5f}"
