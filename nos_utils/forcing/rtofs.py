@@ -295,13 +295,12 @@ class RTOFSProcessor(ForcingProcessor):
         # Extrapolate land points from nearest ocean values
         n_land = np.sum(fill_mask)
         if n_land > 0 and n_land < n_bnd:
-            # Build ocean-only KDTree for land point extrapolation
+            # Build ocean-only KDTree for this specific field's ocean mask
+            # NOT cached — ocean mask differs between 2D/3D and between depth levels
             ocean_mask = np.abs(data_flat) < 1e10
             if np.any(ocean_mask):
-                cache_key_ocean = ("ocean", rtofs_lon.shape if rtofs_lon.ndim == 2
-                                   else (len(rtofs_lon),))
-
-                if cache_key_ocean not in self._interp_cache:
+                do_build = True
+                if do_build:
                     bnd_lons_360 = np.where(self._bnd_lons < 0,
                                             self._bnd_lons + 360, self._bnd_lons)
                     if rtofs_lon.ndim == 2:
@@ -322,16 +321,11 @@ class RTOFSProcessor(ForcingProcessor):
                         _, nn_idx = tree.query(
                             np.column_stack([bnd_lons_360, self._bnd_lats])
                         )
-                        self._interp_cache[cache_key_ocean] = {
-                            "ocean_indices": ocean_idx[nn_idx],
-                        }
+                        ocean_indices = ocean_idx[nn_idx]
+                        ocean_vals = data_flat[ocean_indices].astype(np.float32)
+                        result[fill_mask] = ocean_vals[fill_mask]
                     except ImportError:
-                        self._interp_cache[cache_key_ocean] = None
-
-                ocean_interp = self._interp_cache.get(cache_key_ocean)
-                if ocean_interp is not None:
-                    ocean_vals = data_flat[ocean_interp["ocean_indices"]].astype(np.float32)
-                    result[fill_mask] = ocean_vals[fill_mask]
+                        pass  # No scipy — leave NaN
                     log.debug(f"Extrapolated {n_land} land boundary nodes from nearest ocean")
 
         return result

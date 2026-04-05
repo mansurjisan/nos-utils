@@ -423,13 +423,18 @@ class GFSProcessor(ForcingProcessor):
             result["times"] = [result["times"][i] for i in sorted_idx]
             for var in result["data"]:
                 if result["data"][var]:
-                    result["data"][var] = [result["data"][var][i] for i in sorted_idx
-                                           if i < len(result["data"][var])]
+                    # All data arrays must be same length as times (NaN-filled for missing)
+                    n_data = len(result["data"][var])
+                    n_times = len(sorted_idx)
+                    if n_data == n_times:
+                        result["data"][var] = [result["data"][var][i] for i in sorted_idx]
+                    else:
+                        log.warning(f"{var}: data length {n_data} != times {n_times}, skipping sort")
 
             # Deduplicate: keep last occurrence for each valid time (later cycle preferred)
             seen_times = {}
             for i, t in enumerate(result["times"]):
-                seen_times[t] = i  # overwrites earlier duplicates
+                seen_times[t] = i
             unique_idx = sorted(seen_times.values())
 
             if len(unique_idx) < len(result["times"]):
@@ -437,9 +442,8 @@ class GFSProcessor(ForcingProcessor):
                 log.info(f"Removed {n_dups} duplicate valid times from multi-cycle overlap")
                 result["times"] = [result["times"][i] for i in unique_idx]
                 for var in result["data"]:
-                    if result["data"][var]:
-                        result["data"][var] = [result["data"][var][i] for i in unique_idx
-                                               if i < len(result["data"][var])]
+                    if result["data"][var] and len(result["data"][var]) > max(unique_idx):
+                        result["data"][var] = [result["data"][var][i] for i in unique_idx]
 
         return result
 

@@ -283,8 +283,20 @@ class PrepOrchestrator:
                     vgrid = f
                     # Keep looking for a smaller one
 
+        # Find grid file (hgrid.ll) in FIX directory if not in config
+        grid_file = self.config.grid_file
+        if (grid_file is None or not Path(grid_file).exists()) and fix_dir.exists():
+            for f in fix_dir.glob("*.hgrid.ll"):
+                grid_file = f
+                break
+            if grid_file is None:
+                for f in fix_dir.glob("*.hgrid.gr3"):
+                    grid_file = f
+                    break
+
         proc = RTOFSProcessor(
             self.config, self.paths["rtofs"], output_dir,
+            grid_file=grid_file,
             obc_ctl_file=obc_ctl,
             vgrid_file=vgrid,
         )
