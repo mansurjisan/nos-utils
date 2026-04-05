@@ -202,7 +202,7 @@ class TidalProcessor(ForcingProcessor):
                     parts = lines[i].split()
                     if len(parts) >= 4:
                         f_val = nodal[line]["f"]
-                        v0_plus_u = (nodal[line]["v0"] + nodal[line]["u"]) % 360.0
+                        v0_plus_u = nodal[line]["v0_plus_u"]
                         parts[2] = f"{f_val:.5f}"
                         parts[3] = f"{v0_plus_u:.5f}"
                         lines[i] = " ".join(parts)
@@ -243,7 +243,7 @@ class TidalProcessor(ForcingProcessor):
                 props = TIDAL_CONSTITUENTS.get(const_name, {})
                 omega = props.get("speed", 28.984) * math.pi / 180.0 / 3600.0  # deg/hr -> rad/s
                 nf = nodal[const_name]["f"]
-                eq_arg = (nodal[const_name]["v0"] + nodal[const_name]["u"]) % 360.0
+                eq_arg = nodal[const_name]["v0_plus_u"]
 
                 f.write(f"{const_name}\n")
                 f.write(f"{omega:.10e} {nf:.6f} {eq_arg:.6f}\n")
@@ -259,105 +259,292 @@ class TidalProcessor(ForcingProcessor):
 def compute_nodal_corrections(
     start_time: datetime,
     constituents: List[str],
+    run_days: float = 0.25,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Compute tidal nodal corrections (f, u) and astronomical argument V0.
+    Compute tidal nodal factors and equilibrium arguments (V0+u).
 
-    The nodal factor f and argument u account for the 18.6-year modulation
-    of the lunar orbit. V0 is the equilibrium tide argument at the given time.
+    Exact port of the NOAA/SCHISM Fortran tide_fac program (Schureman 1958).
+    Nodal factors computed at mid-run, equilibrium arguments at start.
 
     Args:
         start_time: Model start datetime
         constituents: List of constituent names
+        run_days: Run length in days (nodal factors computed at midpoint)
 
     Returns:
-        Dict mapping constituent name -> {"f": nodal_factor, "u": deg, "v0": deg}
+        Dict mapping constituent name -> {"f": nodal_factor, "v0_plus_u": deg}
     """
-    # Julian centuries from J2000.0
-    j2000 = datetime(2000, 1, 1, 12, 0, 0)
-    T = (start_time - j2000).total_seconds() / (365.25 * 86400.0)
-    T_century = T / 100.0  # Julian centuries
+    yr = float(start_time.year)
+    month = float(start_time.month)
+    day = float(start_time.day)
+    bhr = start_time.hour + start_time.minute / 60.0 + start_time.second / 3600.0
+    hrm = bhr + run_days * 24.0 / 2.0  # mid-run hour
 
-    N = math.radians(259.157 - 19.328 * T)
+    dayj = _dayjul(yr, month, day)
 
-    # Compute p (lunar perigee longitude) for nodal corrections
-    p = math.radians(83.3535 + 40.6693 * T)
+    # Nodal factors at mid-run
+    f_all = _nfacs(yr, dayj, hrm)
 
-    # Astronomical longitudes for V0 (degrees, Schureman conventions)
-    s_deg = (218.3165 + 481267.8813 * T_century) % 360.0   # Moon mean longitude
-    h_deg = (280.4662 + 36000.7698 * T_century) % 360.0    # Sun mean longitude
-    p_deg = (83.3535 + 4069.0137 * T_century) % 360.0      # Lunar perigee
-    N_deg = (125.0445 - 1934.1363 * T_century) % 360.0     # Ascending node
-    pp_deg = (282.9384 + 1.7195 * T_century) % 360.0       # Solar perihelion
+    # Equilibrium arguments (V0+u) at start, u at mid-run
+    eq_all = _gterms(yr, dayj, bhr, dayj, hrm)
 
-    # Mean lunar time (tau): hour angle of mean Moon + 180°
-    hour = start_time.hour + start_time.minute / 60.0 + start_time.second / 3600.0
-    tau_deg = (15.0 * hour + h_deg - s_deg + 180.0) % 360.0
-
-    # Astronomical arguments: (tau, s, h, p, N', p1)
-    astro_args = [tau_deg, s_deg, h_deg, p_deg, -N_deg, pp_deg]
+    # Map constituent names to Fortran indices
+    CNAME_MAP = {
+        "M2": 0, "S2": 1, "N2": 2, "K1": 3, "M4": 4, "O1": 5,
+        "M6": 6, "MK3": 7, "S4": 8, "MN4": 9, "NU2": 10, "S6": 11,
+        "MU2": 12, "2N2": 13, "OO1": 14, "LAMBDA2": 15, "S1": 16,
+        "M1": 17, "J1": 18, "MM": 19, "SSA": 20, "SA": 21,
+        "MSF": 22, "MF": 23, "RHO1": 24, "Q1": 25, "T2": 26,
+        "R2": 27, "2Q1": 28, "P1": 29, "2SM2": 30, "M3": 31,
+        "L2": 32, "2MK3": 33, "K2": 34, "M8": 35, "MS4": 36,
+    }
 
     result = {}
     for const in constituents:
-        f, u = _nodal_fu(const, N, p)
-
-        # Compute V0 from Doodson numbers
-        props = TIDAL_CONSTITUENTS.get(const)
-        if props and "doodson" in props:
-            doodson = props["doodson"]
-            v0 = sum(d * a for d, a in zip(doodson, astro_args)) % 360.0
+        idx = CNAME_MAP.get(const.upper())
+        if idx is not None:
+            result[const] = {
+                "f": f_all[idx],
+                "v0_plus_u": eq_all[idx],
+                # Keep separate u and v0 for backward compatibility
+                "u": 0.0,
+                "v0": eq_all[idx],
+            }
         else:
-            v0 = 0.0
-
-        result[const] = {"f": f, "u": u, "v0": v0}
+            result[const] = {"f": 1.0, "v0_plus_u": 0.0, "u": 0.0, "v0": 0.0}
+            log.debug(f"No tidal data for {const}, using f=1.0, V0+u=0.0")
 
     return result
 
 
+def _angle(arg: float) -> float:
+    """Place angle in 0-360 degrees."""
+    result = arg % 360.0
+    if result < 0:
+        result += 360.0
+    return result
+
+
+def _dayjul(yr: float, xmonth: float, day: float) -> float:
+    """Compute Julian day number within year."""
+    dayt = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    dinc = 1.0 if ((yr - 1900) % 4 == 0) else 0.0
+    days = list(dayt)
+    for i in range(2, 12):
+        days[i] = dayt[i] + dinc
+    return days[int(xmonth) - 1] + day
+
+
+def _orbit(yr: float, dayj: float, hr: float) -> dict:
+    """Compute primary orbital elements (exact port of Fortran orbit())."""
+    pi180 = math.pi / 180.0
+    x = math.floor((yr - 1901.0) / 4.0)
+    dyr = yr - 1900.0
+    dday = dayj + x - 1.0
+
+    # Moon's node (N)
+    dn = _angle(259.1560564 - 19.328185764 * dyr - 0.0529539336 * dday - 0.0022064139 * hr)
+    n = dn * pi180
+
+    # Lunar perigee (p)
+    dp = _angle(334.3837214 + 40.66246584 * dyr + 0.111404016 * dday + 0.004641834 * hr)
+    p = dp * pi180
+
+    # Inclination, nu, xi
+    i = math.acos(0.9136949 - 0.0356926 * math.cos(n))
+    di = _angle(i / pi180)
+    nu = math.asin(0.0897056 * math.sin(n) / math.sin(i))
+    dnu = nu / pi180
+    xi = n - 2.0 * math.atan(0.64412 * math.tan(n / 2.0)) - nu
+    dxi = xi / pi180
+    dpc = _angle(dp - dxi)
+
+    # Sun mean longitude (h)
+    dh = _angle(280.1895014 - 0.238724988 * dyr + 0.9856473288 * dday + 0.0410686387 * hr)
+
+    # Solar perigee (p1)
+    dp1 = _angle(281.2208569 + 0.01717836 * dyr + 0.000047064 * dday + 0.000001961 * hr)
+
+    # Moon mean longitude (s)
+    ds = _angle(277.0256206 + 129.38482032 * dyr + 13.176396768 * dday + 0.549016532 * hr)
+
+    nup = math.atan(math.sin(nu) / (math.cos(nu) + 0.334766 / math.sin(2.0 * i)))
+    dnup = nup / pi180
+    nup2 = math.atan(math.sin(2.0 * nu) / (math.cos(2.0 * nu) + 0.0726184 / math.sin(i)**2)) / 2.0
+    dnup2 = nup2 / pi180
+
+    return {
+        "ds": ds, "dp": dp, "dh": dh, "dp1": dp1, "dn": dn,
+        "di": di, "dnu": dnu, "dxi": dxi, "dnup": dnup, "dnup2": dnup2, "dpc": dpc,
+    }
+
+
+def _nfacs(yr: float, dayj: float, hr: float) -> List[float]:
+    """Compute nodal factors for 37 constituents (exact port of Fortran nfacs())."""
+    pi180 = math.pi / 180.0
+    orb = _orbit(yr, dayj, hr)
+
+    i = orb["di"] * pi180
+    nu = orb["dnu"] * pi180
+    xi = orb["dxi"] * pi180
+    pc = orb["dpc"] * pi180
+
+    sini = math.sin(i)
+    sini2 = math.sin(i / 2.0)
+    sin2i = math.sin(2.0 * i)
+    cosi2 = math.cos(i / 2.0)
+    tani2 = math.tan(i / 2.0)
+
+    # Schureman equations
+    qainv = math.sqrt(2.310 + 1.435 * math.cos(2.0 * pc))
+    rainv = math.sqrt(1.0 - 12.0 * tani2**2 * math.cos(2.0 * pc) + 36.0 * tani2**4)
+
+    eq73 = (2.0 / 3.0 - sini**2) / 0.5021
+    eq74 = sini**2 / 0.1578
+    eq75 = sini * cosi2**2 / 0.37988
+    eq76 = sin2i / 0.7214
+    eq77 = sini * sini2**2 / 0.0164
+    eq78 = cosi2**4 / 0.91544
+    eq149 = cosi2**6 / 0.8758
+    eq227 = math.sqrt(0.8965 * sin2i**2 + 0.6001 * sin2i * math.cos(nu) + 0.1006)
+    eq235 = 0.001 + math.sqrt(19.0444 * sini**4 + 2.7702 * sini**2 * math.cos(2.0 * nu) + 0.0981)
+
+    f = [0.0] * 37
+    f[0] = eq78       # M2
+    f[1] = 1.0        # S2
+    f[2] = eq78       # N2
+    f[3] = eq227      # K1
+    f[4] = f[0]**2    # M4
+    f[5] = eq75       # O1
+    f[6] = f[0]**3    # M6
+    f[7] = f[0] * f[3]  # MK3
+    f[8] = 1.0        # S4
+    f[9] = f[0]**2    # MN4
+    f[10] = eq78      # nu2
+    f[11] = 1.0       # S6
+    f[12] = eq78      # mu2
+    f[13] = eq78      # 2N2
+    f[14] = eq77      # OO1
+    f[15] = eq78      # lambda2
+    f[16] = 1.0       # S1
+    f[17] = 0.0       # M1 (set to 0 per Fortran comment)
+    f[18] = eq76      # J1
+    f[19] = eq73      # Mm
+    f[20] = 1.0       # Ssa
+    f[21] = 1.0       # Sa
+    f[22] = eq78      # MSf
+    f[23] = eq74      # Mf
+    f[24] = eq75      # rho1
+    f[25] = eq75      # Q1
+    f[26] = 1.0       # T2
+    f[27] = 1.0       # R2
+    f[28] = eq75      # 2Q1
+    f[29] = 1.0       # P1
+    f[30] = eq78      # 2SM2
+    f[31] = eq149     # M3
+    f[32] = 0.0       # L2 (set to 0 per Fortran comment)
+    f[33] = f[0]**2 * f[3]  # 2MK3
+    f[34] = eq235     # K2
+    f[35] = f[0]**4   # M8
+    f[36] = eq78      # MS4
+    return f
+
+
+def _gterms(yr: float, dayj: float, hr: float, daym: float, hrm: float) -> List[float]:
+    """Compute equilibrium arguments V0+u for 37 constituents (exact Fortran port)."""
+    pi180 = math.pi / 180.0
+
+    # Orbital values at START for V0
+    orb_start = _orbit(yr, dayj, hr)
+    s = orb_start["ds"]
+    p = orb_start["dp"]
+    h = orb_start["dh"]
+    p1 = orb_start["dp1"]
+    t = _angle(180.0 + hr * (360.0 / 24.0))
+
+    # Orbital values at MID-RUN for u
+    orb_mid = _orbit(yr, daym, hrm)
+    nu = orb_mid["dnu"]
+    xi = orb_mid["dxi"]
+    nup = orb_mid["dnup"]
+    nup2 = orb_mid["dnup2"]
+
+    eq = [0.0] * 37
+    eq[0] = 2.0 * (t - s + h) + 2.0 * (xi - nu)                    # M2
+    eq[1] = 2.0 * t                                                   # S2
+    eq[2] = 2.0 * (t + h) - 3.0 * s + p + 2.0 * (xi - nu)          # N2
+    eq[3] = t + h - 90.0 - nup                                       # K1
+    eq[4] = 4.0 * (t - s + h) + 4.0 * (xi - nu)                    # M4
+    eq[5] = t - 2.0 * s + h + 90.0 + 2.0 * xi - nu                 # O1
+    eq[6] = 6.0 * (t - s + h) + 6.0 * (xi - nu)                    # M6
+    eq[7] = 3.0 * (t + h) - 2.0 * s - 90.0 + 2.0 * (xi - nu) - nup  # MK3
+    eq[8] = 4.0 * t                                                   # S4
+    eq[9] = 4.0 * (t + h) - 5.0 * s + p + 4.0 * (xi - nu)          # MN4
+    eq[10] = 2.0 * t - 3.0 * s + 4.0 * h - p + 2.0 * (xi - nu)    # nu2
+    eq[11] = 6.0 * t                                                  # S6
+    eq[12] = 2.0 * (t + 2.0 * (h - s)) + 2.0 * (xi - nu)           # mu2
+    eq[13] = 2.0 * (t - 2.0 * s + h + p) + 2.0 * (xi - nu)         # 2N2
+    eq[14] = t + 2.0 * s + h - 90.0 - 2.0 * xi - nu                # OO1
+    eq[15] = 2.0 * t - s + p + 180.0 + 2.0 * (xi - nu)             # lambda2
+    eq[16] = t                                                         # S1
+    eq[17] = t - s + h - 90.0 + xi - nu                              # M1 (simplified)
+    eq[18] = t + s + h - p - 90.0 - nu                               # J1
+    eq[19] = s - p                                                     # Mm
+    eq[20] = 2.0 * h                                                   # Ssa
+    eq[21] = h                                                         # Sa
+    eq[22] = 2.0 * (s - h)                                            # MSf
+    eq[23] = 2.0 * s - 2.0 * xi                                      # Mf
+    eq[24] = t + 3.0 * (h - s) - p + 90.0 + 2.0 * xi - nu          # rho1
+    eq[25] = t - 3.0 * s + h + p + 90.0 + 2.0 * xi - nu            # Q1
+    eq[26] = 2.0 * t - h + p1                                        # T2
+    eq[27] = 2.0 * t + h - p1 + 180.0                               # R2
+    eq[28] = t - 4.0 * s + h + 2.0 * p + 90.0 + 2.0 * xi - nu     # 2Q1
+    eq[29] = t - h + 90.0                                             # P1
+    eq[30] = 2.0 * (t + s - h) + 2.0 * (nu - xi)                   # 2SM2
+    eq[31] = 3.0 * (t - s + h) + 3.0 * (xi - nu)                   # M3
+    # L2: uses r term
+    i_rad = orb_mid["di"] * pi180
+    pc_rad = orb_mid["dpc"] * pi180
+    r = math.sin(2.0 * pc_rad) / ((1.0 / 6.0) * (1.0 / math.tan(0.5 * i_rad))**2 - math.cos(2.0 * pc_rad))
+    r = math.atan(r) / pi180
+    eq[32] = 2.0 * (t + h) - s - p + 180.0 + 2.0 * (xi - nu) - r  # L2
+    eq[33] = 3.0 * (t + h) - 4.0 * s + 90.0 + 4.0 * (xi - nu) + nup  # 2MK3
+    eq[34] = 2.0 * (t + h) - 2.0 * nup2                             # K2
+    eq[35] = 8.0 * (t - s + h) + 8.0 * (xi - nu)                   # M8
+    eq[36] = 2.0 * (2.0 * t - s + h) + 2.0 * (xi - nu)             # MS4
+
+    return [_angle(e) for e in eq]
+
+
 def _nodal_fu(constituent: str, N: float, p: float) -> Tuple[float, float]:
-    """
-    Compute nodal factor f and argument u for a single constituent.
-
-    Based on Schureman (1958) formulas, simplified for major constituents.
-
-    Args:
-        constituent: Constituent name
-        N: Lunar node longitude (radians)
-        p: Lunar perigee longitude (radians)
-
-    Returns:
-        (f, u_degrees) — nodal factor and equilibrium argument correction
-    """
+    """Legacy simplified nodal corrections — kept for backward compatibility."""
     cosN = math.cos(N)
     sinN = math.sin(N)
-    cos2N = math.cos(2 * N)
-    sin2N = math.sin(2 * N)
 
     if constituent in ("M2", "N2"):
         f = 1.0 - 0.037 * cosN
-        u = -2.1 * sinN  # degrees
+        u = -2.1 * sinN
     elif constituent == "S2":
         f = 1.0
         u = 0.0
     elif constituent == "K2":
         f = 1.024 + 0.286 * cosN
-        u = -17.7 * sinN  # degrees
+        u = -17.7 * sinN
     elif constituent == "K1":
         f = 1.006 + 0.115 * cosN
-        u = -8.9 * sinN  # degrees
+        u = -8.9 * sinN
     elif constituent == "O1":
         f = 1.009 + 0.187 * cosN
-        u = 10.8 * sinN  # degrees
+        u = 10.8 * sinN
     elif constituent == "P1":
         f = 1.0
         u = 0.0
     elif constituent == "Q1":
         f = 1.009 + 0.187 * cosN
-        u = 10.8 * sinN  # degrees
+        u = 10.8 * sinN
     else:
-        # Default: no correction
         f = 1.0
         u = 0.0
-        log.debug(f"No nodal correction for {constituent}, using f=1.0, u=0.0")
 
     return f, u

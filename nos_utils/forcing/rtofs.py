@@ -89,7 +89,6 @@ class RTOFSProcessor(ForcingProcessor):
         self._bnd_lons = None
         self._bnd_lats = None
         self._bnd_depths = None
-        self._interp_cache = {}
         self._vgrid = None
 
     def _get_time_window(self) -> Tuple[datetime, datetime]:
@@ -307,24 +306,24 @@ class RTOFSProcessor(ForcingProcessor):
 
         return files_2d, files_3d
 
-    def _build_rtofs_interpolator(
-        self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray,
-    ) -> Optional[dict]:
+    def _interpolate_2d_to_boundary(
+        self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray, rtofs_data: np.ndarray,
+    ) -> np.ndarray:
         """
-        Build nearest-neighbor interpolation index from RTOFS grid to boundary nodes.
-        Cached per grid shape (global 2D vs regional 3D have different grids).
+        Interpolate a 2D RTOFS field to boundary node locations.
+
+        Uses Delaunay triangulation with linear (barycentric) interpolation,
+        matching the Fortran INTERP_REMESH approach. Falls back to nearest-
+        neighbor if scipy is unavailable.
+
+        Land points (fill values) are excluded from triangulation so that
+        interpolation uses only valid ocean data — equivalent to Fortran's
+        implicit land handling through triangulation weights.
         """
-        if rtofs_lon.ndim == 2:
-            cache_key = rtofs_lon.shape
-        else:
-            cache_key = (len(rtofs_lat), len(rtofs_lon))
-
-        if cache_key in self._interp_cache:
-            return self._interp_cache[cache_key]
-
         n_bnd = len(self._bnd_lons)
         bnd_lons_360 = np.where(self._bnd_lons < 0, self._bnd_lons + 360, self._bnd_lons)
 
+        # Flatten RTOFS grid
         if rtofs_lon.ndim == 2:
             lon_flat = rtofs_lon.ravel()
             lat_flat = rtofs_lat.ravel()
@@ -333,97 +332,59 @@ class RTOFSProcessor(ForcingProcessor):
             lon_flat = lon_2d.ravel()
             lat_flat = lat_2d.ravel()
 
-        # Use scipy cKDTree if available (much faster than brute force)
-        try:
-            from scipy.spatial import cKDTree
-            tree = cKDTree(np.column_stack([lon_flat, lat_flat]))
-            _, indices = tree.query(np.column_stack([bnd_lons_360, self._bnd_lats]))
-            indices = indices.astype(np.int64)
-        except ImportError:
-            # Brute force fallback
-            indices = np.zeros(n_bnd, dtype=np.int64)
-            for k in range(n_bnd):
-                dist = (lon_flat - bnd_lons_360[k])**2 + (lat_flat - self._bnd_lats[k])**2
-                indices[k] = np.argmin(dist)
+        data_flat = rtofs_data.ravel()
 
-        result = {
-            "indices": indices,
-            "n_points": len(lon_flat),
-        }
-        self._interp_cache[cache_key] = result
-        log.info(f"Built RTOFS interpolation index for {n_bnd} boundary nodes "
-                 f"(grid {cache_key}, {len(lon_flat)} points)")
-        return result
+        # Mask land/fill values
+        ocean_mask = np.abs(data_flat) < 1e10
+        n_ocean = np.sum(ocean_mask)
 
-    def _interpolate_2d_to_boundary(
-        self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray, rtofs_data: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Interpolate a 2D RTOFS field to boundary node locations.
-
-        Handles land masking: if the nearest RTOFS point is land (fill value),
-        searches outward for the nearest valid ocean point. This is critical
-        for coastal boundary nodes that fall on land in the RTOFS global grid.
-        """
-        n_bnd = len(self._bnd_lons)
-
-        interp = self._build_rtofs_interpolator(rtofs_lon, rtofs_lat)
-        if interp is None:
+        if n_ocean == 0:
+            log.warning("No valid ocean data in field")
             return np.full(n_bnd, np.nan, dtype=np.float32)
 
-        data_flat = rtofs_data.ravel()
-        result = data_flat[interp["indices"]].astype(np.float32)
+        ocean_lon = lon_flat[ocean_mask]
+        ocean_lat = lat_flat[ocean_mask]
+        ocean_val = data_flat[ocean_mask].astype(np.float32)
+        target_pts = np.column_stack([bnd_lons_360, self._bnd_lats])
 
-        # Mark fill values as NaN
-        fill_mask = np.abs(result) > 1e10
-        result[fill_mask] = np.nan
+        try:
+            from scipy.interpolate import griddata
 
-        # Extrapolate land points from nearest ocean values
-        n_land = np.sum(fill_mask)
-        if n_land == n_bnd:
-            # ALL boundary nodes are on land — fill with domain-mean SSH
-            ocean_mask = np.abs(data_flat) < 1e10
-            if np.any(ocean_mask):
-                domain_mean = np.nanmean(data_flat[ocean_mask].astype(np.float32))
-                result[:] = domain_mean
-                log.warning(f"All {n_bnd} boundary nodes on land, filled with "
-                            f"domain mean = {domain_mean:.4f}")
-            else:
-                log.warning(f"All {n_bnd} boundary nodes on land and no ocean data — "
-                            f"leaving NaN")
-        elif n_land > 0:
-            # Build ocean-only KDTree for this specific field's ocean mask
-            # NOT cached — ocean mask differs between 2D/3D and between depth levels
-            ocean_mask = np.abs(data_flat) < 1e10
-            if np.any(ocean_mask):
-                do_build = True
-                if do_build:
-                    bnd_lons_360 = np.where(self._bnd_lons < 0,
-                                            self._bnd_lons + 360, self._bnd_lons)
-                    if rtofs_lon.ndim == 2:
-                        lon_flat = rtofs_lon.ravel()
-                        lat_flat = rtofs_lat.ravel()
-                    else:
-                        lon_2d, lat_2d = np.meshgrid(rtofs_lon, rtofs_lat)
-                        lon_flat = lon_2d.ravel()
-                        lat_flat = lat_2d.ravel()
+            # Linear (Delaunay triangulation) — matches Fortran remesh
+            result = griddata(
+                np.column_stack([ocean_lon, ocean_lat]),
+                ocean_val,
+                target_pts,
+                method="linear",
+            ).astype(np.float32)
 
-                    ocean_lon = lon_flat[ocean_mask]
-                    ocean_lat = lat_flat[ocean_mask]
-                    ocean_idx = np.where(ocean_mask)[0]
+            # Fill any NaN (outside convex hull) with nearest-neighbor
+            nan_mask = np.isnan(result)
+            if np.any(nan_mask):
+                nn_fill = griddata(
+                    np.column_stack([ocean_lon, ocean_lat]),
+                    ocean_val,
+                    target_pts[nan_mask],
+                    method="nearest",
+                ).astype(np.float32)
+                result[nan_mask] = nn_fill
+                log.debug(f"Filled {np.sum(nan_mask)} points outside convex hull "
+                          f"with nearest-neighbor")
 
-                    try:
-                        from scipy.spatial import cKDTree
-                        tree = cKDTree(np.column_stack([ocean_lon, ocean_lat]))
-                        _, nn_idx = tree.query(
-                            np.column_stack([bnd_lons_360, self._bnd_lats])
-                        )
-                        ocean_indices = ocean_idx[nn_idx]
-                        ocean_vals = data_flat[ocean_indices].astype(np.float32)
-                        result[fill_mask] = ocean_vals[fill_mask]
-                    except ImportError:
-                        pass  # No scipy — leave NaN
-                    log.debug(f"Extrapolated {n_land} land boundary nodes from nearest ocean")
+        except ImportError:
+            # Fallback: nearest-neighbor via cKDTree
+            try:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(np.column_stack([ocean_lon, ocean_lat]))
+                _, nn_idx = tree.query(target_pts)
+                result = ocean_val[nn_idx]
+            except ImportError:
+                # Brute-force nearest-neighbor
+                result = np.zeros(n_bnd, dtype=np.float32)
+                for k in range(n_bnd):
+                    dist = (ocean_lon - bnd_lons_360[k])**2 + \
+                           (ocean_lat - self._bnd_lats[k])**2
+                    result[k] = ocean_val[np.argmin(dist)]
 
         return result
 
