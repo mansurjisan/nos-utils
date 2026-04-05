@@ -92,6 +92,8 @@ class RTOFSProcessor(ForcingProcessor):
         self._vgrid = None
         self._lin_interp = {}  # Cached LinearNDInterpolator per grid
         self._nn_tree = {}     # Cached cKDTree for nearest-neighbor fallback
+        self._interp_points = {}   # Cached wet points used to build triangulation
+        self._interp_indices = {}  # Flat-grid indices corresponding to cached points
 
     def _get_time_window(self) -> Tuple[datetime, datetime]:
         """Compute the time window for RTOFS file filtering.
@@ -358,42 +360,54 @@ class RTOFSProcessor(ForcingProcessor):
             from scipy.interpolate import LinearNDInterpolator
             from scipy.spatial import cKDTree
 
-            if cache_key not in self._lin_interp:
-                # First call builds the triangulation from ocean points
+            # Check if cached indices are compatible with current data
+            cached_ok = (
+                cache_key in self._lin_interp
+                and cache_key in self._interp_indices
+                and len(data_flat) >= int(np.max(self._interp_indices[cache_key])) + 1
+            )
+
+            if cache_key not in self._lin_interp or not cached_ok:
+                # First call (or grid changed) — build triangulation from ocean points
                 self._lin_interp[cache_key] = LinearNDInterpolator(
                     ocean_pts, ocean_val,
                 )
                 self._nn_tree[cache_key] = cKDTree(ocean_pts)
-                # Store ocean mask indices for value updates
-                self._lin_interp[("mask", cache_key)] = np.where(ocean_mask)[0]
+                self._interp_points[cache_key] = ocean_pts
+                self._interp_indices[cache_key] = np.where(ocean_mask)[0]
                 log.info(f"Built Delaunay interpolator: {n_ocean} ocean pts "
                          f"(grid {rtofs_lon.shape})")
+                interp_vals = ocean_val
                 result = self._lin_interp[cache_key](target_pts).astype(np.float32)
             else:
-                # Reuse triangulation — update values at original ocean indices
-                orig_idx = self._lin_interp[("mask", cache_key)]
-                # Map current data to original ocean points (fill becomes NaN)
-                vals = np.full(len(orig_idx), np.nan, dtype=np.float32)
-                for i, idx in enumerate(orig_idx):
-                    v = data_flat[idx]
-                    if abs(v) < 1e10:
-                        vals[i] = v
-                # Fill NaN (land at this depth) from nearest valid
-                nan_v = np.isnan(vals)
-                if np.any(nan_v) and not np.all(nan_v):
-                    valid_v = ~nan_v
-                    from scipy.spatial import cKDTree as _cKDTree
-                    valid_tree = _cKDTree(ocean_pts[valid_v])
-                    _, nn = valid_tree.query(ocean_pts[nan_v])
-                    vals[nan_v] = vals[valid_v][nn]
+                # Reuse triangulation with values expressed on the original
+                # wet-point geometry. Deeper levels may turn some of those
+                # points into land, so fill them from the nearest still-wet
+                # cached point before evaluating the interpolator.
+                cached_pts = self._interp_points[cache_key]
+                orig_idx = self._interp_indices[cache_key]
+                vals = data_flat[orig_idx].astype(np.float32, copy=True)
+                valid_v = np.abs(vals) < 1e10
+                vals[~valid_v] = np.nan
+
+                if np.any(~valid_v):
+                    if np.any(valid_v):
+                        from scipy.spatial import cKDTree as _cKDTree
+                        valid_tree = _cKDTree(cached_pts[valid_v])
+                        _, nn = valid_tree.query(cached_pts[~valid_v])
+                        vals[~valid_v] = vals[valid_v][nn]
+                    else:
+                        vals[:] = np.float32(np.nanmean(ocean_val))
+
                 self._lin_interp[cache_key].values[:, 0] = vals
+                interp_vals = vals
                 result = self._lin_interp[cache_key](target_pts).astype(np.float32)
 
             # Fill NaN (outside convex hull) with nearest-neighbor
             nan_mask = np.isnan(result)
             if np.any(nan_mask):
                 _, nn_idx = self._nn_tree[cache_key].query(target_pts[nan_mask])
-                result[nan_mask] = ocean_val[nn_idx]
+                result[nan_mask] = interp_vals[nn_idx]
 
         except ImportError:
             result = np.zeros(n_bnd, dtype=np.float32)
@@ -506,7 +520,7 @@ class RTOFSProcessor(ForcingProcessor):
             return None
 
     def _process_3d(self, files_3d: List[Path]) -> List[Path]:
-        """Extract T,S,U,V from RTOFS 3D files, interpolate to boundary nodes."""
+        """Extract T/S from RTOFS 3D files and write SCHISM boundary files."""
         output_files = []
         n_bnd = len(self._bnd_lons)
         n_levels = self._vgrid.nvrt if self._vgrid else self.config.n_levels
@@ -514,9 +528,6 @@ class RTOFSProcessor(ForcingProcessor):
         try:
             all_temp = []
             all_salt = []
-            all_u = []
-            all_v = []
-
             for f in files_3d:
                 ds = Dataset(str(f))
 
@@ -536,8 +547,6 @@ class RTOFSProcessor(ForcingProcessor):
                 for var_name, target_list in [
                     ("temperature", all_temp),
                     ("salinity", all_salt),
-                    ("u", all_u),
-                    ("v", all_v),
                 ]:
                     if var_name not in ds.variables:
                         continue
