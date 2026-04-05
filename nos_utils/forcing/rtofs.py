@@ -460,6 +460,18 @@ class RTOFSProcessor(ForcingProcessor):
 
             ssh_array = np.stack(all_ssh, axis=0)
 
+            # Fill NaN nodes (e.g., nodes 0-3 that fall outside RTOFS domain)
+            # by propagating from nearest valid boundary node
+            nan_mask = np.isnan(ssh_array[0, :])
+            n_nan = np.sum(nan_mask)
+            if n_nan > 0 and n_nan < n_bnd:
+                valid_indices = np.where(~nan_mask)[0]
+                nan_indices = np.where(nan_mask)[0]
+                for ni in nan_indices:
+                    nearest_valid = valid_indices[np.argmin(np.abs(valid_indices - ni))]
+                    ssh_array[:, ni] = ssh_array[:, nearest_valid]
+                log.info(f"Filled {n_nan} NaN boundary nodes from nearest valid nodes")
+
             # Temporally interpolate to model dt (120s)
             n_rtofs = ssh_array.shape[0]
             rtofs_dt = 21600.0
@@ -585,29 +597,61 @@ class RTOFSProcessor(ForcingProcessor):
 
                 ds.close()
 
-            dt = 21600.0
+            rtofs_dt_3d = 21600.0  # 6-hourly RTOFS input
+            target_dt_3d = 10800.0  # 3-hourly output (matches Fortran DELT_TS)
+
+            # Temporally interpolate 3D fields from 6h to 3h
+            for var_list in [all_temp, all_salt]:
+                if len(var_list) > 1:
+                    try:
+                        from scipy.interpolate import interp1d
+                        n_in = len(var_list)
+                        rtofs_times = np.arange(n_in) * rtofs_dt_3d
+                        n_out = int((n_in - 1) * rtofs_dt_3d / target_dt_3d) + 1
+                        target_times = np.arange(n_out) * target_dt_3d
+                        target_times = target_times[target_times <= rtofs_times[-1]]
+
+                        stacked = np.stack(var_list, axis=0)  # (n_in, n_bnd, n_levels)
+                        interp_out = np.zeros((len(target_times),) + stacked.shape[1:],
+                                              dtype=np.float32)
+                        for node in range(stacked.shape[1]):
+                            for lev in range(stacked.shape[2]):
+                                f_i = interp1d(rtofs_times, stacked[:, node, lev],
+                                               kind="linear", fill_value="extrapolate")
+                                interp_out[:, node, lev] = f_i(target_times)
+                        var_list.clear()
+                        var_list.extend([interp_out[t] for t in range(len(target_times))])
+                    except ImportError:
+                        pass
+
+            dt = target_dt_3d if len(all_temp) > 1 else rtofs_dt_3d
 
             if all_temp:
                 fpath = self.output_path / "TEM_3D.th.nc"
                 merged = np.stack(all_temp, axis=0)
                 self._write_3d_th(fpath, merged, "temperature", "degC", dt, n_bnd)
                 output_files.append(fpath)
-                log.info(f"Created TEM_3D.th.nc: {merged.shape}")
+                log.info(f"Created TEM_3D.th.nc: {merged.shape} at dt={dt}s")
 
             if all_salt:
                 fpath = self.output_path / "SAL_3D.th.nc"
                 merged = np.stack(all_salt, axis=0)
                 self._write_3d_th(fpath, merged, "salinity", "PSU", dt, n_bnd)
                 output_files.append(fpath)
-                log.info(f"Created SAL_3D.th.nc: {merged.shape}")
+                log.info(f"Created SAL_3D.th.nc: {merged.shape} at dt={dt}s")
 
-            if all_u and all_v:
+            # uv3D: write ALL ZEROS — COMF SCHISM computes boundary velocities
+            # from SSH gradients. Prescribing RTOFS velocities is wrong physics.
+            if all_temp:
+                # Use same time dimension as T/S
+                nt_3d = len(all_temp)
                 fpath = self.output_path / "uv3D.th.nc"
-                u_merged = np.stack(all_u, axis=0)
-                v_merged = np.stack(all_v, axis=0)
-                self._write_uv3d_th(fpath, u_merged, v_merged, dt, n_bnd)
+                u_zeros = np.zeros((nt_3d, n_bnd, n_levels), dtype=np.float32)
+                v_zeros = np.zeros((nt_3d, n_bnd, n_levels), dtype=np.float32)
+                self._write_uv3d_th(fpath, u_zeros, v_zeros, dt, n_bnd)
                 output_files.append(fpath)
-                log.info(f"Created uv3D.th.nc: u={u_merged.shape}")
+                log.info(f"Created uv3D.th.nc: zeros ({nt_3d}, {n_bnd}, {n_levels}) "
+                         f"— COMF uses SSH-derived boundary velocities")
 
         except Exception as e:
             log.error(f"Failed to process RTOFS 3D: {e}")
