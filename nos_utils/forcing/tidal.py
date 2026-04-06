@@ -16,7 +16,9 @@ Output: bctides.in
 
 import logging
 import math
+import os
 import shutil
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -82,7 +84,8 @@ class TidalProcessor(ForcingProcessor):
         Generate bctides.in tidal boundary file.
 
         Tries in order:
-        1. Template mode: update bctides.in_template with new nodal corrections
+        0. Fortran mode: call tide_fac executable with template (most accurate)
+        1. Template mode: update bctides.in_template with Python nodal corrections
         2. Copy mode: copy static bctides.in from input_path
         3. Python mode: generate minimal bctides.in from scratch
         """
@@ -91,16 +94,31 @@ class TidalProcessor(ForcingProcessor):
 
         output_file = self.output_path / "bctides.in"
 
-        # Mode 1: Template-based
+        # Find template (needed for both Fortran and template modes)
         template = self.config.bctides_template
-        # Auto-discover template if not explicitly set
         if not template or not Path(template).exists():
             for f in sorted(self.input_path.glob("*bctides*template*")):
                 template = f
                 log.info(f"Auto-discovered bctides template: {f.name}")
                 break
+
+        # Mode 0: Fortran tide_fac executable (production, most accurate)
         if template and Path(template).exists():
-            log.info(f"Using template: {template}")
+            result = self._call_fortran_tide_fac(Path(template), output_file)
+            if result:
+                return ForcingResult(
+                    success=True, source=self.SOURCE_NAME,
+                    output_files=[output_file],
+                    metadata={"mode": "fortran_tide_fac"},
+                )
+
+        # Mode 1: Template-based with Python nodal corrections
+        if template and Path(template).exists():
+            log.warning(
+                "Fortran tide_fac not available — using Python nodal corrections. "
+                "For production, ensure nos_ofs_create_tide_fac_schism is in "
+                "EXECnos or EXECofs."
+            )
             result = self._process_template(Path(template), output_file)
             if result:
                 return ForcingResult(
@@ -111,7 +129,6 @@ class TidalProcessor(ForcingProcessor):
 
         # Mode 2: Copy from input_path (try multiple naming patterns)
         search_names = ["bctides.in", f"{self.config.pdy}_bctides.in"]
-        # Also glob for {ofs}.bctides.in patterns
         search_names.extend([f.name for f in sorted(self.input_path.glob("*bctides.in"))
                              if "template" not in f.name])
         for name in search_names:
@@ -126,7 +143,7 @@ class TidalProcessor(ForcingProcessor):
                 )
 
         # Mode 3: Python-native generation
-        log.info("Generating bctides.in from Python (basic mode)")
+        log.warning("Generating bctides.in from Python (basic mode) — approximate nodal corrections")
         self._generate_python(output_file)
 
         return ForcingResult(
@@ -166,6 +183,81 @@ class TidalProcessor(ForcingProcessor):
             if self.time_hotstart:
                 return self.time_hotstart
             return cycle_dt - timedelta(hours=self.config.nowcast_hours)
+
+    def _call_fortran_tide_fac(self, template_path: Path, output_path: Path) -> bool:
+        """
+        Call Fortran tide_fac executable for accurate nodal corrections.
+
+        Searches for the executable under multiple naming conventions:
+        - COMF SCHISM: nos_ofs_create_tide_fac_schism (in EXECnos or EXECofs)
+        - STOFS: stofs_3d_atl_tide_fac (in EXECstofs3d)
+
+        The executable reads bctides.in_template and writes bctides.in with
+        accurate nodal factors for the specified start time.
+        """
+        exe_names = ["nos_ofs_create_tide_fac_schism", "stofs_3d_atl_tide_fac"]
+        env_dirs = ["EXECnos", "EXECofs", "EXECstofs3d"]
+
+        exe = None
+        for env_var in env_dirs:
+            exec_dir = os.environ.get(env_var)
+            if not exec_dir:
+                continue
+            for name in exe_names:
+                candidate = Path(exec_dir) / name
+                if candidate.exists():
+                    exe = candidate
+                    break
+            if exe:
+                break
+
+        if exe is None:
+            log.debug("No Fortran tide_fac executable found in EXECnos/EXECofs/EXECstofs3d")
+            return False
+
+        start_time = self._compute_start_time()
+        run_days = (self.config.nowcast_hours + self.config.forecast_hours) / 24.0
+
+        try:
+            work_template = output_path.parent / "bctides.in_template"
+            shutil.copy2(template_path, work_template)
+
+            # Fortran input: N_days, hh,dd,mm,yyyy, y (confirmation)
+            input_text = (
+                f"{int(run_days)}\n"
+                f"{start_time.strftime('%H,%d,%m,%Y')}\n"
+                "y\n"
+            )
+
+            log.info(f"Running Fortran tide_fac: {exe}")
+            log.info(f"  phase={self.phase}, start_time={start_time}, run_days={int(run_days)}")
+
+            result = subprocess.run(
+                [str(exe)],
+                input=input_text,
+                cwd=str(output_path.parent),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            if result.returncode != 0:
+                log.warning(f"tide_fac returned {result.returncode}: {result.stderr[:200]}")
+                return False
+
+            if output_path.exists():
+                log.info("Created bctides.in using Fortran tide_fac (accurate nodal corrections)")
+                return True
+
+            log.warning("tide_fac completed but bctides.in not found")
+            return False
+
+        except subprocess.TimeoutExpired:
+            log.warning("Fortran tide_fac timed out")
+            return False
+        except Exception as e:
+            log.warning(f"Error calling Fortran tide_fac: {e}")
+            return False
 
     def _process_template(self, template_path: Path, output_path: Path) -> bool:
         """
