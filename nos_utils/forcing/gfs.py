@@ -466,11 +466,14 @@ class GFSProcessor(ForcingProcessor):
     def _compute_base_date(self) -> datetime:
         """Compute sflux base date (start of model simulation).
 
-        Uses time_hotstart if available, otherwise cycle - nowcast_hours.
-        Phase-independent: sflux uses a continuous time axis across
-        nowcast and forecast, so both must share the same base_date.
+        Returns the START OF DAY (00Z) of the hotstart date.
+        Fortran convention: base_date is always day-start, and the sflux
+        time axis is "days since YYYY-MM-DD 00:00:00". The base_date
+        attribute [Y,M,D,0] must match the actual reference used for
+        computing time values, otherwise SCHISM reads wrong absolute times.
         """
         if self.time_hotstart:
-            return self.time_hotstart
+            return self.time_hotstart.replace(hour=0, minute=0, second=0, microsecond=0)
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + timedelta(hours=self.config.cyc)
-        return cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        base = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        return base.replace(hour=0, minute=0, second=0, microsecond=0)

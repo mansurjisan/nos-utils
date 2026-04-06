@@ -51,8 +51,9 @@ class TestGFSFileDiscovery:
         proc = GFSProcessor(mock_config, Path("/tmp"), Path("/tmp/out"))
         base = proc._compute_base_date()
 
-        # 12z - 6h nowcast = 06z on same day
-        expected = datetime(2026, 4, 1, 6, 0, 0)
+        # base_date is always day-start (00Z), matching Fortran convention
+        # 12z - 6h = 06z → truncated to 00Z on same day
+        expected = datetime(2026, 4, 1, 0, 0, 0)
         assert base == expected
 
 
