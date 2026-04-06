@@ -438,13 +438,24 @@ class HRRRProcessor(ForcingProcessor):
                     subset_file.unlink(missing_ok=True)
                     bin_file.unlink(missing_ok=True)
 
+                # Rotate grid-relative winds to earth coordinates
+                # HRRR Lambert Conformal stores winds relative to the grid,
+                # not earth. Fortran does this via w3fc07 subroutine.
+                if "uwind" in file_data and "vwind" in file_data and native_lons is not None:
+                    u_grid = file_data["uwind"]
+                    v_grid = file_data["vwind"]
+                    u_earth, v_earth = self._rotate_winds_lcc(
+                        u_grid, v_grid, native_lons,
+                    )
+                    file_data["uwind"] = u_earth
+                    file_data["vwind"] = v_earth
+
                 if file_data:
                     result["times"].append(valid_time)
                     for var in self.variables:
                         if var in file_data:
                             result["data"][var].append(file_data[var])
                         elif result["data"][var]:
-                            # Fill with NaN array matching previous shape
                             result["data"][var].append(
                                 np.full_like(result["data"][var][-1], np.nan))
 
@@ -650,6 +661,46 @@ class HRRRProcessor(ForcingProcessor):
             filtered["data"][var] = [arrays[i] for i in keep if i < len(arrays)]
 
         return filtered
+
+    @staticmethod
+    def _rotate_winds_lcc(
+        u_grid: np.ndarray, v_grid: np.ndarray, lons: np.ndarray,
+        lov: float = -97.5, latin1: float = 38.5, latin2: float = 38.5,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Rotate Lambert Conformal grid-relative winds to earth coordinates.
+
+        Port of NCEP w3fc07 subroutine used by Fortran nos_ofs_create_forcing_met.
+        HRRR standard parameters: lov=-97.5, latin1=38.5, latin2=38.5.
+
+        Args:
+            u_grid: U-wind on grid (grid-relative)
+            v_grid: V-wind on grid (grid-relative)
+            lons: 2D longitude array (degrees, -180..180)
+            lov: Longitude of orientation (center longitude of projection)
+            latin1, latin2: Standard parallels
+
+        Returns:
+            (u_earth, v_earth) — winds rotated to earth coordinates
+        """
+        # Cone factor for Lambert Conformal
+        if abs(latin1 - latin2) < 1e-6:
+            cone = np.sin(np.radians(abs(latin1)))
+        else:
+            cone = (np.log(np.cos(np.radians(latin1))) -
+                    np.log(np.cos(np.radians(latin2)))) / \
+                   (np.log(np.tan(np.radians(45 - latin1 / 2))) -
+                    np.log(np.tan(np.radians(45 - latin2 / 2))))
+
+        # Rotation angle at each grid point
+        angle = cone * np.radians(lons - lov)
+
+        sin_a = np.sin(angle)
+        cos_a = np.cos(angle)
+
+        u_earth = cos_a * u_grid + sin_a * v_grid
+        v_earth = -sin_a * u_grid + cos_a * v_grid
+
+        return u_earth.astype(np.float32), v_earth.astype(np.float32)
 
     def _compute_base_date(self) -> datetime:
         """Compute sflux base date (start of model simulation).
