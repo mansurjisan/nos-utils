@@ -468,7 +468,27 @@ class HRRRProcessor(ForcingProcessor):
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+        # Subset to domain bounds (match Fortran subdomain selection)
         if native_lons is not None:
+            lon_min, lon_max, lat_min, lat_max = self.config.domain
+            # Find bounding box in grid indices
+            in_domain = (
+                (native_lons >= lon_min) & (native_lons <= lon_max) &
+                (native_lats >= lat_min) & (native_lats <= lat_max)
+            )
+            rows = np.any(in_domain, axis=1)
+            cols = np.any(in_domain, axis=0)
+            r0, r1 = np.where(rows)[0][[0, -1]]
+            c0, c1 = np.where(cols)[0][[0, -1]]
+
+            native_lons = native_lons[r0:r1+1, c0:c1+1]
+            native_lats = native_lats[r0:r1+1, c0:c1+1]
+            for var in result["data"]:
+                result["data"][var] = [d[r0:r1+1, c0:c1+1] for d in result["data"][var]]
+
+            log.info(f"Subset HRRR to domain: [{r0}:{r1+1}, {c0}:{c1+1}] = "
+                     f"{native_lons.shape}, lon=[{np.min(native_lons):.2f},{np.max(native_lons):.2f}]")
+
             result["lons"] = native_lons
             result["lats"] = native_lats
 
