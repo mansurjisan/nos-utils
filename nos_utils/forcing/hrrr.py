@@ -438,6 +438,11 @@ class HRRRProcessor(ForcingProcessor):
                     subset_file.unlink(missing_ok=True)
                     bin_file.unlink(missing_ok=True)
 
+                # Fill land/NaN cells from nearest valid point
+                # Matches Fortran behavior at line 2043 of nos_ofs_create_forcing_met.f
+                for var in list(file_data.keys()):
+                    file_data[var] = self._fill_land_nearest(file_data[var])
+
                 # Rotate grid-relative winds to earth coordinates
                 # HRRR Lambert Conformal stores winds relative to the grid,
                 # not earth. Fortran does this via w3fc07 subroutine.
@@ -661,6 +666,31 @@ class HRRRProcessor(ForcingProcessor):
             filtered["data"][var] = [arrays[i] for i in keep if i < len(arrays)]
 
         return filtered
+
+    @staticmethod
+    def _fill_land_nearest(field: np.ndarray) -> np.ndarray:
+        """Fill NaN (land) cells from nearest valid (ocean) point.
+
+        Matches Fortran nos_ofs_create_forcing_met behavior where land
+        cells are filled from nearest coastal points before writing sflux.
+        """
+        nan_mask = np.isnan(field)
+        if not np.any(nan_mask) or np.all(nan_mask):
+            return field
+
+        try:
+            from scipy.ndimage import distance_transform_edt
+
+            # Use distance transform to find nearest valid pixel for each NaN
+            valid_mask = ~nan_mask
+            _, nearest_idx = distance_transform_edt(
+                nan_mask, return_distances=True, return_indices=True,
+            )
+            filled = field.copy()
+            filled[nan_mask] = field[tuple(nearest_idx[:, nan_mask])]
+            return filled
+        except ImportError:
+            return field
 
     @staticmethod
     def _rotate_winds_lcc(
