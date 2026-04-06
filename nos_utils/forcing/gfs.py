@@ -38,7 +38,13 @@ class GFSProcessor(ForcingProcessor):
     """
 
     SOURCE_NAME = "GFS"
-    MIN_FILE_SIZE = 500_000_000  # 500 MB
+    # Minimum file size by resolution (bytes).
+    # GFS 0.25°: ~500 MB, GFS 0.50°: ~60 MB per file.
+    MIN_FILE_SIZE_BY_RES = {
+        "0p25": 400_000_000,  # 400 MB
+        "0p50": 40_000_000,   # 40 MB
+    }
+    MIN_FILE_SIZE = 40_000_000  # fallback: 40 MB
 
     # GRIB2 variable mapping: internal name -> (GRIB2 name, level)
     GRIB2_VARIABLES = {
@@ -95,6 +101,8 @@ class GFSProcessor(ForcingProcessor):
         self._extractor = extractor
         self.phase = phase
         self.time_hotstart = time_hotstart
+        # Set resolution-appropriate file size threshold
+        self.MIN_FILE_SIZE = self.MIN_FILE_SIZE_BY_RES.get(resolution, 40_000_000)
 
     @property
     def extractor(self) -> GRIBExtractor:

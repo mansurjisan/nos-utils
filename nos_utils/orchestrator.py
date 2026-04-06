@@ -21,6 +21,7 @@ Usage:
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -160,6 +161,16 @@ class PrepOrchestrator:
             proc = HotstartProcessor(self.config, Path(self.paths.get("restart", "")),
                                      output_dir, run_name=self.run_name)
             time_hotstart = proc._parse_file_datetime(hs_info.filepath)
+
+        # Fallback: read time_hotstart from environment (set by shell prep)
+        if time_hotstart is None:
+            env_ths = os.environ.get("time_hotstart", "")
+            if env_ths and len(env_ths) >= 10:
+                try:
+                    time_hotstart = datetime.strptime(env_ths[:10], "%Y%m%d%H")
+                    log.info(f"Using time_hotstart from environment: {time_hotstart}")
+                except ValueError:
+                    pass
 
         # Step 2: GFS atmospheric
         if "gfs" in self.paths:

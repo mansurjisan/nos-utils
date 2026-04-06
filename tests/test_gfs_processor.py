@@ -110,4 +110,7 @@ class TestGFSProcess:
         assert result.metadata["num_input_files"] > 0
 
     def test_min_file_size(self):
-        assert GFSProcessor.MIN_FILE_SIZE == 500_000_000
+        # Class-level fallback is 40 MB; resolution-specific set in __init__
+        assert GFSProcessor.MIN_FILE_SIZE == 40_000_000
+        assert GFSProcessor.MIN_FILE_SIZE_BY_RES["0p25"] == 400_000_000
+        assert GFSProcessor.MIN_FILE_SIZE_BY_RES["0p50"] == 40_000_000
