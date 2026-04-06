@@ -233,6 +233,7 @@ class PrepOrchestrator:
         sflux_dir = output_dir / "sflux" if self.config.nws == 2 else output_dir
         proc = GFSProcessor(
             self.config, self.paths["gfs"], sflux_dir,
+            resolution=self.config.gfs_resolution,
             phase=phase, time_hotstart=time_hotstart,
         )
         return proc.process()

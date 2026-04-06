@@ -51,6 +51,7 @@ class ForcingConfig:
     # Met settings
     igrd_met: int = 0
     met_num: int = 1
+    gfs_resolution: str = "0p50"  # Match Fortran: uses 0.5° GFS (not 0.25°)
     scale_hflux: float = 1.0
 
     # Model grid (needed when igrd_met > 0)
