@@ -215,9 +215,19 @@ class SfluxWriter:
         try:
             nc = Dataset(str(output_path), "w", format="NETCDF4")
 
-            # Dimensions
-            nx = len(lons)
-            ny = len(lats)
+            # Dimensions — handle both 1D (regular grid) and 2D (native LCC) lon/lat
+            lons_arr = np.asarray(lons)
+            lats_arr = np.asarray(lats)
+
+            if lons_arr.ndim == 2:
+                ny, nx = lons_arr.shape
+                lon_2d = lons_arr
+                lat_2d = lats_arr
+            else:
+                nx = len(lons_arr)
+                ny = len(lats_arr)
+                lon_2d, lat_2d = np.meshgrid(lons_arr, lats_arr)
+
             nc.createDimension("nx_grid", nx)
             nc.createDimension("ny_grid", ny)
             nc.createDimension("ntime", len(times))
@@ -241,7 +251,6 @@ class SfluxWriter:
             lat_var.units = "degrees_north"
             lat_var.long_name = "Latitude"
 
-            lon_2d, lat_2d = np.meshgrid(lons, lats)
             lon_var[:] = lon_2d
             lat_var[:] = lat_2d
 

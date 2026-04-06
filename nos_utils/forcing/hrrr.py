@@ -121,8 +121,13 @@ class HRRRProcessor(ForcingProcessor):
                 )
             log.info(f"Found {len(hrrr_files)} HRRR files")
 
-            # Step 2: Regrid LCC -> lat/lon and extract
-            extracted = self._extract_all(hrrr_files)
+            # Step 2: Extract data
+            # igrd_met=0: pass native LCC grid (matches Fortran behavior)
+            # igrd_met>0: regrid to regular lat/lon
+            if self.config.igrd_met == 0:
+                extracted = self._extract_native(hrrr_files)
+            else:
+                extracted = self._extract_all(hrrr_files)
             if not extracted["times"]:
                 return ForcingResult(
                     success=True, source=self.SOURCE_NAME,
@@ -321,6 +326,146 @@ class HRRRProcessor(ForcingProcessor):
                                     f"expected {len(sorted_idx)}")
                     result["data"][var] = [result["data"][var][i] for i in sorted_idx
                                            if i < n_data]
+
+        return result
+
+    def _extract_native(self, hrrr_files: List[Path]) -> dict:
+        """Extract HRRR data on native Lambert Conformal grid (no regrid).
+
+        Matches Fortran nos_ofs_create_forcing_met behavior with IGRD=0:
+        pass the native HRRR grid through to sflux, storing 2D lon/lat.
+        """
+        import subprocess
+        import tempfile
+
+        result = {"times": [], "lons": None, "lats": None, "data": {}}
+        for var in self.variables:
+            result["data"][var] = []
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="hrrr_native_"))
+        native_lons = None
+        native_lats = None
+
+        try:
+            for hrrr_file in hrrr_files:
+                valid_time = self._parse_valid_time(hrrr_file)
+                if valid_time is None:
+                    continue
+
+                file_data = {}
+                for var in self.variables:
+                    if var not in self.GRIB2_VARIABLES:
+                        continue
+                    grib_var, level = self.GRIB2_VARIABLES[var]
+                    match_str = f":{grib_var}:{level}:"
+
+                    # Extract to binary on native grid (no regrid, no subset)
+                    subset_file = tmpdir / f"match_{hrrr_file.stem}_{var}.grb2"
+                    bin_file = tmpdir / f"data_{hrrr_file.stem}_{var}.bin"
+
+                    cmd1 = [
+                        self.extractor.wgrib2, str(hrrr_file),
+                        "-match", match_str,
+                        "-grib", str(subset_file),
+                    ]
+                    r1 = subprocess.run(cmd1, capture_output=True, text=True, timeout=300)
+                    if r1.returncode != 0 or not subset_file.exists():
+                        continue
+
+                    # Dump first record to binary
+                    cmd2 = [
+                        self.extractor.wgrib2, str(subset_file),
+                        "-d", "1",
+                        "-no_header", "-bin", str(bin_file),
+                    ]
+                    r2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=60)
+                    if r2.returncode != 0 or not bin_file.exists():
+                        subset_file.unlink(missing_ok=True)
+                        continue
+
+                    data = np.fromfile(bin_file, dtype=np.float32)
+                    nx, ny = self.extractor._get_nxny(subset_file)
+
+                    if nx and ny and data.size == nx * ny:
+                        field = data.reshape((ny, nx))
+                        # Mask fill values
+                        field = np.where(np.abs(field) > 1e10, np.nan, field)
+                        file_data[var] = field
+                    else:
+                        log.debug(f"Grid dim mismatch for {var}: size={data.size}, nx={nx}, ny={ny}")
+
+                    # Get native lon/lat from first successful extraction
+                    if native_lons is None and nx and ny:
+                        lon_file = tmpdir / "lon.bin"
+                        lat_file = tmpdir / "lat.bin"
+                        cmd_lon = [
+                            self.extractor.wgrib2, str(subset_file),
+                            "-d", "1", "-no_header",
+                            "-lon_grib", str(lon_file),
+                        ]
+                        cmd_lat = [
+                            self.extractor.wgrib2, str(subset_file),
+                            "-d", "1", "-no_header",
+                            "-lat_grib", str(lat_file),
+                        ]
+                        # Use rpn to dump lon/lat
+                        cmd_lonlat = [
+                            self.extractor.wgrib2, str(subset_file),
+                            "-d", "1",
+                            "-rpn", "rcl_lon", "-no_header", "-bin", str(lon_file),
+                        ]
+                        r = subprocess.run(cmd_lonlat, capture_output=True, text=True, timeout=60)
+                        if r.returncode == 0 and lon_file.exists():
+                            lons = np.fromfile(lon_file, dtype=np.float32).reshape((ny, nx))
+                            # Now get lat
+                            cmd_lat2 = [
+                                self.extractor.wgrib2, str(subset_file),
+                                "-d", "1",
+                                "-rpn", "rcl_lat", "-no_header", "-bin", str(lat_file),
+                            ]
+                            r2 = subprocess.run(cmd_lat2, capture_output=True, text=True, timeout=60)
+                            if r2.returncode == 0 and lat_file.exists():
+                                lats = np.fromfile(lat_file, dtype=np.float32).reshape((ny, nx))
+                                # Convert lon from 0-360 to -180..180
+                                lons = np.where(lons > 180, lons - 360, lons)
+                                native_lons = lons
+                                native_lats = lats
+                                log.info(f"Native HRRR grid: {ny}x{nx}, "
+                                         f"lon=[{np.min(lons):.3f}, {np.max(lons):.3f}], "
+                                         f"lat=[{np.min(lats):.3f}, {np.max(lats):.3f}]")
+
+                    # Cleanup
+                    subset_file.unlink(missing_ok=True)
+                    bin_file.unlink(missing_ok=True)
+
+                if file_data:
+                    result["times"].append(valid_time)
+                    for var in self.variables:
+                        if var in file_data:
+                            result["data"][var].append(file_data[var])
+                        elif result["data"][var]:
+                            # Fill with NaN array matching previous shape
+                            result["data"][var].append(
+                                np.full_like(result["data"][var][-1], np.nan))
+
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        if native_lons is not None:
+            result["lons"] = native_lons
+            result["lats"] = native_lats
+
+        # Sort by time
+        if result["times"]:
+            sorted_idx = sorted(range(len(result["times"])),
+                                key=lambda i: result["times"][i])
+            result["times"] = [result["times"][i] for i in sorted_idx]
+            for var in result["data"]:
+                if result["data"][var]:
+                    n_data = len(result["data"][var])
+                    result["data"][var] = [result["data"][var][i]
+                                           for i in sorted_idx if i < n_data]
 
         return result
 
