@@ -271,7 +271,10 @@ class RTOFSProcessor(ForcingProcessor):
         files_3d = []
         rtofs_cycle_date = None
 
-        for date in [base_date, base_date - timedelta(days=1)]:
+        # RTOFS has ~2-day production lag. In production at ~01Z, only
+        # PDY-2 is guaranteed complete. Search PDY-2 first to match
+        # Fortran behavior, then fall back to newer cycles if available.
+        for date in [base_date - timedelta(days=2), base_date - timedelta(days=1), base_date]:
             date_str = date.strftime("%Y%m%d")
 
             for rtofs_dir in [
