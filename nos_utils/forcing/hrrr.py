@@ -121,6 +121,9 @@ class HRRRProcessor(ForcingProcessor):
                 )
             log.info(f"Found {len(hrrr_files)} HRRR files")
 
+            # Write met_files_used log for traceability
+            self.write_files_used(hrrr_files, self.output_path.parent, "HRRR", self.phase)
+
             # Step 2: Extract data
             # igrd_met=0: pass native LCC grid (matches Fortran behavior)
             # igrd_met>0: regrid to regular lat/lon

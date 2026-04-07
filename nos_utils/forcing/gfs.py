@@ -192,6 +192,9 @@ class GFSProcessor(ForcingProcessor):
             )
         log.info(f"Found {len(gfs_files)} GFS files")
 
+        # Write met_files_used log for traceability
+        self.write_files_used(gfs_files, self.output_path.parent, "GFS", self.phase)
+
         # Step 2: Extract variables from GRIB2
         extracted = self._extract_all(gfs_files)
         if not extracted["times"]:

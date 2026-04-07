@@ -74,5 +74,54 @@ class ForcingProcessor(ABC):
         """Create output directory if needed."""
         self.output_path.mkdir(parents=True, exist_ok=True)
 
+    def write_files_used(
+        self, files: List[Path], output_dir: Path, source: str, phase: str,
+    ) -> Path:
+        """
+        Write met_files_used log matching Fortran format.
+
+        Format: filepath on one line, then "YYYY MM DD CYC FHR" on the next.
+        Output filename: met_files_used_{phase}_{cyc:02d}_{source}.dat
+        """
+        import re
+
+        cyc = self.config.cyc
+        outfile = output_dir / f"met_files_used_{phase}_{cyc:02d}_{source}.dat"
+
+        with open(outfile, "w") as f:
+            for filepath in files:
+                f.write(f"{filepath}\n")
+                name = filepath.name
+                # Extract cycle date/hour and forecast hour from filename
+                # GFS: gfs.tHHz.pgrb2.0p50.fHHH  in dir gfs.YYYYMMDD/HH/
+                # HRRR: hrrr.tHHz.wrfsfcfHH.grib2 in dir hrrr.YYYYMMDD/
+                try:
+                    # Get cycle hour from tHHz
+                    m_cyc = re.search(r"\.t(\d{2})z\.", name)
+                    cyc_hr = int(m_cyc.group(1)) if m_cyc else 0
+                    # Get forecast hour
+                    m_fhr = re.search(r"[\.f](\d{2,3})(?:\.|\Z)", name)
+                    if not m_fhr:
+                        m_fhr = re.search(r"wrfsfcf(\d{2})", name)
+                    fhr = int(m_fhr.group(1)) if m_fhr else 0
+                    # Get date from parent directory
+                    for part in filepath.parts:
+                        m_date = re.match(r"(?:gfs|hrrr)\.(\d{8})", part)
+                        if m_date:
+                            date_str = m_date.group(1)
+                            break
+                    else:
+                        date_str = self.config.pdy
+                    yyyy = date_str[:4]
+                    mm = date_str[4:6]
+                    dd = date_str[6:8]
+                    f.write(f"{yyyy} {mm} {dd} {cyc_hr:02d} {fhr:03d}\n")
+                except Exception:
+                    f.write(f"{self.config.pdy[:4]} {self.config.pdy[4:6]} "
+                            f"{self.config.pdy[6:8]} 00 000\n")
+
+        log.info(f"Wrote {outfile.name}: {len(files)} files")
+        return outfile
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(source={self.SOURCE_NAME})"
