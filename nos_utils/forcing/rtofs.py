@@ -101,9 +101,9 @@ class RTOFSProcessor(ForcingProcessor):
     def _get_time_window(self) -> Tuple[datetime, datetime]:
         """Compute the time window for RTOFS file filtering.
 
-        OBC files cover the full simulation (nowcast + forecast), so the
-        window always spans from nowcast start to forecast end, regardless
-        of the current phase. A 6h buffer is added on each side.
+        OBC files cover the full simulation (nowcast + forecast).
+        One 6h buffer before start for interpolation; end is exact
+        (no buffer — prevents excessive file inclusion).
         """
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                    timedelta(hours=self.config.cyc)
@@ -112,7 +112,7 @@ class RTOFSProcessor(ForcingProcessor):
             t_start = self.time_hotstart - timedelta(hours=6)
         else:
             t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=6)
-        t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=6)
+        t_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
 
         return t_start, t_end
 
@@ -467,9 +467,17 @@ class RTOFSProcessor(ForcingProcessor):
                 log.info(f"Filled {n_nan} NaN boundary nodes from nearest valid nodes")
 
             # Temporally interpolate to model dt (120s)
+            # Clip to the actual simulation window (nowcast + forecast)
             n_rtofs = ssh_array.shape[0]
             rtofs_dt = 21600.0
-            total_time = (n_rtofs - 1) * rtofs_dt
+
+            cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                       timedelta(hours=self.config.cyc)
+            sim_start = self.time_hotstart if self.time_hotstart else \
+                        cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
+            sim_duration = (sim_end - sim_start).total_seconds()
+            total_time = min((n_rtofs - 1) * rtofs_dt, sim_duration)
             n_model_steps = int(total_time / model_dt) + 1
 
             if n_model_steps > n_rtofs and n_rtofs > 1:
@@ -658,11 +666,17 @@ class RTOFSProcessor(ForcingProcessor):
 
         Uses per-node sigma values from LSC2 vgrid when available,
         giving node-specific vertical structure that matches the Fortran output.
+
+        RTOFS depths are positive downward (0, 5, 10, ... 5000m).
+        SCHISM sigma depths are negative (bottom=-depth to surface=0).
+        The output array shape is (n_bnd, target_levels) with level ordering
+        bottom-to-surface matching SCHISM convention.
         """
         from scipy.interpolate import interp1d
 
         n_bnd = bnd_profile.shape[0]
-        rtofs_z = -np.abs(rtofs_depths)  # negative down
+        # RTOFS depths: positive down → convert to negative (SCHISM convention)
+        rtofs_z = -np.abs(rtofs_depths)  # e.g., [0, -5, -10, ... -5000]
 
         defaults = {"temperature": 15.0, "salinity": 35.0, "u": 0.0, "v": 0.0}
         fill_val = defaults.get(var_name, 0.0)
@@ -674,13 +688,16 @@ class RTOFSProcessor(ForcingProcessor):
             valid = ~np.isnan(profile)
 
             if np.sum(valid) < 2:
+                # Only 1 or 0 valid levels — fill with that value or default
+                if np.sum(valid) == 1:
+                    result[node, :] = profile[valid][0]
                 continue
 
             node_depth = abs(self._bnd_depths[node])
             if node_depth < 0.1:
                 continue  # Skip dry nodes
 
-            # Get SCHISM target depths for this node
+            # Get SCHISM target depths for this node (negative, bottom to surface)
             if self._vgrid and self._vgrid.node_sigma is not None:
                 # Per-node sigma from LSC2 (best match to Fortran)
                 schism_z = self._vgrid.get_node_depths(node, node_depth)
@@ -689,20 +706,33 @@ class RTOFSProcessor(ForcingProcessor):
             else:
                 schism_z = np.linspace(-node_depth, 0, target_levels)
 
+            # Ensure schism_z is sorted bottom to surface (most negative first)
+            schism_z = np.sort(schism_z)
+
             # Pad or trim to target_levels
             if len(schism_z) > target_levels:
                 schism_z = schism_z[-target_levels:]  # Keep surface levels
             elif len(schism_z) < target_levels:
-                # Pad deep levels
+                # Pad deep levels with the deepest available depth
                 n_pad = target_levels - len(schism_z)
                 pad_z = np.full(n_pad, schism_z[0])
                 schism_z = np.concatenate([pad_z, schism_z])
 
+            # RTOFS profile: valid depths sorted from surface to deep
+            # For interpolation, ensure both arrays go in the same direction
+            valid_z = rtofs_z[valid]
+            valid_prof = profile[valid]
+            # Sort by depth (most negative = deepest first)
+            sort_idx = np.argsort(valid_z)
+            valid_z = valid_z[sort_idx]
+            valid_prof = valid_prof[sort_idx]
+
             # Interpolate from RTOFS depths to SCHISM depths
+            # fill_value: use deepest value for below-bottom, surface value for above-surface
             f_interp = interp1d(
-                rtofs_z[valid], profile[valid],
+                valid_z, valid_prof,
                 kind="linear", bounds_error=False,
-                fill_value=(profile[valid][0], profile[valid][-1]),
+                fill_value=(valid_prof[0], valid_prof[-1]),  # (deep, surface)
             )
             result[node, :] = f_interp(schism_z[:target_levels])
 
