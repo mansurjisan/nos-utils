@@ -6,14 +6,16 @@ and constructs a ForcingConfig + paths dict for the PrepOrchestrator.
 
 This is the glue between the operational HPC job environment and nos-utils.
 
-Usage from shell:
+Usage from shell::
+
     export PYTHONPATH=/path/to/nos-utils:$PYTHONPATH
     python3 -c "
         from nos_utils.nco_bridge import config_from_env, run_prep
         run_prep(phase='nowcast')
     "
 
-Usage from Python:
+Usage from Python::
+
     from nos_utils.nco_bridge import config_from_env
     config, paths = config_from_env()
 """

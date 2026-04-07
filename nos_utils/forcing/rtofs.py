@@ -14,14 +14,17 @@ Reads SCHISM boundary node locations from hgrid.ll (or obc.ctl for exact
 Fortran-matching node list) and interpolates RTOFS data to those nodes.
 
 IMPORTANT: SSH bias correction
-  The Fortran gen_3Dth_from_hycom applies a station-based bias correction:
-    1. Reads real-time tide gauge observations (NOSBUFR)
-    2. Computes AVGERR = mean(obs - RTOFS) per station (~1.25m for SECOFS)
-    3. Applies WLOBC += weight * (AVGERR + obs_subtidal) per boundary node
-  This Python processor does NOT apply this correction — the ~1.25m SSH
-  offset relative to Fortran output is expected. For production runs,
-  use hybrid mode (Fortran OBC) until Python has access to real-time
-  tide gauge data.
+
+The Fortran gen_3Dth_from_hycom applies a station-based bias correction:
+
+1. Reads real-time tide gauge observations (NOSBUFR)
+2. Computes AVGERR = mean(obs - RTOFS) per station (~1.25m for SECOFS)
+3. Applies WLOBC += weight * (AVGERR + obs_subtidal) per boundary node
+
+This Python processor does NOT apply this correction — the ~1.25m SSH
+offset relative to Fortran output is expected. For production runs,
+use hybrid mode (Fortran OBC) until Python has access to real-time
+tide gauge data.
 
 Works with any SCHISM-based OFS (SECOFS, STOFS-3D-ATL, CREOFS, etc.)
 """

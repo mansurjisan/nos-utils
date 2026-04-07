@@ -2,9 +2,11 @@
 SCHISM domain partition generator.
 
 Creates partition.prop assigning mesh elements to MPI compute ranks.
+
 Two methods:
-  1. Round-robin (default): Simple element_id % nprocs assignment
-  2. Contiguous blocks: Sequential block assignment
+
+1. Round-robin (default): Simple element_id % nprocs assignment
+2. Contiguous blocks: Sequential block assignment
 
 Input: hgrid.gr3 (SCHISM grid file) — reads n_elements from line 2
 Output: partition.prop (one rank per line, n_elements lines)

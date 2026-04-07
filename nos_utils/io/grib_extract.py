@@ -5,7 +5,8 @@ Two backends:
 - Wgrib2Extractor: Production — uses wgrib2 subprocess (fast, handles all grids)
 - CfgribExtractor: Development — uses cfgrib/xarray (no external binary needed)
 
-Usage:
+Usage::
+
     extractor = get_extractor()  # auto-detect best available
     data, lons, lats = extractor.extract("gfs.grib2", "UGRD", "10 m above ground",
                                           domain=(-88, -63, 17, 40))

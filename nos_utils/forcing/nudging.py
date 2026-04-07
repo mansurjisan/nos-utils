@@ -6,9 +6,11 @@ These files apply interior relaxation (nudging) toward observed T/S values
 at specified nodes with a configurable timescale.
 
 Input: RTOFS 3D NetCDF files (temperature, salinity on depth levels)
+
 Output:
-  - TEM_nu.nc — temperature nudging field
-  - SAL_nu.nc — salinity nudging field
+
+- TEM_nu.nc — temperature nudging field
+- SAL_nu.nc — salinity nudging field
 
 Replaces: nudging portion of nos_ofs_create_forcing_obc / gen_hycom_3Dth_nudge.py
 """

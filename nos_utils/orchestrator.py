@@ -3,7 +3,8 @@ Prep orchestrator — chains all forcing processors in sequence.
 
 Replaces exnos_ofs_prep.sh (~800 lines of shell) with a Python pipeline.
 
-Usage:
+Usage::
+
     from nos_utils.config import ForcingConfig
     from nos_utils.orchestrator import PrepOrchestrator
 
