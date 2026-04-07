@@ -269,12 +269,28 @@ class GFSProcessor(ForcingProcessor):
         return primary
 
     def _build_file_list(self) -> List[Path]:
-        """Build primary file list from multiple GFS cycles covering the run window."""
+        """
+        Build primary file list from GFS cycles covering the run window.
+
+        For forecast phase: uses single cycle with extended leads (matching COMF).
+        For nowcast phase: uses multiple cycles with short leads.
+        """
         cycles = self._compute_search_cycles()
         gfs_files = []
 
+        # Compute max forecast hour needed from a single cycle
+        # For forecast: cycle may be 6h before forecast end, so need longer leads
+        base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
+        cycle_dt = base_date + timedelta(hours=self.config.cyc)
+        forecast_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
+
         for date, cyc in cycles:
             date_str = date.strftime("%Y%m%d")
+            cycle_start = date + timedelta(hours=cyc)
+
+            # Max lead = hours from this cycle to the end of the forecast window
+            max_fhr = int((forecast_end - cycle_start).total_seconds() / 3600)
+            max_fhr = max(max_fhr, self.config.forecast_hours)
 
             # Try standard path structures
             for path_fmt in [
@@ -294,7 +310,7 @@ class GFSProcessor(ForcingProcessor):
                     except (ValueError, IndexError):
                         continue
 
-                    if fhr > self.config.forecast_hours:
+                    if fhr > max_fhr:
                         continue
 
                     if self.MIN_FILE_SIZE and not self.validate_file_size(f, self.MIN_FILE_SIZE):
@@ -345,26 +361,46 @@ class GFSProcessor(ForcingProcessor):
 
     def _compute_search_cycles(self) -> List[Tuple[datetime, int]]:
         """
-        Determine which GFS cycles to search based on nowcast/forecast hours.
+        Determine which GFS cycles to search.
 
-        Walks backward from current cycle in 6h steps to cover the nowcast window,
-        then includes the current cycle for forecast coverage.
+        Production-realistic strategy matching COMF behavior:
+        - Nowcast: walk backward from current cycle to cover the nowcast window
+          (past cycles are available at runtime)
+        - Forecast: use ONLY the latest available cycle before cycle time
+          (future cycles don't exist yet at runtime — extend with longer leads)
+
+        Returns cycles in chronological order (oldest first).
         """
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
         cycle_dt = base_date + timedelta(hours=self.config.cyc)
-        nowcast_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
 
-        cycles = []
-        # Walk backward from current cycle in 6h steps
-        t = cycle_dt
-        while t >= nowcast_start - timedelta(hours=6):
-            cyc_hour = t.hour - (t.hour % 6)  # Snap to 0, 6, 12, 18
-            cyc_date = t.replace(hour=0, minute=0, second=0, microsecond=0)
-            cycles.append((cyc_date, cyc_hour))
-            t -= timedelta(hours=6)
+        if self.phase == "nowcast":
+            # Nowcast: multi-cycle, walk backward to cover nowcast window
+            nowcast_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            cycles = []
+            t = cycle_dt
+            while t >= nowcast_start - timedelta(hours=6):
+                cyc_hour = t.hour - (t.hour % 6)  # Snap to 0, 6, 12, 18
+                cyc_date = t.replace(hour=0, minute=0, second=0, microsecond=0)
+                cycles.append((cyc_date, cyc_hour))
+                t -= timedelta(hours=6)
+            cycles.reverse()
+        else:
+            # Forecast: single cycle — the latest GFS cycle at or before cycle_dt.
+            # In production at t00z, this is typically the previous cycle (t18z)
+            # since t00z GFS may not be fully available yet.
+            # Use the same cycle as the last nowcast cycle for continuity.
+            cyc_hour = cycle_dt.hour - (cycle_dt.hour % 6)
+            cyc_date = cycle_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            cycles = [(cyc_date, cyc_hour)]
 
-        # Reverse so oldest cycle comes first
-        cycles.reverse()
+            # Also include the previous cycle as fallback
+            prev = cycle_dt - timedelta(hours=6)
+            prev_hour = prev.hour - (prev.hour % 6)
+            prev_date = prev.replace(hour=0, minute=0, second=0, microsecond=0)
+            # Put previous cycle first so it gets searched first;
+            # if current cycle exists, its files will also be found
+            cycles.insert(0, (prev_date, prev_hour))
 
         # Deduplicate
         seen = set()
@@ -442,10 +478,11 @@ class GFSProcessor(ForcingProcessor):
                     else:
                         log.warning(f"{var}: data length {n_data} != times {n_times}, skipping sort")
 
-            # Deduplicate: keep last occurrence for each valid time (later cycle preferred)
+            # Deduplicate: keep first occurrence for each valid time (shortest lead preferred)
             seen_times = {}
             for i, t in enumerate(result["times"]):
-                seen_times[t] = i
+                if t not in seen_times:
+                    seen_times[t] = i
             unique_idx = sorted(seen_times.values())
 
             if len(unique_idx) < len(result["times"]):
