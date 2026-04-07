@@ -84,7 +84,8 @@ class ForcingConfig:
     # River climatology for fallback
     river_clim_file: Optional[Path] = None
     # Default river temperature and salinity
-    river_default_temp: float = 15.0
+    # Fortran nos_ofs_create_forcing_river uses 10.0 for msource.th temperature
+    river_default_temp: float = 10.0
     river_default_salt: float = 0.0
 
     # --- Tidal settings ---

@@ -290,20 +290,27 @@ class RiverClimProcessor(ForcingProcessor):
                 return p2
         return None
 
-    def _compute_time_window(self) -> Tuple[datetime, datetime]:
+    def _compute_time_window(self) -> Tuple[datetime, datetime, datetime]:
         """
         Compute start/end for the full simulation (nowcast + forecast combined).
 
-        The Fortran generates river forcing for the entire run period in one call.
+        Returns (start, end_hourly, end_model):
+          - end_hourly: cycle + forecast_hours (for vsource/msource)
+          - end_model:  cycle + forecast_hours + 1h buffer (for schism_th)
+
+        The Fortran writes vsource/msource to forecast end, but extends
+        schism_flux/temp/salt.th by 1 additional hour.
         """
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                    timedelta(hours=self.config.cyc)
 
         start = self.time_hotstart if self.time_hotstart else \
                 cycle_dt - timedelta(hours=self.config.nowcast_hours)
-        end = cycle_dt + timedelta(hours=self.config.forecast_hours)
+        end_hourly = cycle_dt + timedelta(hours=self.config.forecast_hours)
+        # Fortran END_TIME includes a 1-hour buffer beyond the forecast period
+        end_model = cycle_dt + timedelta(hours=self.config.forecast_hours + 1)
 
-        return start, end
+        return start, end_hourly, end_model
 
     def find_input_files(self) -> List[Path]:
         files = []
@@ -358,22 +365,23 @@ class RiverClimProcessor(ForcingProcessor):
                 clim_data[sid] = load_usgs_climatology(clim_path, sid)
 
             # Compute time windows
-            start, end = self._compute_time_window()
+            start, end_hourly, end_model = self._compute_time_window()
             model_dt = getattr(self.config, "dt", 120.0)  # model timestep in seconds
 
-            log.info(f"Time window: {start} to {end}, model_dt={model_dt}s")
+            log.info(f"Time window: {start} to {end_hourly} (hourly), "
+                     f"{start} to {end_model} (model dt={model_dt}s)")
 
             # Generate hourly times for vsource/msource (always 1-hour interval)
             hourly_times = []
             t = start
-            while t <= end:
+            while t <= end_hourly:
                 hourly_times.append(t)
                 t += timedelta(hours=1.0)
 
-            # Generate model-dt times for schism_flux/temp/salt
+            # Generate model-dt times for schism_flux/temp/salt (includes +1h buffer)
             model_times = []
             t = start
-            while t <= end:
+            while t <= end_model:
                 model_times.append(t)
                 t += timedelta(seconds=model_dt)
 
@@ -392,7 +400,8 @@ class RiverClimProcessor(ForcingProcessor):
             ]
 
             # Average clim over these days (matching Fortran behavior)
-            q_avg = np.mean([q_clim[d % len(q_clim)] for d in run_day_indices])
+            # Fortran rounds Q to nearest integer (NINT) before applying Q_scale
+            q_avg = round(float(np.mean([q_clim[d % len(q_clim)] for d in run_day_indices])))
             t_avg = np.mean([t_clim[d % len(t_clim)] for d in run_day_indices])
             s_avg = np.mean([s_clim[d % len(s_clim)] for d in run_day_indices])
 
