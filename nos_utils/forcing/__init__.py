@@ -10,7 +10,8 @@ Ocean Boundary:
     RTOFSProcessor - Real-Time Ocean Forecast System (SSH, T/S/UV boundaries)
 
 River:
-    NWMProcessor   - National Water Model (streamflow → vsource/msource)
+    NWMProcessor        - National Water Model (streamflow → vsource/msource)
+    RiverClimProcessor  - USGS daily climatology (when NWM/BUFR unavailable)
 
 Tidal:
     TidalProcessor - Tidal constituents (bctides.in generation)
@@ -38,6 +39,7 @@ from .hrrr import HRRRProcessor
 from .gefs import GEFSProcessor
 from .rtofs import RTOFSProcessor
 from .nwm import NWMProcessor, RiverConfig
+from .river_clim import RiverClimProcessor
 from .tidal import TidalProcessor, compute_nodal_corrections
 from .nudging import NudgingProcessor
 from .param_nml import ParamNmlProcessor
@@ -60,6 +62,7 @@ __all__ = [
     # River
     "NWMProcessor",
     "RiverConfig",
+    "RiverClimProcessor",
     # Tidal
     "TidalProcessor",
     "compute_nodal_corrections",
