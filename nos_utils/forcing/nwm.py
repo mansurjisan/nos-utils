@@ -508,8 +508,8 @@ class NWMProcessor(ForcingProcessor):
             f = _resolve_nwm_file(today_str, 0, fhr)
             if f:
                 primary.append(f)
-        # Today t06z f001-f119 (shell: f0{0-9}? + f1{0,1}? = f000-f119)
-        for fhr in range(1, 120):
+        # Today t06z f001-f120 (shell: f0{0-9}? + f1{0-2}? = f000-f120)
+        for fhr in range(1, 121):
             f = _resolve_nwm_file(today_str, 6, fhr)
             if f:
                 primary.append(f)
@@ -524,14 +524,17 @@ class NWMProcessor(ForcingProcessor):
             if f:
                 backup.append(f)
 
-        # Merge if primary incomplete
+        # Merge if primary incomplete (deduplicate by filepath)
         if len(primary) >= 2:
             result = primary
-            if len(primary) < n_target and len(backup) > len(primary):
-                n_supplement = len(backup) - len(primary)
-                result = primary + backup[len(primary):len(primary) + n_supplement]
-                log.info(f"NWM: merged {n_supplement} backup files "
-                         f"(primary={len(primary)}, total={len(result)})")
+            if len(primary) < n_target and backup:
+                primary_set = set(str(f) for f in primary)
+                supplement = [f for f in backup if str(f) not in primary_set]
+                n_need = min(n_target - len(primary), len(supplement))
+                result = primary + supplement[:n_need]
+                if n_need > 0:
+                    log.info(f"NWM: merged {n_need} backup files "
+                             f"(primary={len(primary)}, total={len(result)})")
         elif len(backup) >= 2:
             result = backup
             log.info(f"NWM: using backup list ({len(backup)} files)")
@@ -665,13 +668,23 @@ class NWMProcessor(ForcingProcessor):
         import shutil
         output_file = self.output_path / "msource.th"
 
-        # Search for static msource.th in input_path (FIX directory)
-        for name in ["stofs_3d_atl_river_msource.th", "msource.th"]:
-            src = self.input_path / name
-            if src.exists():
-                shutil.copy2(src, output_file)
-                log.info(f"Copied static {name} -> msource.th")
-                return output_file
+        # Search FIX directory (from river_config_file parent or env var)
+        import os
+        fix_dirs = []
+        if self.config.river_config_file:
+            fix_dirs.append(Path(self.config.river_config_file).parent)
+        for env_var in ["FIXstofs3d", "FIXofs"]:
+            if os.environ.get(env_var):
+                fix_dirs.append(Path(os.environ[env_var]))
+        fix_dirs.append(self.input_path)  # fallback to input_path
+
+        for fix_dir in fix_dirs:
+            for name in ["stofs_3d_atl_river_msource.th", "msource.th"]:
+                src = fix_dir / name
+                if src.exists():
+                    shutil.copy2(src, output_file)
+                    log.info(f"Copied static {name} from {fix_dir} -> msource.th")
+                    return output_file
 
         # Fallback: generate msource.th with default T/S
         log.warning("Static msource.th not found, generating with defaults")

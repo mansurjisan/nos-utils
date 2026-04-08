@@ -78,7 +78,7 @@ class ADTBlender:
             log.info("No ADT satellite data available — using RTOFS-only SSH")
             return None
 
-        # Find weight file
+        # Find weight file (for weighted blending if available)
         weight_path = self._find_weight_file()
 
         try:
@@ -88,7 +88,8 @@ class ADTBlender:
                 return None
 
             # Apply ADT blending formula to SSH_1.nc
-            output = self._apply_adt_blend(ssh_path, adt_ssh, work_dir)
+            output = self._apply_adt_blend(ssh_path, adt_ssh, work_dir,
+                                           weight_path=weight_path)
             return output
 
         except Exception as e:
@@ -189,6 +190,7 @@ class ADTBlender:
 
     def _apply_adt_blend(
         self, ssh_path: Path, adt_ssh: np.ndarray, work_dir: Path,
+        weight_path: Optional[Path] = None,
     ) -> Optional[Path]:
         """Apply ADT blending formula to SSH_1.nc.
 

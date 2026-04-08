@@ -64,5 +64,5 @@ class TestHRRRFailureHandling:
         assert len(result.warnings) > 0
 
     def test_min_file_size(self):
-        """HRRR enforces 100 MB minimum (matching shell FILESIZE=100000000)."""
-        assert HRRRProcessor.MIN_FILE_SIZE == 100_000_000
+        """HRRR is non-fatal, no file size enforcement."""
+        assert HRRRProcessor.MIN_FILE_SIZE == 0
