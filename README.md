@@ -1,6 +1,10 @@
 # nos-utils
 
+[![Docs](https://readthedocs.org/projects/nos-utils/badge/?version=latest)](https://nos-utils.readthedocs.io/en/latest/)
+
 Python forcing generators for NOAA NOS-OFS ocean forecast systems.
+
+**Documentation**: [nos-utils.readthedocs.io](https://nos-utils.readthedocs.io/en/latest/)
 
 ## Install
 
@@ -43,5 +47,5 @@ nos-utils prep --ofs secofs --pdy 20260324 --cyc 12 --gfs /data/gfs --output /wo
 ## Test
 
 ```bash
-pytest -v    # 124 unit tests, no data needed
+pytest -v    # 169 unit tests, no data needed
 ```
