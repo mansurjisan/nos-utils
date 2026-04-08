@@ -798,38 +798,71 @@ class RTOFSProcessor(ForcingProcessor):
             from scipy.spatial import cKDTree
 
             if cache_key not in self._nn_tree:
-                # First call for this grid shape — build Delaunay (Fortran REMESH mode=0)
-                self._interp[cache_key] = LinearNDInterpolator(ocean_pts, ocean_val)
+                # Fortran REMESH mode=0: add 4 corner points at 1% outside
+                # target bounding box, valued at field mean. This extends the
+                # convex hull to cover all boundary nodes and matches Fortran behavior.
+                avg_val = float(np.mean(ocean_val))
+                tgt_lon_min, tgt_lon_max = target_pts[:, 0].min(), target_pts[:, 0].max()
+                tgt_lat_min, tgt_lat_max = target_pts[:, 1].min(), target_pts[:, 1].max()
+                lon_pad = 0.01 * (tgt_lon_max - tgt_lon_min)
+                lat_pad = 0.01 * (tgt_lat_max - tgt_lat_min)
+                corner_pts = np.array([
+                    [tgt_lon_min - lon_pad, tgt_lat_min - lat_pad],
+                    [tgt_lon_min - lon_pad, tgt_lat_max + lat_pad],
+                    [tgt_lon_max + lon_pad, tgt_lat_max + lat_pad],
+                    [tgt_lon_max + lon_pad, tgt_lat_min - lat_pad],
+                ], dtype=np.float64)
+                corner_vals = np.full(4, avg_val, dtype=np.float32)
+
+                aug_pts = np.vstack([corner_pts, ocean_pts])
+                aug_vals = np.concatenate([corner_vals, ocean_val])
+
+                self._interp[cache_key] = LinearNDInterpolator(aug_pts, aug_vals)
                 self._nn_tree[cache_key] = cKDTree(ocean_pts)
                 self._ocean_pts[cache_key] = ocean_pts
                 self._n_ocean_surface[cache_key] = n_ocean
-                log.info(f"Built Delaunay interpolator: {n_ocean} ocean pts "
-                         f"(grid {rtofs_lon.shape}, subsetted to domain)")
+                self._n_corner = 4  # number of prepended corner points
+                log.info(f"Built Delaunay interpolator: {n_ocean}+4 corner pts "
+                         f"(grid {rtofs_lon.shape}, avg={avg_val:.4f})")
                 result = self._interp[cache_key](target_pts).astype(np.float32)
             else:
                 # Reuse surface triangulation for deeper levels
+                # Corner values get the new field mean
+                avg_val = float(np.mean(ocean_val))
+                n_corners = getattr(self, '_n_corner', 4)
                 if n_ocean == self._n_ocean_surface[cache_key]:
-                    self._interp[cache_key].values[:, 0] = ocean_val
+                    new_vals = np.concatenate([
+                        np.full(n_corners, avg_val, dtype=np.float32),
+                        ocean_val,
+                    ])
+                    self._interp[cache_key].values[:, 0] = new_vals
                 else:
-                    # Different mask — map current ocean values to surface triangulation
                     current_tree = cKDTree(ocean_pts)
                     _, nn_idx = current_tree.query(self._ocean_pts[cache_key])
                     mapped_vals = ocean_val[nn_idx]
-                    self._interp[cache_key].values[:, 0] = mapped_vals
+                    new_vals = np.concatenate([
+                        np.full(n_corners, avg_val, dtype=np.float32),
+                        mapped_vals,
+                    ])
+                    self._interp[cache_key].values[:, 0] = new_vals
                 result = self._interp[cache_key](target_pts).astype(np.float32)
 
-            # Fill NaN nodes (outside convex hull) from nearest valid BOUNDARY node
-            # This matches Fortran REMESH fallback which uses nearest model grid point
+            # Fortran REMESH fallback: points with negative weights or |w|>3
+            # are filled from nearest valid BOUNDARY node (not nearest data point).
+            # With corner points, fewer nodes should be NaN, but handle remaining.
             nan_mask = np.isnan(result)
             if np.any(nan_mask):
                 valid_bnd = np.where(~nan_mask)[0]
                 if len(valid_bnd) > 0:
                     nan_bnd = np.where(nan_mask)[0]
-                    bnd_tree = cKDTree(target_pts[valid_bnd])
-                    _, nn_idx = bnd_tree.query(target_pts[nan_bnd])
+                    # Use cos(lat)-corrected distance (approximates haversine)
+                    mean_lat = np.radians(np.mean(self._bnd_lats))
+                    corrected_pts = target_pts.copy()
+                    corrected_pts[:, 0] *= np.cos(mean_lat)
+                    bnd_tree = cKDTree(corrected_pts[valid_bnd])
+                    _, nn_idx = bnd_tree.query(corrected_pts[nan_bnd])
                     result[nan_bnd] = result[valid_bnd[nn_idx]]
                 else:
-                    # All NaN — use NN from RTOFS data directly
                     _, nn_idx = self._nn_tree[cache_key].query(target_pts[nan_mask])
                     result[nan_mask] = ocean_val[nn_idx]
 
