@@ -93,7 +93,10 @@ class RTOFSProcessor(ForcingProcessor):
         self._bnd_lats = None
         self._bnd_depths = None
         self._vgrid = None
-        self._nn_tree = {}     # Cached cKDTree per (grid_shape, n_ocean)
+        self._nn_tree = {}      # Cached cKDTree per grid shape
+        self._interp = None     # Cached LinearNDInterpolator
+        self._ocean_indices = None  # Flat indices of ocean points in cached triangulation
+        self._ocean_pts = None  # Cached ocean point coordinates
 
     def _get_time_window(self) -> Tuple[datetime, datetime]:
         """Compute the time window for RTOFS file filtering.
@@ -320,10 +323,14 @@ class RTOFSProcessor(ForcingProcessor):
         """
         Interpolate a 2D RTOFS field to boundary node locations.
 
-        Uses nearest-neighbor interpolation from ocean-only points, which
-        matches the Fortran INTERP_REMESH behavior for coastal boundary nodes.
-        Delaunay/linear interpolation misses nearshore RTOFS cells and
-        produces biased values at shallow nodes.
+        Matches Fortran INTERP_REMESH: Delaunay triangulation of ocean points
+        with barycentric (linear) interpolation inside triangles. Nodes outside
+        the convex hull or with negative weights are filled from the nearest
+        already-interpolated boundary node (not nearest RTOFS point).
+
+        For 3D fields, the surface-level triangulation is cached and reused
+        for deeper levels where the ocean mask shrinks. Land values at cached
+        ocean points are filled from the nearest still-valid point.
         """
         n_bnd = len(self._bnd_lons)
         bnd_lons_360 = np.where(self._bnd_lons < 0, self._bnd_lons + 360, self._bnd_lons)
@@ -351,20 +358,52 @@ class RTOFSProcessor(ForcingProcessor):
         ocean_pts = np.column_stack([lon_flat[ocean_mask], lat_flat[ocean_mask]])
         ocean_val = data_flat[ocean_mask].astype(np.float32)
 
-        # Cache key: (grid shape, n_ocean) — rebuild when ocean mask changes per level
-        cache_key = (rtofs_lon.shape, n_ocean)
+        # Cache key: grid shape — reuse surface triangulation for deeper levels
+        cache_key = rtofs_lon.shape
 
         try:
+            from scipy.interpolate import LinearNDInterpolator
             from scipy.spatial import cKDTree
 
             if cache_key not in self._nn_tree:
+                # First call — build Delaunay from ocean points (like Fortran REMESH mode=0)
+                self._interp = LinearNDInterpolator(ocean_pts, ocean_val)
                 self._nn_tree[cache_key] = cKDTree(ocean_pts)
-                log.info(f"Built KDTree interpolator: {n_ocean} ocean pts "
+                self._ocean_indices = np.where(ocean_mask)[0]
+                self._ocean_pts = ocean_pts
+                log.info(f"Built Delaunay interpolator: {n_ocean} ocean pts "
                          f"(grid {rtofs_lon.shape})")
+                result = self._interp(target_pts).astype(np.float32)
+            else:
+                # Reuse triangulation, update values for this depth level
+                vals = data_flat[self._ocean_indices].astype(np.float32, copy=True)
+                invalid = np.abs(vals) >= 1e10
+                if np.any(invalid):
+                    # Fill land points from nearest valid ocean point
+                    valid_mask = ~invalid
+                    if np.any(valid_mask):
+                        valid_tree = cKDTree(self._ocean_pts[valid_mask])
+                        _, nn = valid_tree.query(self._ocean_pts[invalid])
+                        vals[invalid] = vals[valid_mask][nn]
+                    else:
+                        vals[:] = np.nanmean(ocean_val)
+                self._interp.values[:, 0] = vals
+                result = self._interp(target_pts).astype(np.float32)
 
-            # Nearest-neighbor: find closest ocean point for each boundary node
-            _, nn_idx = self._nn_tree[cache_key].query(target_pts)
-            result = ocean_val[nn_idx]
+            # Fill NaN nodes (outside convex hull) from nearest valid BOUNDARY node
+            # This matches Fortran REMESH fallback which uses nearest model grid point
+            nan_mask = np.isnan(result)
+            if np.any(nan_mask):
+                valid_bnd = np.where(~nan_mask)[0]
+                if len(valid_bnd) > 0:
+                    nan_bnd = np.where(nan_mask)[0]
+                    bnd_tree = cKDTree(target_pts[valid_bnd])
+                    _, nn_idx = bnd_tree.query(target_pts[nan_bnd])
+                    result[nan_bnd] = result[valid_bnd[nn_idx]]
+                else:
+                    # All NaN — use NN from RTOFS data directly
+                    _, nn_idx = self._nn_tree[cache_key].query(target_pts[nan_mask])
+                    result[nan_mask] = ocean_val[nn_idx]
 
         except ImportError:
             result = np.zeros(n_bnd, dtype=np.float32)
