@@ -100,6 +100,7 @@ class RTOFSProcessor(ForcingProcessor):
         self._interp = {}       # Cached LinearNDInterpolator per grid shape
         self._ocean_pts = {}    # Cached ocean point coordinates per grid shape
         self._n_ocean_surface = {}  # Cached ocean point count per grid shape
+        self._struct_interp = {}  # Cached StructuredGridInterpolator per grid shape
 
     def _get_time_window(self) -> Tuple[datetime, datetime]:
         """Compute the time window for RTOFS file filtering.
@@ -733,16 +734,44 @@ class RTOFSProcessor(ForcingProcessor):
         """
         Interpolate a 2D RTOFS field to boundary node locations.
 
-        Matches Fortran INTERP_REMESH: Delaunay triangulation of ocean points
-        with barycentric (linear) interpolation inside triangles. Nodes outside
-        the convex hull or with negative weights are filled from the nearest
-        already-interpolated boundary node (not nearest RTOFS point).
+        Primary: Structured grid bilinear interpolation on the native RTOFS
+        curvilinear grid. Eliminates Delaunay triangulation differences.
+
+        Fallback: Delaunay + corner points (matching Fortran INTERP_REMESH)
+        if structured grid interpolation fails or is unavailable.
 
         For 3D fields, the surface-level triangulation is cached and reused
         for deeper levels where the ocean mask shrinks. Land values at cached
         ocean points are filled from the nearest still-valid point.
         """
         n_bnd = len(self._bnd_lons)
+
+        # Try structured grid bilinear interpolation first
+        if rtofs_lon.ndim == 2:
+            cache_key = rtofs_lon.shape
+            try:
+                from ..interp import StructuredGridInterpolator
+
+                if cache_key not in self._struct_interp:
+                    # Build ocean mask from data
+                    ocean_mask = np.isfinite(rtofs_data) & (np.abs(rtofs_data) < 99.0)
+                    self._struct_interp[cache_key] = StructuredGridInterpolator(
+                        rtofs_lon, rtofs_lat, mask=ocean_mask,
+                    )
+
+                # Clean data: replace land/fill with NaN
+                data_clean = rtofs_data.copy().astype(np.float64)
+                data_clean[~np.isfinite(data_clean) | (np.abs(data_clean) >= 99.0)] = np.nan
+
+                result = self._struct_interp[cache_key].interpolate(
+                    self._bnd_lons, self._bnd_lats, data_clean,
+                )
+                return result
+
+            except Exception as e:
+                log.debug(f"Structured grid interp failed ({e}), falling back to Delaunay")
+
+        # Fallback: Delaunay interpolation
         # Use -180/180 convention (matching Fortran: if lon>180, lon=lon-360)
         target_pts = np.column_stack([self._bnd_lons, self._bnd_lats])
 
