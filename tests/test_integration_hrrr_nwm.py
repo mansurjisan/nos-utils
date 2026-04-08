@@ -33,7 +33,7 @@ from nos_utils.forcing.tidal import TidalProcessor, compute_nodal_corrections
 def test_hrrr():
     """Test HRRR processor with real GRIB2 data."""
     HRRR_ROOT = Path(os.environ.get("HRRR_ROOT", "/data/hrrr/v4.1"))
-    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/output")) / "hrrr_test"
+    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", tempfile.mkdtemp(prefix="nos_test_"))) / "hrrr_test"
     PDY = os.environ.get("PDY", "20260324")
     CYC = int(os.environ.get("CYC", "12"))
 
@@ -85,7 +85,7 @@ def test_hrrr():
 def test_nwm():
     """Test NWM processor with real channel_rt data."""
     NWM_ROOT = Path(os.environ.get("NWM_ROOT", "/data/nwm/v3.0"))
-    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/output")) / "nwm_test"
+    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", tempfile.mkdtemp(prefix="nos_test_"))) / "nwm_test"
     PDY = os.environ.get("PDY", "20260324")
     CYC = int(os.environ.get("CYC", "12"))
 
@@ -186,7 +186,7 @@ def test_nwm():
 
 def test_tidal():
     """Test tidal processor — Python-native generation."""
-    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/output")) / "tidal_test"
+    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", tempfile.mkdtemp(prefix="nos_test_"))) / "tidal_test"
     PDY = os.environ.get("PDY", "20260324")
     CYC = int(os.environ.get("CYC", "12"))
 

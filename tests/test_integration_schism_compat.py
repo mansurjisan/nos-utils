@@ -23,6 +23,7 @@ Run inside Docker:
 
 import os
 import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -41,7 +42,7 @@ from nos_utils.forcing.sflux_writer import SfluxWriter
 
 FIX_DIR = Path(os.environ.get("FIX_DIR", "/data/fix/secofs"))
 COM_DIR = Path(os.environ.get("COM_DIR", "/data/com"))
-OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/output"))
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", tempfile.mkdtemp(prefix="nos_test_")))
 PDY = os.environ.get("PDY", "20260324")
 CYC = int(os.environ.get("CYC", "12"))
 
