@@ -131,6 +131,11 @@ class PrepOrchestrator:
         self.run_name = run_name
         self.skip_legacy = skip_legacy
 
+    @property
+    def is_stofs(self) -> bool:
+        """True if running STOFS-3D-ATL (detected from run_name or config)."""
+        return "stofs" in self.run_name.lower() or self.config.obc_roi_2d is not None
+
     def run(self, phase: str = "nowcast") -> PrepResult:
         """
         Run the full prep pipeline.
@@ -144,7 +149,8 @@ class PrepOrchestrator:
         t0 = time.time()
         results = []
         log.info(f"PrepOrchestrator: {self.run_name} {phase} "
-                 f"pdy={self.config.pdy} cyc={self.config.cyc:02d}z")
+                 f"pdy={self.config.pdy} cyc={self.config.cyc:02d}z "
+                 f"mode={'STOFS' if self.is_stofs else 'SECOFS'}")
 
         output_dir = self.paths["output"]
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -157,7 +163,6 @@ class PrepOrchestrator:
         time_hotstart = None
         hs_info = hotstart_result.metadata.get("hotstart_info")
         if hs_info and hasattr(hs_info, "filepath"):
-            # Parse datetime from the hotstart filename
             from .forcing.hotstart import HotstartProcessor
             proc = HotstartProcessor(self.config, Path(self.paths.get("restart", "")),
                                      output_dir, run_name=self.run_name)
@@ -181,17 +186,25 @@ class PrepOrchestrator:
         if "hrrr" in self.paths and self.config.met_num >= 2:
             results.append(self._run_hrrr(output_dir, phase, time_hotstart))
 
-        # Step 4: NWM river (skip in hybrid mode — legacy shell handles it)
-        if "nwm" in self.paths and not self.skip_legacy:
+        # Step 4: NWM river
+        # STOFS: always run NWM (Python handles gen_sourcesink logic)
+        # SECOFS: skip in hybrid mode (legacy shell handles it)
+        if "nwm" in self.paths and (self.is_stofs or not self.skip_legacy):
             results.append(self._run_nwm(output_dir, phase, time_hotstart))
         elif self.skip_legacy:
             log.info("Skipping NWM river (handled by legacy shell)")
 
-        # Step 5: RTOFS OBC (skip in hybrid mode — needs Fortran gen_3Dth_from_hycom)
-        if "rtofs" in self.paths and not self.skip_legacy:
+        # Step 5: RTOFS OBC
+        # STOFS: always run (Python data prep + Fortran wrapper with fallback)
+        # SECOFS: skip in hybrid mode
+        if "rtofs" in self.paths and (self.is_stofs or not self.skip_legacy):
             results.append(self._run_rtofs(output_dir, phase, time_hotstart))
         elif self.skip_legacy:
             log.info("Skipping RTOFS OBC (handled by legacy shell)")
+
+        # Step 5b: Nudging (STOFS only — enabled via config)
+        if self.config.nudging_enabled and "rtofs" in self.paths:
+            results.append(self._run_nudging(output_dir, phase, time_hotstart))
 
         # Step 6: Tidal (phase-aware start time + nodal corrections)
         results.append(self._run_tidal(output_dir, phase, time_hotstart))
@@ -211,11 +224,14 @@ class PrepOrchestrator:
 
         # Determine overall success (all critical steps must succeed)
         critical_sources = {"GFS", "PARAM_NML", "TIDAL"}
+        if self.is_stofs:
+            # STOFS: NWM and RTOFS are also critical
+            critical_sources.update({"NWM", "RTOFS"})
+
         success = all(
             r.success for r in results
             if r.source in critical_sources
         )
-        # If no critical steps ran, check if at least something succeeded
         if not any(r.source in critical_sources for r in results):
             success = any(r.success for r in results)
 
@@ -317,6 +333,21 @@ class PrepOrchestrator:
             vgrid_file=vgrid,
             phase=phase,
             time_hotstart=time_hotstart,
+        )
+        return proc.process()
+
+    def _run_nudging(self, output_dir: Path, phase: str = "nowcast",
+                     time_hotstart=None) -> ForcingResult:
+        """Step 5b: T/S interior nudging (STOFS)."""
+        from .forcing.nudging import NudgingProcessor
+
+        # Nudging needs its own RTOFS data prep with nudge-specific ROI
+        # (wider domain than OBC ROI — cannot reuse OBC TS_1.nc)
+        input_dir = output_dir
+        rtofs_path = self.paths.get("rtofs")
+        proc = NudgingProcessor(
+            self.config, input_dir, output_dir,
+            rtofs_input_path=rtofs_path,
         )
         return proc.process()
 

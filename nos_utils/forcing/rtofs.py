@@ -30,6 +30,9 @@ Works with any SCHISM-based OFS (SECOFS, STOFS-3D-ATL, CREOFS, etc.)
 """
 
 import logging
+import os
+import shutil
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -150,6 +153,11 @@ class RTOFSProcessor(ForcingProcessor):
 
         return len(self._bnd_lons) > 0
 
+    @property
+    def is_stofs_mode(self) -> bool:
+        """True if using STOFS-style ROI-based processing."""
+        return self.config.obc_roi_2d is not None
+
     def process(self) -> ForcingResult:
         if not HAS_NETCDF4:
             return ForcingResult(
@@ -157,9 +165,16 @@ class RTOFSProcessor(ForcingProcessor):
                 errors=["netCDF4 required for RTOFS processing"],
             )
 
-        log.info(f"RTOFS processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z")
+        log.info(f"RTOFS processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z "
+                 f"mode={'STOFS' if self.is_stofs_mode else 'SECOFS'}")
         self.create_output_dir()
 
+        if self.is_stofs_mode:
+            return self._process_stofs()
+        return self._process_secofs()
+
+    def _process_secofs(self) -> ForcingResult:
+        """SECOFS mode: Python Delaunay interpolation to boundary nodes."""
         has_grid = self._load_grid()
         if not has_grid:
             return ForcingResult(
@@ -190,7 +205,6 @@ class RTOFSProcessor(ForcingProcessor):
             obc_files = self._process_3d(files_3d)
             output_files.extend(obc_files)
 
-        # Note about SSH bias correction
         if not warnings:
             warnings.append(
                 "SSH not bias-corrected (no tide gauge data). "
@@ -211,9 +225,405 @@ class RTOFSProcessor(ForcingProcessor):
             },
         )
 
+    def _process_stofs(self) -> ForcingResult:
+        """STOFS mode: ROI subsetting → data prep → Fortran exe (or Python fallback)."""
+        files_2d, files_3d = self.find_input_files_by_type()
+        if not files_2d and not files_3d:
+            return ForcingResult(
+                success=False, source=self.SOURCE_NAME,
+                errors=["No RTOFS input files found"],
+            )
+
+        import tempfile
+        work_dir = Path(tempfile.mkdtemp(prefix="rtofs_stofs_"))
+
+        try:
+            output_files = []
+            warnings = []
+
+            # Step 1: Subset and merge 2D files (SSH)
+            ssh_path = None
+            if files_2d:
+                ssh_path = self._stofs_prepare_ssh(files_2d, work_dir)
+                if ssh_path:
+                    log.info(f"Prepared SSH_1.nc: {ssh_path}")
+
+            # Step 2: Subset and merge 3D files (T/S/U/V)
+            tsuv_path = None
+            if files_3d:
+                tsuv_path = self._stofs_prepare_tsuv(files_3d, work_dir)
+                if tsuv_path:
+                    log.info(f"Prepared TSUV_1.nc: {tsuv_path}")
+
+            if not ssh_path and not tsuv_path:
+                return ForcingResult(
+                    success=False, source=self.SOURCE_NAME,
+                    errors=["Failed to prepare RTOFS data for STOFS OBC"],
+                )
+
+            # Step 3: ADT SSH blending (if enabled and data available)
+            if ssh_path and self.config.adt_enabled:
+                from .adt import ADTBlender
+                blender = ADTBlender(self.config, self.input_path)
+                blended = blender.blend_ssh(ssh_path, work_dir)
+                if blended:
+                    ssh_path = blended
+                    log.info("ADT SSH blending applied")
+                else:
+                    warnings.append("ADT data unavailable, using RTOFS-only SSH")
+
+            # Step 4: Try Fortran gen_3Dth_from_hycom
+            fortran_ok = self._call_fortran_gen_3dth(work_dir, ssh_path, tsuv_path)
+
+            if fortran_ok:
+                # Copy Fortran outputs to final output directory
+                for fname in ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]:
+                    src = work_dir / fname
+                    if src.exists():
+                        dst = self.output_path / fname
+                        shutil.copy2(src, dst)
+                        output_files.append(dst)
+            else:
+                warnings.append("Fortran gen_3Dth not available, using Python interpolation")
+                # Fall back to Python Delaunay — load grid and use existing _process_2d/_process_3d
+                has_grid = self._load_grid()
+                if has_grid:
+                    if files_2d:
+                        f = self._process_2d(files_2d)
+                        if f:
+                            output_files.append(f)
+                    if files_3d:
+                        obc_files = self._process_3d(files_3d)
+                        output_files.extend(obc_files)
+
+            return ForcingResult(
+                success=len(output_files) > 0,
+                source=self.SOURCE_NAME,
+                output_files=output_files,
+                warnings=warnings,
+                metadata={
+                    "n_2d_files": len(files_2d),
+                    "n_3d_files": len(files_3d),
+                    "stofs_mode": True,
+                    "fortran_used": fortran_ok,
+                    "adt_blended": self.config.adt_enabled and not any("ADT" in w for w in warnings),
+                },
+            )
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
     def find_input_files(self) -> List[Path]:
         files_2d, files_3d = self.find_input_files_by_type()
         return files_2d + files_3d
+
+    # ---- STOFS data preparation methods ----
+
+    def _stofs_subset_roi(self, ds, roi: dict, variables: List[str]) -> dict:
+        """Subset RTOFS NetCDF by ROI indices (replaces NCO ncks -d X,x1,x2 -d Y,y1,y2)."""
+        x1, x2 = roi["x1"], roi["x2"]
+        y1, y2 = roi["y1"], roi["y2"]
+        result = {}
+        for var in variables:
+            if var in ds.variables:
+                data = ds.variables[var]
+                ndim = len(data.dimensions)
+                if ndim == 3:  # (time, Y, X)
+                    result[var] = data[:, y1:y2+1, x1:x2+1]
+                elif ndim == 4:  # (time, depth, Y, X)
+                    result[var] = data[:, :, y1:y2+1, x1:x2+1]
+                elif ndim == 2:  # (Y, X)
+                    result[var] = data[y1:y2+1, x1:x2+1]
+                else:
+                    result[var] = data[:]
+        return result
+
+    def _stofs_prepare_ssh(self, files_2d: List[Path], work_dir: Path) -> Optional[Path]:
+        """Subset 2D files by ROI, merge, and prepare SSH_1.nc for Fortran.
+
+        Replaces the NCO pipeline: ncks subset → ncrcat merge → ncap2/ncatted cleanup.
+        """
+        roi = self.config.obc_roi_2d
+        if not roi:
+            return None
+
+        all_ssh = []
+        all_lon = None
+        all_lat = None
+        all_times = []
+
+        for f in files_2d:
+            try:
+                ds = Dataset(str(f))
+                subset = self._stofs_subset_roi(ds, roi, ["ssh", "Longitude", "Latitude"])
+
+                if "ssh" not in subset:
+                    ds.close()
+                    continue
+
+                ssh = np.ma.filled(subset["ssh"], fill_value=-30000.0)
+                # Mask extreme values (matching NCO: where(ssh>10000) ssh=-30000)
+                ssh = np.where(np.abs(ssh) > 10000, -30000.0, ssh)
+
+                for t in range(ssh.shape[0]):
+                    all_ssh.append(ssh[t])
+
+                if all_lon is None:
+                    all_lon = np.array(subset["Longitude"])
+                    all_lat = np.array(subset["Latitude"])
+
+                # Read time
+                if "MT" in ds.variables:
+                    for t in range(ds.variables["MT"].shape[0]):
+                        all_times.append(float(ds.variables["MT"][t]))
+
+                ds.close()
+            except Exception as e:
+                log.warning(f"Failed to read 2D file {f.name}: {e}")
+
+        if not all_ssh:
+            return None
+
+        # Write SSH_1.nc (matching Fortran input format)
+        output = work_dir / "SSH_1.nc"
+        nc = Dataset(str(output), "w", format="NETCDF4")
+
+        ny, nx = all_ssh[0].shape
+        nt = len(all_ssh)
+
+        nc.createDimension("time", nt)
+        nc.createDimension("ylat", ny)
+        nc.createDimension("xlon", nx)
+
+        time_var = nc.createVariable("time", "f8", ("time",))
+        if all_times:
+            time_var[:] = all_times[:nt]
+        else:
+            time_var[:] = np.arange(nt) * 21600.0  # 6-hourly default
+
+        lon_var = nc.createVariable("xlon", "f4", ("ylat", "xlon"))
+        lon_var[:] = all_lon
+
+        lat_var = nc.createVariable("ylat", "f4", ("ylat", "xlon"))
+        lat_var[:] = all_lat
+
+        ssh_var = nc.createVariable("ssh", "f4", ("time", "ylat", "xlon"),
+                                    fill_value=-30000.0)
+        ssh_var.missing_value = -30000.0
+        for t in range(nt):
+            ssh_var[t] = all_ssh[t]
+
+        # Also write surf_el (scaled format expected by Fortran)
+        surf_el = nc.createVariable("surf_el", "f4", ("time", "ylat", "xlon"),
+                                    fill_value=-30000.0)
+        surf_el.scale_factor = 0.001
+        for t in range(nt):
+            data = all_ssh[t].copy()
+            data = np.where(np.abs(data) < 10000, data * 1000.0, -3000.0)
+            surf_el[t] = data
+
+        nc.close()
+        log.info(f"Created SSH_1.nc: {nt} times, {ny}x{nx} grid")
+        return output
+
+    def _stofs_prepare_tsuv(
+        self, files_3d: List[Path], work_dir: Path,
+        roi_override: Optional[dict] = None,
+    ) -> Optional[Path]:
+        """Subset 3D files by ROI, merge, and prepare TSUV_1.nc for Fortran.
+
+        Replaces: ncrcat merge → ncrename dims/vars → ncap2 NCO script.
+
+        Args:
+            roi_override: Use this ROI instead of config.obc_roi_3d.
+                Nudging needs a wider ROI than OBC (422 vs 482 for x1).
+        """
+        roi = roi_override or self.config.obc_roi_3d
+        if not roi:
+            return None
+
+        all_temp = []
+        all_salt = []
+        all_u = []
+        all_v = []
+        all_lon = None
+        all_lat = None
+        all_depth = None
+
+        for f in files_3d:
+            try:
+                ds = Dataset(str(f))
+                subset = self._stofs_subset_roi(
+                    ds, roi,
+                    ["temperature", "salinity", "u", "v", "Longitude", "Latitude"],
+                )
+
+                if "temperature" not in subset:
+                    ds.close()
+                    continue
+
+                for t in range(subset["temperature"].shape[0]):
+                    all_temp.append(np.ma.filled(subset["temperature"][t], fill_value=-30000.0))
+                    all_salt.append(np.ma.filled(subset["salinity"][t], fill_value=-30000.0))
+                    all_u.append(np.ma.filled(subset["u"][t], fill_value=0.0))
+                    all_v.append(np.ma.filled(subset["v"][t], fill_value=0.0))
+
+                if all_lon is None:
+                    all_lon = np.array(subset["Longitude"])
+                    all_lat = np.array(subset["Latitude"])
+                if all_depth is None and "Depth" in ds.variables:
+                    all_depth = np.array(ds.variables["Depth"][:])
+
+                ds.close()
+            except Exception as e:
+                log.warning(f"Failed to read 3D file {f.name}: {e}")
+
+        if not all_temp:
+            return None
+
+        # Write TSUV_1.nc (matching Fortran input format)
+        output = work_dir / "TSUV_1.nc"
+        nc = Dataset(str(output), "w", format="NETCDF4")
+
+        nz, ny, nx = all_temp[0].shape
+        nt = len(all_temp)
+
+        nc.createDimension("time", nt)
+        nc.createDimension("lev", nz)
+        nc.createDimension("ylat", ny)
+        nc.createDimension("xlon", nx)
+
+        time_var = nc.createVariable("time", "f8", ("time",))
+        time_var[:] = np.arange(nt) * 21600.0
+
+        if all_depth is not None:
+            lev_var = nc.createVariable("lev", "f4", ("lev",))
+            lev_var[:] = all_depth
+
+        lon_var = nc.createVariable("xlon", "f4", ("ylat", "xlon"))
+        lon_var[:] = all_lon
+        lat_var = nc.createVariable("ylat", "f4", ("ylat", "xlon"))
+        lat_var[:] = all_lat
+
+        for name, data_list in [("temperature", all_temp), ("salinity", all_salt),
+                                ("water_u", all_u), ("water_v", all_v)]:
+            var = nc.createVariable(name, "f4", ("time", "lev", "ylat", "xlon"))
+            for t in range(nt):
+                var[t] = data_list[t]
+
+        nc.close()
+        log.info(f"Created TSUV_1.nc: {nt} times, {nz} levels, {ny}x{nx} grid")
+        return output
+
+    def _call_fortran_gen_3dth(
+        self, work_dir: Path,
+        ssh_path: Optional[Path],
+        tsuv_path: Optional[Path],
+    ) -> bool:
+        """Call Fortran stofs_3d_atl_gen_3Dth_from_hycom for 3D OBC interpolation.
+
+        Pattern follows TidalProcessor._call_fortran_tide_fac().
+        """
+        exe_names = ["stofs_3d_atl_gen_3Dth_from_hycom"]
+        env_dirs = ["EXECstofs3d", "EXECnos", "EXECofs"]
+
+        exe = None
+        for env_var in env_dirs:
+            exec_dir = os.environ.get(env_var)
+            if not exec_dir:
+                continue
+            for name in exe_names:
+                candidate = Path(exec_dir) / name
+                if candidate.exists():
+                    exe = candidate
+                    break
+            if exe:
+                break
+
+        if exe is None:
+            log.debug("No Fortran gen_3Dth_from_hycom executable found")
+            return False
+
+        # Symlink required input files into work_dir
+        fix_dir = os.environ.get("FIXstofs3d", "")
+        required_links = {
+            "SSH_1.nc": ssh_path,
+            "TS_1.nc": tsuv_path,
+            "UV_1.nc": tsuv_path,
+        }
+
+        # Grid files from FIX
+        fix_files = {
+            "hgrid.ll": "stofs_3d_atl_hgrid.ll",
+            "hgrid.gr3": "stofs_3d_atl_hgrid.gr3",
+            "vgrid.in": "stofs_3d_atl_vgrid.in",
+            "estuary.gr3": "stofs_3d_atl_estuary.gr3",
+            "TEM_nudge.gr3": "stofs_3d_atl_tem_nudge.gr3",
+            "gen_3Dth_from_nc.in": "stofs_3d_atl_obc_3dth_nc.in",
+        }
+
+        for link_name, source in required_links.items():
+            if source and source.exists():
+                target = work_dir / link_name
+                if not target.exists():
+                    target.symlink_to(source)
+
+        if fix_dir:
+            for link_name, fix_name in fix_files.items():
+                src = Path(fix_dir) / fix_name
+                if src.exists():
+                    target = work_dir / link_name
+                    if not target.exists():
+                        target.symlink_to(src)
+
+        # Also try grid_file from config
+        if self.grid_file and Path(self.grid_file).exists():
+            for name in ["hgrid.ll"]:
+                target = work_dir / name
+                if not target.exists():
+                    target.symlink_to(self.grid_file)
+
+        try:
+            result = subprocess.run(
+                [str(exe)],
+                cwd=str(work_dir),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+
+            if result.returncode != 0:
+                log.warning(f"gen_3Dth returned {result.returncode}: {result.stderr[:300]}")
+                return False
+
+            # Apply SSH offset to elev2D.th.nc
+            elev_path = work_dir / "elev2D.th.nc"
+            if elev_path.exists() and self.config.obc_ssh_offset != 0.0:
+                self._apply_ssh_offset(elev_path, self.config.obc_ssh_offset)
+
+            # Verify outputs exist
+            expected = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]
+            found = [f for f in expected if (work_dir / f).exists()]
+            log.info(f"Fortran gen_3Dth produced {len(found)}/{len(expected)} files")
+            return len(found) >= 3  # Allow uv3D to be optional
+
+        except subprocess.TimeoutExpired:
+            log.warning("Fortran gen_3Dth timed out (600s)")
+            return False
+        except Exception as e:
+            log.warning(f"Error calling Fortran gen_3Dth: {e}")
+            return False
+
+    @staticmethod
+    def _apply_ssh_offset(elev_path: Path, offset: float) -> None:
+        """Apply SSH offset to elev2D.th.nc (post-Fortran correction)."""
+        try:
+            ds = Dataset(str(elev_path), "r+")
+            if "time_series" in ds.variables:
+                ds.variables["time_series"][:] += offset
+            ds.close()
+            log.info(f"Applied SSH offset +{offset}m to {elev_path.name}")
+        except Exception as e:
+            log.warning(f"Failed to apply SSH offset: {e}")
 
     @staticmethod
     def _parse_rtofs_hour(filepath: Path) -> Tuple[int, bool]:

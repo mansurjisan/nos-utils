@@ -41,7 +41,7 @@ class GFSProcessor(ForcingProcessor):
     # Minimum file size by resolution (bytes).
     # GFS 0.25°: ~500 MB, GFS 0.50°: ~60 MB per file.
     MIN_FILE_SIZE_BY_RES = {
-        "0p25": 400_000_000,  # 400 MB
+        "0p25": 500_000_000,  # 500 MB (matches shell FILESIZE=500000000)
         "0p50": 40_000_000,   # 40 MB
     }
     MIN_FILE_SIZE = 40_000_000  # fallback: 40 MB

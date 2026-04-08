@@ -43,7 +43,7 @@ class HRRRProcessor(ForcingProcessor):
     """
 
     SOURCE_NAME = "HRRR"
-    MIN_FILE_SIZE = 0  # HRRR is optional, no size enforcement
+    MIN_FILE_SIZE = 100_000_000  # 100 MB (matches shell FILESIZE=100000000)
     MAX_FORECAST_HOURS = 48
 
     # GRIB2 variable mapping (note: MSLMA not PRMSL)
@@ -180,8 +180,10 @@ class HRRRProcessor(ForcingProcessor):
         today_path = self._resolve_path(base_date)
 
         # Nowcast: hourly f01 from previous hours
-        # E.g., for 12z cycle with 24h nowcast: yesterday t12z-t23z + today t00z-t11z
-        nowcast_start_hour = self.config.cyc - self.config.nowcast_hours
+        # HRRR f01 from tXXz has valid time XX+1. To cover nowcast starting
+        # at cycle-nowcast_hours, we need cycles starting 1 hour earlier.
+        # E.g., 12z cycle with 24h nowcast: yesterday t11z-t23z + today t00z-t11z
+        nowcast_start_hour = self.config.cyc - self.config.nowcast_hours - 1  # -1 for f01 offset
         if nowcast_start_hour < 0:
             # Spans previous day
             start_hour_prev = 24 + nowcast_start_hour
