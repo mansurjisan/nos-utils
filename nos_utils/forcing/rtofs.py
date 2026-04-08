@@ -1023,7 +1023,15 @@ class RTOFSProcessor(ForcingProcessor):
             rtofs_dt_3d = 21600.0  # 6-hourly RTOFS input
             target_dt_3d = 10800.0  # 3-hourly output (matches Fortran DELT_TS)
 
-            # Temporally interpolate 3D fields from 6h to 3h
+            # Compute simulation duration for clipping
+            cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                       timedelta(hours=self.config.cyc)
+            sim_start = self.time_hotstart if self.time_hotstart else \
+                        cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
+            sim_duration_3d = (sim_end - sim_start).total_seconds()
+
+            # Temporally interpolate 3D fields from 6h to 3h, clipped to simulation
             for var_list in [all_temp, all_salt]:
                 if len(var_list) > 1:
                     try:
@@ -1032,7 +1040,7 @@ class RTOFSProcessor(ForcingProcessor):
                         rtofs_times = np.arange(n_in) * rtofs_dt_3d
                         n_out = int((n_in - 1) * rtofs_dt_3d / target_dt_3d) + 1
                         target_times = np.arange(n_out) * target_dt_3d
-                        target_times = target_times[target_times <= rtofs_times[-1]]
+                        target_times = target_times[target_times <= min(rtofs_times[-1], sim_duration_3d)]
 
                         stacked = np.stack(var_list, axis=0)  # (n_in, n_bnd, n_levels)
                         interp_out = np.zeros((len(target_times),) + stacked.shape[1:],
