@@ -743,8 +743,8 @@ class RTOFSProcessor(ForcingProcessor):
         ocean points are filled from the nearest still-valid point.
         """
         n_bnd = len(self._bnd_lons)
-        bnd_lons_360 = np.where(self._bnd_lons < 0, self._bnd_lons + 360, self._bnd_lons)
-        target_pts = np.column_stack([bnd_lons_360, self._bnd_lats])
+        # Use -180/180 convention (matching Fortran: if lon>180, lon=lon-360)
+        target_pts = np.column_stack([self._bnd_lons, self._bnd_lats])
 
         # Flatten RTOFS grid
         if rtofs_lon.ndim == 2:
@@ -757,13 +757,13 @@ class RTOFSProcessor(ForcingProcessor):
 
         data_flat = rtofs_data.ravel()
 
-        # Ensure consistent lon convention (0-360) for both RTOFS and boundary
-        lon_flat = np.where(lon_flat < 0, lon_flat + 360, lon_flat)
+        # Convert RTOFS lons to -180/180 (matching Fortran convention)
+        lon_flat = np.where(lon_flat > 180, lon_flat - 360, lon_flat)
 
-        # Subset to domain bounding box + buffer (matching Fortran ISUB/JSUB logic)
-        buf = 2.0  # degrees buffer around boundary nodes
-        lon_min = bnd_lons_360.min() - buf
-        lon_max = bnd_lons_360.max() + buf
+        # Subset to domain bounding box (matching Fortran minlon/maxlon from CTL)
+        buf = 1.0  # 1-degree buffer (Fortran uses CTL bounds + 1 grid cell)
+        lon_min = self._bnd_lons.min() - buf
+        lon_max = self._bnd_lons.max() + buf
         lat_min = self._bnd_lats.min() - buf
         lat_max = self._bnd_lats.max() + buf
         domain_mask = ((lon_flat >= lon_min) & (lon_flat <= lon_max) &
