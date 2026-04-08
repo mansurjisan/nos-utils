@@ -31,7 +31,7 @@ autodoc_default_options = {
     "show-inheritance": True,
 }
 autodoc_member_order = "bysource"
-autodoc_mock_imports = ["numpy", "netCDF4", "scipy", "cfgrib", "xarray"]
+autodoc_mock_imports = ["numpy", "netCDF4", "scipy", "cfgrib", "xarray", "nco", "cdo"]
 
 # Suppress duplicate object warnings from dataclass fields re-exported via __init__
 suppress_warnings = ["duplicate.object.description"]

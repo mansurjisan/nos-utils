@@ -51,6 +51,14 @@ RTOFS
    :undoc-members:
    :show-inheritance:
 
+ADT satellite SSH blending
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: nos_utils.forcing.adt
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 River
 -----
 

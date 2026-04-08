@@ -29,8 +29,18 @@ For development:
 
    pip install -e ".[full,dev]"
 
+For building documentation locally:
+
+.. code-block:: bash
+
+   pip install -e ".[docs]"
+   cd docs && make html
+
 External tools
 --------------
 
 Some processors optionally use **wgrib2** for GRIB2 extraction.  If wgrib2 is
 not on ``$PATH``, the package falls back to ``cfgrib`` (pure Python).
+
+STOFS-3D-ATL shell-script processors (RTOFS OBC, nudging) require standard
+UNIX tools (``nco``, ``cdo``) available on WCOSS2/Hera.

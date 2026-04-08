@@ -13,17 +13,32 @@ Factory methods create pre-configured instances for supported OFS:
 
    from nos_utils.config import ForcingConfig
 
-   # SE Coastal OFS (sflux output)
+   # SE Coastal OFS (sflux output, 6h nowcast / 48h forecast)
    config = ForcingConfig.for_secofs(pdy="20260324", cyc=12)
+
+   # STOFS-3D-ATL (24h nowcast / 108h forecast, ADT blending, nudging)
+   config = ForcingConfig.for_stofs_3d_atl(pdy="20260324", cyc=12)
 
    # STOFS-3D-ATL with UFS-Coastal DATM output
    config = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260324", cyc=12)
 
-   # Ensemble member
+   # Ensemble member (GEFS-driven)
    config = ForcingConfig.for_ensemble(pdy="20260324", cyc=12, member=3)
 
    # From YAML
    config = ForcingConfig.from_yaml("/path/to/ofs.yaml")
+
+STOFS-3D-ATL specifics
+~~~~~~~~~~~~~~~~~~~~~~
+
+The STOFS factory pre-configures several features not used by SECOFS:
+
+* **GFS 0.25 deg** resolution (SECOFS uses 0.50 deg)
+* **Separate HRRR domain** bounds (``hrrr_lon_min``/``hrrr_lat_max``)
+* **RTOFS ROI indices** for 2D and 3D subsetting (``obc_roi_2d``, ``obc_roi_3d``)
+* **ADT satellite SSH blending** (``adt_enabled=True``)
+* **Interior T/S nudging** (``nudging_enabled=True``)
+* **NWM medium-range product** (``nwm_product="medium_range_mem1"``, 121 target files)
 
 Running individual processors
 -----------------------------
@@ -40,6 +55,40 @@ Each processor follows the same pattern:
    print(result.success)        # True/False
    print(result.output_files)   # list of Paths created
    print(result.errors)         # any error messages
+
+RTOFS with ADT blending (STOFS)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from nos_utils.forcing import RTOFSProcessor
+   from nos_utils.forcing.adt import ADTBlender
+
+   config = ForcingConfig.for_stofs_3d_atl(pdy="20260324", cyc=12)
+
+   rtofs = RTOFSProcessor(config,
+                           input_path="/data/rtofs",
+                           output_path="/work/obc",
+                           fix_path="/data/fix/stofs_3d_atl")
+   result = rtofs.process()
+
+   # ADT blending runs automatically when config.adt_enabled is True
+   # and ADT data + weight files are available in fix_path
+
+NWM river forcing (STOFS)
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from nos_utils.forcing import NWMProcessor
+
+   config = ForcingConfig.for_stofs_3d_atl(pdy="20260324", cyc=12)
+
+   nwm = NWMProcessor(config,
+                       input_path="/data/nwm",
+                       output_path="/work/river",
+                       fix_path="/data/fix/stofs_3d_atl")
+   result = nwm.process()
 
 Orchestrator
 ------------
@@ -63,13 +112,18 @@ CLI
 
 .. code-block:: bash
 
-   # Full prep run
+   # SECOFS prep run
    nos-utils prep --ofs secofs --pdy 20260324 --cyc 12 \
        --gfs /data/gfs --hrrr /data/hrrr --rtofs /data/rtofs \
        --nwm /data/nwm --fix /data/fix/secofs --output /work/prep/
 
+   # STOFS-3D-ATL prep run
+   nos-utils prep --ofs stofs_3d_atl --pdy 20260324 --cyc 12 \
+       --gfs /data/gfs --hrrr /data/hrrr --rtofs /data/rtofs \
+       --nwm /data/nwm --fix /data/fix/stofs_3d_atl --output /work/prep/
+
    # UFS-Coastal mode
-   nos-utils prep --ofs secofs --pdy 20260324 --cyc 12 --ufs --output /work/prep/
+   nos-utils prep --ofs stofs_3d_atl --pdy 20260324 --cyc 12 --ufs --output /work/prep/
 
    # List available OFS and processors
    nos-utils list
