@@ -347,6 +347,9 @@ class RTOFSProcessor(ForcingProcessor):
 
         data_flat = rtofs_data.ravel()
 
+        # Ensure consistent lon convention (0-360) for both RTOFS and boundary
+        lon_flat = np.where(lon_flat < 0, lon_flat + 360, lon_flat)
+
         # Subset to domain bounding box + buffer (matching Fortran ISUB/JSUB logic)
         buf = 2.0  # degrees buffer around boundary nodes
         lon_min = bnd_lons_360.min() - buf
@@ -355,9 +358,16 @@ class RTOFSProcessor(ForcingProcessor):
         lat_max = self._bnd_lats.max() + buf
         domain_mask = ((lon_flat >= lon_min) & (lon_flat <= lon_max) &
                        (lat_flat >= lat_min) & (lat_flat <= lat_max))
-        lon_flat = lon_flat[domain_mask]
-        lat_flat = lat_flat[domain_mask]
-        data_flat = data_flat[domain_mask]
+
+        n_in_domain = int(np.sum(domain_mask))
+        if n_in_domain == 0:
+            # Subsetting removed everything — skip subsetting for this grid
+            log.warning(f"Domain subset empty ({lon_min:.1f}-{lon_max:.1f}, "
+                        f"{lat_min:.1f}-{lat_max:.1f}), using full grid")
+        else:
+            lon_flat = lon_flat[domain_mask]
+            lat_flat = lat_flat[domain_mask]
+            data_flat = data_flat[domain_mask]
 
         # Mask land/fill values (Fortran uses abs >= 99)
         ocean_mask = (np.abs(data_flat) < 99.0) & np.isfinite(data_flat)
