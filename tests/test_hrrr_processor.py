@@ -63,6 +63,6 @@ class TestHRRRFailureHandling:
         assert result.success
         assert len(result.warnings) > 0
 
-    def test_min_file_size_not_enforced(self):
-        """HRRR is optional, no file size enforcement."""
+    def test_min_file_size(self):
+        """HRRR is non-fatal, no file size enforcement."""
         assert HRRRProcessor.MIN_FILE_SIZE == 0

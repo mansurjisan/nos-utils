@@ -43,7 +43,7 @@ class HRRRProcessor(ForcingProcessor):
     """
 
     SOURCE_NAME = "HRRR"
-    MIN_FILE_SIZE = 0  # HRRR is optional, no size enforcement
+    MIN_FILE_SIZE = 0  # HRRR is non-fatal, don't reject files by size
     MAX_FORECAST_HOURS = 48
 
     # GRIB2 variable mapping (note: MSLMA not PRMSL)
@@ -180,7 +180,6 @@ class HRRRProcessor(ForcingProcessor):
         today_path = self._resolve_path(base_date)
 
         # Nowcast: hourly f01 from previous hours
-        # E.g., for 12z cycle with 24h nowcast: yesterday t12z-t23z + today t00z-t11z
         nowcast_start_hour = self.config.cyc - self.config.nowcast_hours
         if nowcast_start_hour < 0:
             # Spans previous day

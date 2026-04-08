@@ -51,7 +51,7 @@ class ForcingConfig:
     # Met settings
     igrd_met: int = 0
     met_num: int = 1
-    gfs_resolution: str = "0p50"  # Match Fortran: uses 0.5° GFS (not 0.25°)
+    gfs_resolution: str = "0p50"  # SECOFS default; STOFS overrides to "0p25"
     scale_hflux: float = 1.0
 
     # Model grid (needed when igrd_met > 0)
@@ -63,15 +63,25 @@ class ForcingConfig:
     # Variable selection (empty = processor defaults)
     variables: List[str] = field(default_factory=list)
 
+    # --- HRRR-specific domain (for STOFS, HRRR domain differs from GFS domain) ---
+    hrrr_lon_min: Optional[float] = None  # None = use main domain
+    hrrr_lon_max: Optional[float] = None
+    hrrr_lat_min: Optional[float] = None
+    hrrr_lat_max: Optional[float] = None
+
     # --- OBC (ocean boundary) settings ---
     # RTOFS ROI indices for 2D (ssh) extraction
     obc_roi_2d: Optional[dict] = None  # {x1, x2, y1, y2}
     # RTOFS ROI indices for 3D (T,S,U,V) extraction
     obc_roi_3d: Optional[dict] = None  # {x1, x2, y1, y2}
+    # RTOFS ROI indices for nudging (slightly larger domain than OBC)
+    nudge_roi_3d: Optional[dict] = None  # {x1, x2, y1, y2}
     # SSH offset applied to boundary elevation (meters)
     # Geoid-to-MSL datum offset (meters). OFS-specific — verify from Fortran source.
-    # SECOFS: 1.25 (confirmed). Other OFS: 0.0 until verified.
+    # SECOFS: 1.25 (confirmed). STOFS-3D-ATL: 0.04. Other OFS: 0.0 until verified.
     obc_ssh_offset: float = 0.0
+    # ADT satellite SSH blending (STOFS-3D-ATL uses CMEMS ADT to correct boundary SSH)
+    adt_enabled: bool = False
     # Nudging enabled and timescale
     nudging_enabled: bool = False
     nudging_timescale_seconds: float = 86400.0
@@ -87,6 +97,11 @@ class ForcingConfig:
     # Fortran nos_ofs_create_forcing_river uses 10.0 for msource.th temperature
     river_default_temp: float = 10.0
     river_default_salt: float = 0.0
+    # NWM product type (STOFS uses medium_range_mem1, SECOFS uses analysis_assim)
+    nwm_product: str = "analysis_assim"
+    # Target and minimum NWM file counts for STOFS-style assembly
+    nwm_n_list_target: int = 55
+    nwm_n_list_min: int = 31
 
     # --- Tidal settings ---
     # Tidal constituents to use
@@ -108,6 +123,14 @@ class ForcingConfig:
     def domain(self):
         """Return domain bounds as tuple (lon_min, lon_max, lat_min, lat_max)."""
         return (self.lon_min, self.lon_max, self.lat_min, self.lat_max)
+
+    @property
+    def hrrr_domain(self):
+        """HRRR domain bounds (falls back to main domain if not set)."""
+        if self.hrrr_lon_min is not None:
+            return (self.hrrr_lon_min, self.hrrr_lon_max,
+                    self.hrrr_lat_min, self.hrrr_lat_max)
+        return self.domain
 
     @classmethod
     def for_secofs(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
@@ -145,10 +168,24 @@ class ForcingConfig:
             lat_min=7.347, lat_max=52.5904,
             pdy=pdy, cyc=cyc,
             nowcast_hours=24, forecast_hours=108,
+            gfs_resolution="0p25",
             met_num=2, n_levels=51,
+            # HRRR domain (different from GFS/model domain)
+            hrrr_lon_min=-98.5, hrrr_lon_max=-49.5,
+            hrrr_lat_min=5.5, hrrr_lat_max=50.0,
+            # OBC settings
+            obc_roi_2d={"x1": 2805, "x2": 2923, "y1": 1598, "y2": 2325},
+            obc_roi_3d={"x1": 482, "x2": 600, "y1": 94, "y2": 821},
+            nudge_roi_3d={"x1": 422, "x2": 600, "y1": 94, "y2": 835},
+            obc_ssh_offset=0.04,
+            adt_enabled=True,
+            # Nudging
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
-            obc_ssh_offset=0.0,  # STOFS uses ADT blending, not a constant offset
+            # NWM river settings (medium_range_mem1, 121 target files)
+            nwm_product="medium_range_mem1",
+            nwm_n_list_target=121,
+            nwm_n_list_min=97,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -161,10 +198,20 @@ class ForcingConfig:
             lat_min=7.347, lat_max=52.5904,
             pdy=pdy, cyc=cyc,
             nowcast_hours=24, forecast_hours=108,
+            gfs_resolution="0p25",
             met_num=2, nws=4, n_levels=51,
+            hrrr_lon_min=-98.5, hrrr_lon_max=-49.5,
+            hrrr_lat_min=5.5, hrrr_lat_max=50.0,
+            obc_roi_2d={"x1": 2805, "x2": 2923, "y1": 1598, "y2": 2325},
+            obc_roi_3d={"x1": 482, "x2": 600, "y1": 94, "y2": 821},
+            nudge_roi_3d={"x1": 422, "x2": 600, "y1": 94, "y2": 835},
+            obc_ssh_offset=0.04,
+            adt_enabled=True,
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
-            obc_ssh_offset=0.0,  # STOFS uses ADT blending, not a constant offset
+            nwm_product="medium_range_mem1",
+            nwm_n_list_target=121,
+            nwm_n_list_min=97,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -268,9 +315,30 @@ class ForcingConfig:
         grid_files = grid.get("files", {})
         grid_file = grid_files.get("horizontal_ll") or grid_files.get("horizontal")
 
-        # OBC SSH offset
+        # OBC settings
         obc = ocean.get("obc", {}) if isinstance(ocean, dict) else {}
         obc_ssh_offset = float(obc.get("ssh_offset", 0.0))
+
+        # ROI indices for RTOFS subsetting (STOFS-style index-based)
+        roi_2ds = obc.get("roi_2ds", {})
+        roi_3dz = obc.get("roi_3dz", {})
+        nudge_roi = nudge.get("roi_3dz", {}) if isinstance(nudge, dict) else {}
+
+        # HRRR blend domain (may differ from main domain)
+        hrrr_blend = atm.get("hrrr_blend", {})
+
+        # ADT satellite SSH blending
+        adt = ocean.get("adt", {}) if isinstance(ocean, dict) else {}
+
+        # NWM river product and target counts
+        river_product = river.get("primary", "nwm") if isinstance(river, dict) else "nwm"
+        nwm_product = "medium_range_mem1" if river_product == "nwm" and \
+            river.get("version", "") == "v3.0" else "analysis_assim"
+
+        # GFS resolution
+        gfs_cfg = atm.get("gfs", {})
+        gfs_resolution = gfs_cfg.get("resolution", "0.50")
+        gfs_resolution = gfs_resolution.replace(".", "p")  # "0.25" -> "0p25"
 
         kwargs = dict(
             lon_min=domain.get("lon_min", -180.0),
@@ -283,6 +351,7 @@ class ForcingConfig:
             forecast_hours=int(run.get("forecast_hours", float(run.get("forecast_days", 5.0)) * 24)),
             igrd_met=int(grid.get("igrd_met", 0)),
             met_num=met_num,
+            gfs_resolution=gfs_resolution,
             nws=nws,
             scale_hflux=float(atm.get("scale_hflux", 1.0)),
             n_levels=n_levels,
@@ -291,9 +360,40 @@ class ForcingConfig:
                 nudge.get("timescale_seconds", nudge.get("timescale_days", 1.0) * 86400)
             ) if isinstance(nudge, dict) else 86400.0,
             obc_ssh_offset=obc_ssh_offset,
+            adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
+            nwm_product=nwm_product,
         )
 
+        # HRRR domain bounds (optional, falls back to main domain)
+        if hrrr_blend and hrrr_blend.get("enabled", False):
+            kwargs["hrrr_lon_min"] = float(hrrr_blend.get("lon_min", domain.get("lon_min", -180.0)))
+            kwargs["hrrr_lon_max"] = float(hrrr_blend.get("lon_max", domain.get("lon_max", 180.0)))
+            kwargs["hrrr_lat_min"] = float(hrrr_blend.get("lat_min", domain.get("lat_min", -90.0)))
+            kwargs["hrrr_lat_max"] = float(hrrr_blend.get("lat_max", domain.get("lat_max", 90.0)))
+
+        # OBC ROI indices (STOFS-style)
+        if roi_2ds:
+            kwargs["obc_roi_2d"] = {k: int(v) for k, v in roi_2ds.items()}
+        if roi_3dz:
+            kwargs["obc_roi_3d"] = {k: int(v) for k, v in roi_3dz.items()}
+        if nudge_roi:
+            kwargs["nudge_roi_3d"] = {k: int(v) for k, v in nudge_roi.items()}
+
+        # NWM target counts
+        if isinstance(river, dict):
+            n_target = river.get("n_list_target")
+            n_min = river.get("n_list_min")
+            if n_target:
+                kwargs["nwm_n_list_target"] = int(n_target)
+            if n_min:
+                kwargs["nwm_n_list_min"] = int(n_min)
+
         # Optional Path fields — only set if value is non-empty
+        # River config: try sources_json first (STOFS), then ctl_file (SECOFS)
+        river_files = river.get("files", {}) if isinstance(river, dict) else {}
+        river_config_file = river_files.get("sources_json") or \
+                           river_files.get("ctl_file") or \
+                           river_files.get("nwm_reach")
         if river_config_file:
             kwargs["river_config_file"] = Path(river_config_file)
         if bctides_template:

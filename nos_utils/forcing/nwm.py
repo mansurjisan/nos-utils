@@ -48,12 +48,15 @@ class RiverConfig:
     """River configuration: maps NWM reach IDs to SCHISM mesh nodes."""
 
     def __init__(self, feature_ids: List[int], node_indices: List[int],
-                 clim_flows: List[float], names: Optional[List[str]] = None):
+                 clim_flows: List[float], names: Optional[List[str]] = None,
+                 feature_id_groups: Optional[List[List[int]]] = None):
         self.feature_ids = feature_ids
         self.node_indices = node_indices
         self.clim_flows = clim_flows
         self.names = names or [f"river_{i}" for i in range(len(feature_ids))]
         self.n_rivers = len(feature_ids)
+        # STOFS: groups of feature_ids per source (flow summed within group)
+        self.feature_id_groups = feature_id_groups
 
     @classmethod
     def from_text(cls, filepath: Path) -> "RiverConfig":
@@ -252,6 +255,37 @@ class RiverConfig:
 
         return cls(feature_ids, node_indices, clim_flows, names)
 
+    @classmethod
+    def from_sources_json(cls, filepath: Path) -> "RiverConfig":
+        """Load STOFS sources.json: {element_id: [fid1, fid2, ...]}.
+
+        STOFS-3D-ATL uses VIMS gen_sourcesink.py format where each source
+        element maps to one or more NWM feature_ids. Flow is summed across
+        all feature_ids belonging to each source element.
+
+        Args:
+            filepath: Path to sources.json (e.g. stofs_3d_atl_river_sources_conus.json)
+        """
+        import json
+        with open(filepath) as f:
+            data = json.load(f)
+
+        # data: {str(element_id): [int(feature_id), ...]}
+        element_ids = sorted(data.keys(), key=int)
+        feature_id_groups = [data[eid] for eid in element_ids]
+        node_indices = [int(eid) for eid in element_ids]
+        # First feature_id as representative (for backward compat)
+        feature_ids = [groups[0] if groups else 0 for groups in feature_id_groups]
+        n_sources = len(element_ids)
+        names = [f"src_{eid}" for eid in element_ids]
+        clim_flows = [0.0] * n_sources  # No climatology for STOFS NWM
+
+        log.info(f"Loaded STOFS sources.json: {n_sources} source elements "
+                 f"from {filepath.name}")
+
+        return cls(feature_ids, node_indices, clim_flows, names,
+                   feature_id_groups=feature_id_groups)
+
 
 class NWMProcessor(ForcingProcessor):
     """
@@ -299,13 +333,30 @@ class NWMProcessor(ForcingProcessor):
                 return None
             try:
                 if path.suffix == ".json":
-                    self._river_config = RiverConfig.from_json(path)
+                    # Detect STOFS sources.json format: {element: [fid, ...]}
+                    import json
+                    with open(path) as f:
+                        data = json.load(f)
+                    if isinstance(data, dict) and data:
+                        first_val = next(iter(data.values()))
+                        if isinstance(first_val, list):
+                            self._river_config = RiverConfig.from_sources_json(path)
+                        else:
+                            self._river_config = RiverConfig.from_json(path)
+                    else:
+                        self._river_config = RiverConfig.from_json(path)
                 else:
                     self._river_config = RiverConfig.from_text(path)
             except Exception as e:
                 log.warning(f"Failed to load river config: {e}")
                 return None
         return self._river_config
+
+    @property
+    def is_stofs_mode(self) -> bool:
+        """True if using STOFS-style aggregated sources (from_sources_json)."""
+        return (self.river_config is not None and
+                self.river_config.feature_id_groups is not None)
 
     def process(self) -> ForcingResult:
         """
@@ -334,7 +385,10 @@ class NWMProcessor(ForcingProcessor):
         nwm_files = self.find_input_files()
         if nwm_files:
             log.info(f"Found {len(nwm_files)} NWM files")
-            flows, times = self._extract_streamflow(nwm_files)
+            if self.is_stofs_mode:
+                flows, times = self._extract_streamflow_aggregated(nwm_files)
+            else:
+                flows, times = self._extract_streamflow(nwm_files)
         else:
             log.warning("No NWM files found — using climatology")
             flows, times = self._generate_climatology(n_target)
@@ -350,7 +404,11 @@ class NWMProcessor(ForcingProcessor):
         if vsource:
             output_files.append(vsource)
 
-        msource = self._write_msource(times)
+        # STOFS: msource.th is a static FIX file, not generated
+        if self.is_stofs_mode:
+            msource = self._copy_static_msource()
+        else:
+            msource = self._write_msource(times)
         if msource:
             output_files.append(msource)
 
@@ -367,11 +425,18 @@ class NWMProcessor(ForcingProcessor):
                 "n_timesteps": len(times),
                 "nwm_files_used": len(nwm_files),
                 "used_climatology": len(nwm_files) == 0,
+                "stofs_mode": self.is_stofs_mode,
             },
         )
 
     def find_input_files(self) -> List[Path]:
         """Find NWM channel_rt files for the run window."""
+        if self.is_stofs_mode or self.config.nwm_product == "medium_range_mem1":
+            return self._find_stofs_nwm_files()
+        return self._find_secofs_nwm_files()
+
+    def _find_secofs_nwm_files(self) -> List[Path]:
+        """Find NWM files using SECOFS product search (analysis_assim, short/medium_range)."""
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
         nwm_files = []
 
@@ -390,6 +455,95 @@ class NWMProcessor(ForcingProcessor):
                 break
 
         return nwm_files
+
+    def _find_stofs_nwm_files(self) -> List[Path]:
+        """Find NWM files using STOFS multi-cycle assembly (medium_range_mem1).
+
+        Primary list (from shell script):
+          yesterday t06z f006 (1 file)
+          yesterday t12z f001-f006 (6 files)
+          yesterday t18z f001-f006 (6 files)
+          today     t00z f001-f006 (6 files)
+          today     t06z f001-f110 (102 files → 121 total target)
+
+        Backup: yesterday t06z f006 + yesterday t12z f001-f120
+        """
+        base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
+        prev_date = base_date - timedelta(days=1)
+        today_str = base_date.strftime("%Y%m%d")
+        prev_str = prev_date.strftime("%Y%m%d")
+
+        product = self.config.nwm_product  # "medium_range_mem1"
+        n_target = self.config.nwm_n_list_target
+        n_min = self.config.nwm_n_list_min
+        min_size = 10_000_000  # 10MB
+
+        def _resolve_nwm_file(date_str, cyc, fhr):
+            """Resolve a single NWM file path."""
+            nwm_dir = self.input_path / f"nwm.{date_str}" / product
+            pattern = f"nwm.t{cyc:02d}z.medium_range.channel_rt_1.f{fhr:03d}.conus.nc"
+            path = nwm_dir / pattern
+            if path.exists() and path.stat().st_size >= min_size:
+                return path
+            return None
+
+        # Primary list assembly
+        primary = []
+        # Yesterday t06z f006
+        f = _resolve_nwm_file(prev_str, 6, 6)
+        if f:
+            primary.append(f)
+        # Yesterday t12z f001-f006
+        for fhr in range(1, 7):
+            f = _resolve_nwm_file(prev_str, 12, fhr)
+            if f:
+                primary.append(f)
+        # Yesterday t18z f001-f006
+        for fhr in range(1, 7):
+            f = _resolve_nwm_file(prev_str, 18, fhr)
+            if f:
+                primary.append(f)
+        # Today t00z f001-f006
+        for fhr in range(1, 7):
+            f = _resolve_nwm_file(today_str, 0, fhr)
+            if f:
+                primary.append(f)
+        # Today t06z f001-f120 (shell: f0{0-9}? + f1{0-2}? = f000-f120)
+        for fhr in range(1, 121):
+            f = _resolve_nwm_file(today_str, 6, fhr)
+            if f:
+                primary.append(f)
+
+        # Backup list (shell: yesterday t06z f006 + t12z f001-f129)
+        backup = []
+        f = _resolve_nwm_file(prev_str, 6, 6)
+        if f:
+            backup.append(f)
+        for fhr in range(1, 130):
+            f = _resolve_nwm_file(prev_str, 12, fhr)
+            if f:
+                backup.append(f)
+
+        # Merge if primary incomplete (deduplicate by filepath)
+        if len(primary) >= 2:
+            result = primary
+            if len(primary) < n_target and backup:
+                primary_set = set(str(f) for f in primary)
+                supplement = [f for f in backup if str(f) not in primary_set]
+                n_need = min(n_target - len(primary), len(supplement))
+                result = primary + supplement[:n_need]
+                if n_need > 0:
+                    log.info(f"NWM: merged {n_need} backup files "
+                             f"(primary={len(primary)}, total={len(result)})")
+        elif len(backup) >= 2:
+            result = backup
+            log.info(f"NWM: using backup list ({len(backup)} files)")
+        else:
+            result = primary or backup
+
+        log.info(f"NWM STOFS file discovery: {len(result)} files "
+                 f"(target={n_target}, min={n_min})")
+        return result
 
     def _extract_streamflow(self, nwm_files: List[Path]) -> Tuple[np.ndarray, List[float]]:
         """Extract streamflow for configured rivers from NWM files."""
@@ -433,6 +587,120 @@ class NWMProcessor(ForcingProcessor):
 
         return np.stack(all_flows, axis=0), all_times
 
+    def _extract_streamflow_aggregated(
+        self, nwm_files: List[Path],
+    ) -> Tuple[np.ndarray, List[float]]:
+        """Extract streamflow summed per source element (STOFS gen_sourcesink logic).
+
+        Ports the core logic from VIMS gen_sourcesink.py:
+        - Each source element has a list of NWM feature_ids
+        - Flow is summed across all feature_ids per source element
+        - Negative flows are clamped to zero
+        """
+        groups = self.river_config.feature_id_groups
+        n_sources = len(groups)
+
+        all_flows = []
+        all_times = []
+        ref_feature_ids = None  # feature_id array from first file (for index lookup)
+        src_ncidxs = None  # index groups mapping into feature_id array
+
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+        start_time = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+
+        for nwm_file in nwm_files:
+            try:
+                ds = Dataset(str(nwm_file))
+                file_features = np.array(ds.variables["feature_id"][:])
+                streamflow = np.array(ds.variables["streamflow"][:])
+
+                # Clamp negative flows to zero (matching gen_sourcesink.py)
+                streamflow[streamflow < -1e-5] = 0.0
+                # Fill masked values with zero
+                if hasattr(streamflow, 'mask'):
+                    streamflow = np.where(streamflow.mask, 0.0, streamflow.data)
+
+                # Build index mapping (rebuild if feature_id array changes)
+                if ref_feature_ids is None or not np.array_equal(file_features, ref_feature_ids):
+                    ref_feature_ids = file_features
+                    src_ncidxs = []
+                    for group in groups:
+                        idxs = []
+                        for fid in group:
+                            matches = np.where(ref_feature_ids == int(fid))[0]
+                            if len(matches) > 0:
+                                idxs.append(matches[0])
+                        src_ncidxs.append(idxs)
+
+                # Sum flow per source element
+                flows = np.zeros(n_sources, dtype=np.float32)
+                for s_idx, idxs in enumerate(src_ncidxs):
+                    if idxs:
+                        flows[s_idx] = np.sum(streamflow[idxs])
+
+                all_flows.append(flows)
+
+                # Parse valid time from NetCDF attribute
+                if hasattr(ds, 'model_output_valid_time'):
+                    model_time = datetime.strptime(
+                        ds.model_output_valid_time, "%Y-%m-%d_%H:%M:%S")
+                    t_seconds = (model_time - start_time).total_seconds()
+                else:
+                    t_seconds = len(all_times) * 3600.0  # hourly fallback
+
+                all_times.append(t_seconds / 3600.0)  # hours from start
+                ds.close()
+
+            except Exception as e:
+                log.warning(f"Failed to read {nwm_file.name}: {e}")
+                continue
+
+        if not all_flows:
+            return np.array([]), []
+
+        log.info(f"Extracted aggregated flow for {n_sources} sources "
+                 f"from {len(all_flows)} NWM files")
+        return np.stack(all_flows, axis=0), all_times
+
+    def _copy_static_msource(self) -> Optional[Path]:
+        """Copy static msource.th from FIX directory (STOFS convention)."""
+        import shutil
+        output_file = self.output_path / "msource.th"
+
+        # Search FIX directory (from river_config_file parent or env var)
+        import os
+        fix_dirs = []
+        if self.config.river_config_file:
+            fix_dirs.append(Path(self.config.river_config_file).parent)
+        for env_var in ["FIXstofs3d", "FIXofs"]:
+            if os.environ.get(env_var):
+                fix_dirs.append(Path(os.environ[env_var]))
+        fix_dirs.append(self.input_path)  # fallback to input_path
+
+        for fix_dir in fix_dirs:
+            for name in ["stofs_3d_atl_river_msource.th", "msource.th"]:
+                src = fix_dir / name
+                if src.exists():
+                    shutil.copy2(src, output_file)
+                    log.info(f"Copied static {name} from {fix_dir} -> msource.th")
+                    return output_file
+
+        # Fallback: generate msource.th with default T/S
+        log.warning("Static msource.th not found, generating with defaults")
+        n_rivers = self.river_config.n_rivers
+        temp = self.config.river_default_temp
+        salt = self.config.river_default_salt
+        try:
+            with open(output_file, "w") as f:
+                # Single timestep at t=0 with constant T/S (SCHISM repeats last)
+                values = " ".join(f"{temp:.1f} {salt:.1f}" for _ in range(n_rivers))
+                f.write(f"0.0 {values}\n")
+            return output_file
+        except Exception as e:
+            log.error(f"Failed to write msource.th: {e}")
+            return None
+
     def _generate_climatology(self, n_steps: int) -> Tuple[np.ndarray, List[float]]:
         """Generate climatology-based river forcing."""
         n_rivers = self.river_config.n_rivers
@@ -468,12 +736,22 @@ class NWMProcessor(ForcingProcessor):
         return flows, times
 
     def _write_vsource(self, flows: np.ndarray, times: List[float]) -> Optional[Path]:
-        """Write vsource.th — volume source time history."""
+        """Write vsource.th — volume source time history.
+
+        STOFS convention: first two time stamps forced to 0.0 and 3600.0
+        to ensure SCHISM starts cleanly at t=0.
+        """
         output_file = self.output_path / "vsource.th"
         try:
             with open(output_file, "w") as f:
                 for t_idx, t_hours in enumerate(times):
                     t_seconds = t_hours * 3600.0
+                    # STOFS: force first two time tags (shell script post-processing)
+                    if self.is_stofs_mode:
+                        if t_idx == 0:
+                            t_seconds = 0.0
+                        elif t_idx == 1:
+                            t_seconds = 3600.0
                     values = " ".join(f"{flows[t_idx, r]:.4f}"
                                       for r in range(flows.shape[1]))
                     f.write(f"{t_seconds:.1f} {values}\n")
