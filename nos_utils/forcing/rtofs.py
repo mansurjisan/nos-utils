@@ -347,8 +347,20 @@ class RTOFSProcessor(ForcingProcessor):
 
         data_flat = rtofs_data.ravel()
 
-        # Mask land/fill values
-        ocean_mask = np.abs(data_flat) < 1e10
+        # Subset to domain bounding box + buffer (matching Fortran ISUB/JSUB logic)
+        buf = 2.0  # degrees buffer around boundary nodes
+        lon_min = bnd_lons_360.min() - buf
+        lon_max = bnd_lons_360.max() + buf
+        lat_min = self._bnd_lats.min() - buf
+        lat_max = self._bnd_lats.max() + buf
+        domain_mask = ((lon_flat >= lon_min) & (lon_flat <= lon_max) &
+                       (lat_flat >= lat_min) & (lat_flat <= lat_max))
+        lon_flat = lon_flat[domain_mask]
+        lat_flat = lat_flat[domain_mask]
+        data_flat = data_flat[domain_mask]
+
+        # Mask land/fill values (Fortran uses abs >= 99)
+        ocean_mask = (np.abs(data_flat) < 99.0) & np.isfinite(data_flat)
         n_ocean = int(np.sum(ocean_mask))
 
         if n_ocean == 0:
@@ -369,25 +381,24 @@ class RTOFSProcessor(ForcingProcessor):
                 # First call — build Delaunay from ocean points (like Fortran REMESH mode=0)
                 self._interp = LinearNDInterpolator(ocean_pts, ocean_val)
                 self._nn_tree[cache_key] = cKDTree(ocean_pts)
-                self._ocean_indices = np.where(ocean_mask)[0]
                 self._ocean_pts = ocean_pts
+                self._n_ocean_surface = n_ocean
                 log.info(f"Built Delaunay interpolator: {n_ocean} ocean pts "
-                         f"(grid {rtofs_lon.shape})")
+                         f"(grid {rtofs_lon.shape}, subsetted to domain)")
                 result = self._interp(target_pts).astype(np.float32)
             else:
-                # Reuse triangulation, update values for this depth level
-                vals = data_flat[self._ocean_indices].astype(np.float32, copy=True)
-                invalid = np.abs(vals) >= 1e10
-                if np.any(invalid):
-                    # Fill land points from nearest valid ocean point
-                    valid_mask = ~invalid
-                    if np.any(valid_mask):
-                        valid_tree = cKDTree(self._ocean_pts[valid_mask])
-                        _, nn = valid_tree.query(self._ocean_pts[invalid])
-                        vals[invalid] = vals[valid_mask][nn]
-                    else:
-                        vals[:] = np.nanmean(ocean_val)
-                self._interp.values[:, 0] = vals
+                # Reuse surface triangulation for deeper levels
+                # Deeper levels have fewer ocean points — fill missing from NN
+                if n_ocean == self._n_ocean_surface:
+                    # Same ocean mask — just update values
+                    self._interp.values[:, 0] = ocean_val
+                else:
+                    # Different mask — map current ocean values to surface triangulation
+                    # Find nearest current-ocean point for each surface-ocean point
+                    current_tree = cKDTree(ocean_pts)
+                    _, nn_idx = current_tree.query(self._ocean_pts)
+                    mapped_vals = ocean_val[nn_idx]
+                    self._interp.values[:, 0] = mapped_vals
                 result = self._interp(target_pts).astype(np.float32)
 
             # Fill NaN nodes (outside convex hull) from nearest valid BOUNDARY node
@@ -557,6 +568,8 @@ class RTOFSProcessor(ForcingProcessor):
 
                     data = ds.variables[var_name][:]
                     data = np.ma.filled(data, fill_value=np.nan)
+                    # Match Fortran: mask values >= 99 as land/fill
+                    data[np.abs(data) >= 99.0] = np.nan
 
                     # Handle time dimension: iterate over all time steps
                     if data.ndim == 4:
