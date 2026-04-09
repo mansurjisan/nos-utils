@@ -879,11 +879,45 @@ class RTOFSProcessor(ForcingProcessor):
 
         return result
 
+    def _find_ssh_weights(self) -> Optional[dict]:
+        """Find and load precomputed SSH REMESH weights from FIX."""
+        if hasattr(self, '_ssh_weights_cache'):
+            return self._ssh_weights_cache
+
+        import os
+        for env_var in ["FIXofs", "FIXstofs3d"]:
+            fix_dir = os.environ.get(env_var)
+            if not fix_dir:
+                continue
+            for name in ["secofs.obc_ssh_weights.npz", "obc_ssh_weights.npz"]:
+                path = Path(fix_dir) / name
+                if path.exists():
+                    self._ssh_weights_cache = dict(np.load(str(path)))
+                    log.info(f"Loaded precomputed SSH weights from {path}")
+                    return self._ssh_weights_cache
+
+        # Also check input_path (for testing)
+        for name in ["secofs.obc_ssh_weights.npz", "obc_ssh_weights.npz"]:
+            path = self.input_path / name
+            if path.exists():
+                self._ssh_weights_cache = dict(np.load(str(path)))
+                log.info(f"Loaded precomputed SSH weights from {path}")
+                return self._ssh_weights_cache
+
+        self._ssh_weights_cache = None
+        return None
+
     def _process_2d(self, files_2d: List[Path]) -> Optional[Path]:
         """Extract SSH from RTOFS 2D files, interpolate to boundary nodes."""
         output_file = self.output_path / "elev2D.th.nc"
         n_bnd = len(self._bnd_lons)
         model_dt = 120.0  # SCHISM model timestep (seconds)
+
+        # Check for precomputed REMESH weights
+        ssh_weights = self._find_ssh_weights()
+        if ssh_weights:
+            from ..interp.precomputed_weights import apply_precomputed_ssh
+            log.info("Using precomputed REMESH weights for SSH (Fortran-equivalent)")
 
         try:
             all_ssh = []
@@ -897,11 +931,10 @@ class RTOFSProcessor(ForcingProcessor):
                 ssh_raw = np.ma.filled(ssh_raw, fill_value=np.nan)
 
                 for t in range(ssh_raw.shape[0]):
-                    ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
-                    # Geoid-to-MSL datum offset (config-driven, per OFS):
-                    #   SECOFS: +1.25m (nos_ofs_create_forcing_obc_schism.f line 3133)
-                    #   STOFS-3D-ATL: 0.0 (uses ADT blending, not constant offset)
-                    #   Other OFS: verify offset from Fortran source before setting
+                    if ssh_weights:
+                        ssh_bnd = apply_precomputed_ssh(ssh_weights, ssh_raw[t])
+                    else:
+                        ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
                     ssh_bnd += self.config.obc_ssh_offset
                     all_ssh.append(ssh_bnd)
 
