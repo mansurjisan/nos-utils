@@ -746,32 +746,7 @@ class RTOFSProcessor(ForcingProcessor):
         """
         n_bnd = len(self._bnd_lons)
 
-        # Try structured grid bilinear interpolation first
-        if rtofs_lon.ndim == 2:
-            cache_key = rtofs_lon.shape
-            try:
-                from ..interp import StructuredGridInterpolator
-
-                if cache_key not in self._struct_interp:
-                    # Build ocean mask from data
-                    ocean_mask = np.isfinite(rtofs_data) & (np.abs(rtofs_data) < 99.0)
-                    self._struct_interp[cache_key] = StructuredGridInterpolator(
-                        rtofs_lon, rtofs_lat, mask=ocean_mask,
-                    )
-
-                # Clean data: replace land/fill with NaN
-                data_clean = rtofs_data.copy().astype(np.float64)
-                data_clean[~np.isfinite(data_clean) | (np.abs(data_clean) >= 99.0)] = np.nan
-
-                result = self._struct_interp[cache_key].interpolate(
-                    self._bnd_lons, self._bnd_lats, data_clean,
-                )
-                return result
-
-            except Exception as e:
-                log.debug(f"Structured grid interp failed ({e}), falling back to Delaunay")
-
-        # Fallback: Delaunay interpolation
+        # Delaunay interpolation with corner points (matching Fortran INTERP_REMESH)
         # Use -180/180 convention (matching Fortran: if lon>180, lon=lon-360)
         target_pts = np.column_stack([self._bnd_lons, self._bnd_lats])
 
