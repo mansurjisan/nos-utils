@@ -335,10 +335,11 @@ class ForcingConfig:
         nwm_product = "medium_range_mem1" if river_product == "nwm" and \
             river.get("version", "") == "v3.0" else "analysis_assim"
 
-        # GFS resolution
+        # GFS resolution: "0.25", "0.50", or "sflux" (surface flux files)
         gfs_cfg = atm.get("gfs", {})
         gfs_resolution = gfs_cfg.get("resolution", "0.50")
-        gfs_resolution = gfs_resolution.replace(".", "p")  # "0.25" -> "0p25"
+        if gfs_resolution != "sflux":
+            gfs_resolution = gfs_resolution.replace(".", "p")  # "0.25" -> "0p25"
 
         kwargs = dict(
             lon_min=domain.get("lon_min", -180.0),
