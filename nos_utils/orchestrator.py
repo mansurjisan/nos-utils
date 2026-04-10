@@ -178,42 +178,60 @@ class PrepOrchestrator:
                 except ValueError:
                     pass
 
-        # Step 2: GFS atmospheric
+        # ---- Phase 1: Independent steps (parallel) ----
+        # GFS, RTOFS, NWM, Tidal only depend on time_hotstart.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        parallel_tasks = {}
+
         if "gfs" in self.paths:
-            results.append(self._run_gfs(output_dir, phase, time_hotstart))
+            parallel_tasks["GFS"] = lambda: self._run_gfs(output_dir, phase, time_hotstart)
 
-        # Step 3: HRRR secondary (optional, non-fatal)
         if "hrrr" in self.paths and self.config.met_num >= 2:
-            results.append(self._run_hrrr(output_dir, phase, time_hotstart))
+            parallel_tasks["HRRR"] = lambda: self._run_hrrr(output_dir, phase, time_hotstart)
 
-        # Step 4: NWM river
-        # STOFS: always run NWM (Python handles gen_sourcesink logic)
-        # SECOFS: skip in hybrid mode (legacy shell handles it)
-        if "nwm" in self.paths and (self.is_stofs or not self.skip_legacy):
-            results.append(self._run_nwm(output_dir, phase, time_hotstart))
-        elif self.skip_legacy:
-            log.info("Skipping NWM river (handled by legacy shell)")
-
-        # Step 5: RTOFS OBC
-        # STOFS: always run (Python data prep + Fortran wrapper with fallback)
-        # SECOFS: skip in hybrid mode
         if "rtofs" in self.paths and (self.is_stofs or not self.skip_legacy):
-            results.append(self._run_rtofs(output_dir, phase, time_hotstart))
+            parallel_tasks["RTOFS"] = lambda: self._run_rtofs(output_dir, phase, time_hotstart)
         elif self.skip_legacy:
             log.info("Skipping RTOFS OBC (handled by legacy shell)")
 
-        # Step 5b: Nudging (STOFS only — enabled via config)
+        if "nwm" in self.paths and (self.is_stofs or not self.skip_legacy):
+            parallel_tasks["NWM"] = lambda: self._run_nwm(output_dir, phase, time_hotstart)
+        elif self.skip_legacy:
+            log.info("Skipping NWM river (handled by legacy shell)")
+
+        parallel_tasks["TIDAL"] = lambda: self._run_tidal(output_dir, phase, time_hotstart)
+
+        phase1_results = {}
+        if parallel_tasks:
+            log.info(f"Running {len(parallel_tasks)} steps in parallel: "
+                     f"{', '.join(parallel_tasks.keys())}")
+            with ThreadPoolExecutor(max_workers=len(parallel_tasks)) as pool:
+                futures = {pool.submit(fn): name for name, fn in parallel_tasks.items()}
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        r = future.result()
+                        phase1_results[name] = r
+                        results.append(r)
+                        status = "OK" if r.success else "FAILED"
+                        log.info(f"  {name}: {status}")
+                    except Exception as e:
+                        log.error(f"  {name}: EXCEPTION {e}")
+                        results.append(ForcingResult(
+                            success=False, source=name, errors=[str(e)]))
+
+        # ---- Phase 2: Steps with dependencies (sequential) ----
+
+        # Nudging needs RTOFS to have completed
         if self.config.nudging_enabled and "rtofs" in self.paths:
             results.append(self._run_nudging(output_dir, phase, time_hotstart))
 
-        # Step 6: Tidal (phase-aware start time + nodal corrections)
-        results.append(self._run_tidal(output_dir, phase, time_hotstart))
-
-        # Step 7: param.nml (pass time_hotstart for correct rnday/start/ihot)
+        # param.nml only needs time_hotstart
         if "fix" in self.paths:
             results.append(self._run_param_nml(output_dir, phase, time_hotstart))
 
-        # Step 8: UFS-specific (DATM)
+        # UFS-specific (DATM) needs GFS + HRRR sflux
         if self.config.nws == 4:
             results.append(self._run_datm(output_dir))
 
