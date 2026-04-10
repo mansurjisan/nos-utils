@@ -178,8 +178,11 @@ class PrepOrchestrator:
                 except ValueError:
                     pass
 
-        # ---- Phase 1: Independent steps (parallel) ----
-        # GFS, RTOFS, NWM, Tidal only depend on time_hotstart.
+        # ---- Phase 1: Lightweight steps in parallel ----
+        # GFS, HRRR, NWM, Tidal are fast (subprocess/IO-bound, ~90s max).
+        # RTOFS is heavy (large NetCDF reads + Delaunay) and netCDF4's C
+        # library can stall under concurrent thread access, so run it
+        # sequentially in Phase 2.
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         parallel_tasks = {}
@@ -190,11 +193,6 @@ class PrepOrchestrator:
         if "hrrr" in self.paths and self.config.met_num >= 2:
             parallel_tasks["HRRR"] = lambda: self._run_hrrr(output_dir, phase, time_hotstart)
 
-        if "rtofs" in self.paths and (self.is_stofs or not self.skip_legacy):
-            parallel_tasks["RTOFS"] = lambda: self._run_rtofs(output_dir, phase, time_hotstart)
-        elif self.skip_legacy:
-            log.info("Skipping RTOFS OBC (handled by legacy shell)")
-
         if "nwm" in self.paths and (self.is_stofs or not self.skip_legacy):
             parallel_tasks["NWM"] = lambda: self._run_nwm(output_dir, phase, time_hotstart)
         elif self.skip_legacy:
@@ -202,7 +200,6 @@ class PrepOrchestrator:
 
         parallel_tasks["TIDAL"] = lambda: self._run_tidal(output_dir, phase, time_hotstart)
 
-        phase1_results = {}
         if parallel_tasks:
             log.info(f"Running {len(parallel_tasks)} steps in parallel: "
                      f"{', '.join(parallel_tasks.keys())}")
@@ -212,7 +209,6 @@ class PrepOrchestrator:
                     name = futures[future]
                     try:
                         r = future.result()
-                        phase1_results[name] = r
                         results.append(r)
                         status = "OK" if r.success else "FAILED"
                         log.info(f"  {name}: {status}")
@@ -221,7 +217,13 @@ class PrepOrchestrator:
                         results.append(ForcingResult(
                             success=False, source=name, errors=[str(e)]))
 
-        # ---- Phase 2: Steps with dependencies (sequential) ----
+        # ---- Phase 2: Heavy and dependent steps (sequential) ----
+
+        # RTOFS OBC: heavy NetCDF I/O + Delaunay interpolation
+        if "rtofs" in self.paths and (self.is_stofs or not self.skip_legacy):
+            results.append(self._run_rtofs(output_dir, phase, time_hotstart))
+        elif self.skip_legacy:
+            log.info("Skipping RTOFS OBC (handled by legacy shell)")
 
         # Nudging needs RTOFS to have completed
         if self.config.nudging_enabled and "rtofs" in self.paths:
