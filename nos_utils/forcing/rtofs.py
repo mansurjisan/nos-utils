@@ -645,7 +645,9 @@ class RTOFSProcessor(ForcingProcessor):
         """Sort RTOFS files by valid time and dedup n/f overlap.
 
         When nowcast (n) and forecast (f) files have the same valid time,
-        prefer the nowcast file (analysis-based).
+        prefer the forecast file to match Fortran OBC behavior.
+        The Fortran shell script only collects f* files (no n* files),
+        so using forecast here ensures identical input data.
         """
         # Parse valid times
         file_info = []
@@ -654,8 +656,8 @@ class RTOFSProcessor(ForcingProcessor):
             valid_time = cycle_date + timedelta(hours=hour)
             file_info.append((valid_time, is_nowcast, f))
 
-        # Sort by valid time; for ties, nowcast first (True > False)
-        file_info.sort(key=lambda x: (x[0], not x[1]))
+        # Sort by valid time; for ties, forecast first (is_nowcast=False < True)
+        file_info.sort(key=lambda x: (x[0], x[1]))
 
         # Dedup: keep first per valid time (nowcast preferred due to sort)
         seen = {}

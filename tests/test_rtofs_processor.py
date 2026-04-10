@@ -37,6 +37,25 @@ class TestRTOFSFileDiscovery:
         assert len(files_2d) == 2
         assert len(files_3d) == 2
 
+    def test_dedup_prefers_forecast_over_nowcast(self, mock_config, tmp_path):
+        """Verify forecast (f) files are preferred over nowcast (n) for same
+        valid time, matching Fortran which only uses f* files."""
+        rtofs_dir = tmp_path / "rtofs.20260401"
+        rtofs_dir.mkdir()
+
+        # n012 and f012 have the same valid time (cycle + 12h)
+        for prefix in ["n012", "f012", "f024"]:
+            f = rtofs_dir / f"rtofs_glo_2ds_{prefix}_diag.nc"
+            f.write_bytes(b"\x00" * 200_000_000)
+
+        proc = RTOFSProcessor(mock_config, tmp_path, tmp_path / "out")
+        files_2d, _ = proc.find_input_files_by_type()
+
+        # Should have 2 files (f012 wins over n012, plus f024)
+        assert len(files_2d) == 2
+        # The hour-12 file should be forecast, not nowcast
+        assert "_f012_" in files_2d[0].name
+
     def test_cycle_search_prefers_pdy_minus_1(self, mock_config, tmp_path):
         """Verify PDY-1 is searched before PDY-2 (matches Fortran behavior)."""
         # Create files in both PDY-2 and PDY-1 directories
