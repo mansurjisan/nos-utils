@@ -596,10 +596,10 @@ class RTOFSProcessor(ForcingProcessor):
                 log.warning(f"gen_3Dth returned {result.returncode}: {result.stderr[:300]}")
                 return False
 
-            # Apply SSH offset to elev2D.th.nc
-            elev_path = work_dir / "elev2D.th.nc"
-            if elev_path.exists() and self.config.obc_ssh_offset != 0.0:
-                self._apply_ssh_offset(elev_path, self.config.obc_ssh_offset)
+            # NOTE: Do NOT apply SSH offset here — the Fortran executable
+            # (nos_ofs_create_forcing_obc_schism / gen_3Dth_from_hycom)
+            # already applies the offset internally (WL += 1.25 at line ~3133).
+            # Applying it again would double the offset to +2.5m.
 
             # Verify outputs exist
             expected = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]
@@ -685,10 +685,11 @@ class RTOFSProcessor(ForcingProcessor):
         files_3d = []
         rtofs_cycle_date = None
 
-        # RTOFS has ~2-day production lag. In production at ~01Z, only
-        # PDY-2 is guaranteed complete. Search PDY-2 first to match
-        # Fortran behavior, then fall back to newer cycles if available.
-        for date in [base_date - timedelta(days=2), base_date - timedelta(days=1), base_date]:
+        # Search newest RTOFS cycle first to match Fortran shell behavior.
+        # The Fortran prep (nos_ofs_create_forcing_obc.sh) uses the latest
+        # available cycle. PDY itself rarely has RTOFS ready at 00Z, so
+        # PDY-1 is the typical production hit.
+        for date in [base_date - timedelta(days=1), base_date - timedelta(days=2), base_date]:
             date_str = date.strftime("%Y%m%d")
 
             for rtofs_dir in [
@@ -721,6 +722,7 @@ class RTOFSProcessor(ForcingProcessor):
         # Sort by valid time and deduplicate n/f overlap
         if rtofs_cycle_date is None:
             rtofs_cycle_date = base_date
+        self._rtofs_cycle_date = rtofs_cycle_date
         if files_2d:
             files_2d = self._sort_and_dedup(files_2d, rtofs_cycle_date)
         if files_3d:
@@ -960,7 +962,16 @@ class RTOFSProcessor(ForcingProcessor):
             # Temporally interpolate to model dt (120s)
             # Clip to the actual simulation window (nowcast + forecast)
             n_rtofs = ssh_array.shape[0]
-            rtofs_dt = 21600.0
+
+            # Build actual time axis from file valid times (NOT uniform 6h).
+            # RTOFS 2D diag files are hourly (f001-f048) then 3-hourly
+            # (f051+), so assuming uniform spacing is wrong.
+            # Time axis is relative to sim_start (t=0 = model start),
+            # matching the Fortran convention where day_start=0.
+            file_hours = []
+            for f in files_2d:
+                hour, _ = self._parse_rtofs_hour(f)
+                file_hours.append(hour)
 
             cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                        timedelta(hours=self.config.cyc)
@@ -968,13 +979,24 @@ class RTOFSProcessor(ForcingProcessor):
                         cycle_dt - timedelta(hours=self.config.nowcast_hours)
             sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
             sim_duration = (sim_end - sim_start).total_seconds()
-            total_time = min((n_rtofs - 1) * rtofs_dt, sim_duration)
-            n_model_steps = int(total_time / model_dt) + 1
+
+            # Compute time of each file relative to sim_start (model t=0).
+            # Files before sim_start have negative times (buffer).
+            rtofs_cycle = getattr(self, '_rtofs_cycle_date', None)
+            if rtofs_cycle is None:
+                rtofs_cycle = datetime.strptime(self.config.pdy, "%Y%m%d")
+            rtofs_times = np.array(
+                [(rtofs_cycle + timedelta(hours=h) - sim_start).total_seconds()
+                 for h in file_hours],
+                dtype=np.float64,
+            )
+
+            # Model output covers [0, sim_duration] at model_dt intervals
+            n_model_steps = int(sim_duration / model_dt) + 1
 
             if n_model_steps > n_rtofs and n_rtofs > 1:
                 try:
                     from scipy.interpolate import interp1d
-                    rtofs_times = np.arange(n_rtofs) * rtofs_dt
                     model_times = np.arange(n_model_steps) * model_dt
                     model_times = model_times[model_times <= rtofs_times[-1]]
 
@@ -986,12 +1008,14 @@ class RTOFSProcessor(ForcingProcessor):
 
                     ssh_array = ssh_interp
                     dt_out = model_dt
-                    log.info(f"Temporally interpolated SSH: {n_rtofs} steps at 6h → "
+                    avg_dt_h = (rtofs_times[-1] - rtofs_times[0]) / 3600.0 / max(n_rtofs - 1, 1)
+                    log.info(f"Temporally interpolated SSH: {n_rtofs} steps "
+                             f"(avg {avg_dt_h:.1f}h, t0={rtofs_times[0]/3600:.1f}h) → "
                              f"{len(model_times)} steps at dt={model_dt}s")
                 except ImportError:
-                    dt_out = rtofs_dt
+                    dt_out = (rtofs_times[1] - rtofs_times[0]) if n_rtofs > 1 else 3600.0
             else:
-                dt_out = rtofs_dt
+                dt_out = (rtofs_times[1] - rtofs_times[0]) if n_rtofs > 1 else 3600.0
 
             # Write SCHISM format
             nc = Dataset(str(output_file), "w", format="NETCDF4")
@@ -1004,7 +1028,12 @@ class RTOFSProcessor(ForcingProcessor):
             nc.createDimension("one", 1)
 
             time_var = nc.createVariable("time", "f8", ("time",))
-            time_var[:] = [i * dt_out for i in range(nt)]
+            if dt_out == model_dt and nt > n_rtofs:
+                # Temporally interpolated: uniform 120s steps
+                time_var[:] = [i * dt_out for i in range(nt)]
+            else:
+                # No interpolation: use actual file valid times
+                time_var[:] = rtofs_times[:nt]
 
             ts = nc.createVariable("time_series", "f4",
                                    ("time", "nOpenBndNodes", "nLevels", "nComponents"),
