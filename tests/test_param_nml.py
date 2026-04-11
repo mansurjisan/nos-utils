@@ -41,8 +41,9 @@ class TestParamNmlProcessor:
         assert result.success
         content = (out_dir / "param.nml").read_text()
 
-        # 6h nowcast -> rnday = 0.25
-        assert "0.2500" in content
+        # 6h nowcast -> rnday = .2500 (COMF bc-style: no leading zero)
+        assert ".2500" in content
+        assert "0.2500" not in content  # must NOT have leading zero
         # Start time: 2026-04-01 12z - 6h = 06z
         assert "start_year = 2026" in content
         assert "start_month = 04" in content
@@ -83,7 +84,7 @@ class TestParamNmlProcessor:
         result = proc.process()
 
         assert result.metadata["phase"] == "nowcast"
-        assert result.metadata["rnday"] == "0.2500"
+        assert result.metadata["rnday"] == ".2500"
         assert result.metadata["ihot"] == 1
 
 

@@ -533,23 +533,57 @@ class PrepOrchestrator:
                     log.warning(f"  Failed to tar HRRR sflux: {e}")
 
         # Tar OBC files
-        # ORG includes nudging files in the OBC tar
+        # COMF convention: one combined obc.tar with all 6 files (boundary + nudging)
         obc_files = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc",
                      "TEM_nu.nc", "SAL_nu.nc"]
         existing_obc = [work_dir / f for f in obc_files if (work_dir / f).exists()]
         if existing_obc:
-            tar_name = f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar"
-            tar_path = comout / tar_name
+            # Phase-specific tar (backward compat): obc.nowcast.tar / obc.forecast.tar
+            phase_tar_name = f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar"
+            phase_tar_path = comout / phase_tar_name
             try:
                 file_list = [f.name for f in existing_obc]
                 subprocess.run(
-                    ["tar", "-cf", str(tar_path), "-C", str(work_dir)] + file_list,
+                    ["tar", "-cf", str(phase_tar_path), "-C", str(work_dir)] + file_list,
                     check=True, capture_output=True,
                 )
-                archived.append(tar_path)
-                log.info(f"  Archived OBC -> {tar_name}")
+                archived.append(phase_tar_path)
+                log.info(f"  Archived OBC -> {phase_tar_name}")
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                log.warning(f"  Failed to tar OBC: {e}")
+                log.warning(f"  Failed to tar OBC (phase): {e}")
+
+            # Combined obc.tar (COMF convention): single tar with all 6 files
+            combined_tar_name = f"{prefix}.{cycle}.{pdy}.obc.tar"
+            combined_tar_path = comout / combined_tar_name
+            try:
+                file_list = [f.name for f in existing_obc]
+                subprocess.run(
+                    ["tar", "-cf", str(combined_tar_path), "-C", str(work_dir)] + file_list,
+                    check=True, capture_output=True,
+                )
+                archived.append(combined_tar_path)
+                log.info(f"  Archived OBC (combined) -> {combined_tar_name}")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                log.warning(f"  Failed to tar OBC (combined): {e}")
+
+        # Tar NWM source/sink files (COMF convention)
+        # COMF produces: nwm.source.sink.now.tar / nwm.source.sink.fore.tar
+        nwm_files = ["vsource.th", "msource.th", "source_sink.in", "vsink.th"]
+        existing_nwm = [work_dir / f for f in nwm_files if (work_dir / f).exists()]
+        if existing_nwm:
+            phase_tag = "now" if phase == "nowcast" else "fore"
+            nwm_tar_name = f"{prefix}.{cycle}.{pdy}.nwm.source.sink.{phase_tag}.tar"
+            nwm_tar_path = comout / nwm_tar_name
+            try:
+                file_list = [f.name for f in existing_nwm]
+                subprocess.run(
+                    ["tar", "-cf", str(nwm_tar_path), "-C", str(work_dir)] + file_list,
+                    check=True, capture_output=True,
+                )
+                archived.append(nwm_tar_path)
+                log.info(f"  Archived NWM -> {nwm_tar_name}")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                log.warning(f"  Failed to tar NWM: {e}")
 
         # Copy individual files
         copy_map = {

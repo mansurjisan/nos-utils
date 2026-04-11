@@ -54,8 +54,8 @@ class TestSfluxWriter:
         filenames = [f.name for f in files]
         assert "sflux_air_2.1.nc" in filenames
 
-    def test_write_all_splits_by_day(self, synthetic_grid, tmp_output_dir):
-        """Verify write_all groups time steps into separate day files."""
+    def test_write_all_single_file(self, synthetic_grid, tmp_output_dir):
+        """Verify single_file mode writes all timesteps into .1.nc (COMF convention)."""
         lons, lats = synthetic_grid
         ny, nx = len(lats), len(lons)
 
@@ -65,7 +65,31 @@ class TestSfluxWriter:
         data = {"uwind": [np.ones((ny, nx), dtype=np.float32) for _ in range(6)],
                 "vwind": [np.ones((ny, nx), dtype=np.float32) for _ in range(6)]}
 
-        writer = SfluxWriter(tmp_output_dir, source_index=1)
+        writer = SfluxWriter(tmp_output_dir, source_index=1)  # single_file=True by default
+        files = writer.write_all(data, times, lons, lats, base_date)
+
+        # Should have exactly 1 file per type (air only — only uwind/vwind provided)
+        assert len(files) == 1
+        # File should be .1.nc regardless of how many days the data spans
+        assert files[0].name == "sflux_air_1.1.nc"
+
+        # Verify all 6 timesteps are in the single file
+        ds = netCDF4.Dataset(str(files[0]))
+        assert ds.dimensions["ntime"].size == 6
+        ds.close()
+
+    def test_write_all_splits_by_day(self, synthetic_grid, tmp_output_dir):
+        """Verify multi-file mode groups time steps into separate day files."""
+        lons, lats = synthetic_grid
+        ny, nx = len(lats), len(lons)
+
+        base_date = datetime(2026, 3, 31, 6, 0, 0)
+        # 6 time steps spanning 2 days
+        times = [base_date + timedelta(hours=i * 8) for i in range(6)]
+        data = {"uwind": [np.ones((ny, nx), dtype=np.float32) for _ in range(6)],
+                "vwind": [np.ones((ny, nx), dtype=np.float32) for _ in range(6)]}
+
+        writer = SfluxWriter(tmp_output_dir, source_index=1, single_file=False)
         files = writer.write_all(data, times, lons, lats, base_date)
 
         # Should have files for multiple days
@@ -124,9 +148,18 @@ class TestSfluxWriter:
 
         ds.close()
 
-    def test_sflux_inputs(self, tmp_output_dir):
-        """Verify sflux_inputs.txt namelist."""
-        writer = SfluxWriter(tmp_output_dir, source_index=1)
+    def test_sflux_inputs_comf_minimal(self, tmp_output_dir):
+        """Verify sflux_inputs.txt uses COMF minimal format by default."""
+        writer = SfluxWriter(tmp_output_dir, source_index=1)  # single_file=True
+        inputs_file = writer.write_sflux_inputs(met_num=2)
+
+        assert inputs_file.exists()
+        content = inputs_file.read_text()
+        assert content == "&sflux_inputs\n/\n"
+
+    def test_sflux_inputs_explicit(self, tmp_output_dir):
+        """Verify sflux_inputs.txt with explicit parameters in multi-file mode."""
+        writer = SfluxWriter(tmp_output_dir, source_index=1, single_file=False)
         inputs_file = writer.write_sflux_inputs(met_num=2)
 
         assert inputs_file.exists()
