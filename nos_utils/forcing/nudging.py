@@ -254,6 +254,34 @@ class NudgingProcessor(ForcingProcessor):
             log.warning(f"Error calling Fortran gen_nudge: {e}")
             return False
 
+    def _find_nudge_weights(self) -> Optional[dict]:
+        """Find and load precomputed nudge REMESH weights from FIX."""
+        if hasattr(self, '_nudge_weights_cache'):
+            return self._nudge_weights_cache
+
+        for env_var in ["FIXofs", "FIXstofs3d"]:
+            fix_dir = os.environ.get(env_var)
+            if not fix_dir:
+                continue
+            for name in ["secofs.obc_nudge_weights.npz", "obc_nudge_weights.npz"]:
+                path = Path(fix_dir) / name
+                if path.exists():
+                    self._nudge_weights_cache = dict(np.load(str(path)))
+                    log.info(f"Loaded precomputed nudge weights from {path}")
+                    return self._nudge_weights_cache
+
+        # Also check input_path and output_path parents (for testing)
+        for search_dir in [self.input_path, self.output_path.parent]:
+            for name in ["secofs.obc_nudge_weights.npz", "obc_nudge_weights.npz"]:
+                path = search_dir / name
+                if path.exists():
+                    self._nudge_weights_cache = dict(np.load(str(path)))
+                    log.info(f"Loaded precomputed nudge weights from {path}")
+                    return self._nudge_weights_cache
+
+        self._nudge_weights_cache = None
+        return None
+
     def _process_python(self) -> ForcingResult:
         """Python implementation: interpolate RTOFS T/S to interior nudging nodes.
 
@@ -263,6 +291,7 @@ class NudgingProcessor(ForcingProcessor):
            (reduces ~32 raw files to ~10, matching OBC behavior)
         3. Precompute Delaunay interpolation weights ONCE from surface level,
            then apply via gather+multiply for all depth levels and files
+           (or use precomputed Fortran REMESH weights if available)
         4. Vertically interpolate from RTOFS depth levels to SCHISM sigma levels
         5. Vectorized temporal interpolation (numpy, no per-node loop)
         6. Filter to nodes with valid RTOFS coverage
@@ -282,6 +311,17 @@ class NudgingProcessor(ForcingProcessor):
 
         n_nudge = len(nudge_node_ids)
         log.info(f"Nudging candidate nodes: {n_nudge:,}")
+
+        # --- Check for precomputed Fortran REMESH weights ---
+        nudge_weights_npz = self._find_nudge_weights()
+        use_precomputed = nudge_weights_npz is not None
+        if use_precomputed:
+            from ..interp.precomputed_weights import (
+                apply_precomputed_nudge,
+                validate_grid,
+            )
+            log.info("Using precomputed REMESH weights for nudging "
+                     f"({int(nudge_weights_npz['n_target'])} targets)")
 
         # --- 2. Find RTOFS 3D files (with time-window filtering) ---
         # Nudging doesn't need more temporal resolution than OBC — it's a
@@ -339,6 +379,7 @@ class NudgingProcessor(ForcingProcessor):
 
         # Precomputed weight state: computed once from first file's surface
         interp_weights = None  # Will hold _NudgeInterpWeights
+        grid_validated = False  # For precomputed weights grid check
 
         for fi, f in enumerate(files_3d):
             try:
@@ -355,6 +396,18 @@ class NudgingProcessor(ForcingProcessor):
                 lat_arr = lat[:]
                 depth_arr = depth_var[:] if depth_var is not None else np.arange(n_levels)
                 n_rtofs_levels = len(depth_arr)
+
+                # Validate precomputed weights grid on first file
+                if use_precomputed and not grid_validated:
+                    try:
+                        validate_grid(nudge_weights_npz, lon_arr, lat_arr)
+                        grid_validated = True
+                        log.info("Precomputed nudge weights grid validated OK")
+                    except ValueError as ve:
+                        log.warning(f"Precomputed nudge weights grid mismatch: "
+                                    f"{ve}; falling back to Delaunay")
+                        use_precomputed = False
+                        nudge_weights_npz = None
 
                 for var_name, target_list in [
                     ("temperature", all_temp),
@@ -376,37 +429,53 @@ class NudgingProcessor(ForcingProcessor):
                     for t in range(n_times):
                         data_t = data[t]
 
-                        # Build interpolation weights from the first
-                        # valid surface slice, then reuse for everything.
-                        if interp_weights is None:
-                            interp_weights = self._build_interp_weights(
-                                lon_arr, lat_arr, data_t[0],
-                                nudge_lons, nudge_lats,
-                            )
-                            if interp_weights is not None:
-                                log.info(
-                                    f"Precomputed nudge interp weights: "
-                                    f"{interp_weights.n_source} ocean pts "
-                                    f"-> {n_nudge} target pts "
-                                    f"(grid {lon_arr.shape})"
-                                )
-
-                        if interp_weights is not None:
-                            bnd_profile_rtofs = self._apply_weights_all_levels(
-                                interp_weights, data_t,
-                                n_nudge, n_rtofs_levels,
-                            )
-                        else:
-                            # Fallback: use RTOFSProcessor per-level interp
+                        if use_precomputed:
+                            # Fast path: apply precomputed Fortran REMESH
+                            # weights per depth level
+                            fill_val = 15.0 if var_name == "temperature" else 35.0
                             bnd_profile_rtofs = np.full(
                                 (n_nudge, n_rtofs_levels), np.nan,
                                 dtype=np.float32,
                             )
                             for lev in range(min(n_rtofs_levels, data_t.shape[0])):
                                 bnd_profile_rtofs[:, lev] = \
-                                    rtofs_proc._interpolate_2d_to_boundary(
-                                        lon_arr, lat_arr, data_t[lev],
+                                    apply_precomputed_nudge(
+                                        nudge_weights_npz,
+                                        data_t[lev],
+                                        fill_value=fill_val,
                                     )
+                        else:
+                            # Build interpolation weights from the first
+                            # valid surface slice, then reuse for everything.
+                            if interp_weights is None:
+                                interp_weights = self._build_interp_weights(
+                                    lon_arr, lat_arr, data_t[0],
+                                    nudge_lons, nudge_lats,
+                                )
+                                if interp_weights is not None:
+                                    log.info(
+                                        f"Precomputed nudge interp weights: "
+                                        f"{interp_weights.n_source} ocean pts "
+                                        f"-> {n_nudge} target pts "
+                                        f"(grid {lon_arr.shape})"
+                                    )
+
+                            if interp_weights is not None:
+                                bnd_profile_rtofs = self._apply_weights_all_levels(
+                                    interp_weights, data_t,
+                                    n_nudge, n_rtofs_levels,
+                                )
+                            else:
+                                # Fallback: use RTOFSProcessor per-level interp
+                                bnd_profile_rtofs = np.full(
+                                    (n_nudge, n_rtofs_levels), np.nan,
+                                    dtype=np.float32,
+                                )
+                                for lev in range(min(n_rtofs_levels, data_t.shape[0])):
+                                    bnd_profile_rtofs[:, lev] = \
+                                        rtofs_proc._interpolate_2d_to_boundary(
+                                            lon_arr, lat_arr, data_t[lev],
+                                        )
 
                         # Vertically interpolate to SCHISM levels
                         if vgrid and n_levels != n_rtofs_levels:
@@ -552,6 +621,7 @@ class NudgingProcessor(ForcingProcessor):
                 "n_timesteps": len(all_temp) if all_temp else len(all_salt),
                 "dt_seconds": dt_out,
                 "fortran_used": False,
+                "precomputed_weights": use_precomputed,
             },
         )
 

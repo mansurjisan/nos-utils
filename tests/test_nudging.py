@@ -425,3 +425,260 @@ class TestNudgingWithSyntheticRTOFS:
         result = proc.process()
         assert not result.success
         assert any("RTOFS" in e for e in result.errors)
+
+
+class TestPrecomputedNudgeWeights:
+    """Tests for precomputed Fortran REMESH nudge weight replay."""
+
+    def test_load_remesh_export(self, tmp_path):
+        """Test parsing of Fortran nudge export text file."""
+        from nos_utils.interp.precomputed_weights import load_remesh_export
+
+        export_path = tmp_path / "obc_nudge_remesh_export.txt"
+        with open(export_path, "w") as f:
+            f.write("## OBC_NUDGE_REMESH_EXPORT_V1\n")
+            f.write("## n_target=       3\n")
+            f.write("## n_source_total=       7\n")
+            f.write("## n_source_data=       3\n")
+            f.write("## corner_mean=  1.5000000000000000E+01\n")
+            f.write("## SOURCE_POINTS\n")
+            f.write("## idx lon lat is_corner\n")
+            # 4 corners + 3 data points
+            f.write("       1  -8.0800000000000000E+01   2.8900000000000000E+01  1\n")
+            f.write("       2  -8.0800000000000000E+01   3.5100000000000000E+01  1\n")
+            f.write("       3  -6.9200000000000000E+01   3.5100000000000000E+01  1\n")
+            f.write("       4  -6.9200000000000000E+01   2.8900000000000000E+01  1\n")
+            f.write("       5  -7.8000000000000000E+01   3.0000000000000000E+01  0\n")
+            f.write("       6  -7.6000000000000000E+01   3.2000000000000000E+01  0\n")
+            f.write("       7  -7.4000000000000000E+01   3.4000000000000000E+01  0\n")
+            f.write("## TARGET_MAPPING\n")
+            f.write("## target idx1 idx2 idx3 w1 w2 w3 mode donor\n")
+            f.write("       1       5       6       7   3.3333333333333331E-01   3.3333333333333331E-01   3.3333333333333337E-01  0      -1\n")
+            f.write("       2       5       6       3   5.0000000000000000E-01   2.5000000000000000E-01   2.5000000000000000E-01  1      -1\n")
+            f.write("       3       5       6       7   0.0000000000000000E+00   0.0000000000000000E+00   0.0000000000000000E+00  2       1\n")
+
+        result = load_remesh_export(export_path)
+
+        assert len(result["source_lon"]) == 7
+        assert len(result["source_lat"]) == 7
+        assert result["source_is_corner"].sum() == 4
+        assert result["target_idx"].shape == (3, 3)
+        assert result["weights"].shape == (3, 3)
+        assert result["mode"].tolist() == [0, 1, 2]
+        assert result["donor"].tolist() == [-1, -1, 1]
+
+    def test_apply_precomputed_nudge_basic(self, tmp_path):
+        """Test apply_precomputed_nudge with a synthetic NPZ."""
+        from nos_utils.interp.precomputed_weights import apply_precomputed_nudge
+
+        # Create a simple 10x10 grid
+        ny, nx = 10, 10
+        lon_1d = np.linspace(-80, -70, nx)
+        lat_1d = np.linspace(28, 36, ny)
+        lon_2d, lat_2d = np.meshgrid(lon_1d, lat_1d)
+
+        # Create a field with known values
+        field = np.arange(ny * nx, dtype=np.float64).reshape(ny, nx)
+
+        # Synthetic NPZ: 5 target nodes, each maps to 3 grid cells
+        n_target = 5
+        npz = {
+            "vertex_flat_idx": np.array([
+                [11, 12, 21],
+                [22, 23, 32],
+                [33, 34, 43],
+                [44, 45, 54],
+                [55, 56, 65],
+            ], dtype=np.int32),
+            "vertex_is_corner": np.zeros((n_target, 3), dtype=bool),
+            "source_data_flat_idx": np.arange(100, dtype=np.int32),
+            "weights": np.array([
+                [0.5, 0.3, 0.2],
+                [0.4, 0.4, 0.2],
+                [0.33, 0.34, 0.33],
+                [0.25, 0.50, 0.25],
+                [0.6, 0.2, 0.2],
+            ], dtype=np.float64),
+            "mode": np.array([0, 0, 0, 0, 0], dtype=np.int32),
+            "donor": np.array([-1, -1, -1, -1, -1], dtype=np.int32),
+            "grid_shape": np.array([ny, nx], dtype=np.int32),
+            "grid_hash": np.array(["test_hash"]),
+            "corner_mean_export": np.float64(0.0),
+            "n_target": np.int32(n_target),
+            "n_source_data": np.int32(100),
+        }
+
+        result = apply_precomputed_nudge(npz, field)
+
+        assert result.shape == (n_target,)
+        assert result.dtype == np.float32
+
+        # Verify first target: 0.5*field[1,1] + 0.3*field[1,2] + 0.2*field[2,1]
+        expected_0 = 0.5 * field.ravel()[11] + 0.3 * field.ravel()[12] + 0.2 * field.ravel()[21]
+        np.testing.assert_almost_equal(result[0], expected_0, decimal=5)
+
+    def test_apply_precomputed_nudge_with_fallback(self, tmp_path):
+        """Test that mode=2 nodes copy from their donor."""
+        from nos_utils.interp.precomputed_weights import apply_precomputed_nudge
+
+        ny, nx = 5, 5
+        field = np.full((ny, nx), 20.0, dtype=np.float64)
+
+        npz = {
+            "vertex_flat_idx": np.array([
+                [5, 6, 10],
+                [5, 6, 10],  # Donor for node 2 (mode=2)
+            ], dtype=np.int32),
+            "vertex_is_corner": np.zeros((2, 3), dtype=bool),
+            "source_data_flat_idx": np.arange(25, dtype=np.int32),
+            "weights": np.array([
+                [0.5, 0.3, 0.2],
+                [0.0, 0.0, 0.0],  # All zero weights — mode=2 copies from donor
+            ], dtype=np.float64),
+            "mode": np.array([0, 2], dtype=np.int32),
+            "donor": np.array([-1, 0], dtype=np.int32),  # node 1 copies from node 0
+            "grid_shape": np.array([ny, nx], dtype=np.int32),
+            "grid_hash": np.array(["test"]),
+            "corner_mean_export": np.float64(0.0),
+            "n_target": np.int32(2),
+            "n_source_data": np.int32(25),
+        }
+
+        result = apply_precomputed_nudge(npz, field)
+
+        # Node 1 (mode=2) should equal node 0
+        np.testing.assert_almost_equal(result[1], result[0], decimal=5)
+
+    def test_apply_precomputed_nudge_nan_handling(self, tmp_path):
+        """NaN source values should not propagate to output."""
+        from nos_utils.interp.precomputed_weights import apply_precomputed_nudge
+
+        ny, nx = 5, 5
+        field = np.full((ny, nx), 20.0, dtype=np.float64)
+        field[0, :] = np.nan  # First row is NaN (land)
+
+        npz = {
+            "vertex_flat_idx": np.array([
+                [6, 7, 11],  # All ocean (row 1+)
+                [1, 2, 6],   # idx 1,2 are NaN (row 0)
+            ], dtype=np.int32),
+            "vertex_is_corner": np.zeros((2, 3), dtype=bool),
+            "source_data_flat_idx": np.arange(5, 25, dtype=np.int32),  # skip row 0
+            "weights": np.array([
+                [0.5, 0.3, 0.2],
+                [0.3, 0.3, 0.4],
+            ], dtype=np.float64),
+            "mode": np.array([0, 0], dtype=np.int32),
+            "donor": np.array([-1, -1], dtype=np.int32),
+            "grid_shape": np.array([ny, nx], dtype=np.int32),
+            "grid_hash": np.array(["test"]),
+            "corner_mean_export": np.float64(0.0),
+            "n_target": np.int32(2),
+            "n_source_data": np.int32(20),
+        }
+
+        result = apply_precomputed_nudge(npz, field)
+
+        # All results should be finite (NaN replaced with corner_mean=20.0)
+        assert np.all(np.isfinite(result))
+
+    def test_apply_precomputed_nudge_shape_mismatch(self):
+        """Should raise ValueError on grid shape mismatch."""
+        from nos_utils.interp.precomputed_weights import apply_precomputed_nudge
+
+        npz = {
+            "grid_shape": np.array([10, 20], dtype=np.int32),
+        }
+        field = np.zeros((5, 5))
+
+        with pytest.raises(ValueError, match="Grid shape mismatch"):
+            apply_precomputed_nudge(npz, field)
+
+    def test_build_nudge_npz(self, tmp_path):
+        """Test building NPZ from an export text file."""
+        scipy = pytest.importorskip("scipy")
+        from nos_utils.interp.precomputed_weights import build_nudge_npz
+
+        # Create synthetic RTOFS grid
+        ny, nx = 20, 30
+        lon_1d = np.linspace(-80, -70, nx)
+        lat_1d = np.linspace(28, 36, ny)
+        rtofs_lon, rtofs_lat = np.meshgrid(lon_1d, lat_1d)
+
+        # Create a synthetic export file
+        # Pick 3 ocean source points that exist on the grid
+        src_lons = [lon_1d[5], lon_1d[10], lon_1d[15]]
+        src_lats = [lat_1d[5], lat_1d[10], lat_1d[15]]
+
+        export_path = tmp_path / "obc_nudge_remesh_export.txt"
+        with open(export_path, "w") as f:
+            f.write("## OBC_NUDGE_REMESH_EXPORT_V1\n")
+            f.write("## n_target=       2\n")
+            f.write("## n_source_total=       7\n")
+            f.write("## n_source_data=       3\n")
+            f.write("## corner_mean=  2.0000000000000000E+01\n")
+            f.write("## SOURCE_POINTS\n")
+            f.write("## idx lon lat is_corner\n")
+            # 4 corners (target bounding box + padding)
+            f.write(f"       1  {-78.1:25.16E}  {29.9:25.16E}  1\n")
+            f.write(f"       2  {-78.1:25.16E}  {34.1:25.16E}  1\n")
+            f.write(f"       3  {-71.9:25.16E}  {34.1:25.16E}  1\n")
+            f.write(f"       4  {-71.9:25.16E}  {29.9:25.16E}  1\n")
+            # 3 ocean points
+            for i, (slon, slat) in enumerate(zip(src_lons, src_lats)):
+                f.write(f"       {i+5}  {slon:25.16E}  {slat:25.16E}  0\n")
+            f.write("## TARGET_MAPPING\n")
+            f.write("## target idx1 idx2 idx3 w1 w2 w3 mode donor\n")
+            f.write("       1       5       6       7   4.0000000000000000E-01   3.0000000000000000E-01   3.0000000000000000E-01  0      -1\n")
+            f.write("       2       5       6       7   2.0000000000000000E-01   5.0000000000000000E-01   3.0000000000000000E-01  0      -1\n")
+
+        out_npz = tmp_path / "test.obc_nudge_weights.npz"
+        build_nudge_npz(export_path, rtofs_lon, rtofs_lat, out_npz)
+
+        assert out_npz.exists()
+
+        data = dict(np.load(str(out_npz)))
+        assert int(data["n_target"]) == 2
+        assert int(data["n_source_data"]) == 3
+        assert data["weights"].shape == (2, 3)
+        assert data["vertex_flat_idx"].shape == (2, 3)
+        assert data["mode"].shape == (2,)
+
+    def test_find_nudge_weights_from_env(self, secofs_config, tmp_path):
+        """Test _find_nudge_weights discovers NPZ from FIXofs."""
+        # Create a dummy NPZ
+        npz_path = tmp_path / "secofs.obc_nudge_weights.npz"
+        np.savez(str(npz_path), n_target=np.int32(100))
+
+        proc = NudgingProcessor(secofs_config, tmp_path, tmp_path / "out")
+
+        import os
+        old_fix = os.environ.get("FIXofs")
+        try:
+            os.environ["FIXofs"] = str(tmp_path)
+            result = proc._find_nudge_weights()
+            assert result is not None
+            assert int(result["n_target"]) == 100
+        finally:
+            if old_fix is not None:
+                os.environ["FIXofs"] = old_fix
+            else:
+                os.environ.pop("FIXofs", None)
+
+    def test_find_nudge_weights_not_found(self, secofs_config, tmp_path):
+        """Returns None when no NPZ exists."""
+        proc = NudgingProcessor(secofs_config, tmp_path / "empty", tmp_path / "out")
+        # Clear any cached value
+        if hasattr(proc, '_nudge_weights_cache'):
+            delattr(proc, '_nudge_weights_cache')
+
+        import os
+        old_fix = os.environ.get("FIXofs")
+        try:
+            os.environ.pop("FIXofs", None)
+            os.environ.pop("FIXstofs3d", None)
+            result = proc._find_nudge_weights()
+            assert result is None
+        finally:
+            if old_fix is not None:
+                os.environ["FIXofs"] = old_fix
