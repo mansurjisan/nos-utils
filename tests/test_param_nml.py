@@ -48,7 +48,7 @@ class TestParamNmlProcessor:
         assert "start_year = 2026" in content
         assert "start_month = 04" in content
         assert "start_day = 01" in content
-        assert "start_hour = 6" in content
+        assert "start_hour = 06" in content  # zero-padded to match COMF Fortran
         # Placeholders should be gone
         assert "rnday_value" not in content
         assert "start_year_value" not in content

@@ -383,8 +383,17 @@ class NudgingProcessor(ForcingProcessor):
             )
 
         # --- 5. Temporal interpolation: 6-hourly RTOFS -> 3-hourly output ---
+        # Clip to simulation duration so output timesteps match COMF Fortran.
+        # Without clipping, raw RTOFS file count (e.g. 63) would produce far
+        # more timesteps than the actual simulation needs (e.g. 19 for 54h).
         rtofs_dt = 21600.0   # 6-hourly input
         target_dt = 10800.0  # 3-hourly output (matches COMF Fortran)
+
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+        sim_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
+        sim_duration = (sim_end - sim_start).total_seconds()
 
         for var_list in [all_temp, all_salt]:
             if len(var_list) > 1:
@@ -394,7 +403,9 @@ class NudgingProcessor(ForcingProcessor):
                     rtofs_times = np.arange(n_in) * rtofs_dt
                     n_out = int((n_in - 1) * rtofs_dt / target_dt) + 1
                     target_times = np.arange(n_out) * target_dt
-                    target_times = target_times[target_times <= rtofs_times[-1]]
+                    target_times = target_times[
+                        target_times <= min(rtofs_times[-1], sim_duration)
+                    ]
 
                     stacked = np.stack(var_list, axis=0)
                     interp_out = np.zeros(
@@ -411,7 +422,8 @@ class NudgingProcessor(ForcingProcessor):
                     var_list.clear()
                     var_list.extend([interp_out[t] for t in range(len(target_times))])
                     log.info(f"Temporally interpolated nudge field: "
-                             f"{n_in} -> {len(target_times)} steps")
+                             f"{n_in} -> {len(target_times)} steps "
+                             f"(sim_duration={sim_duration:.0f}s)")
                 except ImportError:
                     pass
 
