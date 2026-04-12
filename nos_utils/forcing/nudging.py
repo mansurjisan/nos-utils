@@ -257,13 +257,16 @@ class NudgingProcessor(ForcingProcessor):
     def _process_python(self) -> ForcingResult:
         """Python implementation: interpolate RTOFS T/S to interior nudging nodes.
 
-        Steps:
+        Optimized pipeline:
         1. Read nudge weight file to identify nodes with weight > 0
-        2. Find RTOFS 3D files using same discovery as RTOFSProcessor
-        3. For each RTOFS timestep and depth level, interpolate T/S to nudge nodes
+        2. Find RTOFS 3D files with simulation time-window filtering
+           (reduces ~32 raw files to ~10, matching OBC behavior)
+        3. Precompute Delaunay interpolation weights ONCE from surface level,
+           then apply via gather+multiply for all depth levels and files
         4. Vertically interpolate from RTOFS depth levels to SCHISM sigma levels
-        5. Filter to nodes with valid RTOFS coverage
-        6. Write TEM_nu.nc and SAL_nu.nc in COMF format
+        5. Vectorized temporal interpolation (numpy, no per-node loop)
+        6. Filter to nodes with valid RTOFS coverage
+        7. Write TEM_nu.nc and SAL_nu.nc in COMF format
         """
         from .rtofs import RTOFSProcessor
 
@@ -280,12 +283,29 @@ class NudgingProcessor(ForcingProcessor):
         n_nudge = len(nudge_node_ids)
         log.info(f"Nudging candidate nodes: {n_nudge:,}")
 
-        # --- 2. Find RTOFS 3D files ---
+        # --- 2. Find RTOFS 3D files (with time-window filtering) ---
+        # Nudging doesn't need more temporal resolution than OBC — it's a
+        # slowly-varying relaxation field. We filter files to the simulation
+        # window (nowcast_start to forecast_end) plus a 6h buffer, matching
+        # the OBC time-window approach. This typically reduces ~32 raw files
+        # to ~10, cutting I/O and interpolation time proportionally.
         rtofs_root = self.rtofs_input_path or self.input_path
         rtofs_proc = RTOFSProcessor(
             self.config, rtofs_root, self.output_path,
+            phase="nowcast",   # enables time-window filtering
         )
         _, files_3d = rtofs_proc.find_input_files_by_type()
+
+        if not files_3d:
+            # Retry without phase filtering as fallback (e.g., when RTOFS
+            # cycle date doesn't align with simulation window in test data)
+            rtofs_proc_nophase = RTOFSProcessor(
+                self.config, rtofs_root, self.output_path,
+            )
+            _, files_3d = rtofs_proc_nophase.find_input_files_by_type()
+            # Transfer the cycle date for valid-time calculation
+            if hasattr(rtofs_proc_nophase, '_rtofs_cycle_date'):
+                rtofs_proc._rtofs_cycle_date = rtofs_proc_nophase._rtofs_cycle_date
 
         if not files_3d:
             return ForcingResult(
@@ -303,10 +323,11 @@ class NudgingProcessor(ForcingProcessor):
         if vgrid and vgrid._filepath is not None:
             vgrid.load_boundary_sigma(nudge_node_ids.tolist())
 
-        # --- 4. Interpolate RTOFS to nudge nodes ---
-        # Set up the interpolator state on rtofs_proc so we can reuse
-        # _interpolate_2d_to_boundary. We temporarily point its boundary
-        # arrays at our nudge nodes.
+        # --- 4. Interpolate RTOFS to nudge nodes (optimized) ---
+        # Instead of calling _interpolate_2d_to_boundary per depth level
+        # (which rebuilds/evaluates the Delaunay triangulation each time),
+        # we precompute interpolation weights once from the surface level
+        # and reuse them for all levels and files via simple indexed ops.
         rtofs_proc._bnd_lons = nudge_lons
         rtofs_proc._bnd_lats = nudge_lats
         rtofs_proc._bnd_depths = nudge_depths
@@ -316,7 +337,10 @@ class NudgingProcessor(ForcingProcessor):
         all_temp = []
         all_salt = []
 
-        for f in files_3d:
+        # Precomputed weight state: computed once from first file's surface
+        interp_weights = None  # Will hold _NudgeInterpWeights
+
+        for fi, f in enumerate(files_3d):
             try:
                 ds = Dataset(str(f))
                 lon = ds.variables.get("Longitude") or ds.variables.get("lon")
@@ -352,15 +376,37 @@ class NudgingProcessor(ForcingProcessor):
                     for t in range(n_times):
                         data_t = data[t]
 
-                        # Interpolate each RTOFS depth level to nudge nodes
-                        bnd_profile_rtofs = np.full(
-                            (n_nudge, n_rtofs_levels), np.nan, dtype=np.float32,
-                        )
-                        for lev in range(min(n_rtofs_levels, data_t.shape[0])):
-                            bnd_profile_rtofs[:, lev] = \
-                                rtofs_proc._interpolate_2d_to_boundary(
-                                    lon_arr, lat_arr, data_t[lev],
+                        # Build interpolation weights from the first
+                        # valid surface slice, then reuse for everything.
+                        if interp_weights is None:
+                            interp_weights = self._build_interp_weights(
+                                lon_arr, lat_arr, data_t[0],
+                                nudge_lons, nudge_lats,
+                            )
+                            if interp_weights is not None:
+                                log.info(
+                                    f"Precomputed nudge interp weights: "
+                                    f"{interp_weights.n_source} ocean pts "
+                                    f"-> {n_nudge} target pts "
+                                    f"(grid {lon_arr.shape})"
                                 )
+
+                        if interp_weights is not None:
+                            bnd_profile_rtofs = self._apply_weights_all_levels(
+                                interp_weights, data_t,
+                                n_nudge, n_rtofs_levels,
+                            )
+                        else:
+                            # Fallback: use RTOFSProcessor per-level interp
+                            bnd_profile_rtofs = np.full(
+                                (n_nudge, n_rtofs_levels), np.nan,
+                                dtype=np.float32,
+                            )
+                            for lev in range(min(n_rtofs_levels, data_t.shape[0])):
+                                bnd_profile_rtofs[:, lev] = \
+                                    rtofs_proc._interpolate_2d_to_boundary(
+                                        lon_arr, lat_arr, data_t[lev],
+                                    )
 
                         # Vertically interpolate to SCHISM levels
                         if vgrid and n_levels != n_rtofs_levels:
@@ -384,8 +430,6 @@ class NudgingProcessor(ForcingProcessor):
 
         # --- 5. Temporal interpolation: 6-hourly RTOFS -> 3-hourly output ---
         # Clip to simulation duration so output timesteps match COMF Fortran.
-        # Without clipping, raw RTOFS file count (e.g. 63) would produce far
-        # more timesteps than the actual simulation needs (e.g. 19 for 54h).
         rtofs_dt = 21600.0   # 6-hourly input
         target_dt = 10800.0  # 3-hourly output (matches COMF Fortran)
 
@@ -397,35 +441,59 @@ class NudgingProcessor(ForcingProcessor):
 
         for var_list in [all_temp, all_salt]:
             if len(var_list) > 1:
-                try:
-                    from scipy.interpolate import interp1d
-                    n_in = len(var_list)
-                    rtofs_times = np.arange(n_in) * rtofs_dt
-                    n_out = int((n_in - 1) * rtofs_dt / target_dt) + 1
-                    target_times = np.arange(n_out) * target_dt
-                    target_times = target_times[
-                        target_times <= min(rtofs_times[-1], sim_duration)
-                    ]
+                n_in = len(var_list)
+                rtofs_times = np.arange(n_in) * rtofs_dt
+                n_out = int((n_in - 1) * rtofs_dt / target_dt) + 1
+                target_times = np.arange(n_out) * target_dt
+                target_times = target_times[
+                    target_times <= min(rtofs_times[-1], sim_duration)
+                ]
 
-                    stacked = np.stack(var_list, axis=0)
-                    interp_out = np.zeros(
-                        (len(target_times),) + stacked.shape[1:], dtype=np.float32,
+                stacked = np.stack(var_list, axis=0)  # (n_in, n_nodes, n_levels)
+
+                # Vectorized temporal interpolation using numpy.
+                # Reshape to (n_in, n_nodes*n_levels), interp along axis 0,
+                # then reshape back. np.interp is 1-D, so we transpose and
+                # use a single apply_along_axis-free loop over the flat dim.
+                orig_shape = stacked.shape[1:]  # (n_nodes, n_levels)
+                flat = stacked.reshape(n_in, -1)  # (n_in, N)
+                n_flat = flat.shape[1]
+                interp_out = np.empty(
+                    (len(target_times), n_flat), dtype=np.float32,
+                )
+                # np.interp is fast in C — one call per flat column is still
+                # much faster than scipy.interp1d per (node, level) pair,
+                # because we eliminated the Python overhead of 32K*63 interp1d
+                # constructor calls. For further speed, we vectorize by
+                # computing fractional indices and using linear combination.
+                if len(target_times) > 0 and n_in > 1:
+                    # Compute fractional indices into rtofs_times for each
+                    # target time. This avoids any scipy overhead.
+                    frac_idx = np.clip(
+                        target_times / rtofs_dt, 0, n_in - 1,
                     )
-                    for node in range(stacked.shape[1]):
-                        for lev in range(stacked.shape[2]):
-                            f_i = interp1d(
-                                rtofs_times, stacked[:, node, lev],
-                                kind="linear", fill_value="extrapolate",
-                            )
-                            interp_out[:, node, lev] = f_i(target_times)
+                    idx_lo = np.floor(frac_idx).astype(np.intp)
+                    idx_hi = np.minimum(idx_lo + 1, n_in - 1)
+                    alpha = (frac_idx - idx_lo).astype(np.float32)
 
-                    var_list.clear()
-                    var_list.extend([interp_out[t] for t in range(len(target_times))])
-                    log.info(f"Temporally interpolated nudge field: "
-                             f"{n_in} -> {len(target_times)} steps "
-                             f"(sim_duration={sim_duration:.0f}s)")
-                except ImportError:
-                    pass
+                    # Fully vectorized: gather + lerp
+                    # flat[idx_lo] has shape (n_target_times, N)
+                    val_lo = flat[idx_lo]  # (n_out, N)
+                    val_hi = flat[idx_hi]  # (n_out, N)
+                    interp_out[:] = val_lo + alpha[:, np.newaxis] * (val_hi - val_lo)
+                elif len(target_times) == 1:
+                    interp_out[0] = flat[0]
+
+                interp_out = interp_out.reshape(
+                    (len(target_times),) + orig_shape,
+                )
+                var_list.clear()
+                var_list.extend(
+                    [interp_out[t] for t in range(len(target_times))],
+                )
+                log.info(f"Temporally interpolated nudge field: "
+                         f"{n_in} -> {len(target_times)} steps "
+                         f"(sim_duration={sim_duration:.0f}s)")
 
         # --- 6. Filter to nodes with valid RTOFS coverage ---
         # A node is valid if it has non-NaN data at the surface level for the
@@ -486,6 +554,247 @@ class NudgingProcessor(ForcingProcessor):
                 "fortran_used": False,
             },
         )
+
+    # ------------------------------------------------------------------
+    # Precomputed-weight interpolation helpers
+    # ------------------------------------------------------------------
+
+    class _NudgeInterpWeights:
+        """Stores precomputed Delaunay interpolation weights.
+
+        Holds triangle vertex indices and barycentric weights for every
+        target node.  Applying these to a new data field is a simple
+        gather + weighted sum — no Delaunay evaluation needed.
+        """
+        __slots__ = (
+            "tri_indices",     # (n_target, 3) int — simplex vertex indices into aug_pts
+            "bary_weights",    # (n_target, 3) float32 — barycentric weights
+            "n_corners",       # int — number of prepended corner points
+            "n_source",        # int — number of ocean source points (excl. corners)
+            "domain_mask",     # (n_flat,) bool — mask selecting domain bbox pts
+            "ocean_mask_sub",  # (n_domain,) bool — ocean mask within domain subset
+            "nan_fill_idx",    # (n_nan,) int — indices of target pts that got NaN
+            "nan_donor_idx",   # (n_nan,) int — valid-target donor for each NaN pt
+        )
+
+        def __init__(self):
+            pass
+
+    def _build_interp_weights(
+        self,
+        rtofs_lon: np.ndarray,
+        rtofs_lat: np.ndarray,
+        surface_data: np.ndarray,
+        target_lons: np.ndarray,
+        target_lats: np.ndarray,
+    ) -> "_NudgeInterpWeights":
+        """Build Delaunay interpolation weights from a single 2D field.
+
+        This is called ONCE using the surface level of the first RTOFS
+        file.  It builds the Delaunay triangulation, locates every target
+        node's enclosing simplex, and stores the barycentric weights.
+
+        Subsequent calls to ``_apply_weights_all_levels`` use these
+        weights to interpolate any 2D field on the same grid in O(N)
+        time (indexed gather + weighted sum) instead of O(N log N)
+        Delaunay evaluation.
+
+        Returns None if scipy is unavailable or all data is masked.
+        """
+        try:
+            from scipy.spatial import Delaunay, cKDTree
+        except ImportError:
+            return None
+
+        target_pts = np.column_stack([target_lons, target_lats])
+
+        # Flatten RTOFS grid (same logic as _interpolate_2d_to_boundary)
+        # Ensure plain ndarray (not masked) for Delaunay
+        rtofs_lon_arr = np.ma.filled(np.asarray(rtofs_lon), fill_value=np.nan)
+        rtofs_lat_arr = np.ma.filled(np.asarray(rtofs_lat), fill_value=np.nan)
+        surface_arr = np.ma.filled(np.asarray(surface_data), fill_value=np.nan)
+
+        if rtofs_lon_arr.ndim == 2:
+            lon_flat = rtofs_lon_arr.ravel()
+            lat_flat = rtofs_lat_arr.ravel()
+        else:
+            lon_2d, lat_2d = np.meshgrid(rtofs_lon_arr, rtofs_lat_arr)
+            lon_flat = lon_2d.ravel()
+            lat_flat = lat_2d.ravel()
+
+        data_flat = surface_arr.ravel()
+        lon_flat = np.where(lon_flat > 180, lon_flat - 360, lon_flat)
+
+        # Domain bounding-box subset
+        buf = 1.0
+        lon_min = target_lons.min() - buf
+        lon_max = target_lons.max() + buf
+        lat_min = target_lats.min() - buf
+        lat_max = target_lats.max() + buf
+        domain_mask = (
+            (lon_flat >= lon_min) & (lon_flat <= lon_max) &
+            (lat_flat >= lat_min) & (lat_flat <= lat_max)
+        )
+
+        if int(np.sum(domain_mask)) == 0:
+            domain_mask = np.ones(len(lon_flat), dtype=bool)
+
+        lon_sub = lon_flat[domain_mask]
+        lat_sub = lat_flat[domain_mask]
+        data_sub = data_flat[domain_mask]
+
+        ocean_mask_sub = (np.abs(data_sub) < 99.0) & np.isfinite(data_sub)
+        n_ocean = int(np.sum(ocean_mask_sub))
+        if n_ocean == 0:
+            return None
+
+        ocean_lon = lon_sub[ocean_mask_sub]
+        ocean_lat = lat_sub[ocean_mask_sub]
+        ocean_val = data_sub[ocean_mask_sub].astype(np.float32)
+
+        # Corner points (matching Fortran REMESH mode=0)
+        avg_val = float(np.mean(ocean_val))
+        tgt_lon_min, tgt_lon_max = target_pts[:, 0].min(), target_pts[:, 0].max()
+        tgt_lat_min, tgt_lat_max = target_pts[:, 1].min(), target_pts[:, 1].max()
+        lon_pad = 0.01 * (tgt_lon_max - tgt_lon_min)
+        lat_pad = 0.01 * (tgt_lat_max - tgt_lat_min)
+        corner_pts = np.array([
+            [tgt_lon_min - lon_pad, tgt_lat_min - lat_pad],
+            [tgt_lon_min - lon_pad, tgt_lat_max + lat_pad],
+            [tgt_lon_max + lon_pad, tgt_lat_max + lat_pad],
+            [tgt_lon_max + lon_pad, tgt_lat_min - lat_pad],
+        ], dtype=np.float64)
+        n_corners = 4
+
+        aug_pts = np.vstack([corner_pts, np.column_stack([ocean_lon, ocean_lat])])
+        aug_vals = np.concatenate([
+            np.full(n_corners, avg_val, dtype=np.float32), ocean_val,
+        ])
+
+        # Build Delaunay and find simplices
+        tri = Delaunay(aug_pts)
+        simplex_ids = tri.find_simplex(target_pts)
+
+        # Compute barycentric coordinates for each target point
+        n_target = len(target_pts)
+        tri_indices = np.zeros((n_target, 3), dtype=np.intp)
+        bary_weights = np.zeros((n_target, 3), dtype=np.float32)
+
+        valid_simplex = simplex_ids >= 0
+        if np.any(valid_simplex):
+            vs = valid_simplex
+            s_ids = simplex_ids[vs]
+            verts = tri.simplices[s_ids]  # (n_valid, 3) indices into aug_pts
+            tri_indices[vs] = verts
+
+            # Barycentric weights via transform
+            # For each target point p in simplex s:
+            #   bary[0:2] = T_inv @ (p - r3)
+            #   bary[2]   = 1 - bary[0] - bary[1]
+            T_inv = tri.transform[s_ids, :2]     # (n_valid, 2, 2)
+            r3 = tri.transform[s_ids, 2]         # (n_valid, 2)
+            dp = target_pts[vs] - r3             # (n_valid, 2)
+            b = np.einsum('ijk,ik->ij', T_inv, dp)  # (n_valid, 2)
+            bary_weights[vs, 0] = b[:, 0]
+            bary_weights[vs, 1] = b[:, 1]
+            bary_weights[vs, 2] = 1.0 - b[:, 0] - b[:, 1]
+
+        # Handle NaN targets (outside convex hull) — fill from nearest
+        # valid boundary node (same as _interpolate_2d_to_boundary)
+        nan_fill_idx = np.array([], dtype=np.intp)
+        nan_donor_idx = np.array([], dtype=np.intp)
+        nan_mask = ~valid_simplex
+        if np.any(nan_mask):
+            valid_tgt = np.where(valid_simplex)[0]
+            if len(valid_tgt) > 0:
+                nan_tgt = np.where(nan_mask)[0]
+                mean_lat = np.radians(np.mean(target_lats))
+                corrected = target_pts.copy()
+                corrected[:, 0] *= np.cos(mean_lat)
+                bnd_tree = cKDTree(corrected[valid_tgt])
+                _, nn = bnd_tree.query(corrected[nan_tgt])
+                nan_fill_idx = nan_tgt
+                nan_donor_idx = valid_tgt[nn]
+
+        w = NudgingProcessor._NudgeInterpWeights()
+        w.tri_indices = tri_indices
+        w.bary_weights = bary_weights
+        w.n_corners = n_corners
+        w.n_source = n_ocean
+        w.domain_mask = domain_mask
+        w.ocean_mask_sub = ocean_mask_sub
+        w.nan_fill_idx = nan_fill_idx
+        w.nan_donor_idx = nan_donor_idx
+        return w
+
+    def _apply_weights_all_levels(
+        self,
+        weights: "_NudgeInterpWeights",
+        data_3d: np.ndarray,
+        n_target: int,
+        n_levels: int,
+    ) -> np.ndarray:
+        """Apply precomputed interpolation weights to all depth levels.
+
+        For each level:
+        1. Flatten + domain subset + ocean mask the RTOFS field
+        2. Prepend corner values (field mean)
+        3. Gather vertex values using tri_indices
+        4. Weighted sum using bary_weights
+
+        This is O(n_levels * n_target) with very small constants —
+        no Delaunay evaluation, no scipy calls.
+
+        Args:
+            weights: Precomputed from ``_build_interp_weights``
+            data_3d: (n_levels, ny, nx) or (n_levels, n_flat) RTOFS field
+            n_target: Number of nudge target nodes
+            n_levels: Number of RTOFS depth levels
+
+        Returns:
+            (n_target, n_levels) float32 array
+        """
+        result = np.full((n_target, n_levels), np.nan, dtype=np.float32)
+        tri_idx = weights.tri_indices     # (n_target, 3)
+        bary_w = weights.bary_weights     # (n_target, 3)
+        n_corners = weights.n_corners
+        domain_mask = weights.domain_mask
+        ocean_mask_sub = weights.ocean_mask_sub
+
+        for lev in range(min(n_levels, data_3d.shape[0])):
+            data_2d = data_3d[lev]
+            data_flat = data_2d.ravel()
+            data_sub = data_flat[domain_mask]
+
+            # Ocean values within domain subset
+            ocean_val = data_sub[ocean_mask_sub].astype(np.float32)
+            # Mask land/fill
+            bad = (np.abs(ocean_val) >= 99.0) | ~np.isfinite(ocean_val)
+            ocean_val[bad] = np.nan
+
+            # Augmented values: corners (mean) + ocean
+            finite_mask = np.isfinite(ocean_val)
+            if not np.any(finite_mask):
+                # Entire level is land — leave as NaN
+                continue
+            avg_val = float(np.nanmean(ocean_val))
+            aug_vals = np.empty(n_corners + len(ocean_val), dtype=np.float32)
+            aug_vals[:n_corners] = avg_val
+            aug_vals[n_corners:] = np.where(finite_mask, ocean_val, avg_val)
+
+            # Gather + weighted sum
+            v0 = aug_vals[tri_idx[:, 0]]
+            v1 = aug_vals[tri_idx[:, 1]]
+            v2 = aug_vals[tri_idx[:, 2]]
+            interp_vals = bary_w[:, 0] * v0 + bary_w[:, 1] * v1 + bary_w[:, 2] * v2
+
+            # Fill NaN targets from nearest valid target
+            if len(weights.nan_fill_idx) > 0:
+                interp_vals[weights.nan_fill_idx] = interp_vals[weights.nan_donor_idx]
+
+            result[:, lev] = interp_vals
+
+        return result
 
     def _load_nudge_nodes(self):
         """Load nudging node IDs, coordinates, and depths.
