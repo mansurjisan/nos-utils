@@ -142,6 +142,7 @@ class ForcingConfig:
             nowcast_hours=6, forecast_hours=48,
             met_num=2,
             obc_ssh_offset=1.25,  # Geoid-to-MSL datum offset for SECOFS
+            nudging_enabled=True,  # COMF Fortran generates TEM_nu/SAL_nu
         )
         defaults.update(overrides)
         return cls(**defaults)

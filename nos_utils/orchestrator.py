@@ -358,15 +358,27 @@ class PrepOrchestrator:
 
     def _run_nudging(self, output_dir: Path, phase: str = "nowcast",
                      time_hotstart=None) -> ForcingResult:
-        """Step 5b: T/S interior nudging (STOFS)."""
+        """Step 5b: T/S interior nudging (STOFS + SECOFS)."""
         from .forcing.nudging import NudgingProcessor
 
         # Nudging needs its own RTOFS data prep with nudge-specific ROI
         # (wider domain than OBC ROI — cannot reuse OBC TS_1.nc)
         input_dir = output_dir
         rtofs_path = self.paths.get("rtofs")
+
+        # Try to find nudge weight file from FIX directory
+        nudge_weight_file = None
+        fix_dir = self.paths.get("fix")
+        if fix_dir:
+            for pattern in ["*.nudge.gr3", "*.TEM_nudge.gr3"]:
+                matches = sorted(Path(fix_dir).glob(pattern))
+                if matches:
+                    nudge_weight_file = matches[0]
+                    break
+
         proc = NudgingProcessor(
             self.config, input_dir, output_dir,
+            nudge_weight_file=nudge_weight_file,
             rtofs_input_path=rtofs_path,
         )
         return proc.process()
