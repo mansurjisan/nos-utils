@@ -222,10 +222,12 @@ def apply_precomputed_ssh(npz: dict, ssh_2d: np.ndarray) -> np.ndarray:
     corner_mean = float(source_data.mean())
 
     # Gather vertex values: corner → mean, grid → flat[idx]
+    # Use np.clip to avoid negative index wrapping for corner vertices
+    safe_idx = np.clip(npz["vertex_flat_idx"], 0, len(flat) - 1)
     vals = np.where(
         npz["vertex_is_corner"],
         corner_mean,
-        flat[npz["vertex_flat_idx"]],
+        flat[safe_idx],
     )
 
     # Weighted sum
@@ -467,10 +469,12 @@ def apply_precomputed_nudge(
         corner_mean = float(fill_value)
 
     # Gather vertex values: corner -> mean, grid -> flat[idx]
+    # Use np.clip to avoid negative index wrapping for corner vertices
+    safe_idx = np.clip(npz["vertex_flat_idx"], 0, len(flat) - 1)
     vals = np.where(
         npz["vertex_is_corner"],
         corner_mean,
-        flat[npz["vertex_flat_idx"]],
+        flat[safe_idx],
     )
 
     # Replace NaN source values with corner_mean to avoid NaN propagation
