@@ -1058,12 +1058,14 @@ class RTOFSProcessor(ForcingProcessor):
         n_bnd = len(self._bnd_lons)
         n_levels = self._vgrid.nvrt if self._vgrid else self.config.n_levels
 
-        # Reuse SSH precomputed weights for T/S — same 1488 boundary nodes,
-        # same RTOFS source grid. apply_precomputed_ssh works on any 2D field.
+        # Try to reuse SSH precomputed weights for T/S — same 1488 boundary
+        # nodes but RTOFS 3D files may use a different grid (regional subset
+        # like US_east: 1710x742) than the global 2D grid (3298x4500).
+        # Only use weights if grid shapes match; otherwise fall back to Delaunay.
         ssh_weights = self._find_ssh_weights()
+        ssh_weights_for_3d = None  # set after first file validates grid shape
         if ssh_weights:
             from ..interp.precomputed_weights import apply_precomputed_ssh
-            log.info("Using precomputed REMESH weights for 3D T/S (same as SSH)")
 
         try:
             all_temp = []
@@ -1106,12 +1108,23 @@ class RTOFSProcessor(ForcingProcessor):
                     for t in range(n_times):
                         data_t = data[t]
 
+                        # Check if SSH weights match 3D grid (first time only)
+                        if ssh_weights and ssh_weights_for_3d is None:
+                            expected = tuple(ssh_weights["grid_shape"])
+                            actual = data_t.shape[1:]  # (levels, Y, X) → (Y, X)
+                            if len(actual) >= 2 and (actual[-2], actual[-1]) == expected:
+                                ssh_weights_for_3d = ssh_weights
+                                log.info("Using precomputed REMESH weights for 3D T/S (same grid as SSH)")
+                            else:
+                                ssh_weights_for_3d = False
+                                log.info(f"3D grid {actual} differs from SSH weights {expected} — using Delaunay for T/S")
+
                         # Interpolate each RTOFS depth level to boundary nodes
                         bnd_profile_rtofs = np.full((n_bnd, n_rtofs_levels), np.nan, dtype=np.float32)
                         for lev in range(min(n_rtofs_levels, data_t.shape[0])):
-                            if ssh_weights:
+                            if ssh_weights_for_3d and ssh_weights_for_3d is not False:
                                 bnd_profile_rtofs[:, lev] = apply_precomputed_ssh(
-                                    ssh_weights, data_t[lev])
+                                    ssh_weights_for_3d, data_t[lev])
                             else:
                                 bnd_profile_rtofs[:, lev] = self._interpolate_2d_to_boundary(
                                     lon_arr, lat_arr, data_t[lev]
