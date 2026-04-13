@@ -185,3 +185,127 @@ class TestRTOFSTimeAxis:
         assert real_span_h == 66.0
         assert old_bug_span_h == 276.0
         assert real_span_h < old_bug_span_h  # fix is smaller
+
+
+class TestRTOFSFind3DWeights:
+    """Test _find_3d_weights() discovery of precomputed 3D weight NPZ files."""
+
+    def test_find_3d_weights_from_fixofs(self, mock_config, tmp_path):
+        """Discovers 3D weights NPZ from FIXofs environment variable."""
+        import os
+
+        npz_path = tmp_path / "secofs.obc_3d_weights.npz"
+        np.savez(str(npz_path), grid_shape=np.array([1710, 742], dtype=np.int32))
+
+        proc = RTOFSProcessor(mock_config, tmp_path, tmp_path / "out")
+        old_fix = os.environ.get("FIXofs")
+        try:
+            os.environ["FIXofs"] = str(tmp_path)
+            if hasattr(proc, '_3d_weights_cache'):
+                delattr(proc, '_3d_weights_cache')
+            result = proc._find_3d_weights()
+            assert result is not None
+            assert tuple(result["grid_shape"]) == (1710, 742)
+        finally:
+            if old_fix is not None:
+                os.environ["FIXofs"] = old_fix
+            else:
+                os.environ.pop("FIXofs", None)
+
+    def test_find_3d_weights_from_fixstofs3d(self, mock_config, tmp_path):
+        """Discovers 3D weights NPZ from FIXstofs3d environment variable."""
+        import os
+
+        npz_path = tmp_path / "obc_3d_weights.npz"
+        np.savez(str(npz_path), grid_shape=np.array([1710, 742], dtype=np.int32))
+
+        proc = RTOFSProcessor(mock_config, tmp_path, tmp_path / "out")
+        old_fix = os.environ.get("FIXstofs3d")
+        old_fixofs = os.environ.get("FIXofs")
+        try:
+            os.environ.pop("FIXofs", None)
+            os.environ["FIXstofs3d"] = str(tmp_path)
+            if hasattr(proc, '_3d_weights_cache'):
+                delattr(proc, '_3d_weights_cache')
+            result = proc._find_3d_weights()
+            assert result is not None
+            assert tuple(result["grid_shape"]) == (1710, 742)
+        finally:
+            if old_fix is not None:
+                os.environ["FIXstofs3d"] = old_fix
+            else:
+                os.environ.pop("FIXstofs3d", None)
+            if old_fixofs is not None:
+                os.environ["FIXofs"] = old_fixofs
+            else:
+                os.environ.pop("FIXofs", None)
+
+    def test_find_3d_weights_from_input_path(self, mock_config, tmp_path):
+        """Discovers 3D weights NPZ from input_path directory."""
+        import os
+
+        npz_path = tmp_path / "secofs.obc_3d_weights.npz"
+        np.savez(str(npz_path), grid_shape=np.array([1710, 742], dtype=np.int32))
+
+        proc = RTOFSProcessor(mock_config, tmp_path, tmp_path / "out")
+        old_fix = os.environ.get("FIXofs")
+        old_stofs = os.environ.get("FIXstofs3d")
+        try:
+            os.environ.pop("FIXofs", None)
+            os.environ.pop("FIXstofs3d", None)
+            if hasattr(proc, '_3d_weights_cache'):
+                delattr(proc, '_3d_weights_cache')
+            result = proc._find_3d_weights()
+            assert result is not None
+        finally:
+            if old_fix is not None:
+                os.environ["FIXofs"] = old_fix
+            if old_stofs is not None:
+                os.environ["FIXstofs3d"] = old_stofs
+
+    def test_find_3d_weights_not_found(self, mock_config, tmp_path):
+        """Returns None when no 3D NPZ exists."""
+        import os
+
+        proc = RTOFSProcessor(mock_config, tmp_path / "empty", tmp_path / "out")
+        old_fix = os.environ.get("FIXofs")
+        old_stofs = os.environ.get("FIXstofs3d")
+        try:
+            os.environ.pop("FIXofs", None)
+            os.environ.pop("FIXstofs3d", None)
+            if hasattr(proc, '_3d_weights_cache'):
+                delattr(proc, '_3d_weights_cache')
+            result = proc._find_3d_weights()
+            assert result is None
+        finally:
+            if old_fix is not None:
+                os.environ["FIXofs"] = old_fix
+            if old_stofs is not None:
+                os.environ["FIXstofs3d"] = old_stofs
+
+    def test_find_3d_weights_cached(self, mock_config, tmp_path):
+        """Second call returns cached result without re-reading disk."""
+        import os
+
+        npz_path = tmp_path / "secofs.obc_3d_weights.npz"
+        np.savez(str(npz_path), grid_shape=np.array([1710, 742], dtype=np.int32))
+
+        proc = RTOFSProcessor(mock_config, tmp_path, tmp_path / "out")
+        old_fix = os.environ.get("FIXofs")
+        try:
+            os.environ["FIXofs"] = str(tmp_path)
+            if hasattr(proc, '_3d_weights_cache'):
+                delattr(proc, '_3d_weights_cache')
+            result1 = proc._find_3d_weights()
+            assert result1 is not None
+
+            # Remove file but cache should still return result
+            npz_path.unlink()
+            result2 = proc._find_3d_weights()
+            assert result2 is not None
+            assert result2 is result1
+        finally:
+            if old_fix is not None:
+                os.environ["FIXofs"] = old_fix
+            else:
+                os.environ.pop("FIXofs", None)

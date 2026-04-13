@@ -1,5 +1,5 @@
 """
-Precomputed INTERP_REMESH weight replay for SSH and nudging interpolation.
+Precomputed INTERP_REMESH weight replay for SSH, 3D T/S, and nudging interpolation.
 
 Uses weights exported from the Fortran INTERP_REMESH subroutine to
 produce numerically equivalent interpolation without Delaunay
@@ -8,9 +8,15 @@ files in the FIX directory.
 
 SSH weights (obc_ssh_weights.npz):
     1488 boundary nodes for elev2D.th.nc
+    Source grid: global RTOFS 2D (3298x4500)
+
+3D weights (obc_3d_weights.npz):
+    1488 boundary nodes for TEM_3D.th.nc / SAL_3D.th.nc
+    Source grid: regional RTOFS 3D (e.g., US_east 1710x742)
 
 Nudge weights (obc_nudge_weights.npz):
     ~32K interior nodes for TEM_nu.nc / SAL_nu.nc
+    Source grid: global RTOFS 2D (3298x4500)
 
 Runtime:
 1. First call: KDTree maps source coordinates to RTOFS grid cells (cached)
@@ -327,6 +333,97 @@ def build_nudge_npz(
     )
 
     log.info(f"Built NUDGE weight NPZ: {len(exp['mode'])} targets, "
+             f"{len(source_data_flat_idx)} source cells, "
+             f"max dist={dist.max():.2e}, hash={grid_hash}")
+
+
+def build_3d_npz(
+    export_txt: Path,
+    rtofs_lon_2d: np.ndarray,
+    rtofs_lat_2d: np.ndarray,
+    out_npz: Path,
+    tol: float = 0.01,
+) -> None:
+    """
+    One-time conversion: 3D T/S export text -> production .npz with grid indices.
+
+    The export text has the same format as the SSH and nudge exports
+    (produced by INTERP_REMESH with TS3D_REMESH_ACTIVE), but uses the
+    regional RTOFS 3D grid (e.g., US_east 1710x742) instead of the
+    global 2D grid (3298x4500). Target nodes are the same 1488 boundary
+    nodes as SSH.
+
+    Args:
+        export_txt: Path to obc_3d_remesh_export.txt
+        rtofs_lon_2d: RTOFS 3D regional longitude array (ny, nx)
+        rtofs_lat_2d: RTOFS 3D regional latitude array (ny, nx)
+        out_npz: Output NPZ path
+        tol: Max allowed distance (degrees) for source-to-grid matching
+    """
+    exp = load_remesh_export(export_txt)
+
+    lon = np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d)
+    lat = rtofs_lat_2d
+    flat_lon = lon.ravel()
+    flat_lat = lat.ravel()
+
+    src_lon = exp["source_lon"]
+    src_lat = exp["source_lat"]
+    is_corner = exp["source_is_corner"]
+
+    # Map non-corner source points to nearest RTOFS grid cell
+    tree = cKDTree(np.column_stack([flat_lon, flat_lat]))
+    ocean_src = np.column_stack([src_lon[~is_corner], src_lat[~is_corner]])
+    dist, flat_idx = tree.query(ocean_src)
+
+    if np.any(dist > tol):
+        bad = np.where(dist > tol)[0]
+        raise ValueError(
+            f"{len(bad)} source points exceed tol={tol}; "
+            f"max dist={dist.max():.6f} at source idx {bad[0]}"
+        )
+
+    if len(np.unique(flat_idx)) < len(flat_idx):
+        n_dup = len(flat_idx) - len(np.unique(flat_idx))
+        log.warning(f"{n_dup} source points map to duplicate grid cells "
+                    f"(expected for ocean-filtered subset)")
+
+    # Build canonical flat index for all source points
+    source_flat_idx = np.full(len(src_lon), -1, dtype=np.int32)
+    source_flat_idx[~is_corner] = flat_idx.astype(np.int32)
+
+    # Map target vertices to flat grid indices
+    vertex_src = exp["target_idx"] - 1  # 1-based to 0-based
+    vertex_flat_idx = source_flat_idx[vertex_src]
+    vertex_is_corner = vertex_flat_idx < 0
+
+    # Donor: 1-based to 0-based
+    donor0 = np.where(exp["donor"] > 0, exp["donor"] - 1, -1).astype(np.int32)
+
+    # Grid identity checksum
+    lon_canon = np.ascontiguousarray(lon, dtype=np.float64)
+    lat_canon = np.ascontiguousarray(lat, dtype=np.float64)
+    grid_hash = hashlib.md5(lon_canon.tobytes() + lat_canon.tobytes()).hexdigest()
+
+    # Source data flat indices
+    source_data_flat_idx = source_flat_idx[~is_corner].astype(np.int32)
+
+    np.savez(
+        str(out_npz),
+        vertex_flat_idx=vertex_flat_idx.astype(np.int32),
+        vertex_is_corner=vertex_is_corner,
+        source_data_flat_idx=source_data_flat_idx,
+        weights=exp["weights"],
+        mode=exp["mode"],
+        donor=donor0,
+        grid_shape=np.array(lon.shape, dtype=np.int32),
+        grid_hash=np.array([grid_hash]),
+        corner_mean_export=np.float64(float(exp["metadata"].get("corner_mean", "0"))),
+        n_target=np.int32(len(exp["mode"])),
+        n_source_data=np.int32(int(exp["metadata"].get("n_source_data", "0"))),
+    )
+
+    log.info(f"Built 3D weight NPZ: {len(exp['mode'])} targets, "
              f"{len(source_data_flat_idx)} source cells, "
              f"max dist={dist.max():.2e}, hash={grid_hash}")
 

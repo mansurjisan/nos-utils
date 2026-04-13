@@ -911,6 +911,45 @@ class RTOFSProcessor(ForcingProcessor):
         self._ssh_weights_cache = None
         return None
 
+    def _find_3d_weights(self) -> Optional[dict]:
+        """Find and load precomputed 3D REMESH weights for regional RTOFS grid.
+
+        The 3D RTOFS files (TEM_3D, SAL_3D) use a regional subset grid
+        (e.g., US_east: 1710x742) which differs from the global 2D grid
+        (3298x4500) used for SSH. This method searches for a separate
+        NPZ with weights matching the regional grid.
+        """
+        if hasattr(self, '_3d_weights_cache'):
+            return self._3d_weights_cache
+
+        import os
+        search_names = [
+            "secofs.obc_3d_weights.npz",
+            "obc_3d_weights.npz",
+        ]
+        for env_var in ["FIXofs", "FIXstofs3d"]:
+            fix_dir = os.environ.get(env_var)
+            if not fix_dir:
+                continue
+            for name in search_names:
+                path = Path(fix_dir) / name
+                if path.exists():
+                    self._3d_weights_cache = dict(np.load(str(path), allow_pickle=True))
+                    log.info(f"Loaded precomputed 3D weights from {path}")
+                    return self._3d_weights_cache
+
+        # Also check input_path and parent directories (for testing)
+        for search_dir in [self.input_path, self.input_path.parent]:
+            for name in search_names:
+                path = search_dir / name
+                if path.exists():
+                    self._3d_weights_cache = dict(np.load(str(path), allow_pickle=True))
+                    log.info(f"Loaded precomputed 3D weights from {path}")
+                    return self._3d_weights_cache
+
+        self._3d_weights_cache = None
+        return None
+
     def _process_2d(self, files_2d: List[Path]) -> Optional[Path]:
         """Extract SSH from RTOFS 2D files, interpolate to boundary nodes."""
         output_file = self.output_path / "elev2D.th.nc"
@@ -1058,14 +1097,17 @@ class RTOFSProcessor(ForcingProcessor):
         n_bnd = len(self._bnd_lons)
         n_levels = self._vgrid.nvrt if self._vgrid else self.config.n_levels
 
-        # Try to reuse SSH precomputed weights for T/S — same 1488 boundary
-        # nodes but RTOFS 3D files may use a different grid (regional subset
-        # like US_east: 1710x742) than the global 2D grid (3298x4500).
-        # Only use weights if grid shapes match; otherwise fall back to Delaunay.
+        # Weight discovery for 3D T/S interpolation.
+        # The RTOFS 3D files use a regional grid (e.g., US_east: 1710x742)
+        # which differs from the global 2D grid (3298x4500) used for SSH.
+        # Fallback chain:
+        #   1. Dedicated 3D weights (obc_3d_weights.npz) for regional grid
+        #   2. SSH weights (obc_ssh_weights.npz) if grid shape happens to match
+        #   3. Delaunay triangulation (slowest, no precomputed weights)
+        weights_3d = self._find_3d_weights()
         ssh_weights = self._find_ssh_weights()
-        ssh_weights_for_3d = None  # set after first file validates grid shape
-        if ssh_weights:
-            from ..interp.precomputed_weights import apply_precomputed_ssh
+        resolved_weights = None  # set after first file validates grid shape
+        from ..interp.precomputed_weights import apply_precomputed_ssh
 
         try:
             all_temp = []
@@ -1108,23 +1150,58 @@ class RTOFSProcessor(ForcingProcessor):
                     for t in range(n_times):
                         data_t = data[t]
 
-                        # Check if SSH weights match 3D grid (first time only)
-                        if ssh_weights and ssh_weights_for_3d is None:
-                            expected = tuple(ssh_weights["grid_shape"])
-                            actual = data_t.shape[1:]  # (levels, Y, X) → (Y, X)
-                            if len(actual) >= 2 and (actual[-2], actual[-1]) == expected:
-                                ssh_weights_for_3d = ssh_weights
-                                log.info("Using precomputed REMESH weights for 3D T/S (same grid as SSH)")
+                        # Resolve which weights to use (first time only)
+                        if resolved_weights is None:
+                            actual = data_t.shape[1:]  # (levels, Y, X) -> (Y, X)
+                            if len(actual) >= 2:
+                                grid_2d = (actual[-2], actual[-1])
                             else:
-                                ssh_weights_for_3d = False
-                                log.info(f"3D grid {actual} differs from SSH weights {expected} — using Delaunay for T/S")
+                                grid_2d = tuple(data_t.shape)
+
+                            # Try dedicated 3D weights first
+                            if weights_3d is not None:
+                                expected_3d = tuple(weights_3d["grid_shape"])
+                                if grid_2d == expected_3d:
+                                    resolved_weights = weights_3d
+                                    log.info(
+                                        f"Using precomputed 3D weights for T/S "
+                                        f"(regional grid {grid_2d})"
+                                    )
+                                else:
+                                    log.info(
+                                        f"3D weights grid {expected_3d} != data "
+                                        f"grid {grid_2d}, trying SSH weights"
+                                    )
+
+                            # Fall back to SSH weights if 3D didn't match
+                            if resolved_weights is None and ssh_weights is not None:
+                                expected_ssh = tuple(ssh_weights["grid_shape"])
+                                if grid_2d == expected_ssh:
+                                    resolved_weights = ssh_weights
+                                    log.info(
+                                        "Using precomputed SSH weights for "
+                                        "3D T/S (same grid as SSH)"
+                                    )
+                                else:
+                                    log.info(
+                                        f"SSH weights grid {expected_ssh} != "
+                                        f"data grid {grid_2d}"
+                                    )
+
+                            # Final fallback: Delaunay (resolved_weights stays None)
+                            if resolved_weights is None:
+                                resolved_weights = False  # sentinel: use Delaunay
+                                log.info(
+                                    f"No precomputed weights match 3D grid "
+                                    f"{grid_2d} — using Delaunay for T/S"
+                                )
 
                         # Interpolate each RTOFS depth level to boundary nodes
                         bnd_profile_rtofs = np.full((n_bnd, n_rtofs_levels), np.nan, dtype=np.float32)
                         for lev in range(min(n_rtofs_levels, data_t.shape[0])):
-                            if ssh_weights_for_3d and ssh_weights_for_3d is not False:
+                            if resolved_weights and resolved_weights is not False:
                                 bnd_profile_rtofs[:, lev] = apply_precomputed_ssh(
-                                    ssh_weights_for_3d, data_t[lev])
+                                    resolved_weights, data_t[lev])
                             else:
                                 bnd_profile_rtofs[:, lev] = self._interpolate_2d_to_boundary(
                                     lon_arr, lat_arr, data_t[lev]
