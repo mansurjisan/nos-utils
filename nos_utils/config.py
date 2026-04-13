@@ -142,6 +142,7 @@ class ForcingConfig:
             nowcast_hours=6, forecast_hours=48,
             met_num=2,
             obc_ssh_offset=1.25,  # Geoid-to-MSL datum offset for SECOFS
+            nudging_enabled=True,  # COMF Fortran generates TEM_nu/SAL_nu
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -335,10 +336,11 @@ class ForcingConfig:
         nwm_product = "medium_range_mem1" if river_product == "nwm" and \
             river.get("version", "") == "v3.0" else "analysis_assim"
 
-        # GFS resolution
+        # GFS resolution: "0.25", "0.50", or "sflux" (surface flux files)
         gfs_cfg = atm.get("gfs", {})
         gfs_resolution = gfs_cfg.get("resolution", "0.50")
-        gfs_resolution = gfs_resolution.replace(".", "p")  # "0.25" -> "0p25"
+        if gfs_resolution != "sflux":
+            gfs_resolution = gfs_resolution.replace(".", "p")  # "0.25" -> "0p25"
 
         kwargs = dict(
             lon_min=domain.get("lon_min", -180.0),

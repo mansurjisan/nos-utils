@@ -4,13 +4,22 @@ SCHISM sflux NetCDF writer.
 Creates sflux_air, sflux_rad, sflux_prc files in SCHISM-compatible format.
 Shared by GFS, HRRR, and GEFS processors — eliminates duplicate output code.
 
-File naming convention: sflux_{type}_{source_index}.{day_num}.nc
+File naming convention: sflux_{type}_{source_index}.{file_num}.nc
   - type: air, rad, prc
   - source_index: 1 = primary (GFS/GEFS), 2 = secondary (HRRR)
-  - day_num: 1, 2, 3, ... (NOT zero-padded to 4 digits)
+  - file_num: always 1 in single_file mode (COMF default);
+              1, 2, 3, ... per day in multi-file mode
 
 Dimensions: (ntime, ny_grid, nx_grid)
 Time: days since base_date, must be monotonically increasing.
+
+COMF convention (single_file=True, the default):
+  All timesteps go into one file per type: sflux_air_1.1.nc
+  sflux_inputs.txt is minimal: ``&sflux_inputs\n/``
+
+Multi-file mode (single_file=False):
+  Timesteps are split by calendar day relative to base_date.
+  sflux_inputs.txt includes explicit weight/window parameters.
 """
 
 import logging
@@ -58,17 +67,21 @@ class SfluxWriter:
         writer.write_sflux_inputs(met_num=2)
     """
 
-    def __init__(self, output_dir: Path, source_index: int = 1):
+    def __init__(self, output_dir: Path, source_index: int = 1, single_file: bool = True):
         """
         Args:
             output_dir: Directory to write sflux files into
             source_index: 1 for primary (GFS/GEFS), 2 for secondary (HRRR)
+            single_file: If True (default), write all timesteps into a single
+                .1.nc file per type, matching COMF convention. If False, split
+                by calendar day (legacy STOFS behavior).
         """
         if not HAS_NETCDF4:
             raise ImportError("netCDF4 required for sflux output. Install with: pip install netCDF4")
 
         self.output_dir = Path(output_dir)
         self.source_index = source_index
+        self.single_file = single_file
 
     def write_all(
         self,
@@ -79,7 +92,12 @@ class SfluxWriter:
         base_date: datetime,
     ) -> List[Path]:
         """
-        Write all sflux files, splitting by day.
+        Write all sflux files.
+
+        In single_file mode (default, COMF convention): writes all timesteps
+        into sflux_{type}_{source}.1.nc — one file per type.
+
+        In multi-file mode: splits by calendar day into .1.nc, .2.nc, etc.
 
         Args:
             data: Dict mapping variable names to lists of 2D arrays (one per time step)
@@ -103,7 +121,14 @@ class SfluxWriter:
                     f"(times: {times[i-1]} -> {times[i]})"
                 )
 
-        # Group time steps by day relative to base_date
+        if self.single_file:
+            # COMF convention: all timesteps in one file per type (always .1.nc)
+            files = self.write_day(data, times, lons, lats, base_date, day_num=1)
+            log.info(f"Wrote {len(files)} sflux files (single-file mode, "
+                     f"{len(times)} timesteps)")
+            return files
+
+        # Multi-file mode: group time steps by day relative to base_date
         day_groups: Dict[int, List[int]] = {}
         for i, t in enumerate(times):
             day_num = max(1, (t - base_date).days + 1)
@@ -163,6 +188,13 @@ class SfluxWriter:
         """
         Write sflux_inputs.txt namelist for SCHISM.
 
+        In single_file mode (COMF convention): writes minimal defaults
+        ``&sflux_inputs`` followed by ``/``.  SCHISM applies the same
+        defaults internally, so the result is functionally identical.
+
+        In multi-file mode: writes explicit weight/window parameters
+        (legacy behavior).
+
         Args:
             met_num: Number of met sources (1 or 2)
 
@@ -173,18 +205,19 @@ class SfluxWriter:
 
         with open(output_file, "w") as f:
             f.write("&sflux_inputs\n")
-            f.write("air_1_relative_weight=1.0,\n")
-            if met_num >= 2:
-                f.write("air_2_relative_weight=1.0,\n")
-            else:
-                f.write("air_2_relative_weight=0.0,\n")
-            f.write("air_1_max_window_hours=120.0,\n")
-            f.write("air_1_fail_if_missing=.true.,\n")
-            f.write("air_2_fail_if_missing=.false.,\n")
-            f.write("rad_1_relative_weight=1.0,\n")
-            f.write("rad_1_max_window_hours=120.0,\n")
-            f.write("prc_1_relative_weight=1.0,\n")
-            f.write("prc_1_max_window_hours=120.0,\n")
+            if not self.single_file:
+                f.write("air_1_relative_weight=1.0,\n")
+                if met_num >= 2:
+                    f.write("air_2_relative_weight=1.0,\n")
+                else:
+                    f.write("air_2_relative_weight=0.0,\n")
+                f.write("air_1_max_window_hours=120.0,\n")
+                f.write("air_1_fail_if_missing=.true.,\n")
+                f.write("air_2_fail_if_missing=.false.,\n")
+                f.write("rad_1_relative_weight=1.0,\n")
+                f.write("rad_1_max_window_hours=120.0,\n")
+                f.write("prc_1_relative_weight=1.0,\n")
+                f.write("prc_1_max_window_hours=120.0,\n")
             f.write("/\n")
 
         log.info(f"Created {output_file}")

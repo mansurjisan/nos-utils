@@ -167,12 +167,18 @@ class ParamNmlProcessor(ForcingProcessor):
 
         rnday = run_hours / 24.0
 
+        # Format rnday to match COMF shell `bc -l` output:
+        # bc strips the leading zero for values < 1.0 (e.g. ".2500" not "0.2500")
+        rnday_str = f"{rnday:.4f}"
+        if rnday_str.startswith("0."):
+            rnday_str = rnday_str[1:]  # ".2500" instead of "0.2500"
+
         return {
-            "rnday_value": f"{rnday:.4f}",
+            "rnday_value": rnday_str,
             "start_year_value": str(start_dt.year),
             "start_month_value": f"{start_dt.month:02d}",
             "start_day_value": f"{start_dt.day:02d}",
-            "start_hour_value": str(start_dt.hour),
+            "start_hour_value": f"{start_dt.hour:02d}",
             "ihot_value": str(ihot),
         }
 

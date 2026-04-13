@@ -5,8 +5,9 @@ Processes GFS 0.25° GRIB2 data and creates SCHISM sflux or DATM forcing files.
 
 Input: GFS GRIB2 files from COMINgfs
   Pattern: gfs.YYYYMMDD/HH/atmos/gfs.tHHz.pgrb2.0p25.fHHH
-  Resolution: 0.25° (hourly) or 0.50° (3-hourly)
-  Min file size: 500 MB
+           gfs.YYYYMMDD/HH/atmos/gfs.tHHz.sfluxgrbfHHH.grib2
+  Resolution: "0p25" (hourly, ~500MB), "0p50" (3-hourly, ~60MB),
+              "sflux" (hourly, ~30MB — surface fields only, native ~0.25°)
 
 Output:
   sflux mode (nws=2): sflux_air_1.N.nc, sflux_rad_1.N.nc, sflux_prc_1.N.nc
@@ -43,6 +44,7 @@ class GFSProcessor(ForcingProcessor):
     MIN_FILE_SIZE_BY_RES = {
         "0p25": 400_000_000,  # 400 MB
         "0p50": 40_000_000,   # 40 MB
+        "sflux": 10_000_000,  # 10 MB (surface-only, ~30 MB typical)
     }
     MIN_FILE_SIZE = 40_000_000  # fallback: 40 MB
 
@@ -304,12 +306,19 @@ class GFSProcessor(ForcingProcessor):
                 if not path_fmt.exists():
                     continue
 
-                pattern = f"gfs.t{cyc:02d}z.pgrb2.{self.resolution}.f*"
+                if self.resolution == "sflux":
+                    pattern = f"gfs.t{cyc:02d}z.sfluxgrbf*.grib2"
+                else:
+                    pattern = f"gfs.t{cyc:02d}z.pgrb2.{self.resolution}.f*"
                 found = sorted(path_fmt.glob(pattern))
 
                 for f in found:
                     try:
-                        fhr = int(f.name.split(".f")[-1])
+                        if self.resolution == "sflux":
+                            # gfs.t00z.sfluxgrbf006.grib2 -> 006
+                            fhr = int(f.stem.replace(f"gfs.t{cyc:02d}z.sfluxgrbf", ""))
+                        else:
+                            fhr = int(f.name.split(".f")[-1])
                     except (ValueError, IndexError):
                         continue
 
@@ -348,12 +357,18 @@ class GFSProcessor(ForcingProcessor):
             if not path_fmt.exists():
                 continue
 
-            pattern = f"gfs.t12z.pgrb2.{self.resolution}.f*"
+            if self.resolution == "sflux":
+                pattern = "gfs.t12z.sfluxgrbf*.grib2"
+            else:
+                pattern = f"gfs.t12z.pgrb2.{self.resolution}.f*"
             found = sorted(path_fmt.glob(pattern))
             files = []
             for f in found:
                 try:
-                    fhr = int(f.name.split(".f")[-1])
+                    if self.resolution == "sflux":
+                        fhr = int(f.stem.replace("gfs.t12z.sfluxgrbf", ""))
+                    else:
+                        fhr = int(f.name.split(".f")[-1])
                     if fhr <= self.config.forecast_hours:
                         files.append(f)
                 except (ValueError, IndexError):

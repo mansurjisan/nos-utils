@@ -230,6 +230,50 @@ class SchismGrid:
         log.info(f"Read {len(node_ids)} boundary nodes from {ctl_path.name}")
         return lons, lats, depths, node_ids
 
+    @staticmethod
+    def read_gr3_values(filepath) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Read node values from a gr3-format file (e.g., nudge weight files).
+
+        This is a lightweight reader that only parses the node section,
+        skipping elements and boundaries. Suitable for large gr3 files
+        (300+ MB) where only the per-node values are needed.
+
+        The gr3 format has lines: ``node_id  lon  lat  value  [extras...]``
+        after the 2-line header.
+
+        Args:
+            filepath: Path to gr3 file
+
+        Returns:
+            (node_ids_1based, lons, lats, values) — all as numpy arrays
+        """
+        filepath = Path(filepath)
+        log.info(f"Reading gr3 values: {filepath.name} "
+                 f"({filepath.stat().st_size / 1e6:.0f} MB)")
+
+        with open(filepath) as f:
+            f.readline()  # comment / header
+            parts = f.readline().split()
+            # gr3 format line 2: n_elements n_nodes (same as hgrid.gr3)
+            n_nodes = int(parts[1])
+
+            node_ids = np.zeros(n_nodes, dtype=np.int32)
+            lons = np.zeros(n_nodes, dtype=np.float64)
+            lats = np.zeros(n_nodes, dtype=np.float64)
+            values = np.zeros(n_nodes, dtype=np.float64)
+
+            for i in range(n_nodes):
+                parts = f.readline().split()
+                node_ids[i] = int(parts[0])
+                lons[i] = float(parts[1])
+                lats[i] = float(parts[2])
+                values[i] = float(parts[3])
+
+        n_nonzero = int(np.sum(values > 0))
+        log.info(f"  {n_nodes:,} nodes, {n_nonzero:,} with value > 0")
+        return node_ids, lons, lats, values
+
     def __repr__(self):
         return (f"SchismGrid(nodes={self.n_nodes:,}, elements={self.n_elements:,}, "
                 f"open_bnd={len(self.open_boundaries)}, "

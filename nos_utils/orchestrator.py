@@ -178,42 +178,62 @@ class PrepOrchestrator:
                 except ValueError:
                     pass
 
-        # Step 2: GFS atmospheric
+        # ---- Phase 1: Lightweight steps in parallel ----
+        # GFS, HRRR, NWM, Tidal are fast (subprocess/IO-bound, ~90s max).
+        # RTOFS is heavy (large NetCDF reads + Delaunay) and netCDF4's C
+        # library can stall under concurrent thread access, so run it
+        # sequentially in Phase 2.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        parallel_tasks = {}
+
         if "gfs" in self.paths:
-            results.append(self._run_gfs(output_dir, phase, time_hotstart))
+            parallel_tasks["GFS"] = lambda: self._run_gfs(output_dir, phase, time_hotstart)
 
-        # Step 3: HRRR secondary (optional, non-fatal)
         if "hrrr" in self.paths and self.config.met_num >= 2:
-            results.append(self._run_hrrr(output_dir, phase, time_hotstart))
+            parallel_tasks["HRRR"] = lambda: self._run_hrrr(output_dir, phase, time_hotstart)
 
-        # Step 4: NWM river
-        # STOFS: always run NWM (Python handles gen_sourcesink logic)
-        # SECOFS: skip in hybrid mode (legacy shell handles it)
         if "nwm" in self.paths and (self.is_stofs or not self.skip_legacy):
-            results.append(self._run_nwm(output_dir, phase, time_hotstart))
+            parallel_tasks["NWM"] = lambda: self._run_nwm(output_dir, phase, time_hotstart)
         elif self.skip_legacy:
             log.info("Skipping NWM river (handled by legacy shell)")
 
-        # Step 5: RTOFS OBC
-        # STOFS: always run (Python data prep + Fortran wrapper with fallback)
-        # SECOFS: skip in hybrid mode
+        parallel_tasks["TIDAL"] = lambda: self._run_tidal(output_dir, phase, time_hotstart)
+
+        if parallel_tasks:
+            log.info(f"Running {len(parallel_tasks)} steps in parallel: "
+                     f"{', '.join(parallel_tasks.keys())}")
+            with ThreadPoolExecutor(max_workers=len(parallel_tasks)) as pool:
+                futures = {pool.submit(fn): name for name, fn in parallel_tasks.items()}
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        r = future.result()
+                        results.append(r)
+                        status = "OK" if r.success else "FAILED"
+                        log.info(f"  {name}: {status}")
+                    except Exception as e:
+                        log.error(f"  {name}: EXCEPTION {e}")
+                        results.append(ForcingResult(
+                            success=False, source=name, errors=[str(e)]))
+
+        # ---- Phase 2: Heavy and dependent steps (sequential) ----
+
+        # RTOFS OBC: heavy NetCDF I/O + Delaunay interpolation
         if "rtofs" in self.paths and (self.is_stofs or not self.skip_legacy):
             results.append(self._run_rtofs(output_dir, phase, time_hotstart))
         elif self.skip_legacy:
             log.info("Skipping RTOFS OBC (handled by legacy shell)")
 
-        # Step 5b: Nudging (STOFS only — enabled via config)
+        # Nudging needs RTOFS to have completed
         if self.config.nudging_enabled and "rtofs" in self.paths:
             results.append(self._run_nudging(output_dir, phase, time_hotstart))
 
-        # Step 6: Tidal (phase-aware start time + nodal corrections)
-        results.append(self._run_tidal(output_dir, phase, time_hotstart))
-
-        # Step 7: param.nml (pass time_hotstart for correct rnday/start/ihot)
+        # param.nml only needs time_hotstart
         if "fix" in self.paths:
             results.append(self._run_param_nml(output_dir, phase, time_hotstart))
 
-        # Step 8: UFS-specific (DATM)
+        # UFS-specific (DATM) needs GFS + HRRR sflux
         if self.config.nws == 4:
             results.append(self._run_datm(output_dir))
 
@@ -338,15 +358,27 @@ class PrepOrchestrator:
 
     def _run_nudging(self, output_dir: Path, phase: str = "nowcast",
                      time_hotstart=None) -> ForcingResult:
-        """Step 5b: T/S interior nudging (STOFS)."""
+        """Step 5b: T/S interior nudging (STOFS + SECOFS)."""
         from .forcing.nudging import NudgingProcessor
 
         # Nudging needs its own RTOFS data prep with nudge-specific ROI
         # (wider domain than OBC ROI — cannot reuse OBC TS_1.nc)
         input_dir = output_dir
         rtofs_path = self.paths.get("rtofs")
+
+        # Try to find nudge weight file from FIX directory
+        nudge_weight_file = None
+        fix_dir = self.paths.get("fix")
+        if fix_dir:
+            for pattern in ["*.nudge.gr3", "*.TEM_nudge.gr3"]:
+                matches = sorted(Path(fix_dir).glob(pattern))
+                if matches:
+                    nudge_weight_file = matches[0]
+                    break
+
         proc = NudgingProcessor(
             self.config, input_dir, output_dir,
+            nudge_weight_file=nudge_weight_file,
             rtofs_input_path=rtofs_path,
         )
         return proc.process()
@@ -513,23 +545,57 @@ class PrepOrchestrator:
                     log.warning(f"  Failed to tar HRRR sflux: {e}")
 
         # Tar OBC files
-        # ORG includes nudging files in the OBC tar
+        # COMF convention: one combined obc.tar with all 6 files (boundary + nudging)
         obc_files = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc",
                      "TEM_nu.nc", "SAL_nu.nc"]
         existing_obc = [work_dir / f for f in obc_files if (work_dir / f).exists()]
         if existing_obc:
-            tar_name = f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar"
-            tar_path = comout / tar_name
+            # Phase-specific tar (backward compat): obc.nowcast.tar / obc.forecast.tar
+            phase_tar_name = f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar"
+            phase_tar_path = comout / phase_tar_name
             try:
                 file_list = [f.name for f in existing_obc]
                 subprocess.run(
-                    ["tar", "-cf", str(tar_path), "-C", str(work_dir)] + file_list,
+                    ["tar", "-cf", str(phase_tar_path), "-C", str(work_dir)] + file_list,
                     check=True, capture_output=True,
                 )
-                archived.append(tar_path)
-                log.info(f"  Archived OBC -> {tar_name}")
+                archived.append(phase_tar_path)
+                log.info(f"  Archived OBC -> {phase_tar_name}")
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                log.warning(f"  Failed to tar OBC: {e}")
+                log.warning(f"  Failed to tar OBC (phase): {e}")
+
+            # Combined obc.tar (COMF convention): single tar with all 6 files
+            combined_tar_name = f"{prefix}.{cycle}.{pdy}.obc.tar"
+            combined_tar_path = comout / combined_tar_name
+            try:
+                file_list = [f.name for f in existing_obc]
+                subprocess.run(
+                    ["tar", "-cf", str(combined_tar_path), "-C", str(work_dir)] + file_list,
+                    check=True, capture_output=True,
+                )
+                archived.append(combined_tar_path)
+                log.info(f"  Archived OBC (combined) -> {combined_tar_name}")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                log.warning(f"  Failed to tar OBC (combined): {e}")
+
+        # Tar NWM source/sink files (COMF convention)
+        # COMF produces: nwm.source.sink.now.tar / nwm.source.sink.fore.tar
+        nwm_files = ["vsource.th", "msource.th", "source_sink.in", "vsink.th"]
+        existing_nwm = [work_dir / f for f in nwm_files if (work_dir / f).exists()]
+        if existing_nwm:
+            phase_tag = "now" if phase == "nowcast" else "fore"
+            nwm_tar_name = f"{prefix}.{cycle}.{pdy}.nwm.source.sink.{phase_tag}.tar"
+            nwm_tar_path = comout / nwm_tar_name
+            try:
+                file_list = [f.name for f in existing_nwm]
+                subprocess.run(
+                    ["tar", "-cf", str(nwm_tar_path), "-C", str(work_dir)] + file_list,
+                    check=True, capture_output=True,
+                )
+                archived.append(nwm_tar_path)
+                log.info(f"  Archived NWM -> {nwm_tar_name}")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                log.warning(f"  Failed to tar NWM: {e}")
 
         # Copy individual files
         copy_map = {

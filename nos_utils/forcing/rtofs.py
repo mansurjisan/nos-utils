@@ -896,7 +896,7 @@ class RTOFSProcessor(ForcingProcessor):
             for name in ["secofs.obc_ssh_weights.npz", "obc_ssh_weights.npz"]:
                 path = Path(fix_dir) / name
                 if path.exists():
-                    self._ssh_weights_cache = dict(np.load(str(path)))
+                    self._ssh_weights_cache = dict(np.load(str(path), allow_pickle=True))
                     log.info(f"Loaded precomputed SSH weights from {path}")
                     return self._ssh_weights_cache
 
@@ -904,7 +904,7 @@ class RTOFSProcessor(ForcingProcessor):
         for name in ["secofs.obc_ssh_weights.npz", "obc_ssh_weights.npz"]:
             path = self.input_path / name
             if path.exists():
-                self._ssh_weights_cache = dict(np.load(str(path)))
+                self._ssh_weights_cache = dict(np.load(str(path), allow_pickle=True))
                 log.info(f"Loaded precomputed SSH weights from {path}")
                 return self._ssh_weights_cache
 
