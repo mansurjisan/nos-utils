@@ -1058,6 +1058,13 @@ class RTOFSProcessor(ForcingProcessor):
         n_bnd = len(self._bnd_lons)
         n_levels = self._vgrid.nvrt if self._vgrid else self.config.n_levels
 
+        # Reuse SSH precomputed weights for T/S — same 1488 boundary nodes,
+        # same RTOFS source grid. apply_precomputed_ssh works on any 2D field.
+        ssh_weights = self._find_ssh_weights()
+        if ssh_weights:
+            from ..interp.precomputed_weights import apply_precomputed_ssh
+            log.info("Using precomputed REMESH weights for 3D T/S (same as SSH)")
+
         try:
             all_temp = []
             all_salt = []
@@ -1102,9 +1109,13 @@ class RTOFSProcessor(ForcingProcessor):
                         # Interpolate each RTOFS depth level to boundary nodes
                         bnd_profile_rtofs = np.full((n_bnd, n_rtofs_levels), np.nan, dtype=np.float32)
                         for lev in range(min(n_rtofs_levels, data_t.shape[0])):
-                            bnd_profile_rtofs[:, lev] = self._interpolate_2d_to_boundary(
-                                lon_arr, lat_arr, data_t[lev]
-                            )
+                            if ssh_weights:
+                                bnd_profile_rtofs[:, lev] = apply_precomputed_ssh(
+                                    ssh_weights, data_t[lev])
+                            else:
+                                bnd_profile_rtofs[:, lev] = self._interpolate_2d_to_boundary(
+                                    lon_arr, lat_arr, data_t[lev]
+                                )
 
                         # Vertically interpolate from RTOFS levels to SCHISM levels
                         if self._vgrid and n_levels != n_rtofs_levels:
