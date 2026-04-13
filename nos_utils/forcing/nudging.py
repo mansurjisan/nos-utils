@@ -866,12 +866,20 @@ class NudgingProcessor(ForcingProcessor):
 
         return result
 
+    # Module-level caches — shared across phases (nowcast + forecast)
+    # Avoids re-reading 321MB gr3 and 1.6GB vgrid twice.
+    _cached_nudge_nodes = None  # (file_path, node_ids, lons, lats, depths)
+    _cached_vgrid = None        # (file_path, vgrid_object)
+
     def _load_nudge_nodes(self):
         """Load nudging node IDs, coordinates, and depths.
 
         Reads the nudge weight gr3 file (e.g., secofs.nudge.gr3) and returns
         all nodes with non-zero weight. If a grid_file is provided separately,
         depths come from there; otherwise from the gr3 file itself.
+
+        Results are cached at the class level so the forecast phase reuses
+        the nowcast's parsed data (~60s saved per phase).
 
         Returns:
             (node_ids_1based, lons, lats, depths) or (None, None, None, None)
@@ -897,6 +905,12 @@ class NudgingProcessor(ForcingProcessor):
             log.warning(f"Nudge weight file not found: {nudge_file}")
             return None, None, None, None
 
+        # Check cache (avoids re-reading 321MB gr3 + grid on forecast phase)
+        cache = NudgingProcessor._cached_nudge_nodes
+        if cache is not None and cache[0] == str(nudge_file):
+            log.info(f"Using cached nudge nodes ({cache[1].shape[0]:,} nodes)")
+            return cache[1], cache[2], cache[3], cache[4]
+
         log.info(f"Reading nudge weight file: {nudge_file}")
         node_ids, lons, lats, values = SchismGrid.read_gr3_values(nudge_file)
 
@@ -917,11 +931,19 @@ class NudgingProcessor(ForcingProcessor):
             sel_depths = np.zeros(len(sel_ids), dtype=np.float64)
 
         log.info(f"Nudge nodes: {len(sel_ids):,} with weight > 0")
+
+        # Cache for reuse in forecast phase
+        NudgingProcessor._cached_nudge_nodes = (
+            str(nudge_file), sel_ids, sel_lons, sel_lats, sel_depths
+        )
         return sel_ids, sel_lons, sel_lats, sel_depths
 
     def _load_vgrid(self):
-        """Load vertical grid if available."""
+        """Load vertical grid if available. Cached across phases."""
+        from ..io.schism_vgrid import SchismVgrid
+
         # Try vgrid from FIX
+        vgrid_path = None
         for env_var in ["FIXofs", "FIXstofs3d"]:
             fix_dir = os.environ.get(env_var)
             if not fix_dir:
@@ -929,22 +951,33 @@ class NudgingProcessor(ForcingProcessor):
             for name in ["*.vgrid.in", "vgrid.in"]:
                 matches = sorted(Path(fix_dir).glob(name))
                 if matches:
-                    from ..io.schism_vgrid import SchismVgrid
-                    return SchismVgrid.read(matches[0])
+                    vgrid_path = matches[0]
+                    break
+            if vgrid_path:
+                break
 
         # Try from config grid_file parent directory
-        if self.config.grid_file:
+        if vgrid_path is None and self.config.grid_file:
             vgrid_path = Path(self.config.grid_file).parent / "vgrid.in"
             if not vgrid_path.exists():
-                # Try OFS-prefixed
                 grid_name = Path(self.config.grid_file).stem.split(".")[0]
                 vgrid_path = Path(self.config.grid_file).parent / f"{grid_name}.vgrid.in"
-            if vgrid_path.exists():
-                from ..io.schism_vgrid import SchismVgrid
-                return SchismVgrid.read(vgrid_path)
+            if not vgrid_path.exists():
+                vgrid_path = None
 
-        log.warning("No vgrid.in found for nudging vertical interpolation")
-        return None
+        if vgrid_path is None:
+            log.warning("No vgrid.in found for nudging vertical interpolation")
+            return None
+
+        # Check cache
+        cache = NudgingProcessor._cached_vgrid
+        if cache is not None and cache[0] == str(vgrid_path):
+            log.info("Using cached vgrid")
+            return cache[1]
+
+        vgrid = SchismVgrid.read(vgrid_path)
+        NudgingProcessor._cached_vgrid = (str(vgrid_path), vgrid)
+        return vgrid
 
     def _write_nudge_nc(
         self,
