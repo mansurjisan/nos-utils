@@ -266,7 +266,7 @@ class NudgingProcessor(ForcingProcessor):
             for name in ["secofs.obc_nudge_weights.npz", "obc_nudge_weights.npz"]:
                 path = Path(fix_dir) / name
                 if path.exists():
-                    self._nudge_weights_cache = dict(np.load(str(path)))
+                    self._nudge_weights_cache = dict(np.load(str(path), allow_pickle=True))
                     log.info(f"Loaded precomputed nudge weights from {path}")
                     return self._nudge_weights_cache
 
@@ -275,7 +275,7 @@ class NudgingProcessor(ForcingProcessor):
             for name in ["secofs.obc_nudge_weights.npz", "obc_nudge_weights.npz"]:
                 path = search_dir / name
                 if path.exists():
-                    self._nudge_weights_cache = dict(np.load(str(path)))
+                    self._nudge_weights_cache = dict(np.load(str(path), allow_pickle=True))
                     log.info(f"Loaded precomputed nudge weights from {path}")
                     return self._nudge_weights_cache
 
