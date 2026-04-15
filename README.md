@@ -2,7 +2,7 @@
 
 [![Docs](https://readthedocs.org/projects/nos-utils/badge/?version=latest)](https://nos-utils.readthedocs.io/en/latest/)
 
-Python forcing generators for NOAA NOS-OFS ocean forecast systems.
+Python forcing generators for NOAA National Ocean Service's operational ocean forecast systems.
 
 **Documentation**: [nos-utils.readthedocs.io](https://nos-utils.readthedocs.io/en/latest/)
 
