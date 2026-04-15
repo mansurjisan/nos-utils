@@ -6,6 +6,7 @@ API Reference
 
    config
    forcing
+   interp
    io
    orchestrator
    cli

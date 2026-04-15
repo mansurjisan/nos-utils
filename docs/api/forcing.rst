@@ -70,6 +70,14 @@ NWM
    :undoc-members:
    :show-inheritance:
 
+River climatology
+~~~~~~~~~~~~~~~~~
+
+.. automodule:: nos_utils.forcing.river_clim
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 Tidal
 -----
 

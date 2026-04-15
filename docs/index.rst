@@ -3,43 +3,52 @@ nos-utils
 
 **Python forcing generators for NOAA NOS-OFS ocean forecast systems.**
 
-nos-utils replaces the legacy Fortran preprocessing scripts (COMF/STOFS) with a
-modular, testable Python package.  It generates atmospheric, ocean-boundary,
-river, and tidal forcing files for `SCHISM <https://schism-dev.github.io/schism/>`_-based
-Operational Forecast Systems (OFS) including **SECOFS** (SE Coastal),
-**STOFS-3D-ATL** (Atlantic Storm Surge), and their UFS-Coastal counterparts.
+``nos-utils`` is a standalone Python package that replaces the legacy Fortran
+and shell preprocessing toolchain (COMF/STOFS) with a modular, testable
+pipeline for generating atmospheric, ocean-boundary, river, and tidal forcing
+files for `SCHISM <https://schism-dev.github.io/schism/>`_-based Operational
+Forecast Systems (OFS).
 
-Supported OFS
--------------
+Supported systems
+-----------------
 
-* **SECOFS** -- SE Coastal Ocean Forecast System (6 h nowcast, 48 h forecast)
-* **STOFS-3D-ATL** -- Storm Surge 3-D Atlantic (24 h nowcast, 108 h forecast,
-  ADT satellite SSH blending, T/S nudging, NWM medium-range river forcing)
-* **UFS-Coastal variants** -- DATM-coupled versions of both (``nws=4``)
-* **Ensemble** -- GEFS-driven perturbation members
+* **SECOFS** -- SE Coastal Ocean Forecast System. Production-ready on WCOSS2:
+  validated against the operational COMF Fortran pipeline
+  (SSH RMSE = 0.5 mm, R = 0.999998; prep time ~23 min vs 40 min sequential).
+* **STOFS-3D-ATL** -- Storm Surge 3-D Atlantic. Work in progress: atmospheric,
+  NWM medium-range river, ADT satellite SSH blending, and interior T/S nudging
+  are wired up; operational validation ongoing.
+* **UFS-Coastal variants** -- DATM-coupled (``nws=4``) configurations of both
+  SECOFS and STOFS-3D-ATL (ESMF mesh + HRRR/GFS Delaunay blender).
+* **Ensemble** -- GEFS-driven perturbation members via
+  :meth:`ForcingConfig.for_ensemble`.
 
-Key capabilities
-----------------
+Key features
+------------
 
-* **Atmospheric forcing** -- GFS (0.25/0.50 deg), HRRR (3 km, CONUS),
-  GEFS (ensemble) via GRIB2 extraction and regridding.  STOFS uses separate
-  HRRR domain bounds and GFS 0.25 deg resolution.
-* **Ocean boundary conditions** -- RTOFS interpolation to SCHISM open-boundary
-  nodes (SSH, temperature, salinity, velocity).  STOFS-3D-ATL adds ROI-based
-  subsetting and shell-script OBC generation for production parity.
-* **ADT satellite SSH blending** -- CMEMS Absolute Dynamic Topography corrects
-  RTOFS boundary SSH for STOFS-3D-ATL (``adt_enabled=True``).
-* **River forcing** -- NWM streamflow mapped to SCHISM source/sink nodes.
-  STOFS uses ``medium_range_mem1`` product with 121-file assembly.
-  Climatological fallback via RiverClimProcessor when NWM is unavailable.
-* **Interior nudging** -- Temperature and salinity nudging fields from RTOFS
-  with ROI subsetting and shell-script generation for STOFS.
-* **Tidal constituents** -- Eight major constituents with 18.6-year nodal
-  corrections for ``bctides.in``.
-* **Model configuration** -- ``param.nml`` generation, hotstart discovery,
-  MPI domain partitioning.
-* **UFS-Coastal support** -- ESMF mesh generation, HRRR+GFS Delaunay blending,
-  and DATM NetCDF output (``nws=4``).
+* **Byte-identical COMF output structure** -- ``obc.tar`` (6 files),
+  ``sflux_*.nc``, ``bctides.in``, ``param.nml``, ``vsource.th``, and
+  ``source_sink.in`` match the layout expected by the operational model.
+* **Precomputed INTERP_REMESH weights** -- The Fortran triangulation is
+  exported once and replayed every cycle as pure NumPy gather operations,
+  giving Fortran-equivalent accuracy (SSH RMSE 0.5 mm) at a fraction of the
+  runtime.
+* **ROI subsetting for RTOFS** -- 3D temperature and salinity reads are
+  restricted to the SECOFS subdomain, yielding ~92% I/O reduction.
+* **Parallel Phase 1 prep** -- GFS, HRRR, NWM, and tidal processors run
+  concurrently via ``ThreadPoolExecutor``; heavy NetCDF+Delaunay work for
+  RTOFS and nudging runs sequentially in Phase 2.
+* **Full-cycle speedup** -- Total SECOFS prep: ~23 min with nos-utils vs
+  ~40 min for the sequential COMF Fortran pipeline (1.7x faster).
+* **Interior T/S nudging** -- Python generates ``TEM_nu.nc`` and ``SAL_nu.nc``
+  for all 32,613 SECOFS interior nodes using precomputed nudge weights.
+* **Unified API across OFS** -- the same ``PrepOrchestrator`` runs SECOFS or
+  STOFS just by swapping the :class:`ForcingConfig` factory.
+* **NCO environment bridge** -- ``nco_bridge.run_prep()`` reads standard
+  ``PDY``/``cyc``/``COMINgfs``/``FIXofs`` variables and drives the
+  orchestrator from inside a J-job.
+* **206 unit tests passing** -- all inputs are synthetic fixtures; no data
+  downloads required.
 
 Quick start
 -----------
@@ -51,28 +60,27 @@ Quick start
 .. code-block:: python
 
    from nos_utils.config import ForcingConfig
-   from nos_utils.forcing import GFSProcessor
+   from nos_utils.orchestrator import PrepOrchestrator
 
-   # SECOFS
-   config = ForcingConfig.for_secofs(pdy="20260324", cyc=12)
+   config = ForcingConfig.for_secofs(pdy="20260406", cyc=0)
+   paths = {
+       "gfs":    "/lfs/h1/ops/prod/com/gfs/v16.3",
+       "hrrr":   "/lfs/h1/ops/prod/com/hrrr/v4.1",
+       "rtofs":  "/lfs/h1/ops/prod/com/rtofs/v2.5",
+       "nwm":    "/lfs/h1/ops/prod/com/nwm/v3.0",
+       "fix":    "/path/to/fix/secofs",
+       "output": "/tmp/secofs_prep",
+   }
+   result = PrepOrchestrator(config, paths).run(phase="nowcast")
+   print(result.summary())
 
-   # STOFS-3D-ATL (includes ADT, nudging, medium-range NWM)
-   config = ForcingConfig.for_stofs_3d_atl(pdy="20260324", cyc=12)
-
-   gfs = GFSProcessor(config,
-                       input_path="/data/gfs",
-                       output_path="/data/sflux")
-   result = gfs.process()
-
-CLI usage:
+CLI:
 
 .. code-block:: bash
 
-   nos-utils prep --ofs secofs --pdy 20260324 --cyc 12 \
-       --gfs /data/gfs --hrrr /data/hrrr --output /work/prep/
-
-   nos-utils prep --ofs stofs_3d_atl --pdy 20260324 --cyc 12 \
-       --gfs /data/gfs --hrrr /data/hrrr --rtofs /data/rtofs --output /work/prep/
+   nos-utils prep --ofs secofs --pdy 20260406 --cyc 0 \
+       --gfs /data/gfs --hrrr /data/hrrr --rtofs /data/rtofs \
+       --nwm /data/nwm --fix /data/fix/secofs --output /work/prep/
 
    nos-utils list   # show available OFS factories and processors
 

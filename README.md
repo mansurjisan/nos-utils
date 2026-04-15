@@ -47,5 +47,5 @@ nos-utils prep --ofs secofs --pdy 20260324 --cyc 12 --gfs /data/gfs --output /wo
 ## Test
 
 ```bash
-pytest -v    # 169 unit tests, no data needed
+pytest -v    # 206 unit tests, no data needed
 ```

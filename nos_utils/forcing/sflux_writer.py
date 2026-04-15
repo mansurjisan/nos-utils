@@ -14,12 +14,14 @@ Dimensions: (ntime, ny_grid, nx_grid)
 Time: days since base_date, must be monotonically increasing.
 
 COMF convention (single_file=True, the default):
-  All timesteps go into one file per type: sflux_air_1.1.nc
-  sflux_inputs.txt is minimal: ``&sflux_inputs\n/``
+
+  All timesteps go into one file per type: ``sflux_air_1.1.nc``.
+  ``sflux_inputs.txt`` is minimal (``&sflux_inputs`` / ``/``).
 
 Multi-file mode (single_file=False):
+
   Timesteps are split by calendar day relative to base_date.
-  sflux_inputs.txt includes explicit weight/window parameters.
+  ``sflux_inputs.txt`` includes explicit weight/window parameters.
 """
 
 import logging

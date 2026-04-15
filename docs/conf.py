@@ -10,7 +10,9 @@ sys.path.insert(0, os.path.abspath(".."))
 project = "nos-utils"
 copyright = "2026, NOAA NOS"
 author = "NOAA NOS"
+# Keep in sync with pyproject.toml [project] version
 release = "0.1.0"
+version = "0.1.0"
 
 # -- General configuration ----------------------------------------------------
 extensions = [
@@ -39,6 +41,9 @@ suppress_warnings = ["duplicate.object.description"]
 # -- Options for Napoleon (Google/NumPy docstrings) ---------------------------
 napoleon_google_docstrings = True
 napoleon_numpy_docstrings = True
+# Emit Attributes: sections as :ivar: entries (avoids duplicate-object warnings
+# with autodoc documenting dataclass fields from both docstring and class body)
+napoleon_use_ivar = True
 
 # -- Options for intersphinx --------------------------------------------------
 intersphinx_mapping = {
