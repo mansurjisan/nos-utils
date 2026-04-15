@@ -101,6 +101,7 @@ class RTOFSProcessor(ForcingProcessor):
         self._ocean_pts = {}    # Cached ocean point coordinates per grid shape
         self._n_ocean_surface = {}  # Cached ocean point count per grid shape
         self._struct_interp = {}  # Cached StructuredGridInterpolator per grid shape
+        self._3d_roi = None     # Cached ROI indices (j_start, j_end, i_start, i_end) for 3D subsetting
 
     def _get_time_window(self) -> Tuple[datetime, datetime]:
         """Compute the time window for RTOFS file filtering.
@@ -1091,6 +1092,67 @@ class RTOFSProcessor(ForcingProcessor):
             log.error(traceback.format_exc())
             return None
 
+    def _compute_3d_roi(self, ds) -> Optional[Tuple[int, int, int, int]]:
+        """Compute ROI (Region of Interest) indices for 3D RTOFS file subsetting.
+
+        Finds the j,i index bounds in the RTOFS curvilinear grid that cover
+        the boundary nodes plus a 1-degree buffer.  These indices are cached
+        in ``self._3d_roi`` so the full lon/lat arrays are only read once.
+
+        Returns:
+            (j_start, j_end, i_start, i_end) or None if subsetting is not
+            possible (boundary nodes not loaded, or grid doesn't cover domain).
+        """
+        if self._bnd_lons is None or len(self._bnd_lons) == 0:
+            return None
+
+        lon_var = ds.variables.get("Longitude") or ds.variables.get("lon")
+        lat_var = ds.variables.get("Latitude") or ds.variables.get("lat")
+        if lon_var is None or lat_var is None:
+            return None
+
+        full_lon = lon_var[:]
+        full_lat = lat_var[:]
+
+        # ROI subsetting requires 2D (curvilinear) coordinate arrays
+        if full_lon.ndim != 2 or full_lat.ndim != 2:
+            log.info("3D ROI: skipping — lon/lat are not 2D curvilinear arrays")
+            return None
+
+        # Convert to -180/180 to match boundary node convention
+        full_lon = np.where(full_lon > 180, full_lon - 360, full_lon)
+
+        buf = 1.0  # 1-degree buffer around boundary domain
+        lon_min = float(self._bnd_lons.min()) - buf
+        lon_max = float(self._bnd_lons.max()) + buf
+        lat_min = float(self._bnd_lats.min()) - buf
+        lat_max = float(self._bnd_lats.max()) + buf
+
+        # Boolean mask of grid cells inside the buffered domain
+        mask = ((full_lon >= lon_min) & (full_lon <= lon_max) &
+                (full_lat >= lat_min) & (full_lat <= lat_max))
+
+        if not np.any(mask):
+            log.warning("3D ROI: no grid cells inside boundary domain + buffer")
+            return None
+
+        # Find bounding box of True cells in (j, i) index space
+        j_indices, i_indices = np.where(mask)
+        j_start = int(j_indices.min())
+        j_end = int(j_indices.max()) + 1  # exclusive upper bound for slicing
+        i_start = int(i_indices.min())
+        i_end = int(i_indices.max()) + 1
+
+        full_shape = full_lon.shape  # (Y, X)
+        roi_shape = (j_end - j_start, i_end - i_start)
+        reduction = 1.0 - (roi_shape[0] * roi_shape[1]) / (full_shape[0] * full_shape[1])
+
+        log.info(f"3D ROI computed: j=[{j_start}:{j_end}], i=[{i_start}:{i_end}] "
+                 f"({roi_shape[0]}x{roi_shape[1]} of {full_shape[0]}x{full_shape[1]}, "
+                 f"{reduction*100:.0f}% reduction)")
+
+        return (j_start, j_end, i_start, i_end)
+
     def _process_3d(self, files_3d: List[Path]) -> List[Path]:
         """Extract T/S from RTOFS 3D files and write SCHISM boundary files."""
         output_files = []
@@ -1115,16 +1177,30 @@ class RTOFSProcessor(ForcingProcessor):
             for f in files_3d:
                 ds = Dataset(str(f))
 
-                lon = ds.variables.get("Longitude") or ds.variables.get("lon")
-                lat = ds.variables.get("Latitude") or ds.variables.get("lat")
+                lon_var = ds.variables.get("Longitude") or ds.variables.get("lon")
+                lat_var = ds.variables.get("Latitude") or ds.variables.get("lat")
                 depth = ds.variables.get("Depth") or ds.variables.get("lev")
 
-                if lon is None or lat is None:
+                if lon_var is None or lat_var is None:
                     ds.close()
                     continue
 
-                lon_arr = lon[:]
-                lat_arr = lat[:]
+                # Compute ROI on first file (cached for all subsequent files)
+                if self._3d_roi is None:
+                    self._3d_roi = self._compute_3d_roi(ds)
+                    if self._3d_roi is None:
+                        # Sentinel: ROI not possible, read full arrays
+                        self._3d_roi = False
+
+                # Read lon/lat/data with ROI subsetting
+                if self._3d_roi and self._3d_roi is not False:
+                    j0, j1, i0, i1 = self._3d_roi
+                    lon_arr = lon_var[j0:j1, i0:i1]
+                    lat_arr = lat_var[j0:j1, i0:i1]
+                else:
+                    lon_arr = lon_var[:]
+                    lat_arr = lat_var[:]
+
                 depth_arr = depth[:] if depth is not None else np.arange(n_levels)
                 n_rtofs_levels = len(depth_arr)
 
@@ -1135,7 +1211,12 @@ class RTOFSProcessor(ForcingProcessor):
                     if var_name not in ds.variables:
                         continue
 
-                    data = ds.variables[var_name][:]
+                    # Hyperslab read: only the ROI subset
+                    if self._3d_roi and self._3d_roi is not False:
+                        j0, j1, i0, i1 = self._3d_roi
+                        data = ds.variables[var_name][:, :, j0:j1, i0:i1]
+                    else:
+                        data = ds.variables[var_name][:]
                     data = np.ma.filled(data, fill_value=np.nan)
                     # Match Fortran: mask values >= 99 as land/fill
                     data[np.abs(data) >= 99.0] = np.nan
