@@ -122,10 +122,13 @@ class ForcingConfig:
     # Minimum number of time records required in RTOFS-derived OBC files
     # (elev2D.th.nc, TEM_3D.th.nc, SAL_3D.th.nc, uv3D.th.nc). When any
     # file falls short, the orchestrator copies the previous cycle's
-    # archived OBC from `$COMOUT_PREV/rerun/`. Set to 0 to disable the check.
-    # Operational STOFS gates on N_dim_cr_max=21 — anything smaller triggers
-    # the fallback (see stofs_3d_atl_create_obc_3d_th_non_adjust.sh:688).
-    obc_min_timesteps: int = 21
+    # archived OBC from `$COMOUT_PREV/rerun/`. Set to 0 (default) to disable.
+    # Operational STOFS-3D-ATL gates on N_dim_cr_max=21 (see
+    # stofs_3d_atl_create_obc_3d_th_non_adjust.sh:688); that value is set by
+    # the STOFS factories and from_yaml for STOFS-like configs. Non-STOFS
+    # OFSes have shorter OBC windows (typically ~10 records for 54h runs)
+    # and would be wrongly flagged if this defaulted to 21.
+    obc_min_timesteps: int = 0
 
     # --- Tidal settings ---
     # Tidal constituents to use
@@ -215,6 +218,8 @@ class ForcingConfig:
             st_lawrence_enabled=True,
             # Dynamic SSH adjust — operational default for STOFS-3D-ATL.
             dynamic_adjust_enabled=True,
+            # OBC dim QC threshold (operational N_dim_cr_max).
+            obc_min_timesteps=21,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -243,6 +248,7 @@ class ForcingConfig:
             nwm_n_list_min=97,
             st_lawrence_enabled=True,
             dynamic_adjust_enabled=True,
+            obc_min_timesteps=21,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -429,8 +435,12 @@ class ForcingConfig:
                 if csv_name:
                     kwargs["st_lawrence_csv_name"] = str(csv_name)
 
+        # STOFS-like YAMLs are identified by the presence of OBC ROI indices
+        # (index-based RTOFS subsetting is STOFS-only).
+        is_stofs_like = bool(roi_2ds or roi_3dz)
+
         # Dynamic SSH adjust: explicitly controlled by obc.obc_mode, or by
-        # obc.dynamic_adjust.enabled if specified. For STOFS-3D-ATL YAMLs
+        # obc.dynamic_adjust.enabled if specified. For STOFS-like YAMLs
         # that omit both (including `_base` inheritance), default to True
         # so from_yaml matches the operational semantics of the
         # for_stofs_3d_atl() factory. Non-STOFS OFSes leave it False.
@@ -441,10 +451,14 @@ class ForcingConfig:
         elif obc_mode is not None:
             kwargs["dynamic_adjust_enabled"] = (str(obc_mode) == "dynamic_adjust")
         else:
-            # Neither flag present: enable by default for STOFS-3D-ATL,
-            # which is identified by having OBC ROI indices (the index-based
-            # subsetting is STOFS-only).
-            kwargs["dynamic_adjust_enabled"] = bool(roi_2ds or roi_3dz)
+            kwargs["dynamic_adjust_enabled"] = is_stofs_like
+
+        # OBC dim QC threshold: operational STOFS gates on N_dim_cr_max=21.
+        # Non-STOFS OFSes have shorter OBC windows (typically ~10 records for
+        # a 54h run) and would be wrongly flagged if this ran against them;
+        # keep the dataclass default of 0 (disabled) for non-STOFS.
+        if is_stofs_like:
+            kwargs["obc_min_timesteps"] = 21
 
         # Optional Path fields — only set if value is non-empty
         # River config: try sources_json first (STOFS), then ctl_file (SECOFS)
