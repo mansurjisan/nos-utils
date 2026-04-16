@@ -219,11 +219,34 @@ class PrepOrchestrator:
 
         # ---- Phase 2: Heavy and dependent steps (sequential) ----
 
+        # St. Lawrence River (STOFS only): needs GFS rad.nc from Phase 1.
+        if self.config.st_lawrence_enabled and "law" in self.paths:
+            results.append(self._run_st_lawrence(output_dir))
+        elif self.config.st_lawrence_enabled:
+            log.info(
+                "st_lawrence_enabled but 'law' path not provided — skipping "
+                "St. Lawrence River forcing"
+            )
+
         # RTOFS OBC: heavy NetCDF I/O + Delaunay interpolation
         if "rtofs" in self.paths and (self.is_stofs or not self.skip_legacy):
             results.append(self._run_rtofs(output_dir, phase, time_hotstart))
+
+            # After RTOFS runs, QC the OBC file time dimensions. If any file
+            # has fewer than obc_min_timesteps records, fall back to the
+            # previous cycle's archive. This guards against partial RTOFS
+            # coverage at cycle boundaries.
+            if self.config.obc_min_timesteps > 0:
+                qc_result = self._qc_obc_dimensions(output_dir)
+                if qc_result is not None:
+                    results.append(qc_result)
         elif self.skip_legacy:
             log.info("Skipping RTOFS OBC (handled by legacy shell)")
+
+        # Dynamic SSH adjust: NOAA tide-gauge bias correction on elev2D.th.nc.
+        # Must run after RTOFS has produced the non-adjusted file.
+        if self.config.dynamic_adjust_enabled:
+            results.append(self._run_dynamic_adjust(output_dir))
 
         # Nudging needs RTOFS to have completed
         if self.config.nudging_enabled and "rtofs" in self.paths:
@@ -309,6 +332,43 @@ class PrepOrchestrator:
         )
         return proc.process()
 
+    def _run_st_lawrence(self, output_dir: Path) -> ForcingResult:
+        """St. Lawrence River: Canadian hydrometric CSV + GFS-rad temperature.
+
+        Reads the Environment Canada CSV from ``$COMINlaw/<pdy>/can_streamgauge/``
+        and the matching GFS sflux radiation file (for air-temp regression).
+        Falls back to the previous day's CSV and then to the previous cycle's
+        archive directory (``prev_rerun`` path).
+        """
+        from .forcing.st_lawrence import StLawrenceProcessor
+
+        sflux_dir = output_dir / "sflux" if self.config.nws == 2 else output_dir
+        # Look for the operational rad.nc (``<prefix>.tHHz.gfs.rad.nc``) or
+        # the standard sflux naming (``sflux_rad_1.1.nc``).
+        sflux_rad = None
+        archive_prefix = f"{self.run_name}.t{self.config.cyc:02d}z"
+        rad_candidates = [
+            sflux_dir / f"{archive_prefix}.gfs.rad.nc",
+            sflux_dir / "sflux_rad_1.1.nc",
+            sflux_dir / "sflux_rad_1.0001.nc",
+        ]
+        for p in rad_candidates:
+            if p.exists():
+                sflux_rad = p
+                break
+
+        prev_rerun = self.paths.get("prev_rerun")
+        proc = StLawrenceProcessor(
+            self.config,
+            self.paths["law"],
+            output_dir,
+            csv_name=self.config.st_lawrence_csv_name,
+            sflux_rad_file=sflux_rad,
+            prev_rerun_dir=prev_rerun,
+            archive_prefix=archive_prefix,
+        )
+        return proc.process()
+
     def _run_rtofs(self, output_dir: Path, phase: str = "nowcast",
                    time_hotstart=None) -> ForcingResult:
         """Step 5: RTOFS ocean boundary conditions."""
@@ -353,6 +413,206 @@ class PrepOrchestrator:
             vgrid_file=vgrid,
             phase=phase,
             time_hotstart=time_hotstart,
+        )
+        return proc.process()
+
+    # Mapping from the active OBC filename (what SCHISM reads) to the
+    # standard archive basename under $COMOUT_PREV/rerun/ (see
+    # stofs_3d_atl_create_obc_3d_th_non_adjust.sh:641-642). The archive
+    # file is stored as `<run>.<cycle>.<archive_base>.nc`.
+    _OBC_ARCHIVE_NAMES: Dict[str, str] = {
+        "elev2D.th.nc": "elev2dth_non_adj",
+        "TEM_3D.th.nc": "tem3dth",
+        "SAL_3D.th.nc": "sal3dth",
+        "uv3D.th.nc": "uv3dth",
+    }
+
+    def _qc_obc_dimensions(self, output_dir: Path) -> Optional[ForcingResult]:
+        """Validate OBC time dims and fall back to COMOUT_PREV on short files.
+
+        Returns None (no QC event) when every file satisfies the minimum,
+        otherwise a ForcingResult describing the fallback outcome.
+
+        The operational convention (see stofs_3d_atl_create_obc_3d_th_non_adjust.sh
+        lines 650-710) is to use the file directly when its time dim is
+        >= N_dim_cr_max (21) and otherwise copy the previous cycle's
+        archive file, which is stored under a DIFFERENT name
+        (``<run>.<cycle>.elev2dth_non_adj.nc`` for ``elev2D.th.nc``, etc.).
+        """
+        import shutil
+
+        try:
+            from netCDF4 import Dataset
+        except ImportError:
+            log.info("netCDF4 unavailable; skipping OBC dimension QC")
+            return None
+
+        min_t = self.config.obc_min_timesteps
+        obc_files = list(self._OBC_ARCHIVE_NAMES.keys())
+        short_files: List[str] = []
+        file_dims: Dict[str, int] = {}
+        for name in obc_files:
+            p = output_dir / name
+            if not p.exists():
+                continue
+            try:
+                with Dataset(str(p)) as ds:
+                    if "time" in ds.dimensions:
+                        n_t = len(ds.dimensions["time"])
+                    elif "time" in ds.variables:
+                        n_t = int(ds.variables["time"].shape[0])
+                    else:
+                        continue
+                file_dims[name] = n_t
+                if n_t < min_t:
+                    short_files.append(name)
+            except Exception as exc:
+                log.warning(f"OBC QC: failed to read {p}: {exc}")
+                continue
+
+        if not short_files:
+            return None
+
+        prev_rerun = self.paths.get("prev_rerun")
+        warnings: List[str] = [
+            f"OBC QC: {name} has {file_dims[name]} records < "
+            f"{min_t} (operational N_dim_cr_max)" for name in short_files
+        ]
+        errors: List[str] = []
+        copied: List[Path] = []
+
+        if not prev_rerun:
+            errors.append(
+                "obc_min_timesteps not satisfied and 'prev_rerun' path "
+                "not provided — OBC files may be invalid"
+            )
+            return ForcingResult(
+                success=False, source="OBC_QC",
+                errors=errors, warnings=warnings,
+                metadata={"short_files": short_files, "file_dims": file_dims},
+            )
+
+        prev = Path(prev_rerun)
+        cycle_tag = f"t{self.config.cyc:02d}z"
+        for name in short_files:
+            archive_base = self._OBC_ARCHIVE_NAMES.get(name)
+            # Try the operational archive name first, then common alternatives.
+            candidates: List[Path] = []
+            if archive_base is not None:
+                candidates.append(
+                    prev / f"{self.run_name}.{cycle_tag}.{archive_base}.nc"
+                )
+            candidates.extend([
+                prev / f"{self.run_name}.{cycle_tag}.{name}",
+                prev / name,
+            ])
+            for src in candidates:
+                if src.exists():
+                    dst = output_dir / name
+                    try:
+                        shutil.copy2(src, dst)
+                        copied.append(dst)
+                        log.info(
+                            f"OBC QC: replaced short {name} with {src}"
+                        )
+                    except OSError as exc:
+                        errors.append(
+                            f"OBC QC: failed to copy {src} -> {dst}: {exc}"
+                        )
+                    break
+            else:
+                errors.append(
+                    f"OBC QC: no archive fallback found for {name} in {prev} "
+                    f"(tried {len(candidates)} candidate names)"
+                )
+
+        return ForcingResult(
+            success=len(errors) == 0,
+            source="OBC_QC",
+            output_files=copied,
+            errors=errors,
+            warnings=warnings,
+            metadata={
+                "short_files": short_files,
+                "file_dims": file_dims,
+                "n_fallback_copied": len(copied),
+            },
+        )
+
+    def _run_dynamic_adjust(self, output_dir: Path) -> ForcingResult:
+        """Apply NOAA tide-gauge bias correction to elev2D.th.nc.
+
+        Resolves the several supporting paths required by the operational
+        script (NOAA obs, previous cycle staout_1, param.nml, avg bias,
+        FIX .bp files) from ``self.paths``:
+          * ``noaa_obs``  -> ``$DCOMROOT/<pdy>/coops_waterlvlobs`` directory
+          * ``prev_rerun`` -> ``$COMOUT_PREV/rerun`` directory
+          * ``fix``        -> directory containing station.bp + diff.bp
+        Any missing path causes the processor to degrade to a zero-bias
+        correction (see DynamicAdjustProcessor for details).
+        """
+        from .forcing.dynamic_adjust import DynamicAdjustProcessor
+
+        fix_dir = self.paths.get("fix")
+        obs_dir = self.paths.get("noaa_obs")
+        prev_rerun = self.paths.get("prev_rerun")
+
+        # Resolve FIX inputs — search for the STOFS-3D-ATL naming first
+        # then any matching pattern.
+        station_bp = None
+        diff_bp = None
+        if fix_dir:
+            fix_path = Path(fix_dir)
+            for name in (
+                "stofs_3d_atl_obc_adjust_station.bp",
+                f"{self.run_name}_station.in",
+                "station.bp",
+            ):
+                cand = fix_path / name
+                if cand.exists():
+                    station_bp = cand
+                    break
+            for name in (
+                "stofs_3d_atl_obc_adjust_msl_geoid.bp",
+                "OBC_stofs_3d_atl_obc_adjust_msl_geoid.bp",
+                "diff.bp",
+            ):
+                cand = fix_path / name
+                if cand.exists():
+                    diff_bp = cand
+                    break
+
+        prev_staout_1 = None
+        prev_param_nml = None
+        prev_avg_bias = None
+        if prev_rerun:
+            prev = Path(prev_rerun)
+            if (prev / "staout_1").exists():
+                prev_staout_1 = prev / "staout_1"
+            cycle_tag = f"t{self.config.cyc:02d}z"
+            for pnl in (prev / f"{self.run_name}.{cycle_tag}.param.nml",
+                        prev / "param.nml"):
+                if pnl.exists():
+                    prev_param_nml = pnl
+                    break
+            for ab in (prev / f"{self.run_name}.{cycle_tag}.avg_bias",
+                       prev / "average_bias_today"):
+                if ab.exists():
+                    prev_avg_bias = ab
+                    break
+
+        proc = DynamicAdjustProcessor(
+            self.config,
+            input_path=output_dir,
+            output_path=output_dir,
+            obs_dir=obs_dir,
+            prev_staout_1=prev_staout_1,
+            prev_param_nml=prev_param_nml,
+            station_bp=station_bp,
+            diff_bp=diff_bp,
+            prev_avg_bias_file=prev_avg_bias,
+            elev2d_th_nc=output_dir / "elev2D.th.nc",
+            bias_window_days=self.config.dynamic_adjust_window_days,
         )
         return proc.process()
 

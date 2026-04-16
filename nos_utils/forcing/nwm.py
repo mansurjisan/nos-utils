@@ -404,13 +404,21 @@ class NWMProcessor(ForcingProcessor):
         if vsource:
             output_files.append(vsource)
 
-        # STOFS: msource.th is a static FIX file, not generated
+        # STOFS: msource.th and vsink.th are static FIX files, not generated
         if self.is_stofs_mode:
             msource = self._copy_static_msource()
         else:
             msource = self._write_msource(times)
         if msource:
             output_files.append(msource)
+
+        # STOFS: copy static vsink.th from FIX (volume sinks, e.g. diversions).
+        # Operational shell scripts stage this alongside msource.th with no
+        # per-cycle computation, so nos-utils mirrors that behavior.
+        if self.is_stofs_mode:
+            vsink = self._copy_static_vsink()
+            if vsink:
+                output_files.append(vsink)
 
         source_sink = self._write_source_sink()
         if source_sink:
@@ -663,34 +671,47 @@ class NWMProcessor(ForcingProcessor):
                  f"from {len(all_flows)} NWM files")
         return np.stack(all_flows, axis=0), all_times
 
-    def _copy_static_msource(self) -> Optional[Path]:
-        """Copy static msource.th from FIX directory (STOFS convention)."""
-        import shutil
-        output_file = self.output_path / "msource.th"
-
-        # Search FIX directory (from river_config_file parent or env var)
+    def _fix_search_dirs(self) -> List[Path]:
+        """FIX directories to search for static river files (in priority order)."""
         import os
-        fix_dirs = []
+        dirs: List[Path] = []
         if self.config.river_config_file:
-            fix_dirs.append(Path(self.config.river_config_file).parent)
-        for env_var in ["FIXstofs3d", "FIXofs"]:
-            if os.environ.get(env_var):
-                fix_dirs.append(Path(os.environ[env_var]))
-        fix_dirs.append(self.input_path)  # fallback to input_path
+            dirs.append(Path(self.config.river_config_file).parent)
+        for env_var in ("FIXstofs3d", "FIXofs"):
+            env_val = os.environ.get(env_var)
+            if env_val:
+                dirs.append(Path(env_val))
+        dirs.append(self.input_path)
+        return dirs
 
-        for fix_dir in fix_dirs:
-            for name in ["stofs_3d_atl_river_msource.th", "msource.th"]:
+    def _copy_static_river_file(self, output_name: str,
+                                candidates: List[str]) -> Optional[Path]:
+        """Search FIX dirs for any of *candidates* and copy to output/{output_name}."""
+        import shutil
+        output_file = self.output_path / output_name
+        for fix_dir in self._fix_search_dirs():
+            for name in candidates:
                 src = fix_dir / name
                 if src.exists():
                     shutil.copy2(src, output_file)
-                    log.info(f"Copied static {name} from {fix_dir} -> msource.th")
+                    log.info(f"Copied static {name} from {fix_dir} -> {output_name}")
                     return output_file
+        return None
+
+    def _copy_static_msource(self) -> Optional[Path]:
+        """Copy static msource.th from FIX directory (STOFS convention)."""
+        path = self._copy_static_river_file(
+            "msource.th", ["stofs_3d_atl_river_msource.th", "msource.th"],
+        )
+        if path is not None:
+            return path
 
         # Fallback: generate msource.th with default T/S
         log.warning("Static msource.th not found, generating with defaults")
         n_rivers = self.river_config.n_rivers
         temp = self.config.river_default_temp
         salt = self.config.river_default_salt
+        output_file = self.output_path / "msource.th"
         try:
             with open(output_file, "w") as f:
                 # Single timestep at t=0 with constant T/S (SCHISM repeats last)
@@ -700,6 +721,20 @@ class NWMProcessor(ForcingProcessor):
         except Exception as e:
             log.error(f"Failed to write msource.th: {e}")
             return None
+
+    def _copy_static_vsink(self) -> Optional[Path]:
+        """Copy static vsink.th from FIX directory (STOFS convention)."""
+        path = self._copy_static_river_file(
+            "vsink.th", ["stofs_3d_atl_river_vsink.th", "vsink.th"],
+        )
+        if path is None:
+            # No fallback generation — STOFS relies on the FIX file being
+            # provisioned; without it, vsink simply isn't staged and SCHISM
+            # skips volume sinks.
+            log.warning(
+                "Static vsink.th not found in FIX dirs; skipping volume-sink file"
+            )
+        return path
 
     def _generate_climatology(self, n_steps: int) -> Tuple[np.ndarray, List[float]]:
         """Generate climatology-based river forcing."""

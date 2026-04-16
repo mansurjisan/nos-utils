@@ -278,7 +278,14 @@ class RTOFSProcessor(ForcingProcessor):
             fortran_ok = self._call_fortran_gen_3dth(work_dir, ssh_path, tsuv_path)
 
             if fortran_ok:
-                # Copy Fortran outputs to final output directory
+                # Copy Fortran outputs to final output directory.
+                # NOTE: do NOT apply obc_ssh_offset here — the Fortran exe
+                # (nos_ofs_create_forcing_obc_schism / gen_3Dth_from_hycom)
+                # already adds the geoid-to-MSL offset internally. See the
+                # note at _call_fortran_gen_3dth and commit ca16ad5 which
+                # removed a double-offset bug. The Python fallback path
+                # (_interpolate_2d) does apply it inline, but only because
+                # that path doesn't call the Fortran.
                 for fname in ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]:
                     src = work_dir / fname
                     if src.exists():
