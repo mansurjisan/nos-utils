@@ -103,6 +103,30 @@ class ForcingConfig:
     nwm_n_list_target: int = 55
     nwm_n_list_min: int = 31
 
+    # St. Lawrence River climatology (STOFS-3D-ATL only).
+    # When True, the orchestrator runs StLawrenceProcessor which reads the
+    # Environment Canada hydrometric CSV at $COMINlaw/<pdy>/can_streamgauge/
+    # and produces flux.th / TEM_1.th. Falls back to previous-day CSV and
+    # then to the previous cycle's archived .riv.obs.* files.
+    st_lawrence_enabled: bool = False
+    st_lawrence_csv_name: str = "02OA016_hydrometric.csv"
+
+    # Dynamic SSH adjustment (STOFS-3D-ATL NOAA tide-gauge bias correction).
+    # When True, the orchestrator runs DynamicAdjustProcessor after RTOFS
+    # to subtract a per-cycle bias from elev2D.th.nc using 11 NOAA
+    # reference stations. Needs the previous cycle's staout_1, param.nml,
+    # and average_bias file in $COMOUT_PREV; degrades gracefully otherwise.
+    dynamic_adjust_enabled: bool = False
+    dynamic_adjust_window_days: int = 2
+
+    # Minimum number of time records required in RTOFS-derived OBC files
+    # (elev2D.th.nc, TEM_3D.th.nc, SAL_3D.th.nc, uv3D.th.nc). When any
+    # file falls short, the orchestrator copies the previous cycle's
+    # archived OBC from `$COMOUT_PREV/rerun/`. Set to 0 to disable the check.
+    # Operational STOFS gates on N_dim_cr_max=21 — anything smaller triggers
+    # the fallback (see stofs_3d_atl_create_obc_3d_th_non_adjust.sh:688).
+    obc_min_timesteps: int = 21
+
     # --- Tidal settings ---
     # Tidal constituents to use
     tidal_constituents: List[str] = field(
@@ -187,6 +211,10 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
+            # St. Lawrence climatology — always on for STOFS-3D-ATL.
+            st_lawrence_enabled=True,
+            # Dynamic SSH adjust — operational default for STOFS-3D-ATL.
+            dynamic_adjust_enabled=True,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -213,6 +241,8 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
+            st_lawrence_enabled=True,
+            dynamic_adjust_enabled=True,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -389,6 +419,32 @@ class ForcingConfig:
                 kwargs["nwm_n_list_target"] = int(n_target)
             if n_min:
                 kwargs["nwm_n_list_min"] = int(n_min)
+
+        # St. Lawrence River climatology flag
+        if isinstance(river, dict):
+            stl = river.get("st_lawrence", {})
+            if isinstance(stl, dict):
+                kwargs["st_lawrence_enabled"] = bool(stl.get("enabled", False))
+                csv_name = stl.get("csv_name")
+                if csv_name:
+                    kwargs["st_lawrence_csv_name"] = str(csv_name)
+
+        # Dynamic SSH adjust: explicitly controlled by obc.obc_mode, or by
+        # obc.dynamic_adjust.enabled if specified. For STOFS-3D-ATL YAMLs
+        # that omit both (including `_base` inheritance), default to True
+        # so from_yaml matches the operational semantics of the
+        # for_stofs_3d_atl() factory. Non-STOFS OFSes leave it False.
+        obc_mode = obc.get("obc_mode") if isinstance(obc, dict) else None
+        dyn_cfg = obc.get("dynamic_adjust", {}) if isinstance(obc, dict) else {}
+        if isinstance(dyn_cfg, dict) and "enabled" in dyn_cfg:
+            kwargs["dynamic_adjust_enabled"] = bool(dyn_cfg["enabled"])
+        elif obc_mode is not None:
+            kwargs["dynamic_adjust_enabled"] = (str(obc_mode) == "dynamic_adjust")
+        else:
+            # Neither flag present: enable by default for STOFS-3D-ATL,
+            # which is identified by having OBC ROI indices (the index-based
+            # subsetting is STOFS-only).
+            kwargs["dynamic_adjust_enabled"] = bool(roi_2ds or roi_3dz)
 
         # Optional Path fields — only set if value is non-empty
         # River config: try sources_json first (STOFS), then ctl_file (SECOFS)

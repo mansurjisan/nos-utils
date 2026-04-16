@@ -7,11 +7,13 @@ Atmospheric:
     GEFSProcessor - Global Ensemble Forecast System (0.25/0.50°, 3-hourly)
 
 Ocean Boundary:
-    RTOFSProcessor - Real-Time Ocean Forecast System (SSH, T/S/UV boundaries)
+    RTOFSProcessor         - Real-Time Ocean Forecast System (SSH, T/S/UV boundaries)
+    DynamicAdjustProcessor - NOAA tide-gauge bias correction for SSH boundary
 
 River:
     NWMProcessor        - National Water Model (streamflow → vsource/msource)
     RiverClimProcessor  - USGS daily climatology (when NWM/BUFR unavailable)
+    StLawrenceProcessor - St. Lawrence River (Canadian hydrometric + GFS-rad temp)
 
 Tidal:
     TidalProcessor - Tidal constituents (bctides.in generation)
@@ -38,8 +40,10 @@ from .gfs import GFSProcessor
 from .hrrr import HRRRProcessor
 from .gefs import GEFSProcessor
 from .rtofs import RTOFSProcessor
+from .dynamic_adjust import DynamicAdjustProcessor
 from .nwm import NWMProcessor, RiverConfig
 from .river_clim import RiverClimProcessor
+from .st_lawrence import StLawrenceProcessor
 from .tidal import TidalProcessor, compute_nodal_corrections
 from .nudging import NudgingProcessor
 from .param_nml import ParamNmlProcessor
@@ -59,10 +63,12 @@ __all__ = [
     "GEFSProcessor",
     # Ocean boundary
     "RTOFSProcessor",
+    "DynamicAdjustProcessor",
     # River
     "NWMProcessor",
     "RiverConfig",
     "RiverClimProcessor",
+    "StLawrenceProcessor",
     # Tidal
     "TidalProcessor",
     "compute_nodal_corrections",
