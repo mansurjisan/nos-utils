@@ -298,10 +298,15 @@ class PrepOrchestrator:
 
     def _run_gfs(self, output_dir: Path, phase: str,
                  time_hotstart=None) -> ForcingResult:
-        """Step 2: GFS atmospheric forcing."""
+        """Step 2: GFS atmospheric forcing.
+
+        Always writes sflux files to ``output_dir/sflux/``. In nws=4
+        (UFS-Coastal), the BlenderProcessor downstream merges these with
+        HRRR sflux into datm_forcing.nc on the wide DATM grid.
+        """
         from .forcing.gfs import GFSProcessor
 
-        sflux_dir = output_dir / "sflux" if self.config.nws == 2 else output_dir
+        sflux_dir = output_dir / "sflux"
         proc = GFSProcessor(
             self.config, self.paths["gfs"], sflux_dir,
             resolution=self.config.gfs_resolution,
@@ -311,10 +316,14 @@ class PrepOrchestrator:
 
     def _run_hrrr(self, output_dir: Path, phase: str,
                   time_hotstart=None) -> ForcingResult:
-        """Step 3: HRRR secondary atmospheric (optional)."""
+        """Step 3: HRRR secondary atmospheric (optional).
+
+        Always writes sflux files to ``output_dir/sflux/``. The
+        BlenderProcessor merges these with GFS sflux when nws=4.
+        """
         from .forcing.hrrr import HRRRProcessor
 
-        sflux_dir = output_dir / "sflux" if self.config.nws == 2 else output_dir
+        sflux_dir = output_dir / "sflux"
         proc = HRRRProcessor(
             self.config, self.paths["hrrr"], sflux_dir,
             phase=phase, time_hotstart=time_hotstart,
@@ -342,7 +351,7 @@ class PrepOrchestrator:
         """
         from .forcing.st_lawrence import StLawrenceProcessor
 
-        sflux_dir = output_dir / "sflux" if self.config.nws == 2 else output_dir
+        sflux_dir = output_dir / "sflux"
         # Look for the operational rad.nc (``<prefix>.tHHz.gfs.rad.nc``) or
         # the standard sflux naming (``sflux_rad_1.1.nc``).
         sflux_rad = None
@@ -698,6 +707,8 @@ class PrepOrchestrator:
         """Step 8: DATM blending + ESMF mesh for UFS-Coastal."""
         output_files = []
         warnings = []
+        errors = []
+        blend_ok = False
 
         # 8a: Blend GFS+HRRR sflux into datm_forcing.nc (if sflux dir has both sources)
         sflux_dir = output_dir / "sflux"
@@ -707,16 +718,25 @@ class PrepOrchestrator:
 
             if gfs_sflux:
                 from .forcing.blender import BlenderProcessor
-                blender = BlenderProcessor(self.config, sflux_dir, output_dir)
+                blender = BlenderProcessor(
+                    self.config, sflux_dir, output_dir,
+                    target_dx=self.config.datm_dx,
+                )
                 blend_result = blender.process()
                 if blend_result.success:
                     output_files.extend(blend_result.output_files)
                     log.info(f"DATM blending: {len(blend_result.output_files)} files")
+                    blend_ok = True
                 else:
-                    warnings.extend(blend_result.errors)
+                    errors.extend(blend_result.errors)
+            else:
+                errors.append("No GFS sflux files found in sflux/ — blender skipped")
+        else:
+            errors.append(f"sflux/ subdir does not exist at {sflux_dir} — blender skipped")
 
         # 8b: Generate ESMF mesh from the datm_forcing.nc
         datm_file = output_dir / "datm_forcing.nc"
+        mesh_ok = False
         if datm_file.exists():
             from .forcing.esmf_mesh import ESMFMeshProcessor
             mesh_proc = ESMFMeshProcessor(
@@ -726,15 +746,20 @@ class PrepOrchestrator:
             mesh_result = mesh_proc.process()
             if mesh_result.success:
                 output_files.extend(mesh_result.output_files)
+                mesh_ok = True
             else:
-                warnings.extend(mesh_result.errors)
+                errors.extend(mesh_result.errors)
         else:
             warnings.append("datm_forcing.nc not found — ESMF mesh not generated")
 
+        # _run_datm is only called when nws=4 (orchestrator gates the call),
+        # so we expect both blend and mesh to succeed.
+        success = blend_ok and mesh_ok
         return ForcingResult(
-            success=True, source="DATM",
+            success=success, source="DATM",
             output_files=output_files,
             warnings=warnings,
+            errors=errors,
         )
 
     def archive_to_comout(self, result: PrepResult, comout: Path) -> List[Path]:

@@ -69,6 +69,20 @@ class ForcingConfig:
     hrrr_lat_min: Optional[float] = None
     hrrr_lat_max: Optional[float] = None
 
+    # --- DATM input grid (UFS-Coastal nws=4) ---
+    # Wide DATM forcing grid for blended HRRR+GFS input to CDEPS.
+    # Different from `domain` (model mesh). DATM grid covers a halo around
+    # the mesh extent so atmospheric forcing reaches all coupled boundaries.
+    # When set, GFS/HRRR processors extract over this wider domain (in nws=4
+    # mode) and the BlenderProcessor builds output on this grid.
+    # All four must be set together or all None (falls back to `domain`).
+    datm_lon_min: Optional[float] = None
+    datm_lon_max: Optional[float] = None
+    datm_lat_min: Optional[float] = None
+    datm_lat_max: Optional[float] = None
+    # DATM grid resolution in degrees (for blender output).
+    datm_dx: float = 0.025
+
     # --- OBC (ocean boundary) settings ---
     # RTOFS ROI indices for 2D (ssh) extraction
     obc_roi_2d: Optional[dict] = None  # {x1, x2, y1, y2}
@@ -159,6 +173,31 @@ class ForcingConfig:
                     self.hrrr_lat_min, self.hrrr_lat_max)
         return self.domain
 
+    @property
+    def datm_domain(self):
+        """DATM forcing grid bounds (falls back to main domain if not set).
+
+        Used by BlenderProcessor as the output grid extent. When all four
+        ``datm_*`` fields are set, returns those; otherwise returns ``domain``.
+        """
+        if self.datm_lon_min is not None:
+            return (self.datm_lon_min, self.datm_lon_max,
+                    self.datm_lat_min, self.datm_lat_max)
+        return self.domain
+
+    @property
+    def forcing_domain(self):
+        """Domain used by atmospheric forcing extraction (GFS, HRRR).
+
+        - nws=4 (UFS-Coastal): returns ``datm_domain`` so the inputs cover
+          the wider DATM grid the blender will write onto.
+        - nws=2 (standalone SCHISM): returns ``domain`` (model mesh extent),
+          unchanged from prior behavior.
+        """
+        if self.nws == 4:
+            return self.datm_domain
+        return self.domain
+
     @classmethod
     def for_secofs(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
         """Factory with SECOFS defaults (SE Coastal Ocean Forecast System)."""
@@ -176,14 +215,24 @@ class ForcingConfig:
 
     @classmethod
     def for_secofs_ufs(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
-        """Factory with SECOFS UFS-Coastal defaults (nws=4, DATM coupling)."""
+        """Factory with SECOFS UFS-Coastal defaults (nws=4, DATM coupling).
+
+        DATM forcing grid is the ATLANTIC preset (-98 to -55, 10 to 53)
+        at 0.025° to match the operational shell pipeline (1721x1721).
+        GFS resolution is 0p25 for hourly cadence (was 0p50 default = 3-hourly).
+        """
         defaults = dict(
             lon_min=-88.0, lon_max=-63.0,
             lat_min=17.0, lat_max=40.0,
             pdy=pdy, cyc=cyc,
             nowcast_hours=6, forecast_hours=48,
             met_num=2, nws=4,
+            gfs_resolution="0p25",
             obc_ssh_offset=1.25,
+            # DATM forcing grid (ATLANTIC preset)
+            datm_lon_min=-98.0, datm_lon_max=-55.0,
+            datm_lat_min=10.0, datm_lat_max=53.0,
+            datm_dx=0.025,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -226,7 +275,12 @@ class ForcingConfig:
 
     @classmethod
     def for_stofs_3d_atl_ufs(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
-        """Factory with STOFS-3D-ATL UFS-Coastal defaults (nws=4, DATM coupling)."""
+        """Factory with STOFS-3D-ATL UFS-Coastal defaults (nws=4, DATM coupling).
+
+        DATM forcing grid uses the ATLANTIC preset bounds at 0.025° to match
+        the operational shell pipeline. The STOFS model domain is slightly
+        wider, but DATM input data is bounded to ATLANTIC by convention.
+        """
         defaults = dict(
             lon_min=-98.5035, lon_max=-52.4867,
             lat_min=7.347, lat_max=52.5904,
@@ -249,6 +303,10 @@ class ForcingConfig:
             st_lawrence_enabled=True,
             dynamic_adjust_enabled=True,
             obc_min_timesteps=21,
+            # DATM forcing grid (ATLANTIC preset, slightly narrower than model)
+            datm_lon_min=-98.0, datm_lon_max=-55.0,
+            datm_lat_min=10.0, datm_lat_max=53.0,
+            datm_dx=0.025,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -459,6 +517,51 @@ class ForcingConfig:
         # keep the dataclass default of 0 (disabled) for non-STOFS.
         if is_stofs_like:
             kwargs["obc_min_timesteps"] = 21
+
+        # UFS-Coastal DATM grid configuration. The DATM grid covers a halo
+        # around the SCHISM mesh extent so atmospheric forcing reaches all
+        # coupled boundaries. Two YAML forms supported:
+        #
+        #   ufs_coastal:
+        #     datm_bounds: {lon_min: ..., lon_max: ..., lat_min: ..., lat_max: ...}
+        #     blend_resolution: 0.025
+        #
+        # or via preset name (legacy, mirrors ush/python/nos_ofs/datm/blend_hrrr_gfs.py):
+        #
+        #   ufs_coastal:
+        #     datm_domain: ATLANTIC
+        #
+        # Explicit datm_bounds wins over the preset name if both are set.
+        ufs_coastal = data.get("ufs_coastal", {})
+        if isinstance(ufs_coastal, dict) and ufs_coastal.get("enabled", True):
+            datm_bounds_yaml = ufs_coastal.get("datm_bounds", {})
+            if isinstance(datm_bounds_yaml, dict) and datm_bounds_yaml:
+                kwargs["datm_lon_min"] = float(datm_bounds_yaml["lon_min"])
+                kwargs["datm_lon_max"] = float(datm_bounds_yaml["lon_max"])
+                kwargs["datm_lat_min"] = float(datm_bounds_yaml["lat_min"])
+                kwargs["datm_lat_max"] = float(datm_bounds_yaml["lat_max"])
+            elif ufs_coastal.get("datm_domain"):
+                # Preset name lookup. Mirrors the table in
+                # ush/python/nos_ofs/datm/blend_hrrr_gfs.py:52-55.
+                DATM_PRESETS = {
+                    "ATLANTIC":    (-98.0, -55.0, 10.0, 53.0),
+                    "SECOFS":      (-90.0, -61.0, 15.0, 42.0),
+                    "STOFS3D_ATL": (-99.0, -52.0,  7.0, 53.0),
+                }
+                preset = str(ufs_coastal["datm_domain"]).upper()
+                if preset in DATM_PRESETS:
+                    lon_min, lon_max, lat_min, lat_max = DATM_PRESETS[preset]
+                    kwargs["datm_lon_min"] = lon_min
+                    kwargs["datm_lon_max"] = lon_max
+                    kwargs["datm_lat_min"] = lat_min
+                    kwargs["datm_lat_max"] = lat_max
+                else:
+                    log.warning(
+                        f"Unknown ufs_coastal.datm_domain preset '{preset}'. "
+                        f"Known: {sorted(DATM_PRESETS)}. Falling back to model domain."
+                    )
+            if "blend_resolution" in ufs_coastal:
+                kwargs["datm_dx"] = float(ufs_coastal["blend_resolution"])
 
         # Optional Path fields — only set if value is non-empty
         # River config: try sources_json first (STOFS), then ctl_file (SECOFS)

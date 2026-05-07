@@ -85,6 +85,7 @@ class GFSProcessor(ForcingProcessor):
         extractor: Optional[GRIBExtractor] = None,
         phase: str = "nowcast",
         time_hotstart: Optional[datetime] = None,
+        direct_datm: bool = False,
     ):
         """
         Args:
@@ -96,6 +97,10 @@ class GFSProcessor(ForcingProcessor):
             extractor: GRIB2 extractor (auto-detected if None)
             phase: "nowcast" or "forecast" — determines time window
             time_hotstart: Hotstart datetime (nowcast starts from here)
+            direct_datm: Write datm_forcing.nc directly via DATMWriter
+                instead of sflux files. Standalone-DATM only — for
+                UFS-Coastal coupled runs leave False so the orchestrator
+                can blend GFS+HRRR sflux into a wide DATM grid.
         """
         super().__init__(config, input_path, output_path)
         self.variables = variables or (config.variables if config.variables else self.DEFAULT_VARIABLES)
@@ -103,6 +108,7 @@ class GFSProcessor(ForcingProcessor):
         self._extractor = extractor
         self.phase = phase
         self.time_hotstart = time_hotstart
+        self.direct_datm = direct_datm
         # Set resolution-appropriate file size threshold
         self.MIN_FILE_SIZE = self.MIN_FILE_SIZE_BY_RES.get(resolution, 40_000_000)
 
@@ -181,7 +187,7 @@ class GFSProcessor(ForcingProcessor):
         Pipeline: discover files -> extract GRIB2 -> filter to time window -> write sflux or DATM
         """
         log.info(f"GFS processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z "
-                 f"phase={self.phase} domain={self.config.domain} res={self.resolution}")
+                 f"phase={self.phase} domain={self.config.forcing_domain} res={self.resolution}")
 
         self.create_output_dir()
 
@@ -212,8 +218,14 @@ class GFSProcessor(ForcingProcessor):
         output_files = []
         warnings = []
 
-        if self.config.nws == 4:
-            # DATM output
+        # Output mode:
+        #   direct_datm=True  → write datm_forcing.nc directly via DATMWriter.
+        #     Produces narrow-domain DATM (no HRRR blend). Used by tests
+        #     and standalone-DATM callers.
+        #   direct_datm=False → write sflux files. In nws=4 (UFS-Coastal)
+        #     the orchestrator's BlenderProcessor merges these with HRRR
+        #     sflux into a wide DATM grid. Default for production.
+        if self.direct_datm:
             writer = DATMWriter()
             datm_path = self.output_path / "datm_forcing.nc"
             writer.write(
@@ -222,7 +234,6 @@ class GFSProcessor(ForcingProcessor):
             )
             output_files.append(datm_path)
         else:
-            # sflux output (default)
             writer = SfluxWriter(self.output_path, source_index=1)
             base_date = self._compute_base_date()
             files = writer.write_all(
@@ -436,7 +447,9 @@ class GFSProcessor(ForcingProcessor):
         for var in self.variables:
             result["data"][var] = []
 
-        domain = self.config.domain
+        # Use forcing_domain so nws=4 (UFS-Coastal) extracts over the
+        # wide DATM grid; nws=2 still extracts over model domain.
+        domain = self.config.forcing_domain
 
         # Get grid coordinates from first file
         result["lons"], result["lats"] = self.extractor.get_grid(gfs_files[0], domain)

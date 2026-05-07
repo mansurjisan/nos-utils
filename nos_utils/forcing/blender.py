@@ -106,10 +106,14 @@ class BlenderProcessor(ForcingProcessor):
 
         log.info(f"GFS files: {len(gfs_files)}, HRRR files: {len(hrrr_files)}")
 
-        # Build target grid
-        lon_min, lon_max, lat_min, lat_max = self.config.domain
+        # Build target grid using datm_domain (wide DATM bounds for UFS-Coastal).
+        # Falls back to model domain when datm_* fields are unset.
+        lon_min, lon_max, lat_min, lat_max = self.config.datm_domain
         target_lons = np.arange(lon_min, lon_max + self.target_dx, self.target_dx)
         target_lats = np.arange(lat_min, lat_max + self.target_dx, self.target_dx)
+        log.info(f"Target grid: dx={self.target_dx}° "
+                 f"nx={len(target_lons)} ny={len(target_lats)} "
+                 f"bounds=({lon_min:.4f},{lon_max:.4f},{lat_min:.4f},{lat_max:.4f})")
 
         # Load GFS data
         gfs_data, gfs_times, gfs_lons, gfs_lats = self._load_sflux_stack(gfs_files)
