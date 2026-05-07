@@ -306,19 +306,25 @@ class GFSProcessor(ForcingProcessor):
         cycles = self._compute_search_cycles()
         gfs_files = []
 
-        # Compute max forecast hour needed from a single cycle
-        # For forecast: cycle may be 6h before forecast end, so need longer leads
+        # Compute max forecast hour needed from a single cycle.
+        # forecast_end includes the +3h buffer so files reaching past the
+        # nominal forecast endpoint are included (CDEPS interpolation needs
+        # forcing values slightly past the model stop time).
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
         cycle_dt = base_date + timedelta(hours=self.config.cyc)
-        forecast_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
+        forecast_end = (
+            cycle_dt
+            + timedelta(hours=self.config.forecast_hours)
+            + timedelta(hours=3)  # buffer
+        )
 
         for date, cyc in cycles:
             date_str = date.strftime("%Y%m%d")
             cycle_start = date + timedelta(hours=cyc)
 
-            # Max lead = hours from this cycle to the end of the forecast window
+            # Max lead = hours from this cycle to the buffered forecast end
             max_fhr = int((forecast_end - cycle_start).total_seconds() / 3600)
-            max_fhr = max(max_fhr, self.config.forecast_hours)
+            max_fhr = max(max_fhr, self.config.forecast_hours + 3)
 
             # Try standard path structures
             for path_fmt in [
@@ -415,9 +421,16 @@ class GFSProcessor(ForcingProcessor):
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
         cycle_dt = base_date + timedelta(hours=self.config.cyc)
 
-        if self.phase == "nowcast":
-            # Nowcast: multi-cycle, walk backward to cover nowcast window
-            nowcast_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        if self.phase == "nowcast" or self.phase == "full":
+            # Nowcast (or full nowcast+forecast): multi-cycle, walk backward
+            # to cover nowcast window with +3h buffer (matches CDEPS DATM
+            # interpolation requirements; missing buffer hours show up as
+            # 6 missing timesteps in datm_forcing.nc — 3 at each end).
+            nowcast_start = (
+                cycle_dt
+                - timedelta(hours=self.config.nowcast_hours)
+                - timedelta(hours=3)  # buffer
+            )
             cycles = []
             t = cycle_dt
             while t >= nowcast_start - timedelta(hours=6):
