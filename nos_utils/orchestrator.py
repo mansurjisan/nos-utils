@@ -300,15 +300,15 @@ class PrepOrchestrator:
                  time_hotstart=None) -> ForcingResult:
         """Step 2: GFS atmospheric forcing.
 
-        Always writes sflux files to ``output_dir/sflux/``. In nws=4
-        (UFS-Coastal), the BlenderProcessor downstream merges these with
-        HRRR sflux into datm_forcing.nc on the wide DATM grid.
+        - nws=2 (standalone SCHISM): writes 3 sflux files to ``output_dir/sflux/``.
+        - nws=4 (UFS-Coastal): writes a single ``gfs_forcing.nc`` to
+          ``output_dir/`` for the BlenderProcessor.
         """
         from .forcing.gfs import GFSProcessor
 
-        sflux_dir = output_dir / "sflux"
+        proc_dir = output_dir if self.config.nws == 4 else (output_dir / "sflux")
         proc = GFSProcessor(
-            self.config, self.paths["gfs"], sflux_dir,
+            self.config, self.paths["gfs"], proc_dir,
             resolution=self.config.gfs_resolution,
             phase=phase, time_hotstart=time_hotstart,
         )
@@ -318,14 +318,15 @@ class PrepOrchestrator:
                   time_hotstart=None) -> ForcingResult:
         """Step 3: HRRR secondary atmospheric (optional).
 
-        Always writes sflux files to ``output_dir/sflux/``. The
-        BlenderProcessor merges these with GFS sflux when nws=4.
+        - nws=2: writes 3 sflux files to ``output_dir/sflux/``.
+        - nws=4: writes a single ``hrrr_forcing.nc`` to ``output_dir/``
+          for the BlenderProcessor.
         """
         from .forcing.hrrr import HRRRProcessor
 
-        sflux_dir = output_dir / "sflux"
+        proc_dir = output_dir if self.config.nws == 4 else (output_dir / "sflux")
         proc = HRRRProcessor(
-            self.config, self.paths["hrrr"], sflux_dir,
+            self.config, self.paths["hrrr"], proc_dir,
             phase=phase, time_hotstart=time_hotstart,
         )
         return proc.process()
@@ -704,35 +705,35 @@ class PrepOrchestrator:
         return proc.process()
 
     def _run_datm(self, output_dir: Path) -> ForcingResult:
-        """Step 8: DATM blending + ESMF mesh for UFS-Coastal."""
+        """Step 8: DATM blending + ESMF mesh for UFS-Coastal.
+
+        Reads ``gfs_forcing.nc`` and (optionally) ``hrrr_forcing.nc`` from
+        ``output_dir/`` (written by GFSProcessor/HRRRProcessor in nws=4
+        mode via ForcingNcWriter), blends them onto the wide ATLANTIC
+        DATM grid, and emits ``datm_forcing.nc`` + ``esmf_mesh.nc``.
+        """
         output_files = []
         warnings = []
         errors = []
         blend_ok = False
 
-        # 8a: Blend GFS+HRRR sflux into datm_forcing.nc (if sflux dir has both sources)
-        sflux_dir = output_dir / "sflux"
-        if sflux_dir.exists():
-            gfs_sflux = list(sflux_dir.glob("sflux_air_1.*.nc"))
-            hrrr_sflux = list(sflux_dir.glob("sflux_air_2.*.nc"))
-
-            if gfs_sflux:
-                from .forcing.blender import BlenderProcessor
-                blender = BlenderProcessor(
-                    self.config, sflux_dir, output_dir,
-                    target_dx=self.config.datm_dx,
-                )
-                blend_result = blender.process()
-                if blend_result.success:
-                    output_files.extend(blend_result.output_files)
-                    log.info(f"DATM blending: {len(blend_result.output_files)} files")
-                    blend_ok = True
-                else:
-                    errors.extend(blend_result.errors)
+        # 8a: Blend GFS + HRRR forcing.nc files into datm_forcing.nc.
+        gfs_forcing = output_dir / "gfs_forcing.nc"
+        if gfs_forcing.exists():
+            from .forcing.blender import BlenderProcessor
+            blender = BlenderProcessor(
+                self.config, output_dir, output_dir,
+                target_dx=self.config.datm_dx,
+            )
+            blend_result = blender.process()
+            if blend_result.success:
+                output_files.extend(blend_result.output_files)
+                log.info(f"DATM blending: {len(blend_result.output_files)} files")
+                blend_ok = True
             else:
-                errors.append("No GFS sflux files found in sflux/ — blender skipped")
+                errors.extend(blend_result.errors)
         else:
-            errors.append(f"sflux/ subdir does not exist at {sflux_dir} — blender skipped")
+            errors.append(f"gfs_forcing.nc not found at {gfs_forcing} — blender skipped")
 
         # 8b: Generate ESMF mesh from the datm_forcing.nc
         datm_file = output_dir / "datm_forcing.nc"

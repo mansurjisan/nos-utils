@@ -26,6 +26,7 @@ from ..io.grib_extract import GRIBExtractor, get_extractor
 from .base import ForcingProcessor, ForcingResult
 from .sflux_writer import SfluxWriter
 from .datm_writer import DATMWriter
+from .forcing_writer import ForcingNcWriter
 
 log = logging.getLogger(__name__)
 
@@ -222,9 +223,11 @@ class GFSProcessor(ForcingProcessor):
         #   direct_datm=True  → write datm_forcing.nc directly via DATMWriter.
         #     Produces narrow-domain DATM (no HRRR blend). Used by tests
         #     and standalone-DATM callers.
-        #   direct_datm=False → write sflux files. In nws=4 (UFS-Coastal)
-        #     the orchestrator's BlenderProcessor merges these with HRRR
-        #     sflux into a wide DATM grid. Default for production.
+        #   nws=4 (UFS-Coastal) and not direct_datm → write a single
+        #     gfs_forcing.nc via ForcingNcWriter. The orchestrator's
+        #     BlenderProcessor merges this with hrrr_forcing.nc into a
+        #     wide DATM grid (matches the shell pipeline architecture).
+        #   nws=2 (standalone SCHISM) → write 3 sflux files via SfluxWriter.
         if self.direct_datm:
             writer = DATMWriter()
             datm_path = self.output_path / "datm_forcing.nc"
@@ -233,6 +236,15 @@ class GFSProcessor(ForcingProcessor):
                 extracted["lons"], extracted["lats"], datm_path,
             )
             output_files.append(datm_path)
+        elif self.config.nws == 4:
+            writer = ForcingNcWriter()
+            forcing_path = self.output_path / "gfs_forcing.nc"
+            writer.write_1d(
+                extracted["data"], extracted["times"],
+                extracted["lons"], extracted["lats"], forcing_path,
+                source_name="GFS",
+            )
+            output_files.append(forcing_path)
         else:
             writer = SfluxWriter(self.output_path, source_index=1)
             base_date = self._compute_base_date()

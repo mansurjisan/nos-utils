@@ -53,6 +53,7 @@ from .esmf_mesh import ESMFMeshProcessor
 from .blender import BlenderProcessor
 from .sflux_writer import SfluxWriter
 from .datm_writer import DATMWriter
+from .forcing_writer import ForcingNcWriter
 
 __all__ = [
     "ForcingProcessor",
@@ -85,4 +86,5 @@ __all__ = [
     # Writers
     "SfluxWriter",
     "DATMWriter",
+    "ForcingNcWriter",
 ]

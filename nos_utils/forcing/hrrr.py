@@ -30,6 +30,7 @@ from ..config import ForcingConfig
 from ..io.grib_extract import GRIBExtractor, get_extractor
 from .base import ForcingProcessor, ForcingResult
 from .sflux_writer import SfluxWriter
+from .forcing_writer import ForcingNcWriter
 
 log = logging.getLogger(__name__)
 
@@ -140,13 +141,32 @@ class HRRRProcessor(ForcingProcessor):
             # Step 3: Filter to phase-specific time window
             extracted = self._filter_to_time_window(extracted)
 
-            # Step 4: Write sflux (source_index=2 for secondary)
-            writer = SfluxWriter(self.output_path, source_index=2)
-            base_date = self._compute_base_date()
-            files = writer.write_all(
-                extracted["data"], extracted["times"],
-                extracted["lons"], extracted["lats"], base_date,
-            )
+            # Step 4: Write output.
+            # nws=4 (UFS-Coastal): write a single hrrr_forcing.nc consumed
+            # by BlenderProcessor (matches the shell pipeline architecture).
+            # nws=2 (standalone): write 3 sflux files (source_index=2 for secondary).
+            if self.config.nws == 4:
+                writer = ForcingNcWriter()
+                forcing_path = self.output_path / "hrrr_forcing.nc"
+                lats_arr = extracted["lats"]
+                lons_arr = extracted["lons"]
+                if lats_arr.ndim == 2:
+                    files = [writer.write_2d(
+                        extracted["data"], extracted["times"],
+                        lons_arr, lats_arr, forcing_path, source_name="HRRR",
+                    )]
+                else:
+                    files = [writer.write_1d(
+                        extracted["data"], extracted["times"],
+                        lons_arr, lats_arr, forcing_path, source_name="HRRR",
+                    )]
+            else:
+                writer = SfluxWriter(self.output_path, source_index=2)
+                base_date = self._compute_base_date()
+                files = writer.write_all(
+                    extracted["data"], extracted["times"],
+                    extracted["lons"], extracted["lats"], base_date,
+                )
 
             return ForcingResult(
                 success=True, source=self.SOURCE_NAME,

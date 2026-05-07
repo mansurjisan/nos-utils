@@ -1,25 +1,38 @@
 """
-HRRR + GFS atmospheric forcing blender.
+HRRR + GFS atmospheric forcing blender for UFS-Coastal DATM.
 
-Blends high-resolution HRRR (3km, CONUS) with global GFS (0.25°) on a
-regular lat/lon grid via Delaunay triangulation. HRRR overrides GFS
-where HRRR has spatial coverage.
+Reads ``gfs_forcing.nc`` (global, 1D coords) and ``hrrr_forcing.nc``
+(CONUS, 2D LCC coords) produced by GFS/HRRR processors via the
+ForcingNcWriter, then blends them onto a regular lat/lon target grid.
 
-Input:
-  - GFS sflux files (sflux_air_1.*.nc) — primary, global coverage
-  - HRRR sflux files (sflux_air_2.*.nc) — secondary, CONUS only
+Algorithm mirrors ``ush/python/nos_ofs/datm/blend_hrrr_gfs.py`` (the
+operational shell pipeline blender) so output is byte-equivalent up
+to floating-point ordering:
 
-Output:
-  - datm_forcing.nc — blended forcing on regular grid for UFS-Coastal DATM
+  1. Build ATLANTIC target grid from config.datm_domain at target_dx.
+  2. Subset HRRR to the target box (with 1° buffer); precompute Delaunay
+     triangulation + barycentric coordinates for HRRR LCC -> target.
+  3. Subset GFS to the target box; flip latitude axis if descending.
+  4. Build a unified hourly time grid covering the union of HRRR and
+     GFS time ranges. HRRR-covered timesteps blend HRRR-over-GFS;
+     timesteps beyond HRRR range fall back to GFS-only.
+  5. For each output timestep:
+     - Linear time-interpolate GFS values from the bracketing GFS times.
+     - Bilinear spatial-interpolate GFS to the target grid.
+     - If HRRR has a matching time and HRRR has spatial coverage at a
+       cell, override GFS with HRRR at that cell.
+  6. Apply Lambert Conformal wind rotation to HRRR-sourced winds
+     (HRRR U/V are grid-relative; rotate to earth-relative).
+  7. Write a single ``datm_forcing.nc`` with 2D ``latitude(y,x)`` and
+     ``longitude(y,x)``, time in seconds since 1970, calendar=standard.
 
-Wind rotation: HRRR Lambert Conformal winds are grid-relative and must
-be rotated to earth-relative. Formula uses LoV and LaD from the LC projection.
+Output format matches CDEPS/ESMF expectations for the DATM component.
 """
 
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -34,34 +47,33 @@ try:
 except ImportError:
     HAS_NETCDF4 = False
 
-# HRRR Lambert Conformal projection parameters
+# HRRR Lambert Conformal projection (CONUS)
 HRRR_LOV = -97.5   # Longitude of vertical (degrees)
 HRRR_LAD = 38.5    # Latitude of tangency (degrees)
 
-# DATM variable mapping
+# Variable mapping: output (HRRR) name -> (GFS name candidates)
+# Some variables differ between sources (MSLMA vs PRMSL); we try the
+# first that exists in the GFS file.
 BLEND_VARIABLES = [
-    "uwind", "vwind", "stmp", "spfh", "prmsl", "prate", "dswrf", "dlwrf",
+    ("UGRD_10maboveground", ["UGRD_10maboveground"]),
+    ("VGRD_10maboveground", ["VGRD_10maboveground"]),
+    ("TMP_2maboveground",   ["TMP_2maboveground"]),
+    ("SPFH_2maboveground",  ["SPFH_2maboveground"]),
+    ("PRATE_surface",       ["PRATE_surface"]),
+    ("DSWRF_surface",       ["DSWRF_surface"]),
+    ("DLWRF_surface",       ["DLWRF_surface"]),
+    ("MSLMA_meansealevel",  ["MSLMA_meansealevel", "PRMSL_meansealevel"]),
 ]
 
-# DATM naming convention
-SFLUX_TO_DATM = {
-    "uwind": "UGRD_10maboveground",
-    "vwind": "VGRD_10maboveground",
-    "stmp": "TMP_2maboveground",
-    "spfh": "SPFH_2maboveground",
-    "prmsl": "MSLMA_meansealevel",
-    "prate": "PRATE_surface",
-    "dswrf": "DSWRF_surface",
-    "dlwrf": "DLWRF_surface",
-}
+FILL_VALUE = np.float32(9.999e20)
 
 
 class BlenderProcessor(ForcingProcessor):
     """
-    Blend HRRR + GFS sflux files into a single DATM forcing file.
+    Blend HRRR + GFS forcing.nc files into a single datm_forcing.nc.
 
-    Uses Delaunay triangulation for HRRR (Lambert Conformal) to regular
-    lat/lon interpolation. HRRR overrides GFS where coverage exists.
+    Mirrors ``ush/python/nos_ofs/datm/blend_hrrr_gfs.py`` so output is
+    semantically equivalent to the shell pipeline.
     """
 
     SOURCE_NAME = "BLENDER"
@@ -75,8 +87,10 @@ class BlenderProcessor(ForcingProcessor):
     ):
         """
         Args:
-            config: ForcingConfig with domain bounds
-            input_path: Directory containing sflux_air_1.*.nc (GFS) and sflux_air_2.*.nc (HRRR)
+            config: ForcingConfig with datm_domain bounds
+            input_path: Directory containing gfs_forcing.nc and (optionally)
+                hrrr_forcing.nc. Created by the ForcingNcWriter from the
+                GFS/HRRR processors when nws=4.
             output_path: Output directory for datm_forcing.nc
             target_dx: Output grid resolution in degrees (default 0.025°)
         """
@@ -84,286 +98,366 @@ class BlenderProcessor(ForcingProcessor):
         self.target_dx = target_dx
 
     def process(self) -> ForcingResult:
-        """Blend GFS + HRRR sflux files into datm_forcing.nc."""
         if not HAS_NETCDF4:
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
                 errors=["netCDF4 required for blending"],
             )
 
-        log.info(f"Blender: dx={self.target_dx}°")
-        self.create_output_dir()
-
-        # Find sflux files
-        gfs_files = sorted(self.input_path.glob("sflux_air_1.*.nc"))
-        hrrr_files = sorted(self.input_path.glob("sflux_air_2.*.nc"))
-
-        if not gfs_files:
+        try:
+            from scipy.spatial import Delaunay
+            from scipy.interpolate import RegularGridInterpolator, interp1d
+        except ImportError:
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
-                errors=["No GFS sflux files found for blending"],
+                errors=["scipy required for blending (Delaunay + interp1d)"],
             )
 
-        log.info(f"GFS files: {len(gfs_files)}, HRRR files: {len(hrrr_files)}")
+        self.create_output_dir()
 
-        # Build target grid using datm_domain (wide DATM bounds for UFS-Coastal).
-        # Falls back to model domain when datm_* fields are unset.
+        gfs_path = self.input_path / "gfs_forcing.nc"
+        hrrr_path = self.input_path / "hrrr_forcing.nc"
+
+        if not gfs_path.exists():
+            return ForcingResult(
+                success=False, source=self.SOURCE_NAME,
+                errors=[f"GFS forcing file not found: {gfs_path}"],
+            )
+
+        # Target grid (ATLANTIC for UFS-Coastal SECOFS)
         lon_min, lon_max, lat_min, lat_max = self.config.datm_domain
-        target_lons = np.arange(lon_min, lon_max + self.target_dx, self.target_dx)
-        target_lats = np.arange(lat_min, lat_max + self.target_dx, self.target_dx)
-        log.info(f"Target grid: dx={self.target_dx}° "
-                 f"nx={len(target_lons)} ny={len(target_lats)} "
-                 f"bounds=({lon_min:.4f},{lon_max:.4f},{lat_min:.4f},{lat_max:.4f})")
-
-        # Load GFS data
-        gfs_data, gfs_times, gfs_lons, gfs_lats = self._load_sflux_stack(gfs_files)
-
-        # Load HRRR data (if available)
-        hrrr_data = None
-        hrrr_interp = None
-        if hrrr_files:
-            hrrr_data, hrrr_times, hrrr_lons_2d, hrrr_lats_2d = self._load_sflux_stack(
-                hrrr_files, return_2d_coords=True
-            )
-            if hrrr_data and hrrr_lons_2d is not None:
-                hrrr_interp = self._build_interpolator(
-                    hrrr_lons_2d, hrrr_lats_2d, target_lons, target_lats
-                )
-
-        # Blend onto target grid
-        output_file = self.output_path / "datm_forcing.nc"
-        self._write_blended(
-            gfs_data, gfs_times, gfs_lons, gfs_lats,
-            hrrr_data, hrrr_interp,
-            target_lons, target_lats, output_file,
+        target_lon = np.arange(
+            lon_min, lon_max + self.target_dx / 2,
+            self.target_dx, dtype=np.float32,
         )
+        target_lat = np.arange(
+            lat_min, lat_max + self.target_dx / 2,
+            self.target_dx, dtype=np.float32,
+        )
+        target_lon2d, target_lat2d = np.meshgrid(target_lon, target_lat)
+        ny, nx = target_lat2d.shape
+        log.info(
+            f"Blender target grid: {nx}x{ny} @ {self.target_dx}° "
+            f"bounds=({lon_min:.4f},{lon_max:.4f},{lat_min:.4f},{lat_max:.4f})"
+        )
+
+        # ---- Open inputs ----
+        gfs = Dataset(str(gfs_path), "r")
+        gfs_lat_full = np.asarray(gfs.variables["latitude"][:], dtype=np.float32)
+        gfs_lon_full = np.asarray(gfs.variables["longitude"][:], dtype=np.float32)
+        gfs_time = np.asarray(gfs.variables["time"][:], dtype=np.float64)
+
+        # GFS lon may be 0..360; convert to -180..180
+        gfs_lon_180 = np.where(gfs_lon_full > 180, gfs_lon_full - 360, gfs_lon_full)
+
+        # Subset GFS to target box (1° buffer)
+        BUFFER = 1.0
+        lat_mask = (gfs_lat_full >= lat_min - BUFFER) & (gfs_lat_full <= lat_max + BUFFER)
+        lon_mask = (gfs_lon_180 >= lon_min - BUFFER) & (gfs_lon_180 <= lon_max + BUFFER)
+        gfs_lat_idx = np.where(lat_mask)[0]
+        gfs_lon_idx = np.where(lon_mask)[0]
+        gfs_lat = gfs_lat_full[lat_mask]
+        gfs_lon = gfs_lon_180[lon_mask]
+        log.info(f"GFS subset: {len(gfs_lat)} x {len(gfs_lon)}, {len(gfs_time)} timesteps")
+
+        if gfs_lat[0] > gfs_lat[-1]:
+            gfs_lat_asc = gfs_lat[::-1]
+            gfs_flip = True
+        else:
+            gfs_lat_asc = gfs_lat
+            gfs_flip = False
+
+        # ---- HRRR (optional) ----
+        hrrr = None
+        hrrr_time_raw = None
+        hrrr_valid_mask = None
+        bary_coords = None
+        tri_vert_idx = None
+        valid_flat_indices = None
+        hrrr_row_slice = None
+        hrrr_col_slice = None
+        cos_rot = None
+        sin_rot = None
+
+        if hrrr_path.exists():
+            hrrr = Dataset(str(hrrr_path), "r")
+            hrrr_time_raw = np.asarray(hrrr.variables["time"][:], dtype=np.float64)
+            hrrr_lon2d_full = np.asarray(hrrr.variables["longitude"][:], dtype=np.float32)
+            hrrr_lat2d_full = np.asarray(hrrr.variables["latitude"][:], dtype=np.float32)
+
+            # Subset HRRR to target box (1° buffer)
+            hrrr_mask = (
+                (hrrr_lon2d_full >= lon_min - BUFFER) &
+                (hrrr_lon2d_full <= lon_max + BUFFER) &
+                (hrrr_lat2d_full >= lat_min - BUFFER) &
+                (hrrr_lat2d_full <= lat_max + BUFFER)
+            )
+            rows_with = np.any(hrrr_mask, axis=1)
+            cols_with = np.any(hrrr_mask, axis=0)
+
+            if rows_with.any() and cols_with.any():
+                r0, r1 = np.where(rows_with)[0][[0, -1]]
+                c0, c1 = np.where(cols_with)[0][[0, -1]]
+                hrrr_row_slice = slice(r0, r1 + 1)
+                hrrr_col_slice = slice(c0, c1 + 1)
+                hrrr_lon2d = hrrr_lon2d_full[hrrr_row_slice, hrrr_col_slice]
+                hrrr_lat2d = hrrr_lat2d_full[hrrr_row_slice, hrrr_col_slice]
+                log.info(f"HRRR subset: {hrrr_lon2d.shape}, {len(hrrr_time_raw)} timesteps")
+
+                # Delaunay triangulation
+                hrrr_pts = np.column_stack([hrrr_lon2d.ravel(), hrrr_lat2d.ravel()])
+                tri = Delaunay(hrrr_pts)
+                target_pts_flat = np.column_stack([
+                    target_lon2d.ravel(), target_lat2d.ravel(),
+                ])
+                simplices = tri.find_simplex(target_pts_flat)
+                hrrr_valid_mask = (simplices >= 0).reshape(ny, nx)
+                n_covered = int(hrrr_valid_mask.sum())
+                log.info(f"HRRR covers {n_covered}/{ny*nx} target points "
+                         f"({100*n_covered/(ny*nx):.1f}%)")
+
+                # Barycentric coords for valid (covered) points
+                valid_flat = simplices >= 0
+                valid_flat_indices = np.where(valid_flat)[0]
+                valid_simplices = simplices[valid_flat]
+                valid_targets = target_pts_flat[valid_flat]
+                tri_vert_idx = tri.simplices[valid_simplices]
+                tri_verts = hrrr_pts[tri_vert_idx]
+                T0 = tri_verts[:, 0, :]
+                T1 = tri_verts[:, 1, :]
+                T2 = tri_verts[:, 2, :]
+                v0 = T1 - T0
+                v1 = T2 - T0
+                v2 = valid_targets - T0
+                den = v0[:, 0] * v1[:, 1] - v1[:, 0] * v0[:, 1]
+                u = (v2[:, 0] * v1[:, 1] - v1[:, 0] * v2[:, 1]) / den
+                v = (v0[:, 0] * v2[:, 1] - v2[:, 0] * v0[:, 1]) / den
+                w = 1.0 - u - v
+                bary_coords = np.column_stack([w, u, v]).astype(np.float32)
+
+                # Wind rotation parameters (LC)
+                D2R = np.pi / 180.0
+                ROTCON = np.sin(HRRR_LAD * D2R)
+                rot_angle = ROTCON * (target_lon2d - HRRR_LOV) * D2R
+                cos_rot = np.cos(rot_angle).astype(np.float32)
+                sin_rot = np.sin(rot_angle).astype(np.float32)
+            else:
+                log.warning("HRRR has no overlap with target domain — using GFS only")
+                hrrr.close()
+                hrrr = None
+                hrrr_time_raw = None
+
+        # ---- Build unified time grid (hourly, union of HRRR and GFS) ----
+        if hrrr_time_raw is not None and len(hrrr_time_raw) >= 2:
+            dt = float(hrrr_time_raw[1] - hrrr_time_raw[0])
+        elif len(gfs_time) >= 2:
+            dt = float(gfs_time[1] - gfs_time[0])
+        else:
+            dt = 3600.0
+
+        if hrrr_time_raw is not None:
+            t_start = float(min(hrrr_time_raw[0], gfs_time[0]))
+            t_end = float(max(hrrr_time_raw[-1], gfs_time[-1]))
+        else:
+            t_start = float(gfs_time[0])
+            t_end = float(gfs_time[-1])
+
+        out_time = np.arange(t_start, t_end + dt / 2, dt)
+        n_times = len(out_time)
+
+        if hrrr_time_raw is not None:
+            hrrr_time_has = np.array([
+                np.any(np.abs(hrrr_time_raw - ot) < dt / 2) for ot in out_time
+            ])
+            n_hrrr_covered_t = int(hrrr_time_has.sum())
+            log.info(f"Time grid: {n_times} steps, HRRR covers {n_hrrr_covered_t}, "
+                     f"GFS-only fill for {n_times - n_hrrr_covered_t}")
+        else:
+            hrrr_time_has = np.zeros(n_times, dtype=bool)
+            log.info(f"Time grid: {n_times} steps, GFS-only (no HRRR)")
+
+        gfs_time_to_idx = interp1d(
+            gfs_time, np.arange(len(gfs_time)),
+            kind="linear", bounds_error=False, fill_value="extrapolate",
+        )
+        target_to_gfs_idx = gfs_time_to_idx(out_time)
+
+        # ---- Open output ----
+        output_file = self.output_path / "datm_forcing.nc"
+        ncout = Dataset(str(output_file), "w", format="NETCDF4_CLASSIC")
+        ncout.createDimension("time", None)
+        ncout.createDimension("y", ny)
+        ncout.createDimension("x", nx)
+
+        time_var = ncout.createVariable("time", "f8", ("time",))
+        time_var.units = "seconds since 1970-01-01 00:00:00"
+        time_var.calendar = "standard"
+        time_var.standard_name = "time"
+        time_var.axis = "T"
+        time_var[:] = out_time
+
+        lat_var = ncout.createVariable("latitude", "f4", ("y", "x"))
+        lat_var.units = "degrees_north"
+        lat_var.standard_name = "latitude"
+        lat_var.long_name = "latitude"
+        lat_var.axis = "Y"
+        lat_var[:] = target_lat2d
+
+        lon_var = ncout.createVariable("longitude", "f4", ("y", "x"))
+        lon_var.units = "degrees_east"
+        lon_var.standard_name = "longitude"
+        lon_var.long_name = "longitude"
+        lon_var.axis = "X"
+        lon_var[:] = target_lon2d
+
+        source_var = ncout.createVariable("data_source", "i1", ("y", "x"))
+        source_var.long_name = "Data source (1=HRRR, 0=GFS)"
+        if hrrr_valid_mask is not None:
+            source_var[:] = hrrr_valid_mask.astype(np.int8)
+        else:
+            source_var[:] = np.zeros((ny, nx), dtype=np.int8)
+
+        ncout.title = "Blended HRRR+GFS Forcing for CDEPS/DATM"
+        ncout.source = "HRRR (CONUS) + GFS (gap fill)"
+        ncout.history = f"Created {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} by nos-utils BlenderProcessor"
+        ncout.Conventions = "CF-1.6"
+
+        # ---- Process each variable ----
+        gfs_vars = list(gfs.variables.keys())
+        hrrr_vars = list(hrrr.variables.keys()) if hrrr is not None else []
+
+        for hrrr_name, gfs_candidates in BLEND_VARIABLES:
+            gfs_name = next((n for n in gfs_candidates if n in gfs_vars), None)
+            if gfs_name is None:
+                log.warning(f"Skipping {hrrr_name}: not in GFS")
+                continue
+
+            hrrr_has_var = (hrrr is not None) and (hrrr_name in hrrr_vars)
+            gfs_var = gfs.variables[gfs_name]
+            hrrr_var = hrrr.variables[hrrr_name] if hrrr_has_var else None
+
+            units = getattr(gfs_var, "units", "")
+            long_name = getattr(gfs_var, "long_name", hrrr_name)
+
+            out_var = ncout.createVariable(
+                hrrr_name, "f4", ("time", "y", "x"),
+                fill_value=FILL_VALUE,
+            )
+            out_var.short_name = hrrr_name
+            out_var.units = units
+            out_var.long_name = long_name
+
+            for t in range(n_times):
+                use_hrrr = hrrr_time_has[t] and hrrr_has_var
+
+                # GFS time interpolation
+                gfs_t_real = float(target_to_gfs_idx[t])
+                t_low = int(np.floor(gfs_t_real))
+                t_high = int(np.ceil(gfs_t_real))
+                t_frac = gfs_t_real - t_low
+                t_low = max(0, min(t_low, len(gfs_time) - 1))
+                t_high = max(0, min(t_high, len(gfs_time) - 1))
+
+                gfs_low = np.asarray(
+                    gfs_var[t_low,
+                            gfs_lat_idx[0]:gfs_lat_idx[-1] + 1,
+                            gfs_lon_idx[0]:gfs_lon_idx[-1] + 1],
+                    dtype=np.float32,
+                )
+                if t_low == t_high:
+                    gfs_data = gfs_low
+                else:
+                    gfs_high = np.asarray(
+                        gfs_var[t_high,
+                                gfs_lat_idx[0]:gfs_lat_idx[-1] + 1,
+                                gfs_lon_idx[0]:gfs_lon_idx[-1] + 1],
+                        dtype=np.float32,
+                    )
+                    gfs_data = (1.0 - t_frac) * gfs_low + t_frac * gfs_high
+
+                if gfs_flip:
+                    gfs_data = gfs_data[::-1, :]
+
+                gfs_interp = RegularGridInterpolator(
+                    (gfs_lat_asc, gfs_lon), gfs_data,
+                    method="linear", bounds_error=False, fill_value=np.nan,
+                )
+                gfs_regrid = gfs_interp(np.column_stack([
+                    target_lat2d.ravel(), target_lon2d.ravel(),
+                ])).reshape(ny, nx).astype(np.float32)
+
+                if use_hrrr:
+                    # Find matching HRRR time
+                    hrrr_t = int(np.argmin(np.abs(hrrr_time_raw - out_time[t])))
+                    if abs(hrrr_time_raw[hrrr_t] - out_time[t]) < dt / 2:
+                        hrrr_slab = np.asarray(
+                            hrrr_var[hrrr_t, hrrr_row_slice, hrrr_col_slice],
+                            dtype=np.float32,
+                        ).ravel()
+                        hrrr_slab = np.where(hrrr_slab > 1e10, np.nan, hrrr_slab)
+
+                        vals_at_verts = hrrr_slab[tri_vert_idx]
+                        hrrr_interp_valid = np.sum(vals_at_verts * bary_coords, axis=1)
+                        hrrr_regrid = np.full(ny * nx, np.nan, dtype=np.float32)
+                        hrrr_regrid[valid_flat_indices] = hrrr_interp_valid
+                        hrrr_regrid = hrrr_regrid.reshape(ny, nx)
+                        combined = np.where(
+                            hrrr_valid_mask & ~np.isnan(hrrr_regrid),
+                            hrrr_regrid, gfs_regrid,
+                        )
+                    else:
+                        combined = gfs_regrid
+                else:
+                    combined = gfs_regrid
+
+                out_var[t, :, :] = combined
+
+        # ---- Lambert Conformal wind rotation (HRRR-sourced cells only) ----
+        if (hrrr is not None and "UGRD_10maboveground" in ncout.variables
+                and "VGRD_10maboveground" in ncout.variables and cos_rot is not None):
+            log.info("Applying Lambert Conformal wind rotation to HRRR cells...")
+            u_v = ncout.variables["UGRD_10maboveground"]
+            v_v = ncout.variables["VGRD_10maboveground"]
+            for t in range(n_times):
+                if not hrrr_time_has[t]:
+                    continue
+                u_data = np.asarray(u_v[t, :, :], dtype=np.float32)
+                v_data = np.asarray(v_v[t, :, :], dtype=np.float32)
+                u_rot = np.where(
+                    hrrr_valid_mask,
+                    cos_rot * u_data + sin_rot * v_data, u_data,
+                )
+                v_rot = np.where(
+                    hrrr_valid_mask,
+                    -sin_rot * u_data + cos_rot * v_data, v_data,
+                )
+                u_v[t, :, :] = u_rot
+                v_v[t, :, :] = v_rot
+
+        ncout.close()
+        gfs.close()
+        if hrrr is not None:
+            hrrr.close()
+
+        log.info(f"Wrote {output_file.name}: {nx}x{ny} grid, {n_times} hourly steps")
 
         return ForcingResult(
             success=True, source=self.SOURCE_NAME,
             output_files=[output_file],
             metadata={
-                "gfs_files": len(gfs_files),
-                "hrrr_files": len(hrrr_files),
+                "nx": nx, "ny": ny, "ntime": n_times,
                 "target_dx": self.target_dx,
-                "nx": len(target_lons),
-                "ny": len(target_lats),
-                "has_hrrr_blend": hrrr_interp is not None,
+                "has_hrrr_blend": hrrr is not None,
             },
         )
 
     def find_input_files(self) -> List[Path]:
-        return sorted(self.input_path.glob("sflux_air_*.*.nc"))
-
-    def _load_sflux_stack(
-        self, files: List[Path], return_2d_coords: bool = False,
-    ) -> tuple:
-        """Load and concatenate sflux files."""
-        all_data = {var: [] for var in BLEND_VARIABLES}
-        all_times = []
-        lons = lats = None
-
-        for f in files:
-            ds = Dataset(str(f))
-            time_vals = ds.variables["time"][:]
-            lon_arr = ds.variables["lon"][:]
-            lat_arr = ds.variables["lat"][:]
-
-            if lons is None:
-                lons = lon_arr
-                lats = lat_arr
-
-            for var in BLEND_VARIABLES:
-                if var in ds.variables:
-                    all_data[var].append(ds.variables[var][:])
-
-            # Also load from rad/prc files (same directory, same numbering)
-            base = f.name.replace("air", "{type}")
-            for ftype, fvars in [("rad", ["dlwrf", "dswrf"]), ("prc", ["prate"])]:
-                companion = f.parent / f.name.replace("air", ftype)
-                if companion.exists():
-                    ds_c = Dataset(str(companion))
-                    for var in fvars:
-                        if var in ds_c.variables and var not in ds.variables:
-                            all_data[var].append(ds_c.variables[var][:])
-                    ds_c.close()
-
-            all_times.extend(time_vals.tolist())
-            ds.close()
-
-        # Concatenate time axis
-        for var in all_data:
-            if all_data[var]:
-                all_data[var] = np.concatenate(all_data[var], axis=0)
-            else:
-                del all_data[var]
-
-        if return_2d_coords:
-            return all_data, all_times, lons, lats
-        else:
-            # Extract 1D coords
-            if lons is not None and lons.ndim == 2:
-                lons_1d = lons[0, :]
-                lats_1d = lats[:, 0]
-            else:
-                lons_1d = lons
-                lats_1d = lats
-            return all_data, all_times, lons_1d, lats_1d
-
-    def _build_interpolator(
-        self, hrrr_lons_2d, hrrr_lats_2d, target_lons, target_lats,
-    ) -> Optional[dict]:
-        """Build Delaunay triangulation for HRRR -> target grid."""
-        try:
-            from scipy.spatial import Delaunay
-        except ImportError:
-            log.warning("scipy not available — no HRRR blending")
-            return None
-
-        target_lon_2d, target_lat_2d = np.meshgrid(target_lons, target_lats)
-        ny, nx = target_lon_2d.shape
-
-        # scipy.spatial.Delaunay rejects masked arrays. HRRR sflux can return
-        # MaskedArray when ncks/ncap2 leave a fill mask on lat/lon coords —
-        # cast to plain ndarray before triangulation.
-        hrrr_lons_flat = np.asarray(hrrr_lons_2d).ravel()
-        hrrr_lats_flat = np.asarray(hrrr_lats_2d).ravel()
-        hrrr_pts = np.column_stack([hrrr_lons_flat, hrrr_lats_flat])
-        tri = Delaunay(hrrr_pts)
-
-        target_pts = np.column_stack([target_lon_2d.ravel(), target_lat_2d.ravel()])
-        simplices = tri.find_simplex(target_pts)
-        coverage = simplices >= 0
-
-        # Barycentric coordinates
-        valid_s = simplices[coverage]
-        valid_t = target_pts[coverage]
-        tri_vi = tri.simplices[valid_s]
-        v0 = hrrr_pts[tri_vi[:, 0]]
-        v1 = hrrr_pts[tri_vi[:, 1]]
-        v2 = hrrr_pts[tri_vi[:, 2]]
-        det = ((v1[:, 1] - v2[:, 1]) * (v0[:, 0] - v2[:, 0]) +
-               (v2[:, 0] - v1[:, 0]) * (v0[:, 1] - v2[:, 1]))
-        lam0 = ((v1[:, 1] - v2[:, 1]) * (valid_t[:, 0] - v2[:, 0]) +
-                (v2[:, 0] - v1[:, 0]) * (valid_t[:, 1] - v2[:, 1])) / det
-        lam1 = ((v2[:, 1] - v0[:, 1]) * (valid_t[:, 0] - v2[:, 0]) +
-                (v0[:, 0] - v2[:, 0]) * (valid_t[:, 1] - v2[:, 1])) / det
-        bary = np.column_stack([lam0, lam1, 1 - lam0 - lam1]).astype(np.float32)
-
-        n_cov = int(np.sum(coverage))
-        log.info(f"HRRR coverage: {n_cov}/{len(target_pts)} points ({100*n_cov/len(target_pts):.1f}%)")
-
-        return {
-            "tri_vi": tri_vi,
-            "bary": bary,
-            "valid_idx": np.where(coverage)[0],
-            "coverage_2d": coverage.reshape(ny, nx),
-            "hrrr_shape": hrrr_lons_2d.shape,
-        }
-
-    def _write_blended(
-        self, gfs_data, gfs_times, gfs_lons, gfs_lats,
-        hrrr_data, hrrr_interp,
-        target_lons, target_lats, output_path,
-    ):
-        """Write blended datm_forcing.nc."""
-        from scipy.interpolate import RegularGridInterpolator
-
-        ny = len(target_lats)
-        nx = len(target_lons)
-        nt = len(gfs_times)
-        target_lon_2d, target_lat_2d = np.meshgrid(target_lons, target_lats)
-
-        nc = Dataset(str(output_path), "w", format="NETCDF4")
-        nc.createDimension("time", None)
-        nc.createDimension("latitude", ny)
-        nc.createDimension("longitude", nx)
-
-        time_var = nc.createVariable("time", "f8", ("time",))
-        time_var.units = "seconds since 1970-01-01 00:00:00"
-        time_var[:] = gfs_times
-
-        lon_var = nc.createVariable("longitude", "f4", ("longitude",))
-        lon_var.units = "degrees_east"
-        lon_var[:] = target_lons
-
-        lat_var = nc.createVariable("latitude", "f4", ("latitude",))
-        lat_var.units = "degrees_north"
-        lat_var[:] = target_lats
-
-        for sflux_name in BLEND_VARIABLES:
-            if sflux_name not in gfs_data:
-                continue
-
-            datm_name = SFLUX_TO_DATM[sflux_name]
-            var = nc.createVariable(datm_name, "f4", ("time", "latitude", "longitude"))
-
-            gfs_field = gfs_data[sflux_name]
-
-            for t in range(min(nt, gfs_field.shape[0])):
-                # Interpolate GFS to target grid
-                try:
-                    interp = RegularGridInterpolator(
-                        (gfs_lats, gfs_lons), gfs_field[t],
-                        method="linear", bounds_error=False, fill_value=np.nan,
-                    )
-                    field = interp(np.column_stack([
-                        target_lat_2d.ravel(), target_lon_2d.ravel()
-                    ])).reshape(ny, nx).astype(np.float32)
-                except Exception:
-                    field = np.full((ny, nx), np.nan, dtype=np.float32)
-
-                # Override with HRRR where coverage exists
-                if hrrr_interp and hrrr_data and sflux_name in hrrr_data:
-                    hrrr_field = hrrr_data[sflux_name]
-                    if t < hrrr_field.shape[0]:
-                        hrrr_flat = hrrr_field[t].ravel()
-                        tri_vi = hrrr_interp["tri_vi"]
-                        bary = hrrr_interp["bary"]
-                        valid_idx = hrrr_interp["valid_idx"]
-                        coverage = hrrr_interp["coverage_2d"]
-
-                        vals = (hrrr_flat[tri_vi[:, 0]] * bary[:, 0] +
-                                hrrr_flat[tri_vi[:, 1]] * bary[:, 1] +
-                                hrrr_flat[tri_vi[:, 2]] * bary[:, 2])
-
-                        blended = field.ravel()
-                        blended[valid_idx] = vals
-                        field = blended.reshape(ny, nx)
-
-                var[t, :, :] = field
-
-        # Data source mask
-        if hrrr_interp:
-            src = nc.createVariable("data_source", "i4", ("latitude", "longitude"))
-            src.long_name = "1=HRRR coverage, 0=GFS only"
-            src[:] = hrrr_interp["coverage_2d"].astype(np.int32)
-
-        nc.title = "Blended HRRR+GFS forcing for UFS-Coastal DATM"
-        nc.close()
-        log.info(f"Created {output_path.name}: nx={nx}, ny={ny}, nt={nt}")
-
-
-def rotate_winds_lcc(u_grid, v_grid, lon_2d, lov=HRRR_LOV, lad=HRRR_LAD):
-    """
-    Rotate grid-relative winds to earth-relative for Lambert Conformal.
-
-    HRRR GRIB2 winds are relative to the LC grid. DATM/SCHISM need
-    earth-relative (true north) winds.
-
-    Args:
-        u_grid, v_grid: Grid-relative wind components
-        lon_2d: 2D longitude array (degrees)
-        lov: Longitude of vertical (degrees)
-        lad: Latitude of tangency (degrees)
-
-    Returns:
-        (u_earth, v_earth) rotated to true north
-    """
-    angle = np.radians(np.sin(np.radians(lad)) * (lon_2d - lov))
-    cos_a = np.cos(angle)
-    sin_a = np.sin(angle)
-
-    u_earth = u_grid * cos_a - v_grid * sin_a
-    v_earth = u_grid * sin_a + v_grid * cos_a
-
-    return u_earth, v_earth
+        """Discover input forcing files."""
+        files = []
+        gfs = self.input_path / "gfs_forcing.nc"
+        hrrr = self.input_path / "hrrr_forcing.nc"
+        if gfs.exists():
+            files.append(gfs)
+        if hrrr.exists():
+            files.append(hrrr)
+        return files
