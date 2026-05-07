@@ -24,13 +24,14 @@ def cmd_prep(args):
     # Build config
     if args.yaml:
         config = ForcingConfig.from_yaml(args.yaml, pdy=args.pdy, cyc=args.cyc)
-    elif args.ofs == "secofs":
-        if args.ufs:
+    elif args.ofs in ("secofs", "secofs_ufs"):
+        # secofs_ufs implies UFS-Coastal mode; --ufs flag is redundant but accepted
+        if args.ufs or args.ofs == "secofs_ufs":
             config = ForcingConfig.for_secofs_ufs(pdy=args.pdy, cyc=args.cyc)
         else:
             config = ForcingConfig.for_secofs(pdy=args.pdy, cyc=args.cyc)
-    elif args.ofs == "stofs_3d_atl":
-        if args.ufs:
+    elif args.ofs in ("stofs_3d_atl", "stofs_3d_atl_ufs"):
+        if args.ufs or args.ofs == "stofs_3d_atl_ufs":
             config = ForcingConfig.for_stofs_3d_atl_ufs(pdy=args.pdy, cyc=args.cyc)
         else:
             config = ForcingConfig.for_stofs_3d_atl(pdy=args.pdy, cyc=args.cyc)
