@@ -9,7 +9,9 @@ CRITICAL: elementMask must be set to 1 (active), NOT 0 (masked).
   zero atmospheric forcing passed to SCHISM (lesson #18).
 
 Input: Regular lat/lon grid (from datm_forcing.nc or sflux files)
-Output: esmf_mesh.nc (ESMF unstructured mesh format)
+Output: datm_esmf_mesh.nc (ESMF unstructured mesh format — name matches
+        the legacy COMF default DATM_MESH_FILE in nos_ofs_gen_ufs_config.sh
+        and the @[DATM_MESH_FILE] reference in datm_in.template).
 """
 
 import logging
@@ -51,7 +53,7 @@ class ESMFMeshProcessor(ForcingProcessor):
         Args:
             config: ForcingConfig with domain bounds
             input_path: Directory containing datm_forcing.nc
-            output_path: Output directory for esmf_mesh.nc
+            output_path: Output directory for datm_esmf_mesh.nc
             forcing_file: Explicit path to forcing file to read grid from
         """
         super().__init__(config, input_path, output_path)
@@ -76,11 +78,11 @@ class ESMFMeshProcessor(ForcingProcessor):
                 errors=["Cannot determine grid for ESMF mesh"],
             )
 
-        output_file = self.output_path / "esmf_mesh.nc"
+        output_file = self.output_path / "datm_esmf_mesh.nc"
         self._create_mesh(lons, lats, output_file)
 
         nx, ny = len(lons), len(lats)
-        log.info(f"Created esmf_mesh.nc: nx={nx}, ny={ny}, "
+        log.info(f"Created datm_esmf_mesh.nc: nx={nx}, ny={ny}, "
                  f"elements={(nx-1)*(ny-1)}, nodes={nx*ny}")
 
         return ForcingResult(

@@ -716,7 +716,13 @@ class PrepOrchestrator:
         Reads ``gfs_forcing.nc`` and (optionally) ``hrrr_forcing.nc`` from
         ``output_dir/`` (written by GFSProcessor/HRRRProcessor in nws=4
         mode via ForcingNcWriter), blends them onto the wide ATLANTIC
-        DATM grid, and emits ``datm_forcing.nc`` + ``esmf_mesh.nc``.
+        DATM grid, and emits ``datm_forcing.nc`` + ``datm_esmf_mesh.nc``.
+
+        Then stages both files into ``output_dir/INPUT/`` to match the
+        legacy ``nos_ofs_create_datm_forcing_blended.sh`` layout — DATM
+        at runtime reads them from ``$DATA/INPUT/`` per the
+        ``model_meshfile = "INPUT/datm_esmf_mesh.nc"`` reference in
+        ``datm_in.template``.
         """
         output_files = []
         warnings = []
@@ -758,6 +764,19 @@ class PrepOrchestrator:
                 errors.extend(mesh_result.errors)
         else:
             warnings.append("datm_forcing.nc not found — ESMF mesh not generated")
+
+        # 8c: Stage datm_forcing.nc + datm_esmf_mesh.nc into $DATA/INPUT/
+        # to match the legacy nos_ofs_create_datm_forcing_blended.sh layout.
+        # CDEPS DATM at runtime reads them from there per datm_in.template.
+        if blend_ok and mesh_ok:
+            import shutil
+            input_dir = output_dir / "INPUT"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            for nc_name in ("datm_forcing.nc", "datm_esmf_mesh.nc"):
+                src = output_dir / nc_name
+                if src.exists():
+                    shutil.copy2(src, input_dir / nc_name)
+                    log.info(f"  Staged INPUT/{nc_name}")
 
         # _run_datm is only called when nws=4 (orchestrator gates the call),
         # so we expect both blend and mesh to succeed.
@@ -918,8 +937,6 @@ class PrepOrchestrator:
             "vsource.th": f"{prefix}.{cycle}.{pdy}.river.vsource.th",
             "msource.th": f"{prefix}.{cycle}.{pdy}.river.msource.th",
             "sflux_inputs.txt": "sflux_inputs.txt",
-            "datm_forcing.nc": f"{prefix}.{cycle}.datm_forcing.nc",
-            "esmf_mesh.nc": f"{prefix}.{cycle}.esmf_mesh.nc",
             "partition.prop": "partition.prop",
             # UFS-Coastal config files (nws=4). Names match what the
             # legacy exnos_ofs_prep.sh archives (lines 361-363):
@@ -942,6 +959,21 @@ class PrepOrchestrator:
                 shutil.copy2(src, dst)
                 archived.append(dst)
                 log.info(f"  Copied {src_name} -> {dst_name}")
+
+        # UFS-Coastal DATM artifacts: match legacy exnos_ofs_prep.sh:355-360.
+        # `mkdir -p $COMOUT/${RUN}.${cycle}.datm_input` and
+        # `cp -p ${DATA}/${DATM_DIR}/*.nc $COMOUT/${RUN}.${cycle}.datm_input/`.
+        # nos_ofs_model_run.sh:599 reads from this exact subdir at runtime.
+        datm_input_src = work_dir / "INPUT"
+        if datm_input_src.is_dir():
+            datm_input_dst = comout / f"{prefix}.{cycle}.datm_input"
+            datm_input_dst.mkdir(parents=True, exist_ok=True)
+            for nc in sorted(datm_input_src.glob("*.nc")):
+                dst = datm_input_dst / nc.name
+                shutil.copy2(nc, dst)
+                archived.append(dst)
+                log.info(f"  Copied INPUT/{nc.name} -> "
+                         f"{prefix}.{cycle}.datm_input/{nc.name}")
 
         # Time marker files
         for marker in [f"time_hotstart.{cycle}", f"time_nowcastend.{cycle}",

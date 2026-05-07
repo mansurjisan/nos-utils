@@ -15,7 +15,7 @@ class TestESMFMeshProcessor:
         result = proc.process()
 
         assert result.success
-        mesh_file = out_dir / "esmf_mesh.nc"
+        mesh_file = out_dir / "datm_esmf_mesh.nc"
         assert mesh_file.exists()
 
     def test_element_mask_is_one(self, mock_config, tmp_path):
@@ -24,7 +24,7 @@ class TestESMFMeshProcessor:
         proc = ESMFMeshProcessor(mock_config, tmp_path, out_dir)
         proc.process()
 
-        ds = netCDF4.Dataset(str(out_dir / "esmf_mesh.nc"))
+        ds = netCDF4.Dataset(str(out_dir / "datm_esmf_mesh.nc"))
         mask = ds.variables["elementMask"][:]
         assert np.all(mask == 1), f"elementMask has zeros! This will mask ALL elements."
         ds.close()
@@ -34,7 +34,7 @@ class TestESMFMeshProcessor:
         proc = ESMFMeshProcessor(mock_config, tmp_path, out_dir)
         result = proc.process()
 
-        ds = netCDF4.Dataset(str(out_dir / "esmf_mesh.nc"))
+        ds = netCDF4.Dataset(str(out_dir / "datm_esmf_mesh.nc"))
 
         n_nodes = ds.dimensions["nodeCount"].size
         n_elements = ds.dimensions["elementCount"].size
