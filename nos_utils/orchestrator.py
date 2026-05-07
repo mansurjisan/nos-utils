@@ -907,7 +907,10 @@ class PrepOrchestrator:
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 log.warning(f"  Failed to tar NWM: {e}")
 
-        # Copy individual files
+        # Copy individual files. UFS-Coastal (nws=4) entries match the
+        # legacy archive layout in scripts/nosofs/exnos_ofs_prep.sh so
+        # downstream consumers (model_configure et al. in COMOUT) work
+        # whether prep ran via legacy shell or Python.
         copy_map = {
             "param.nml": f"{prefix}.{cycle}.{pdy}.{phase}.in",
             "bctides.in": f"{prefix}.{cycle}.{pdy}.bctides.in.{phase}",
@@ -918,6 +921,15 @@ class PrepOrchestrator:
             "datm_forcing.nc": f"{prefix}.{cycle}.datm_forcing.nc",
             "esmf_mesh.nc": f"{prefix}.{cycle}.esmf_mesh.nc",
             "partition.prop": "partition.prop",
+            # UFS-Coastal config files (nws=4). Names match what the
+            # legacy exnos_ofs_prep.sh archives (lines 361-363):
+            # `cp $DATA/<f> $COMOUT/${RUN}.${cycle}.<f>`.
+            "model_configure": f"{prefix}.{cycle}.model_configure",
+            "datm_in":         f"{prefix}.{cycle}.datm_in",
+            "datm.streams":    f"{prefix}.{cycle}.datm.streams",
+            "ufs.configure":   f"{prefix}.{cycle}.ufs.configure",
+            "fd_ufs.yaml":     f"{prefix}.{cycle}.fd_ufs.yaml",
+            "noahmptable.tbl": f"{prefix}.{cycle}.noahmptable.tbl",
         }
 
         for src_name, dst_name in copy_map.items():
