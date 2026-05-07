@@ -222,7 +222,12 @@ class BlenderProcessor(ForcingProcessor):
         target_lon_2d, target_lat_2d = np.meshgrid(target_lons, target_lats)
         ny, nx = target_lon_2d.shape
 
-        hrrr_pts = np.column_stack([hrrr_lons_2d.ravel(), hrrr_lats_2d.ravel()])
+        # scipy.spatial.Delaunay rejects masked arrays. HRRR sflux can return
+        # MaskedArray when ncks/ncap2 leave a fill mask on lat/lon coords —
+        # cast to plain ndarray before triangulation.
+        hrrr_lons_flat = np.asarray(hrrr_lons_2d).ravel()
+        hrrr_lats_flat = np.asarray(hrrr_lats_2d).ravel()
+        hrrr_pts = np.column_stack([hrrr_lons_flat, hrrr_lats_flat])
         tri = Delaunay(hrrr_pts)
 
         target_pts = np.column_stack([target_lon_2d.ravel(), target_lat_2d.ravel()])
