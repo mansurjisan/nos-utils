@@ -83,6 +83,18 @@ class ForcingConfig:
     # DATM grid resolution in degrees (for blender output).
     datm_dx: float = 0.025
 
+    # UFS-Coastal coupling resource layout (nws=4 only).
+    # datm_tasks: PETs assigned to MED+ATM (DATM)
+    # schism_tasks: PETs assigned to OCN (SCHISM)
+    # total_tasks: should equal datm_tasks + schism_tasks
+    ufs_datm_tasks: int = 120
+    ufs_schism_tasks: int = 1080
+    ufs_total_tasks: int = 1200
+    # Forecast length in hours (for model_configure NHOURS)
+    ufs_nhours_fcst: int = 48
+    # Atmospheric coupling timestep (seconds, for model_configure DT_ATMOS)
+    ufs_dt_atmos: int = 720
+
     # --- OBC (ocean boundary) settings ---
     # RTOFS ROI indices for 2D (ssh) extraction
     obc_roi_2d: Optional[dict] = None  # {x1, x2, y1, y2}
@@ -233,6 +245,12 @@ class ForcingConfig:
             datm_lon_min=-98.0, datm_lon_max=-55.0,
             datm_lat_min=10.0, datm_lat_max=53.0,
             datm_dx=0.025,
+            # UFS-Coastal resource layout (default SECOFS V15 layout)
+            ufs_datm_tasks=120,
+            ufs_schism_tasks=1080,
+            ufs_total_tasks=1200,
+            ufs_nhours_fcst=48,
+            ufs_dt_atmos=720,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -307,6 +325,12 @@ class ForcingConfig:
             datm_lon_min=-98.0, datm_lon_max=-55.0,
             datm_lat_min=10.0, datm_lat_max=53.0,
             datm_dx=0.025,
+            # UFS-Coastal resource layout (nowcast 24h + forecast 108h = 132h)
+            ufs_datm_tasks=120,
+            ufs_schism_tasks=1080,
+            ufs_total_tasks=1200,
+            ufs_nhours_fcst=132,
+            ufs_dt_atmos=720,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -562,6 +586,18 @@ class ForcingConfig:
                     )
             if "blend_resolution" in ufs_coastal:
                 kwargs["datm_dx"] = float(ufs_coastal["blend_resolution"])
+            # UFS resource layout (used by UFSConfigProcessor to patch
+            # ufs.configure PET bounds and model_configure NHOURS/DT_ATMOS).
+            if "datm_tasks" in ufs_coastal:
+                kwargs["ufs_datm_tasks"] = int(ufs_coastal["datm_tasks"])
+            if "schism_tasks" in ufs_coastal:
+                kwargs["ufs_schism_tasks"] = int(ufs_coastal["schism_tasks"])
+            if "total_tasks" in ufs_coastal:
+                kwargs["ufs_total_tasks"] = int(ufs_coastal["total_tasks"])
+            if "nhours_fcst" in ufs_coastal:
+                kwargs["ufs_nhours_fcst"] = int(ufs_coastal["nhours_fcst"])
+            if "dt_atmos" in ufs_coastal:
+                kwargs["ufs_dt_atmos"] = int(ufs_coastal["dt_atmos"])
 
         # Optional Path fields — only set if value is non-empty
         # River config: try sources_json first (STOFS), then ctl_file (SECOFS)

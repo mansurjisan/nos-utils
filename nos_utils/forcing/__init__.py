@@ -27,8 +27,10 @@ Model Config:
     PartitionProcessor - Generate partition.prop for MPI decomposition
 
 UFS-Coastal:
-    ESMFMeshProcessor - ESMF mesh file for DATM coupling
-    BlenderProcessor  - HRRR+GFS Delaunay blending for DATM
+    ESMFMeshProcessor   - ESMF mesh file for DATM coupling
+    BlenderProcessor    - HRRR+GFS Delaunay blending for DATM
+    UFSConfigProcessor  - Generate model_configure / datm_in / datm.streams
+                          / ufs.configure / fd_ufs.yaml / noahmptable.tbl
 
 Writers:
     SfluxWriter    - SCHISM sflux NetCDF output (nws=2)
@@ -51,6 +53,7 @@ from .hotstart import HotstartProcessor, HotstartInfo
 from .partition import PartitionProcessor
 from .esmf_mesh import ESMFMeshProcessor
 from .blender import BlenderProcessor
+from .ufs_config import UFSConfigProcessor
 from .sflux_writer import SfluxWriter
 from .datm_writer import DATMWriter
 from .forcing_writer import ForcingNcWriter
@@ -83,6 +86,7 @@ __all__ = [
     # UFS-Coastal
     "ESMFMeshProcessor",
     "BlenderProcessor",
+    "UFSConfigProcessor",
     # Writers
     "SfluxWriter",
     "DATMWriter",

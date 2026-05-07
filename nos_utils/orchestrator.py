@@ -97,10 +97,15 @@ class PrepOrchestrator:
     6. Tidal — tidal constituents (bctides.in)
     7. param.nml — model configuration with runtime parameters
     8. (UFS only) DATM blending + ESMF mesh generation
+    9. (UFS only) UFS-Coastal config files (model_configure, datm_in,
+       datm.streams, ufs.configure, fd_ufs.yaml, noahmptable.tbl)
     """
 
     # Steps that can be handled by Python vs legacy shell
-    PYTHON_STEPS = {"hotstart", "gfs", "hrrr", "tidal", "param_nml", "datm"}
+    PYTHON_STEPS = {
+        "hotstart", "gfs", "hrrr", "tidal", "param_nml",
+        "datm", "ufs_config",
+    }
     LEGACY_STEPS = {"nwm", "rtofs", "nudging"}  # Need Fortran/shell for production
 
     def __init__(
@@ -259,6 +264,7 @@ class PrepOrchestrator:
         # UFS-specific (DATM) needs GFS + HRRR sflux
         if self.config.nws == 4:
             results.append(self._run_datm(output_dir))
+            results.append(self._run_ufs_config(output_dir))
 
         # Step 9: Write time marker files (matches ORG behavior)
         self._write_time_markers(output_dir, phase, time_hotstart)
@@ -762,6 +768,24 @@ class PrepOrchestrator:
             warnings=warnings,
             errors=errors,
         )
+
+    def _run_ufs_config(self, output_dir: Path) -> ForcingResult:
+        """Step 9: UFS-Coastal config files for nws=4 runs.
+
+        Mirrors ``ush/nosofs/nos_ofs_gen_ufs_config.sh`` to emit
+        model_configure, datm_in, datm.streams, ufs.configure (with PET
+        bounds patched), fd_ufs.yaml, and noahmptable.tbl. NX/NY come
+        from the just-written datm_forcing.nc when it is available.
+        """
+        from .forcing.ufs_config import UFSConfigProcessor
+
+        fix_dir = self.paths.get("ufs_fix") or self.paths.get("fix")
+        datm_path = output_dir / "datm_forcing.nc"
+        proc = UFSConfigProcessor(
+            self.config, fix_dir, output_dir,
+            datm_forcing_path=datm_path if datm_path.exists() else None,
+        )
+        return proc.process()
 
     def archive_to_comout(self, result: PrepResult, comout: Path) -> List[Path]:
         """
