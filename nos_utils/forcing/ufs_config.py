@@ -116,6 +116,45 @@ class UFSConfigProcessor(ForcingProcessor):
                 files.append(p)
         return files
 
+    def _resolve_template_dir(self) -> Optional[Path]:
+        """Find the directory containing UFS templates.
+
+        UFS templates live in ``fix/<ofs>_ufs/`` (e.g. ``fix/secofs_ufs/``)
+        but callers commonly pass ``fix/<ofs>/`` (the SCHISM mesh FIX dir).
+        Search order:
+          1. ``self.fix_dir`` itself
+          2. Sibling ``<name>_ufs`` directory (e.g. fix/secofs -> fix/secofs_ufs)
+          3. Inside ``self.fix_dir`` — look for a ``<name>_ufs`` subdir
+        Returns the first directory containing all required templates,
+        or None if none of the candidates have them.
+        """
+        if self.fix_dir is None or not self.fix_dir.exists():
+            return None
+
+        def _has_all(d: Path) -> bool:
+            return all((d / name).exists() for name in _REQUIRED_TEMPLATES)
+
+        candidates: List[Path] = [self.fix_dir]
+        # Sibling: fix/secofs -> fix/secofs_ufs
+        if not self.fix_dir.name.endswith("_ufs"):
+            sibling = self.fix_dir.parent / f"{self.fix_dir.name}_ufs"
+            if sibling.exists():
+                candidates.append(sibling)
+        # Subdir: in case caller passed FIX root (e.g. fix/) and templates
+        # live in fix/<ofs>_ufs/
+        for child in self.fix_dir.iterdir() if self.fix_dir.is_dir() else []:
+            if child.is_dir() and child.name.endswith("_ufs"):
+                candidates.append(child)
+
+        for c in candidates:
+            if _has_all(c):
+                if c != self.fix_dir:
+                    log.info(
+                        f"Auto-resolved UFS template dir: {self.fix_dir} -> {c}"
+                    )
+                return c
+        return None
+
     def process(self) -> ForcingResult:
         """Generate all six UFS-Coastal configuration files."""
         log.info(
@@ -129,20 +168,28 @@ class UFSConfigProcessor(ForcingProcessor):
                 errors=[f"fix_dir does not exist: {self.fix_dir}"],
             )
 
-        # Validate required templates up-front.
-        missing = [
-            name for name in _REQUIRED_TEMPLATES
-            if not (self.fix_dir / name).exists()
-        ]
-        if missing:
+        # Auto-resolve to a sibling/subdir if templates aren't directly here
+        # (e.g. caller passed fix/secofs/ but templates live in fix/secofs_ufs/).
+        resolved = self._resolve_template_dir()
+        if resolved is None:
+            # Build helpful error: list which templates were missing in fix_dir.
+            missing = [
+                name for name in _REQUIRED_TEMPLATES
+                if not (self.fix_dir / name).exists()
+            ]
             return ForcingResult(
                 success=False,
                 source=self.SOURCE_NAME,
                 errors=[
                     f"Required template missing: {self.fix_dir / m}"
                     for m in missing
+                ] + [
+                    f"Hint: looked for templates in {self.fix_dir} and "
+                    f"{self.fix_dir.parent}/{self.fix_dir.name}_ufs but "
+                    f"none had all of {list(_REQUIRED_TEMPLATES)}"
                 ],
             )
+        self.fix_dir = resolved  # use the resolved dir for the rest of process()
 
         self.create_output_dir()
 

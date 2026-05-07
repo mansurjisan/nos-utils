@@ -176,6 +176,32 @@ def test_missing_template_fails(ufs_config, tmp_path):
     assert not (out / "datm_in").exists()
 
 
+def test_auto_resolve_sibling_ufs_dir(ufs_config, tmp_path):
+    """Templates in <name>_ufs sibling should be discovered automatically.
+
+    Real layout on WCOSS2:
+      fix/secofs/        <- SCHISM mesh files (caller's --fix)
+      fix/secofs_ufs/    <- UFS templates (where we need to look)
+    """
+    # Caller passes fix/secofs (no templates here)
+    fix_root = tmp_path / "fix"
+    fix_secofs = fix_root / "secofs"
+    fix_secofs.mkdir(parents=True)
+    (fix_secofs / "secofs_hgrid.gr3").write_text("# stub mesh\n")  # SCHISM stuff
+
+    # Sibling fix/secofs_ufs has the templates
+    fix_secofs_ufs = fix_root / "secofs_ufs"
+    _write_full_fix(fix_secofs_ufs)
+
+    out = tmp_path / "out"
+    proc = UFSConfigProcessor(ufs_config, fix_secofs, out)
+    result = proc.process()
+
+    assert result.success, result.errors
+    assert (out / "model_configure").exists()
+    assert (out / "ufs.configure").exists()
+
+
 def test_nx_ny_from_datm(ufs_config, tmp_path):
     """When a datm_forcing.nc is provided, NX/NY come from its dimensions."""
     pytest.importorskip("netCDF4")
