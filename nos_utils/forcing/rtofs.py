@@ -1047,6 +1047,13 @@ class RTOFSProcessor(ForcingProcessor):
                 try:
                     from scipy.interpolate import interp1d
                     model_times = np.arange(n_model_steps) * model_dt
+                    # Clip to BOTH the run window (sim_duration) AND what
+                    # RTOFS files actually cover. Production trims to
+                    # sim_duration so SCHISM doesn't read past the
+                    # configured run-end (V12 had elev2D extending to
+                    # 259200s vs production 194400s — caused the
+                    # MISC: nc dt1 abort).
+                    model_times = model_times[model_times <= sim_duration]
                     model_times = model_times[model_times <= rtofs_times[-1]]
 
                     ssh_interp = np.zeros((len(model_times), n_bnd), dtype=np.float32)
@@ -1084,13 +1091,19 @@ class RTOFSProcessor(ForcingProcessor):
                 # No interpolation: use actual file valid times
                 time_var[:] = rtofs_times[:nt]
 
+            # SCHISM-required scalar for `nc dt1` consistency check.
+            # Without this variable, model init aborts with `MISC: nc dt1`.
+            ts_step = nc.createVariable("time_step", "f4", ("one",))
+            ts_step[0] = float(dt_out)
+
             ts = nc.createVariable("time_series", "f4",
                                    ("time", "nOpenBndNodes", "nLevels", "nComponents"),
                                    fill_value=-30000.0)
             ts[:, :, 0, 0] = ssh_array
 
             nc.close()
-            log.info(f"Created elev2D.th.nc: ({nt}, {n_bnd}) boundary nodes")
+            log.info(f"Created elev2D.th.nc: ({nt}, {n_bnd}) boundary nodes, "
+                     f"time_step={dt_out}s")
             return output_file
 
         except Exception as e:
@@ -1461,7 +1474,13 @@ class RTOFSProcessor(ForcingProcessor):
 
     def _write_3d_th(self, output_path: Path, data: np.ndarray,
                      var_name: str, units: str, dt: float, n_bnd: int) -> None:
-        """Write TEM_3D.th.nc or SAL_3D.th.nc in SCHISM format."""
+        """Write TEM_3D.th.nc or SAL_3D.th.nc in SCHISM format.
+
+        Schema matches v3.9.1 production (variables: time, time_step,
+        time_series). The ``time_step`` scalar is what SCHISM reads first
+        for its ``nc dt1`` consistency check — without it SCHISM aborts
+        with ``MISC: nc dt1`` during OBC init.
+        """
         nc = Dataset(str(output_path), "w", format="NETCDF4")
         nt = data.shape[0]
         n_levels = data.shape[2]
@@ -1475,6 +1494,10 @@ class RTOFSProcessor(ForcingProcessor):
         time_var = nc.createVariable("time", "f8", ("time",))
         time_var[:] = [i * dt for i in range(nt)]
 
+        # SCHISM-required scalar holding the time-step value
+        ts_step = nc.createVariable("time_step", "f4", ("one",))
+        ts_step[0] = float(dt)
+
         ts = nc.createVariable("time_series", "f4",
                                ("time", "nOpenBndNodes", "nLevels", "nComponents"),
                                fill_value=-30000.0)
@@ -1484,7 +1507,7 @@ class RTOFSProcessor(ForcingProcessor):
 
     def _write_uv3d_th(self, output_path: Path, u: np.ndarray,
                        v: np.ndarray, dt: float, n_bnd: int) -> None:
-        """Write uv3D.th.nc in SCHISM format."""
+        """Write uv3D.th.nc in SCHISM format (with time_step scalar)."""
         nc = Dataset(str(output_path), "w", format="NETCDF4")
         nt = u.shape[0]
         n_levels = u.shape[2]
@@ -1497,6 +1520,9 @@ class RTOFSProcessor(ForcingProcessor):
 
         time_var = nc.createVariable("time", "f8", ("time",))
         time_var[:] = [i * dt for i in range(nt)]
+
+        ts_step = nc.createVariable("time_step", "f4", ("one",))
+        ts_step[0] = float(dt)
 
         ts = nc.createVariable("time_series", "f4",
                                ("time", "nOpenBndNodes", "nLevels", "nComponents"),
