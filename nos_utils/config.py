@@ -137,6 +137,11 @@ class ForcingConfig:
     # Q_mean/T_mean from river.ctl Section 1 — closes most of the value
     # gap to production output.
     river_clim_file: Optional[Path] = None
+    # SCHISM model time step (seconds). Used by `_write_river_th_files`
+    # to generate the time grid for ``schism_flux/temp/salt.th``. Default
+    # 120s matches typical SECOFS production. Set higher (e.g. 3600) for
+    # an hourly grid; SCHISM linearly interpolates between supplied times.
+    schism_dt: float = 120.0
     # River climatology for fallback
     river_clim_file: Optional[Path] = None
     # Default river temperature and salinity

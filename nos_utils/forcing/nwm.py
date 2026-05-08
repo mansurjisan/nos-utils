@@ -1073,19 +1073,25 @@ class NWMProcessor(ForcingProcessor):
         def _fmt_f12_0(t_sec: float) -> str:
             return f"{t_sec:11.0f}."
 
+        # Generate time grid at the SCHISM model dt (production: 120 sec).
+        # This produces a 1651-row file for a 55-hour run (matches
+        # production cadence) instead of an hourly 55-row one. Q/T values
+        # are constant across rows (climatology over the run window) so
+        # the only effect is to give SCHISM denser interpolation points.
+        if times:
+            end_sec = max(0.0, float(times[-1]) * 3600.0)
+        else:
+            end_sec = 0.0
+        dt = max(1.0, float(self.config.schism_dt))
+        # Build [0, dt, 2dt, ..., end_sec] inclusive
+        n_steps = int(round(end_sec / dt)) + 1
+        time_grid_sec = [k * dt for k in range(n_steps)]
+
         try:
             with open(flux_path, "w") as ff, \
                  open(temp_path, "w") as tf, \
                  open(salt_path, "w") as sf:
-                wrote_first = False
-                for t_idx, t_hours in enumerate(times):
-                    t_sec = float(t_hours) * 3600.0
-                    if not wrote_first:
-                        t_sec = 0.0
-                        wrote_first = True
-                    elif t_sec <= 0.5:
-                        continue
-
+                for t_sec in time_grid_sec:
                     t_str = _fmt_f12_0(t_sec)
                     ff.write(t_str
                              + "".join(f"{-q:12.2f}" for q in q_per_river)
@@ -1100,6 +1106,7 @@ class NWMProcessor(ForcingProcessor):
             mode = "production formula (per-grid station × Q_Scale)" \
                 if use_production_formula else "legacy clim_flows fallback"
             log.info(f"Created schism_flux/temp/salt.th: {n_riv} grid points, "
+                     f"{len(time_grid_sec)} rows at {dt:.0f}-sec cadence, "
                      f"{mode}, Q/T source = {clim_label}; "
                      f"avg Q={sum(q_per_river)/n_riv:.1f} m^3/s, "
                      f"avg T={sum(t_per_river)/n_riv:.2f}C, S={salt_const:.4f}")
