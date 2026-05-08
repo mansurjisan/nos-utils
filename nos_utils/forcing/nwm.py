@@ -51,7 +51,20 @@ class RiverConfig:
                  clim_flows: List[float], names: Optional[List[str]] = None,
                  feature_id_groups: Optional[List[List[int]]] = None,
                  sink_node_indices: Optional[List[int]] = None,
-                 sink_feature_id_groups: Optional[List[List[int]]] = None):
+                 sink_feature_id_groups: Optional[List[List[int]]] = None,
+                 # COMF river.ctl per-grid-point fields — used by
+                 # `_write_river_th_files` to apply the legacy Fortran
+                 # formula: flux = Q_obs(RiverID_Q[i]) * Q_Scale[i],
+                 # temp = max(1.0, T_obs(RiverID_T[i]) * T_Scale[i]),
+                 # salt = 0.005 (constant per nos_ofs_create_forcing_river.f:1898)
+                 river_id_q: Optional[List[int]] = None,
+                 q_scale: Optional[List[float]] = None,
+                 river_id_t: Optional[List[int]] = None,
+                 t_scale: Optional[List[float]] = None,
+                 stations_q_mean: Optional[Dict[int, float]] = None,
+                 stations_t_mean: Optional[Dict[int, float]] = None,
+                 station_names: Optional[Dict[int, str]] = None,
+                 station_usgs_ids: Optional[Dict[int, str]] = None):
         self.feature_ids = feature_ids
         self.node_indices = node_indices
         self.clim_flows = clim_flows
@@ -65,6 +78,17 @@ class RiverConfig:
         self.sink_node_indices = sink_node_indices or []
         self.sink_feature_id_groups = sink_feature_id_groups
         self.n_sinks = len(self.sink_node_indices)
+        # COMF per-grid scaling — when populated, _write_river_th_files
+        # uses station-driven Q/T (with Q_Scale / T_Scale per grid point)
+        # to match production's nos_ofs_create_forcing_river output.
+        self.river_id_q = river_id_q or []
+        self.q_scale = q_scale or []
+        self.river_id_t = river_id_t or []
+        self.t_scale = t_scale or []
+        self.stations_q_mean = stations_q_mean or {}
+        self.stations_t_mean = stations_t_mean or {}
+        self.station_names = station_names or {}
+        self.station_usgs_ids = station_usgs_ids or {}
 
     @classmethod
     def from_text(cls, filepath: Path) -> "RiverConfig":
@@ -105,9 +129,8 @@ class RiverConfig:
         lines = text.splitlines()
 
         # Parse Section 1: USGS stations
-        stations = {}  # river_id -> {q_mean, t_mean, name}
+        stations = {}  # river_id -> {q_mean, t_mean, name, usgs_id}
         in_section1 = False
-        sec1_header = None
         nij = 0
 
         for line in lines:
@@ -132,19 +155,25 @@ class RiverConfig:
             # Station data line: RiverID STATION_ID NWS_ID AGENCY Q_min Q_max Q_mean T_min T_max T_mean ...
             try:
                 rid = int(parts[0])
+                usgs_id = parts[1]
                 q_mean = float(parts[6])
                 t_mean = float(parts[9]) if len(parts) > 9 else 15.0
                 # Extract quoted name
                 name = stripped.split('"')[1] if '"' in stripped else f"station_{parts[1]}"
-                stations[rid] = {"q_mean": q_mean, "t_mean": t_mean, "name": name}
+                stations[rid] = {"q_mean": q_mean, "t_mean": t_mean,
+                                 "name": name, "usgs_id": usgs_id}
             except (ValueError, IndexError):
                 continue
 
         # Parse Section 2: grid node mappings
-        feature_ids = []
-        node_indices = []
-        clim_flows = []
-        names = []
+        feature_ids: List[int] = []
+        node_indices: List[int] = []
+        clim_flows: List[float] = []
+        names: List[str] = []
+        river_id_q: List[int] = []
+        q_scale: List[float] = []
+        river_id_t: List[int] = []
+        t_scale: List[float] = []
         in_section2 = False
 
         for line in lines:
@@ -165,26 +194,48 @@ class RiverConfig:
             try:
                 grid_id = int(parts[0])
                 node_id = int(parts[1])
-                river_id_q = int(parts[5])
-                q_scale = float(parts[6])
+                rid_q = int(parts[5])
+                qs = float(parts[6])
+                rid_t = int(parts[7]) if len(parts) > 7 else rid_q
+                ts = float(parts[8]) if len(parts) > 8 else 1.0
                 name = stripped.split('"')[1] if '"' in stripped else f"river_{grid_id}"
 
-                # Compute climatological flow for this node
-                if river_id_q in stations:
-                    clim_flow = stations[river_id_q]["q_mean"] * q_scale
+                # Compute climatological flow for this node (legacy fallback)
+                if rid_q in stations:
+                    clim_flow = stations[rid_q]["q_mean"] * qs
                 else:
-                    clim_flow = 50.0 * q_scale
+                    clim_flow = 50.0 * qs
 
                 feature_ids.append(grid_id)
                 node_indices.append(node_id)
                 clim_flows.append(clim_flow)
                 names.append(name.strip())
+                river_id_q.append(rid_q)
+                q_scale.append(qs)
+                river_id_t.append(rid_t)
+                t_scale.append(ts)
             except (ValueError, IndexError):
                 continue
 
+        # Build station lookups by RiverID for O(1) Q_mean / T_mean access
+        stations_q_mean = {rid: s["q_mean"] for rid, s in stations.items()}
+        stations_t_mean = {rid: s["t_mean"] for rid, s in stations.items()}
+        station_names = {rid: s["name"] for rid, s in stations.items()}
+        station_usgs_ids = {rid: s["usgs_id"] for rid, s in stations.items()}
+
         log.info(f"Parsed river.ctl: {len(stations)} USGS stations, "
                  f"{len(feature_ids)} grid nodes")
-        return cls(feature_ids, node_indices, clim_flows, names)
+        return cls(
+            feature_ids, node_indices, clim_flows, names,
+            river_id_q=river_id_q,
+            q_scale=q_scale,
+            river_id_t=river_id_t,
+            t_scale=t_scale,
+            stations_q_mean=stations_q_mean,
+            stations_t_mean=stations_t_mean,
+            station_names=station_names,
+            station_usgs_ids=station_usgs_ids,
+        )
 
     @classmethod
     def _parse_simple(cls, text: str) -> "RiverConfig":
@@ -924,36 +975,68 @@ class NWMProcessor(ForcingProcessor):
                               ctl_cfg: RiverConfig) -> List[Path]:
         """Write SCHISM open-boundary forcing: schism_flux.th / temp.th / salt.th.
 
-        Mirrors the legacy Fortran ``nos_ofs_create_forcing_river`` output
-        (``ush/python/sorc/nos_ofs_create_forcing_river.fd/`` formats 600/601).
-        For each river in ``ctl_cfg``:
+        Mirrors legacy Fortran ``nos_ofs_create_forcing_river.f`` formula
+        (lines 1893-1898) per grid point ``i`` at time ``N``:
 
-          - flux: ``-clim_flow`` (NEGATIVE — SCHISM convention: inflow < 0)
-          - temp: monthly climatology from ``MONTHLY_RIVER_TEMP``
-            (or ctl's per-station T_mean once that's threaded through —
-            today's smoke test uses the monthly default so SECOFS gets
-            sensible spring values)
-          - salt: 0 (fresh-water rivers)
+            flux  = -river_q(RiverID_Q[i], N) * Q_Scale[i]   ! negate for inflow
+            temp  =  max(1.0, river_T(RiverID_T[i], N) * T_Scale[i])
+            salt  =  0.005                                    ! constant per F90:1898
 
-        Format (Fortran ``F12.0,50F12.2`` for flux; ``F12.0,50F12.4`` for
-        temp/salt) — keeps SCHISM's per-row read happy.
+        Format matches production Fortran (``nos_ofs_create_forcing_river.f``
+        formats 600/601):
+            - flux.th: ``F12.0,50F12.2``  (time secs, F12.2 values)
+            - temp/salt: ``F12.0,50F12.4``
+            - First row at t=0 (forced; legacy F90:2016 convention)
+            - Later rows skipped if ``t_sec <= 0.5`` (legacy F90:2022)
+            - Time written as Fortran-style ``F12.0`` with trailing dot
+              (``"        120."`` not ``"         120"``)
 
-        First row always at t=0 sec. Later rows skipped if t_sec <= 0.5
-        (matches Fortran behavior).
+        Q/T source priority (highest first):
+            1. USGS observation timeseries (TODO: BUFR or NWIS fetcher)
+            2. Daily climatology from ``river.clim.usgs.nc`` (TODO once
+               file is available)
+            3. Annual ``Q_mean`` / ``T_mean`` from river.ctl Section 1
+               (current path — smoke-test fallback)
+
+        Salt is hardcoded 0.005 PSU per the Fortran reference — the legacy
+        does NOT read salt observations.
         """
         n_riv = ctl_cfg.n_rivers
         if n_riv == 0:
             return []
 
-        month = int(self.config.pdy[4:6])
-        temp_default = MONTHLY_RIVER_TEMP.get(month, self.config.river_default_temp)
-        salt_default = self.config.river_default_salt  # 0.0 for fresh-water
+        # If per-grid scaling is populated (parsed from river.ctl), use the
+        # production formula. Otherwise fall back to the simpler clim_flows
+        # array (used by ad-hoc RiverConfig instantiation in tests).
+        use_production_formula = bool(ctl_cfg.river_id_q and ctl_cfg.q_scale)
 
-        flows = ctl_cfg.clim_flows  # length n_riv
+        if use_production_formula:
+            # Resolve per-grid Q and T from station_id mapping × scale.
+            # No live observation yet → use Q_mean / T_mean from Section 1.
+            q_per_river: List[float] = []
+            t_per_river: List[float] = []
+            for i in range(n_riv):
+                sid_q = ctl_cfg.river_id_q[i]
+                sid_t = ctl_cfg.river_id_t[i]
+                q_obs = ctl_cfg.stations_q_mean.get(sid_q, 50.0)
+                t_obs = ctl_cfg.stations_t_mean.get(sid_t, 15.0)
+                q_per_river.append(q_obs * ctl_cfg.q_scale[i])
+                t_per_river.append(max(1.0, t_obs * ctl_cfg.t_scale[i]))
+        else:
+            q_per_river = list(ctl_cfg.clim_flows)
+            month = int(self.config.pdy[4:6])
+            t_default = MONTHLY_RIVER_TEMP.get(month, self.config.river_default_temp)
+            t_per_river = [t_default] * n_riv
+
+        salt_const = 0.005  # F90:1898 hardcoded
 
         flux_path = self.output_path / "schism_flux.th"
         temp_path = self.output_path / "schism_temp.th"
         salt_path = self.output_path / "schism_salt.th"
+
+        # Fortran F12.0 emits "0." not "0" — match that.
+        def _fmt_f12_0(t_sec: float) -> str:
+            return f"{t_sec:11.0f}."
 
         try:
             with open(flux_path, "w") as ff, \
@@ -963,26 +1046,28 @@ class NWMProcessor(ForcingProcessor):
                 for t_idx, t_hours in enumerate(times):
                     t_sec = float(t_hours) * 3600.0
                     if not wrote_first:
-                        # Always write t=0 row first
                         t_sec = 0.0
                         wrote_first = True
                     elif t_sec <= 0.5:
-                        # Skip rows whose seconds value would round to 0
-                        # (matches Fortran: `if (time_sec > 0.50)` gate)
                         continue
 
-                    ff.write(f"{t_sec:12.0f}"
-                             + "".join(f"{-q:12.2f}" for q in flows)
+                    t_str = _fmt_f12_0(t_sec)
+                    ff.write(t_str
+                             + "".join(f"{-q:12.2f}" for q in q_per_river)
                              + "\n")
-                    tf.write(f"{t_sec:12.0f}"
-                             + "".join(f"{temp_default:12.4f}" for _ in flows)
+                    tf.write(t_str
+                             + "".join(f"{t:12.4f}" for t in t_per_river)
                              + "\n")
-                    sf.write(f"{t_sec:12.0f}"
-                             + "".join(f"{salt_default:12.4f}" for _ in flows)
+                    sf.write(t_str
+                             + "".join(f"{salt_const:12.4f}" for _ in q_per_river)
                              + "\n")
-            log.info(f"Created schism_flux/temp/salt.th: {n_riv} boundary rivers, "
-                     f"climatology Q (avg={sum(flows)/n_riv:.1f} m^3/s, "
-                     f"T={temp_default:.1f}C, S={salt_default:.1f})")
+
+            mode = "production formula (per-grid station × Q_Scale)" \
+                if use_production_formula else "legacy clim_flows fallback"
+            log.info(f"Created schism_flux/temp/salt.th: {n_riv} grid points, "
+                     f"{mode}; "
+                     f"avg Q={sum(q_per_river)/n_riv:.1f} m^3/s, "
+                     f"avg T={sum(t_per_river)/n_riv:.2f}C, S={salt_const:.4f}")
             return [flux_path, temp_path, salt_path]
         except Exception as e:
             log.error(f"Failed to write schism_*.th boundary forcing: {e}")
