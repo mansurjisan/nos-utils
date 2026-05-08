@@ -442,11 +442,14 @@ class NWMProcessor(ForcingProcessor):
         if msource:
             output_files.append(msource)
 
-        # STOFS: copy static vsink.th from FIX (volume sinks, e.g. diversions).
-        # Operational shell scripts stage this alongside msource.th with no
-        # per-cycle computation, so nos-utils mirrors that behavior.
-        if self.is_stofs_mode:
-            vsink = self._copy_static_vsink()
+        # STOFS sink volumes: SCHISM expects vsink.th columns to match the
+        # n_sinks declared in source_sink.in. Static FIX files from older
+        # baselines carry a different sink count and would crash SCHISM
+        # during partition with a heap overflow. Generate the time series
+        # in-place with zeros (no diversion flow) so the count is always
+        # consistent. NWM doesn't provide sink data anyway.
+        if self.is_stofs_mode and self.river_config.n_sinks > 0:
+            vsink = self._write_vsink(times)
             if vsink:
                 output_files.append(vsink)
 
@@ -840,6 +843,37 @@ class NWMProcessor(ForcingProcessor):
             return output_file
         except Exception as e:
             log.error(f"Failed to write vsource.th: {e}")
+            return None
+
+    def _write_vsink(self, times: List[float]) -> Optional[Path]:
+        """Write vsink.th — volume sink time history (zero flow).
+
+        SCHISM requires vsink.th columns to match ``nsink`` from
+        source_sink.in. NWM doesn't provide sink flow data and the static
+        FIX vsink.th is keyed to an older sinks.json with a different sink
+        count, so we generate a zero-flow time series sized to the current
+        ``n_sinks``. This declares the sink elements without imposing any
+        diversion volume — equivalent to running without active diversions.
+        """
+        output_file = self.output_path / "vsink.th"
+        n_sinks = self.river_config.n_sinks
+        if n_sinks == 0:
+            return None
+        try:
+            with open(output_file, "w") as f:
+                zeros = " ".join(["0.0000"] * n_sinks)
+                for t_idx, t_hours in enumerate(times):
+                    t_seconds = t_hours * 3600.0
+                    if self.is_stofs_mode:
+                        if t_idx == 0:
+                            t_seconds = 0.0
+                        elif t_idx == 1:
+                            t_seconds = 3600.0
+                    f.write(f"{t_seconds:.1f} {zeros}\n")
+            log.info(f"Created vsink.th: {len(times)} steps, {n_sinks} sinks (zero volume)")
+            return output_file
+        except Exception as e:
+            log.error(f"Failed to write vsink.th: {e}")
             return None
 
     def _write_msource(self, times: List[float]) -> Optional[Path]:
