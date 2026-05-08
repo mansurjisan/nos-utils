@@ -115,8 +115,12 @@ class ForcingConfig:
     n_levels: int = 51
 
     # --- River settings ---
-    # River config file mapping NWM reach IDs to SCHISM nodes
+    # River config file mapping NWM reach IDs to SCHISM source elements
     river_config_file: Optional[Path] = None
+    # Optional STOFS-style sinks file ({elem_id: [fid, ...]}) — when set,
+    # NWMProcessor includes a sink list in source_sink.in. Required for
+    # SCHISM domains with diversion sinks (SECOFS, STOFS-3D-ATL).
+    sinks_config_file: Optional[Path] = None
     # River climatology for fallback
     river_clim_file: Optional[Path] = None
     # Default river temperature and salinity
@@ -607,6 +611,9 @@ class ForcingConfig:
                            river_files.get("nwm_reach")
         if river_config_file:
             kwargs["river_config_file"] = Path(river_config_file)
+        sinks_config_file = river_files.get("sinks_json")
+        if sinks_config_file:
+            kwargs["sinks_config_file"] = Path(sinks_config_file)
         if bctides_template:
             kwargs["bctides_template"] = Path(bctides_template)
         if grid_file:

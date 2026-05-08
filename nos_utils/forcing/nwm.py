@@ -49,7 +49,9 @@ class RiverConfig:
 
     def __init__(self, feature_ids: List[int], node_indices: List[int],
                  clim_flows: List[float], names: Optional[List[str]] = None,
-                 feature_id_groups: Optional[List[List[int]]] = None):
+                 feature_id_groups: Optional[List[List[int]]] = None,
+                 sink_node_indices: Optional[List[int]] = None,
+                 sink_feature_id_groups: Optional[List[List[int]]] = None):
         self.feature_ids = feature_ids
         self.node_indices = node_indices
         self.clim_flows = clim_flows
@@ -57,6 +59,12 @@ class RiverConfig:
         self.n_rivers = len(feature_ids)
         # STOFS: groups of feature_ids per source (flow summed within group)
         self.feature_id_groups = feature_id_groups
+        # STOFS sinks (e.g. diversions) — element IDs SCHISM should treat as
+        # negative-flux sources. The volume timeseries comes from a static
+        # vsink.th in FIX (Python doesn't generate it per-cycle).
+        self.sink_node_indices = sink_node_indices or []
+        self.sink_feature_id_groups = sink_feature_id_groups
+        self.n_sinks = len(self.sink_node_indices)
 
     @classmethod
     def from_text(cls, filepath: Path) -> "RiverConfig":
@@ -256,7 +264,8 @@ class RiverConfig:
         return cls(feature_ids, node_indices, clim_flows, names)
 
     @classmethod
-    def from_sources_json(cls, filepath: Path) -> "RiverConfig":
+    def from_sources_json(cls, filepath: Path,
+                          sinks_path: Optional[Path] = None) -> "RiverConfig":
         """Load STOFS sources.json: {element_id: [fid1, fid2, ...]}.
 
         STOFS-3D-ATL uses VIMS gen_sourcesink.py format where each source
@@ -265,6 +274,11 @@ class RiverConfig:
 
         Args:
             filepath: Path to sources.json (e.g. stofs_3d_atl_river_sources_conus.json)
+            sinks_path: Optional path to sinks.json — same {element_id: [fid, ...]}
+                schema. If provided, the resulting RiverConfig also lists the
+                sink elements so source_sink.in includes them. Sink volume
+                timeseries comes from a static vsink.th in FIX, not generated
+                here.
         """
         import json
         with open(filepath) as f:
@@ -280,11 +294,24 @@ class RiverConfig:
         names = [f"src_{eid}" for eid in element_ids]
         clim_flows = [0.0] * n_sources  # No climatology for STOFS NWM
 
+        sink_node_indices: List[int] = []
+        sink_feature_id_groups: Optional[List[List[int]]] = None
+        if sinks_path is not None and Path(sinks_path).exists():
+            with open(sinks_path) as f:
+                sink_data = json.load(f)
+            sink_keys = sorted(sink_data.keys(), key=int)
+            sink_node_indices = [int(eid) for eid in sink_keys]
+            sink_feature_id_groups = [sink_data[eid] for eid in sink_keys]
+            log.info(f"Loaded STOFS sinks.json: {len(sink_node_indices)} sink elements "
+                     f"from {Path(sinks_path).name}")
+
         log.info(f"Loaded STOFS sources.json: {n_sources} source elements "
                  f"from {filepath.name}")
 
         return cls(feature_ids, node_indices, clim_flows, names,
-                   feature_id_groups=feature_id_groups)
+                   feature_id_groups=feature_id_groups,
+                   sink_node_indices=sink_node_indices,
+                   sink_feature_id_groups=sink_feature_id_groups)
 
 
 class NWMProcessor(ForcingProcessor):
@@ -340,7 +367,10 @@ class NWMProcessor(ForcingProcessor):
                     if isinstance(data, dict) and data:
                         first_val = next(iter(data.values()))
                         if isinstance(first_val, list):
-                            self._river_config = RiverConfig.from_sources_json(path)
+                            sinks_path = (Path(self.config.sinks_config_file)
+                                          if self.config.sinks_config_file else None)
+                            self._river_config = RiverConfig.from_sources_json(
+                                path, sinks_path=sinks_path)
                         else:
                             self._river_config = RiverConfig.from_json(path)
                     else:
@@ -701,7 +731,13 @@ class NWMProcessor(ForcingProcessor):
     def _copy_static_msource(self) -> Optional[Path]:
         """Copy static msource.th from FIX directory (STOFS convention)."""
         path = self._copy_static_river_file(
-            "msource.th", ["stofs_3d_atl_river_msource.th", "msource.th"],
+            "msource.th",
+            [
+                "stofs_3d_atl_river_msource.th",
+                "secofs_ufs.msource.th",
+                "secofs.msource.th",
+                "msource.th",
+            ],
         )
         if path is not None:
             return path
@@ -723,10 +759,19 @@ class NWMProcessor(ForcingProcessor):
             return None
 
     def _copy_static_vsink(self) -> Optional[Path]:
-        """Copy static vsink.th from FIX directory (STOFS convention)."""
-        path = self._copy_static_river_file(
-            "vsink.th", ["stofs_3d_atl_river_vsink.th", "vsink.th"],
-        )
+        """Copy static vsink.th from FIX directory (STOFS convention).
+
+        Search order tries the most specific names first so a SECOFS-UFS
+        deploy picks up its own symlinked file rather than a STOFS-3D-ATL
+        sibling that may live in a shared FIX root.
+        """
+        candidates = [
+            "stofs_3d_atl_river_vsink.th",
+            "secofs_ufs.vsink.th",
+            "secofs.vsink.th",
+            "vsink.th",
+        ]
+        path = self._copy_static_river_file("vsink.th", candidates)
         if path is None:
             # No fallback generation — STOFS relies on the FIX file being
             # provisioned; without it, vsink simply isn't staged and SCHISM
@@ -820,17 +865,41 @@ class NWMProcessor(ForcingProcessor):
             return None
 
     def _write_source_sink(self) -> Optional[Path]:
-        """Write source_sink.in — SCHISM source/sink configuration."""
+        """Write source_sink.in — SCHISM source/sink configuration.
+
+        Format (matches the static FIX file shipped with deterministic SECOFS
+        production, e.g. ``$FIXofs/secofs/secofs.source_sink.in``):
+
+            <nsource>
+            <source_elem_id_1>
+            ...
+            <source_elem_id_n>
+            <blank>
+            <nsink>
+            <sink_elem_id_1>
+            ...
+
+        Single-column throughout — earlier output of ``<elem_id> 1`` plus a
+        hardcoded ``0`` sinks made SCHISM read past the source list and hit
+        EOF on unit 31 (`schism_init.F90:2918`).
+        """
         output_file = self.output_path / "source_sink.in"
         try:
             with open(output_file, "w") as f:
-                n = self.river_config.n_rivers
-                f.write(f"{n}\n")
+                n_src = self.river_config.n_rivers
+                f.write(f"{n_src}\n")
                 for node_idx in self.river_config.node_indices:
-                    f.write(f"{node_idx} 1\n")
-                f.write("0\n")  # num_sinks = 0
+                    f.write(f"{node_idx}\n")
+                f.write("\n")  # blank separator (matches FIX baseline)
 
-            log.info(f"Created {output_file.name}: {self.river_config.n_rivers} sources")
+                n_sink = self.river_config.n_sinks
+                f.write(f"{n_sink}\n")
+                for node_idx in self.river_config.sink_node_indices:
+                    f.write(f"{node_idx}\n")
+
+            log.info(
+                f"Created {output_file.name}: {n_src} sources, {n_sink} sinks"
+            )
             return output_file
         except Exception as e:
             log.error(f"Failed to write source_sink.in: {e}")

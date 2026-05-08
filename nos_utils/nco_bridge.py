@@ -134,6 +134,12 @@ def config_from_env(
             if resolved.exists():
                 config.river_config_file = resolved
                 log.info(f"Resolved river_config_file: {resolved}")
+        # Sinks config file (paired with sources_json)
+        if config.sinks_config_file and not Path(config.sinks_config_file).is_absolute():
+            resolved = fix_path / config.sinks_config_file
+            if resolved.exists():
+                config.sinks_config_file = resolved
+                log.info(f"Resolved sinks_config_file: {resolved}")
         # Bctides template
         if config.bctides_template and not Path(config.bctides_template).is_absolute():
             resolved = fix_path / config.bctides_template
