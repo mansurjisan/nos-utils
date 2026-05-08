@@ -485,11 +485,12 @@ class NWMProcessor(ForcingProcessor):
         if vsource:
             output_files.append(vsource)
 
-        # STOFS: msource.th and vsink.th are static FIX files, not generated
-        if self.is_stofs_mode:
-            msource = self._copy_static_msource()
-        else:
-            msource = self._write_msource(times)
+        # msource.th must have the SAME timestep count as vsource.th — SCHISM
+        # allocates buffers based on the file dimensions and reads them
+        # together. A single-timestep msource.th alongside a 55-row vsource.th
+        # caused heap corruption at `partition_hgrid_` (V11 nowcast crash).
+        # Always generate at the same time grid as vsource/vsink.
+        msource = self._write_msource(times)
         if msource:
             output_files.append(msource)
 
