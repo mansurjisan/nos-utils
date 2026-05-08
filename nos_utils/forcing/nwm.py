@@ -753,17 +753,21 @@ class NWMProcessor(ForcingProcessor):
         if path is not None:
             return path
 
-        # Fallback: generate msource.th with default T/S
-        log.warning("Static msource.th not found, generating with defaults")
+        # Fallback: generate msource.th with default T/S in v3.9.1 PACKED
+        # format (all temps then all salts, NOT interleaved). Format matches
+        # `pyschism`-derived ``nwm_base.py:Msource.__str__``:
+        #   {rel_time:G} {T_1:.4e} ... {T_N:.4e} {S_1:.4e} ... {S_N:.4e}
+        # Single timestep at t=0 with constant T/S (SCHISM repeats last).
+        log.warning("Static msource.th not found, generating with defaults (packed)")
         n_rivers = self.river_config.n_rivers
         temp = self.config.river_default_temp
         salt = self.config.river_default_salt
         output_file = self.output_path / "msource.th"
         try:
             with open(output_file, "w") as f:
-                # Single timestep at t=0 with constant T/S (SCHISM repeats last)
-                values = " ".join(f"{temp:.1f} {salt:.1f}" for _ in range(n_rivers))
-                f.write(f"0.0 {values}\n")
+                temps = " ".join(f"{temp:.4e}" for _ in range(n_rivers))
+                salts = " ".join(f"{salt:.4e}" for _ in range(n_rivers))
+                f.write(f"{0:G} {temps} {salts}\n")
             return output_file
         except Exception as e:
             log.error(f"Failed to write msource.th: {e}")
@@ -829,8 +833,14 @@ class NWMProcessor(ForcingProcessor):
     def _write_vsource(self, flows: np.ndarray, times: List[float]) -> Optional[Path]:
         """Write vsource.th — volume source time history.
 
-        STOFS convention: first two time stamps forced to 0.0 and 3600.0
-        to ensure SCHISM starts cleanly at t=0.
+        Format matches v3.9.1 production (`pyschism`-derived
+        `nwm_base.py:TimeHistoryFile.__str__`):
+
+            f"{relative_time_seconds:G} {flow_1:.4e} {flow_2:.4e} ..."
+
+        i.e., general-scientific time + 4-digit scientific values per
+        source. STOFS convention forces the first two time stamps to
+        0 and 3600 sec so SCHISM starts cleanly at t=0.
         """
         output_file = self.output_path / "vsource.th"
         try:
@@ -843,9 +853,9 @@ class NWMProcessor(ForcingProcessor):
                             t_seconds = 0.0
                         elif t_idx == 1:
                             t_seconds = 3600.0
-                    values = " ".join(f"{flows[t_idx, r]:.4f}"
+                    values = " ".join(f"{flows[t_idx, r]:.4e}"
                                       for r in range(flows.shape[1]))
-                    f.write(f"{t_seconds:.1f} {values}\n")
+                    f.write(f"{t_seconds:G} {values}\n")
 
             log.info(f"Created {output_file.name}: {flows.shape[0]} steps, {flows.shape[1]} rivers")
             return output_file
@@ -862,6 +872,10 @@ class NWMProcessor(ForcingProcessor):
         count, so we generate a zero-flow time series sized to the current
         ``n_sinks``. This declares the sink elements without imposing any
         diversion volume — equivalent to running without active diversions.
+
+        Format matches v3.9.1 production (`pyschism`-derived
+        `nwm_base.py:TimeHistoryFile.__str__`):
+        ``{rel_time:G} {value:.4e} ...`` per row.
         """
         output_file = self.output_path / "vsink.th"
         n_sinks = self.river_config.n_sinks
@@ -869,7 +883,7 @@ class NWMProcessor(ForcingProcessor):
             return None
         try:
             with open(output_file, "w") as f:
-                zeros = " ".join(["0.0000"] * n_sinks)
+                zeros = " ".join([f"{0.0:.4e}"] * n_sinks)
                 for t_idx, t_hours in enumerate(times):
                     t_seconds = t_hours * 3600.0
                     if self.is_stofs_mode:
@@ -877,7 +891,7 @@ class NWMProcessor(ForcingProcessor):
                             t_seconds = 0.0
                         elif t_idx == 1:
                             t_seconds = 3600.0
-                    f.write(f"{t_seconds:.1f} {zeros}\n")
+                    f.write(f"{t_seconds:G} {zeros}\n")
             log.info(f"Created vsink.th: {len(times)} steps, {n_sinks} sinks (zero volume)")
             return output_file
         except Exception as e:
@@ -975,7 +989,13 @@ class NWMProcessor(ForcingProcessor):
             return []
 
     def _write_msource(self, times: List[float]) -> Optional[Path]:
-        """Write msource.th — mass source (temperature, salinity)."""
+        """Write msource.th — mass source (temperature, salinity).
+
+        Format matches v3.9.1 production ``Msource.__str__``: PACKED
+        (all temps then all salts, NOT interleaved):
+
+            {rel_time:G} {T_1:.4e} ... {T_N:.4e} {S_1:.4e} ... {S_N:.4e}
+        """
         output_file = self.output_path / "msource.th"
         n_rivers = self.river_config.n_rivers
         month = int(self.config.pdy[4:6])
@@ -984,13 +1004,14 @@ class NWMProcessor(ForcingProcessor):
 
         try:
             with open(output_file, "w") as f:
+                temps = " ".join(f"{temp:.4e}" for _ in range(n_rivers))
+                salts = " ".join(f"{salt:.4e}" for _ in range(n_rivers))
                 for t_hours in times:
                     t_seconds = t_hours * 3600.0
-                    # Each river has temp, salt pair
-                    values = " ".join(f"{temp:.1f} {salt:.1f}" for _ in range(n_rivers))
-                    f.write(f"{t_seconds:.1f} {values}\n")
+                    f.write(f"{t_seconds:G} {temps} {salts}\n")
 
-            log.info(f"Created {output_file.name}: temp={temp:.1f}°C, salt={salt:.1f} PSU")
+            log.info(f"Created {output_file.name}: temp={temp:.1f}°C, salt={salt:.1f} PSU "
+                     f"(packed format, {n_rivers} rivers, {len(times)} steps)")
             return output_file
         except Exception as e:
             log.error(f"Failed to write msource.th: {e}")
