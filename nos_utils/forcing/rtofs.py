@@ -1024,8 +1024,13 @@ class RTOFSProcessor(ForcingProcessor):
 
             cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                        timedelta(hours=self.config.cyc)
-            sim_start = self.time_hotstart if self.time_hotstart else \
-                        cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            # Anchor the OBC window to the YAML run config, not to the
+            # legacy `time_hotstart` env var. For SECOFS-UFS the env var
+            # can point to a 24h-old hotstart while the actual model run
+            # window is the YAML-declared `nowcast_hours + forecast_hours`
+            # (6 + 48 = 54h for SECOFS). Using time_hotstart caused
+            # elev2D.th.nc to overshoot to 72h vs production's 54h.
+            sim_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
             sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
             sim_duration = (sim_end - sim_start).total_seconds()
 
@@ -1323,11 +1328,12 @@ class RTOFSProcessor(ForcingProcessor):
             rtofs_dt_3d = 21600.0  # 6-hourly RTOFS input
             target_dt_3d = 10800.0  # 3-hourly output (matches Fortran DELT_TS)
 
-            # Compute simulation duration for clipping
+            # Compute simulation duration for clipping. Anchor to YAML
+            # run config — see elev2D path for rationale on ignoring
+            # time_hotstart env var here.
             cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                        timedelta(hours=self.config.cyc)
-            sim_start = self.time_hotstart if self.time_hotstart else \
-                        cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            sim_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
             sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
             sim_duration_3d = (sim_end - sim_start).total_seconds()
 
