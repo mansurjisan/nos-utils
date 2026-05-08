@@ -129,6 +129,14 @@ class ForcingConfig:
     # temp.th / salt.th. Legacy nos_ofs_create_forcing_river produces the
     # latter; Python now writes them too when this field is set.
     river_ctl_file: Optional[Path] = None
+    # Daily climatology netCDF used by the legacy Fortran when USGS BUFR
+    # observations are unavailable. Stores discharge/temperature/salinity
+    # per station for 366 days of the year. When set, NWMProcessor's
+    # _write_river_th_files reads daily climatology Q/T (with 3-day
+    # centered average matching legacy behavior) instead of the annual
+    # Q_mean/T_mean from river.ctl Section 1 — closes most of the value
+    # gap to production output.
+    river_clim_file: Optional[Path] = None
     # River climatology for fallback
     river_clim_file: Optional[Path] = None
     # Default river temperature and salinity
@@ -627,6 +635,11 @@ class ForcingConfig:
         ctl_file = river_files.get("ctl_file")
         if ctl_file:
             kwargs["river_ctl_file"] = Path(ctl_file)
+        # Daily climatology netCDF — used as Q/T fallback when USGS BUFR
+        # observations are unavailable.
+        clim_file = river_files.get("clim_file")
+        if clim_file:
+            kwargs["river_clim_file"] = Path(clim_file)
         if bctides_template:
             kwargs["bctides_template"] = Path(bctides_template)
         if grid_file:

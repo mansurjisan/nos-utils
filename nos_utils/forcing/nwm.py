@@ -1012,14 +1012,48 @@ class NWMProcessor(ForcingProcessor):
 
         if use_production_formula:
             # Resolve per-grid Q and T from station_id mapping × scale.
-            # No live observation yet → use Q_mean / T_mean from Section 1.
+            # Source priority for the per-station Q/T value:
+            #   1. Daily climatology from river.clim.usgs.nc (3-day
+            #      centered average, matching the Fortran behavior at
+            #      `nos_ofs_create_forcing_river.f` lines 1499-1551).
+            #   2. Annual Q_mean / T_mean from river.ctl Section 1.
+            station_q: Dict[int, float] = {}
+            station_t: Dict[int, float] = {}
+            clim_label = "annual Q_mean/T_mean"
+            clim_path = self.config.river_clim_file
+            if clim_path is not None and Path(clim_path).exists():
+                try:
+                    from datetime import datetime
+                    from .river_clim import load_usgs_climatology, _find_clim_index
+                    pdy_dt = datetime.strptime(self.config.pdy, "%Y%m%d")
+                    for sid_int, usgs_id in ctl_cfg.station_usgs_ids.items():
+                        try:
+                            months, days, dis, tem, sal = load_usgs_climatology(
+                                Path(clim_path), str(usgs_id))
+                            ci = _find_clim_index(months, days, pdy_dt)
+                            n = len(dis)
+                            window = [(ci - 1) % n, ci, (ci + 1) % n]
+                            q_avg = float(np.mean([dis[d] for d in window]))
+                            t_avg = float(np.mean([tem[d] for d in window]))
+                            station_q[sid_int] = q_avg
+                            station_t[sid_int] = t_avg
+                        except (ValueError, KeyError):
+                            # Station not in climatology netCDF — keep ctl Q_mean
+                            pass
+                    if station_q:
+                        clim_label = (f"daily climatology 3-day avg "
+                                      f"(pdy={self.config.pdy}, {len(station_q)} stations)")
+                except Exception as e:
+                    log.warning(f"Failed to read river climatology, falling "
+                                f"back to ctl Q_mean: {e}")
+
             q_per_river: List[float] = []
             t_per_river: List[float] = []
             for i in range(n_riv):
                 sid_q = ctl_cfg.river_id_q[i]
                 sid_t = ctl_cfg.river_id_t[i]
-                q_obs = ctl_cfg.stations_q_mean.get(sid_q, 50.0)
-                t_obs = ctl_cfg.stations_t_mean.get(sid_t, 15.0)
+                q_obs = station_q.get(sid_q, ctl_cfg.stations_q_mean.get(sid_q, 50.0))
+                t_obs = station_t.get(sid_t, ctl_cfg.stations_t_mean.get(sid_t, 15.0))
                 q_per_river.append(q_obs * ctl_cfg.q_scale[i])
                 t_per_river.append(max(1.0, t_obs * ctl_cfg.t_scale[i]))
         else:
@@ -1027,6 +1061,7 @@ class NWMProcessor(ForcingProcessor):
             month = int(self.config.pdy[4:6])
             t_default = MONTHLY_RIVER_TEMP.get(month, self.config.river_default_temp)
             t_per_river = [t_default] * n_riv
+            clim_label = "legacy clim_flows (no per-station data)"
 
         salt_const = 0.005  # F90:1898 hardcoded
 
@@ -1065,7 +1100,7 @@ class NWMProcessor(ForcingProcessor):
             mode = "production formula (per-grid station × Q_Scale)" \
                 if use_production_formula else "legacy clim_flows fallback"
             log.info(f"Created schism_flux/temp/salt.th: {n_riv} grid points, "
-                     f"{mode}; "
+                     f"{mode}, Q/T source = {clim_label}; "
                      f"avg Q={sum(q_per_river)/n_riv:.1f} m^3/s, "
                      f"avg T={sum(t_per_river)/n_riv:.2f}C, S={salt_const:.4f}")
             return [flux_path, temp_path, salt_path]

@@ -146,6 +146,18 @@ def config_from_env(
             if resolved.exists():
                 config.river_ctl_file = resolved
                 log.info(f"Resolved river_ctl_file: {resolved}")
+        # River daily climatology netCDF (Q/T fallback when no live USGS).
+        # Production stores it in $FIXofs/shared/, so check there too.
+        if config.river_clim_file and not Path(config.river_clim_file).is_absolute():
+            for candidate in (
+                fix_path / config.river_clim_file,
+                fix_path / "shared" / config.river_clim_file,
+                fix_path.parent / "shared" / config.river_clim_file,
+            ):
+                if candidate.exists():
+                    config.river_clim_file = candidate
+                    log.info(f"Resolved river_clim_file: {candidate}")
+                    break
         # Bctides template
         if config.bctides_template and not Path(config.bctides_template).is_absolute():
             resolved = fix_path / config.bctides_template
