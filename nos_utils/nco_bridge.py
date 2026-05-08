@@ -140,6 +140,12 @@ def config_from_env(
             if resolved.exists():
                 config.sinks_config_file = resolved
                 log.info(f"Resolved sinks_config_file: {resolved}")
+        # River .ctl file (open-boundary USGS rivers, separate from sources.json)
+        if config.river_ctl_file and not Path(config.river_ctl_file).is_absolute():
+            resolved = fix_path / config.river_ctl_file
+            if resolved.exists():
+                config.river_ctl_file = resolved
+                log.info(f"Resolved river_ctl_file: {resolved}")
         # Bctides template
         if config.bctides_template and not Path(config.bctides_template).is_absolute():
             resolved = fix_path / config.bctides_template

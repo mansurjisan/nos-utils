@@ -121,6 +121,14 @@ class ForcingConfig:
     # NWMProcessor includes a sink list in source_sink.in. Required for
     # SCHISM domains with diversion sinks (SECOFS, STOFS-3D-ATL).
     sinks_config_file: Optional[Path] = None
+    # COMF-style river.ctl listing USGS-named open-boundary rivers (Savannah,
+    # Fraser, Columbia, etc. for SECOFS). Loaded separately from
+    # river_config_file because SECOFS-UFS uses BOTH mechanisms in parallel:
+    # sources.json drives the 3522 interior NWM sources via source_sink.in,
+    # while river.ctl drives the 6 boundary-flux rivers via flux.th /
+    # temp.th / salt.th. Legacy nos_ofs_create_forcing_river produces the
+    # latter; Python now writes them too when this field is set.
+    river_ctl_file: Optional[Path] = None
     # River climatology for fallback
     river_clim_file: Optional[Path] = None
     # Default river temperature and salinity
@@ -614,6 +622,11 @@ class ForcingConfig:
         sinks_config_file = river_files.get("sinks_json")
         if sinks_config_file:
             kwargs["sinks_config_file"] = Path(sinks_config_file)
+        # river.ctl is loaded separately (in addition to sources.json) so
+        # boundary-flux rivers and interior NWM sources can coexist.
+        ctl_file = river_files.get("ctl_file")
+        if ctl_file:
+            kwargs["river_ctl_file"] = Path(ctl_file)
         if bctides_template:
             kwargs["bctides_template"] = Path(bctides_template)
         if grid_file:

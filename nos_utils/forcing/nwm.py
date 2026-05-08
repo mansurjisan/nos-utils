@@ -453,6 +453,14 @@ class NWMProcessor(ForcingProcessor):
             if vsink:
                 output_files.append(vsink)
 
+        # SECOFS-UFS open-boundary rivers (river.ctl). Loaded separately
+        # from sources.json; the two mechanisms coexist. Climatological Q
+        # for the smoke test; per-cycle USGS observations are a TODO.
+        ctl_cfg = self._load_ctl_river_config()
+        if ctl_cfg is not None and ctl_cfg.n_rivers > 0:
+            river_th_files = self._write_river_th_files(times, ctl_cfg)
+            output_files.extend(river_th_files)
+
         source_sink = self._write_source_sink()
         if source_sink:
             output_files.append(source_sink)
@@ -875,6 +883,96 @@ class NWMProcessor(ForcingProcessor):
         except Exception as e:
             log.error(f"Failed to write vsink.th: {e}")
             return None
+
+    def _load_ctl_river_config(self) -> Optional[RiverConfig]:
+        """Load the COMF-style river.ctl as a separate RiverConfig.
+
+        SECOFS-UFS uses BOTH a STOFS sources.json (interior source/sink) and
+        a COMF river.ctl (open-boundary USGS rivers like Savannah, Fraser,
+        Columbia). They drive different SCHISM forcing files: source_sink.in
+        family vs. flux.th / temp.th / salt.th. This loader returns the
+        boundary-flux side. Returns None when river_ctl_file isn't set.
+        """
+        ctl_path = self.config.river_ctl_file
+        if not ctl_path:
+            return None
+        ctl_path = Path(ctl_path)
+        if not ctl_path.exists():
+            log.warning(f"river_ctl_file not found: {ctl_path}")
+            return None
+        try:
+            return RiverConfig.from_text(ctl_path)
+        except Exception as e:
+            log.warning(f"Failed to load river.ctl: {e}")
+            return None
+
+    def _write_river_th_files(self, times: List[float],
+                              ctl_cfg: RiverConfig) -> List[Path]:
+        """Write SCHISM open-boundary forcing: schism_flux.th / temp.th / salt.th.
+
+        Mirrors the legacy Fortran ``nos_ofs_create_forcing_river`` output
+        (``ush/python/sorc/nos_ofs_create_forcing_river.fd/`` formats 600/601).
+        For each river in ``ctl_cfg``:
+
+          - flux: ``-clim_flow`` (NEGATIVE — SCHISM convention: inflow < 0)
+          - temp: monthly climatology from ``MONTHLY_RIVER_TEMP``
+            (or ctl's per-station T_mean once that's threaded through —
+            today's smoke test uses the monthly default so SECOFS gets
+            sensible spring values)
+          - salt: 0 (fresh-water rivers)
+
+        Format (Fortran ``F12.0,50F12.2`` for flux; ``F12.0,50F12.4`` for
+        temp/salt) — keeps SCHISM's per-row read happy.
+
+        First row always at t=0 sec. Later rows skipped if t_sec <= 0.5
+        (matches Fortran behavior).
+        """
+        n_riv = ctl_cfg.n_rivers
+        if n_riv == 0:
+            return []
+
+        month = int(self.config.pdy[4:6])
+        temp_default = MONTHLY_RIVER_TEMP.get(month, self.config.river_default_temp)
+        salt_default = self.config.river_default_salt  # 0.0 for fresh-water
+
+        flows = ctl_cfg.clim_flows  # length n_riv
+
+        flux_path = self.output_path / "schism_flux.th"
+        temp_path = self.output_path / "schism_temp.th"
+        salt_path = self.output_path / "schism_salt.th"
+
+        try:
+            with open(flux_path, "w") as ff, \
+                 open(temp_path, "w") as tf, \
+                 open(salt_path, "w") as sf:
+                wrote_first = False
+                for t_idx, t_hours in enumerate(times):
+                    t_sec = float(t_hours) * 3600.0
+                    if not wrote_first:
+                        # Always write t=0 row first
+                        t_sec = 0.0
+                        wrote_first = True
+                    elif t_sec <= 0.5:
+                        # Skip rows whose seconds value would round to 0
+                        # (matches Fortran: `if (time_sec > 0.50)` gate)
+                        continue
+
+                    ff.write(f"{t_sec:12.0f}"
+                             + "".join(f"{-q:12.2f}" for q in flows)
+                             + "\n")
+                    tf.write(f"{t_sec:12.0f}"
+                             + "".join(f"{temp_default:12.4f}" for _ in flows)
+                             + "\n")
+                    sf.write(f"{t_sec:12.0f}"
+                             + "".join(f"{salt_default:12.4f}" for _ in flows)
+                             + "\n")
+            log.info(f"Created schism_flux/temp/salt.th: {n_riv} boundary rivers, "
+                     f"climatology Q (avg={sum(flows)/n_riv:.1f} m^3/s, "
+                     f"T={temp_default:.1f}C, S={salt_default:.1f})")
+            return [flux_path, temp_path, salt_path]
+        except Exception as e:
+            log.error(f"Failed to write schism_*.th boundary forcing: {e}")
+            return []
 
     def _write_msource(self, times: List[float]) -> Optional[Path]:
         """Write msource.th — mass source (temperature, salinity)."""

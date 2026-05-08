@@ -907,6 +907,28 @@ class PrepOrchestrator:
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 log.warning(f"  Failed to tar OBC (combined): {e}")
 
+        # SECOFS-UFS boundary-flux river forcing — schism_flux/temp/salt.th
+        # tarred together as ${prefix}.${cycle}.${pdy}.river.th.tar. Matches
+        # legacy `nos_ofs_create_forcing_river.sh` output so
+        # `nos_ofs_model_run.sh` nowcast staging extracts and renames
+        # schism_flux.th -> flux.th etc. with no shell change.
+        river_th_files = ["schism_flux.th", "schism_temp.th", "schism_salt.th"]
+        existing_river_th = [work_dir / f for f in river_th_files
+                             if (work_dir / f).exists()]
+        if existing_river_th:
+            river_tar_name = f"{prefix}.{cycle}.{pdy}.river.th.tar"
+            river_tar_path = comout / river_tar_name
+            try:
+                file_list = [f.name for f in existing_river_th]
+                subprocess.run(
+                    ["tar", "-cf", str(river_tar_path), "-C", str(work_dir)] + file_list,
+                    check=True, capture_output=True,
+                )
+                archived.append(river_tar_path)
+                log.info(f"  Archived river.th -> {river_tar_name}")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                log.warning(f"  Failed to tar river.th: {e}")
+
         # Tar NWM source/sink files (COMF convention)
         # COMF produces: nwm.source.sink.now.tar / nwm.source.sink.fore.tar
         nwm_files = ["vsource.th", "msource.th", "source_sink.in", "vsink.th"]
