@@ -1078,14 +1078,21 @@ class RTOFSProcessor(ForcingProcessor):
             else:
                 dt_out = (rtofs_times[1] - rtofs_times[0]) if n_rtofs > 1 else 3600.0
 
-            # Write SCHISM format
-            nc = Dataset(str(output_file), "w", format="NETCDF4")
+            # Write SCHISM format. NETCDF4_CLASSIC (not NETCDF4): SCHISM's
+            # NUOPC cap opens these via collective parallel-NetCDF at 2794-rank
+            # scale; HDF5-flavored files segfault during MPI-IO collective open
+            # *before* partition_hgrid runs. Production v3.9 writes classic.
+            nc = Dataset(str(output_file), "w", format="NETCDF4_CLASSIC")
             nt = ssh_array.shape[0]
 
+            # Dimension declaration order matches v3.9 production header layout
+            # (nComponents *before* nOpenBndNodes). Parallel pnetcdf readers can
+            # consult dim records by header offset, so the order matters even
+            # though variables reference dims by name.
             nc.createDimension("time", nt)
+            nc.createDimension("nComponents", 1)
             nc.createDimension("nOpenBndNodes", n_bnd)
             nc.createDimension("nLevels", 1)
-            nc.createDimension("nComponents", 1)
             nc.createDimension("one", 1)
 
             # Production elev2D uses time as f4 (not f8). Match for byte-format
@@ -1106,8 +1113,11 @@ class RTOFSProcessor(ForcingProcessor):
             # Production omits _FillValue on time_series (no fill cells exist
             # because all RTOFS-interpolated boundary points are valid). Match
             # production by not setting fill_value here.
+            # Last dim is `one` (not `nComponents`) for elev2D — matches
+            # production. Both dims are size 1 so shape is unchanged but the
+            # binding name affects file layout.
             ts = nc.createVariable("time_series", "f4",
-                                   ("time", "nOpenBndNodes", "nLevels", "nComponents"))
+                                   ("time", "nOpenBndNodes", "nLevels", "one"))
             ts[:, :, 0, 0] = ssh_array
 
             nc.close()
@@ -1493,15 +1503,22 @@ class RTOFSProcessor(ForcingProcessor):
 
         Dtypes match production: time_step and time_series are float64,
         time is float64. No ``_FillValue`` attribute (production omits it).
+
+        Format is NETCDF4_CLASSIC (not NETCDF4): SCHISM's NUOPC cap opens
+        these via collective parallel-NetCDF at 2794-rank scale. HDF5-flavored
+        files segfault during MPI-IO collective open *before* partition_hgrid
+        runs. Production v3.9 writes classic.
         """
-        nc = Dataset(str(output_path), "w", format="NETCDF4")
+        nc = Dataset(str(output_path), "w", format="NETCDF4_CLASSIC")
         nt = data.shape[0]
         n_levels = data.shape[2]
 
+        # Dimension declaration order matches v3.9 production:
+        # time, nComponents, nOpenBndNodes, nLevels, one.
         nc.createDimension("time", nt)
+        nc.createDimension("nComponents", 1)
         nc.createDimension("nOpenBndNodes", n_bnd)
         nc.createDimension("nLevels", n_levels)
-        nc.createDimension("nComponents", 1)
         nc.createDimension("one", 1)
 
         time_var = nc.createVariable("time", "f8", ("time",))
@@ -1512,9 +1529,10 @@ class RTOFSProcessor(ForcingProcessor):
         ts_step[0] = float(dt)
 
         # Production: time_series is float64 on 3D OBC files (f4 only on elev2D)
-        # and has no _FillValue attribute.
+        # and has no _FillValue attribute. Last dim is `one` (not `nComponents`)
+        # for scalar tracers — both are size 1, but production binds to `one`.
         ts = nc.createVariable("time_series", "f8",
-                               ("time", "nOpenBndNodes", "nLevels", "nComponents"))
+                               ("time", "nOpenBndNodes", "nLevels", "one"))
         ts[:, :, :, 0] = data
 
         nc.close()
@@ -1525,15 +1543,17 @@ class RTOFSProcessor(ForcingProcessor):
 
         Production dtype: time_step and time_series are float64; no
         _FillValue attribute. See _write_3d_th docstring for rationale.
+        Format is NETCDF4_CLASSIC and dim order matches v3.9 production.
+        Last dim of time_series stays as `nComponents` (size 2 for u,v).
         """
-        nc = Dataset(str(output_path), "w", format="NETCDF4")
+        nc = Dataset(str(output_path), "w", format="NETCDF4_CLASSIC")
         nt = u.shape[0]
         n_levels = u.shape[2]
 
         nc.createDimension("time", nt)
+        nc.createDimension("nComponents", 2)
         nc.createDimension("nOpenBndNodes", n_bnd)
         nc.createDimension("nLevels", n_levels)
-        nc.createDimension("nComponents", 2)
         nc.createDimension("one", 1)
 
         time_var = nc.createVariable("time", "f8", ("time",))
