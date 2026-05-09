@@ -410,6 +410,26 @@ class BlenderProcessor(ForcingProcessor):
                 else:
                     combined = gfs_regrid
 
+                # CDEPS/CMEPS bilinear regrid does NOT filter _FillValue or
+                # NaN, so any non-finite cell here will poison neighboring
+                # SCHISM nodes after regrid (manifests as wind speed > 100
+                # m/s and SCHISM aborts at step 2). Fill any remaining
+                # non-finite cells with the slab mean — bounded data is
+                # always preferable to fills here.
+                bad = ~np.isfinite(combined)
+                if bad.any():
+                    n_bad = int(bad.sum())
+                    finite_vals = combined[~bad]
+                    if finite_vals.size > 0:
+                        fill = float(finite_vals.mean())
+                    else:
+                        fill = 0.0
+                    combined = np.where(bad, fill, combined)
+                    log.warning(
+                        f"  {hrrr_name} t={t}: filled {n_bad} non-finite "
+                        f"cells with mean={fill:.3f}"
+                    )
+
                 out_var[t, :, :] = combined
 
         # ---- Lambert Conformal wind rotation (HRRR-sourced cells only) ----
