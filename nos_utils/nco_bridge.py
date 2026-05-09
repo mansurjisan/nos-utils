@@ -98,6 +98,21 @@ def config_from_env(
         if val:
             paths[key] = val
 
+    # Fallback: some launchers (run_secofs_ufs.sh, certain WCOSS2 J-jobs) only
+    # export COMINrtofs_2d / COMINrtofs_3d, not COMINrtofs. Both 2D and 3D
+    # RTOFS data live at the same root, so accept either as the rtofs path.
+    # Without this fallback, the orchestrator silently skips the entire
+    # RTOFS+nudging stage and produces no OBC NetCDFs.
+    if "rtofs" not in paths:
+        for fallback_var in ("COMINrtofs_2d", "COMINrtofs_3d"):
+            val = os.environ.get(fallback_var, "")
+            if val:
+                paths["rtofs"] = val
+                log.info(
+                    f"COMINrtofs not set; using {fallback_var}={val} as rtofs path"
+                )
+                break
+
     # Hotstart search directory.
     # Priority: RESTART_DIR (explicit) > COMIN (previous cycle) > COMOUT parent (heuristic)
     restart_dir = os.environ.get("RESTART_DIR", "")
