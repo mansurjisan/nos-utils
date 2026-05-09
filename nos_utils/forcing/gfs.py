@@ -139,7 +139,19 @@ class GFSProcessor(ForcingProcessor):
                 t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=3)
             t_end = cycle_dt + timedelta(hours=3)  # buffer past nowcast end
         elif self.phase == "forecast":
-            t_start = cycle_dt - timedelta(hours=3)  # buffer before forecast start
+            # For UFS-coupled runs (nws=4), the SAME datm_forcing.nc is read
+            # by both the nowcast and forecast SCHISM executions, because
+            # the forecast prep overwrites the nowcast prep's archived file.
+            # Extend t_start back to cover the nowcast window so CDEPS DATM
+            # has data at the nowcast SCHISM start (cycle - nowcast_hours).
+            # Otherwise CDEPS aborts with
+            #   (shr_stream_findBounds) ERROR: rDateIn lt rDatelvd limit true
+            if self.config.nws == 4:
+                t_start = (cycle_dt
+                           - timedelta(hours=self.config.nowcast_hours)
+                           - timedelta(hours=3))
+            else:
+                t_start = cycle_dt - timedelta(hours=3)
             t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=3)
         else:
             # Full

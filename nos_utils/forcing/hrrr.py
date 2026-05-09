@@ -673,7 +673,15 @@ class HRRRProcessor(ForcingProcessor):
                 t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=3)
             t_end = cycle_dt + timedelta(hours=3)
         elif self.phase == "forecast":
-            t_start = cycle_dt - timedelta(hours=3)
+            # UFS-coupled (nws=4): forecast prep's datm_forcing.nc is reused
+            # by the nowcast SCHISM execution. Extend t_start back to cover
+            # the nowcast window — see gfs.py:_get_time_window for details.
+            if self.config.nws == 4:
+                t_start = (cycle_dt
+                           - timedelta(hours=self.config.nowcast_hours)
+                           - timedelta(hours=3))
+            else:
+                t_start = cycle_dt - timedelta(hours=3)
             t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=3)
         else:
             if self.time_hotstart:
