@@ -1088,7 +1088,9 @@ class RTOFSProcessor(ForcingProcessor):
             nc.createDimension("nComponents", 1)
             nc.createDimension("one", 1)
 
-            time_var = nc.createVariable("time", "f8", ("time",))
+            # Production elev2D uses time as f4 (not f8). Match for byte-format
+            # parity with v3.9 production output.
+            time_var = nc.createVariable("time", "f4", ("time",))
             if dt_out == model_dt and nt > n_rtofs:
                 # Temporally interpolated: uniform 120s steps
                 time_var[:] = [i * dt_out for i in range(nt)]
@@ -1101,9 +1103,11 @@ class RTOFSProcessor(ForcingProcessor):
             ts_step = nc.createVariable("time_step", "f4", ("one",))
             ts_step[0] = float(dt_out)
 
+            # Production omits _FillValue on time_series (no fill cells exist
+            # because all RTOFS-interpolated boundary points are valid). Match
+            # production by not setting fill_value here.
             ts = nc.createVariable("time_series", "f4",
-                                   ("time", "nOpenBndNodes", "nLevels", "nComponents"),
-                                   fill_value=-30000.0)
+                                   ("time", "nOpenBndNodes", "nLevels", "nComponents"))
             ts[:, :, 0, 0] = ssh_array
 
             nc.close()
@@ -1486,6 +1490,9 @@ class RTOFSProcessor(ForcingProcessor):
         time_series). The ``time_step`` scalar is what SCHISM reads first
         for its ``nc dt1`` consistency check — without it SCHISM aborts
         with ``MISC: nc dt1`` during OBC init.
+
+        Dtypes match production: time_step and time_series are float64,
+        time is float64. No ``_FillValue`` attribute (production omits it).
         """
         nc = Dataset(str(output_path), "w", format="NETCDF4")
         nt = data.shape[0]
@@ -1500,20 +1507,25 @@ class RTOFSProcessor(ForcingProcessor):
         time_var = nc.createVariable("time", "f8", ("time",))
         time_var[:] = [i * dt for i in range(nt)]
 
-        # SCHISM-required scalar holding the time-step value
-        ts_step = nc.createVariable("time_step", "f4", ("one",))
+        # Production uses f8 for time_step on 3D OBC files (f4 only for elev2D).
+        ts_step = nc.createVariable("time_step", "f8", ("one",))
         ts_step[0] = float(dt)
 
-        ts = nc.createVariable("time_series", "f4",
-                               ("time", "nOpenBndNodes", "nLevels", "nComponents"),
-                               fill_value=-30000.0)
+        # Production: time_series is float64 on 3D OBC files (f4 only on elev2D)
+        # and has no _FillValue attribute.
+        ts = nc.createVariable("time_series", "f8",
+                               ("time", "nOpenBndNodes", "nLevels", "nComponents"))
         ts[:, :, :, 0] = data
 
         nc.close()
 
     def _write_uv3d_th(self, output_path: Path, u: np.ndarray,
                        v: np.ndarray, dt: float, n_bnd: int) -> None:
-        """Write uv3D.th.nc in SCHISM format (with time_step scalar)."""
+        """Write uv3D.th.nc in SCHISM format (with time_step scalar).
+
+        Production dtype: time_step and time_series are float64; no
+        _FillValue attribute. See _write_3d_th docstring for rationale.
+        """
         nc = Dataset(str(output_path), "w", format="NETCDF4")
         nt = u.shape[0]
         n_levels = u.shape[2]
@@ -1527,12 +1539,11 @@ class RTOFSProcessor(ForcingProcessor):
         time_var = nc.createVariable("time", "f8", ("time",))
         time_var[:] = [i * dt for i in range(nt)]
 
-        ts_step = nc.createVariable("time_step", "f4", ("one",))
+        ts_step = nc.createVariable("time_step", "f8", ("one",))
         ts_step[0] = float(dt)
 
-        ts = nc.createVariable("time_series", "f4",
-                               ("time", "nOpenBndNodes", "nLevels", "nComponents"),
-                               fill_value=-30000.0)
+        ts = nc.createVariable("time_series", "f8",
+                               ("time", "nOpenBndNodes", "nLevels", "nComponents"))
         ts[:, :, :, 0] = u
         ts[:, :, :, 1] = v
 
