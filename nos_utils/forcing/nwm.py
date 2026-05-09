@@ -1123,23 +1123,28 @@ class NWMProcessor(ForcingProcessor):
         (all temps then all salts, NOT interleaved):
 
             {rel_time:G} {T_1:.4e} ... {T_N:.4e} {S_1:.4e} ... {S_N:.4e}
+
+        Values: production uses ``-9999.0`` as a sentinel meaning
+        "use ambient T/S at the source element" (not a forced value).
+        Production COMOUT confirms all-``-9999`` content; matching it
+        avoids forcing artificial source-water properties that don't
+        match the surrounding ambient cells.
         """
         output_file = self.output_path / "msource.th"
         n_rivers = self.river_config.n_rivers
-        month = int(self.config.pdy[4:6])
-        temp = MONTHLY_RIVER_TEMP.get(month, self.config.river_default_temp)
-        salt = self.config.river_default_salt
+        # Production sentinel -- SCHISM treats this as "ambient water properties"
+        SENTINEL = -9999.0
 
         try:
             with open(output_file, "w") as f:
-                temps = " ".join(f"{temp:.4e}" for _ in range(n_rivers))
-                salts = " ".join(f"{salt:.4e}" for _ in range(n_rivers))
+                vals = " ".join(f"{SENTINEL:.4e}" for _ in range(2 * n_rivers))
                 for t_hours in times:
                     t_seconds = t_hours * 3600.0
-                    f.write(f"{t_seconds:G} {temps} {salts}\n")
+                    f.write(f"{t_seconds:G} {vals}\n")
 
-            log.info(f"Created {output_file.name}: temp={temp:.1f}°C, salt={salt:.1f} PSU "
-                     f"(packed format, {n_rivers} rivers, {len(times)} steps)")
+            log.info(f"Created {output_file.name}: ambient sentinel "
+                     f"({SENTINEL}), packed format, {n_rivers} rivers, "
+                     f"{len(times)} steps")
             return output_file
         except Exception as e:
             log.error(f"Failed to write msource.th: {e}")
