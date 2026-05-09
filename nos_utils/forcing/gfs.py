@@ -146,10 +146,14 @@ class GFSProcessor(ForcingProcessor):
             # has data at the nowcast SCHISM start (cycle - nowcast_hours).
             # Otherwise CDEPS aborts with
             #   (shr_stream_findBounds) ERROR: rDateIn lt rDatelvd limit true
+            #
+            # No additional 3h buffer here: _compute_search_cycles only walks
+            # back to prev cycle (cycle - 6h), so requesting earlier data is
+            # an empty promise. The CDEPS check is strict `<`, so first record
+            # at exactly cycle-nowcast_hours equals SCHISM start time and the
+            # check passes (rDateIn < rDatelvd is false on equality).
             if self.config.nws == 4:
-                t_start = (cycle_dt
-                           - timedelta(hours=self.config.nowcast_hours)
-                           - timedelta(hours=3))
+                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
             else:
                 t_start = cycle_dt - timedelta(hours=3)
             t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=3)

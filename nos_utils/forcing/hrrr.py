@@ -677,9 +677,7 @@ class HRRRProcessor(ForcingProcessor):
             # by the nowcast SCHISM execution. Extend t_start back to cover
             # the nowcast window — see gfs.py:_get_time_window for details.
             if self.config.nws == 4:
-                t_start = (cycle_dt
-                           - timedelta(hours=self.config.nowcast_hours)
-                           - timedelta(hours=3))
+                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
             else:
                 t_start = cycle_dt - timedelta(hours=3)
             t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=3)
