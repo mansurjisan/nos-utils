@@ -173,15 +173,32 @@ class PrepOrchestrator:
                                      output_dir, run_name=self.run_name)
             time_hotstart = proc._parse_file_datetime(hs_info.filepath)
 
-        # Fallback: read time_hotstart from environment (set by shell prep)
+        # No hotstart file (cold-start or coupled-mode): derive time_hotstart
+        # from cycle - nowcast_hours. This is REQUIRED so the nowcast
+        # launcher's sim_start aligns with the OBC/forcing time axes, which
+        # rtofs.py anchors to cycle - nowcast_hours (see commit 576ec5b).
+        #
+        # We deliberately ignore the environment variable here: upstream
+        # J-jobs may set $time_hotstart to a different convention (e.g.
+        # 24h-back instead of 6h-back), which creates an 18h misalignment
+        # between param.nml's start_{year,month,day,hour} and OBC[t=0].
+        # That misalignment manifests as partition_hgrid heap corruption
+        # in SCHISM init.
         if time_hotstart is None:
+            from datetime import timedelta as _td
+            cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                       _td(hours=self.config.cyc)
+            time_hotstart = cycle_dt - _td(hours=self.config.nowcast_hours)
             env_ths = os.environ.get("time_hotstart", "")
-            if env_ths and len(env_ths) >= 10:
-                try:
-                    time_hotstart = datetime.strptime(env_ths[:10], "%Y%m%d%H")
-                    log.info(f"Using time_hotstart from environment: {time_hotstart}")
-                except ValueError:
-                    pass
+            if env_ths and env_ths[:10] != time_hotstart.strftime("%Y%m%d%H"):
+                log.info(
+                    f"Overriding env time_hotstart={env_ths[:10]} with "
+                    f"YAML-derived {time_hotstart.strftime('%Y%m%d%H')} "
+                    f"(cycle - nowcast_hours) to align with OBC time axis"
+                )
+            else:
+                log.info(f"Derived time_hotstart from cycle - nowcast_hours: "
+                         f"{time_hotstart}")
 
         # ---- Phase 1: Lightweight steps in parallel ----
         # GFS, HRRR, NWM, Tidal are fast (subprocess/IO-bound, ~90s max).
