@@ -142,12 +142,36 @@ class ForcingConfig:
     # 120s matches typical SECOFS production. Set higher (e.g. 3600) for
     # an hourly grid; SCHISM linearly interpolates between supplied times.
     schism_dt: float = 120.0
+    # Extra hours of buffer appended to the *hourly* time grid for
+    # ``vsource.th`` / ``vsink.th`` / ``msource.th``. Production
+    # ``nos_ofs_create_forcing_river.sh`` writes
+    # ``time_end = time_hotstart + 72h``, which for SECOFS / SECOFS-UFS
+    # (nowcast=6h, forecast=48h, sim=54h) is 18h past the forecast end —
+    # i.e. 73 hourly rows, not 55. SCHISM uses these rows for source-term
+    # interpolation; running short can cause the time-axis check to abort
+    # longer-than-nowcast runs. Default 0 keeps prior behavior for STOFS
+    # (which has its own 121-file medium-range path); the SECOFS factories
+    # override to 18 to match production.
+    river_hourly_extra_hours: int = 0
+    # Extra hours of buffer appended to the *sub-hourly* time grid for
+    # ``schism_flux.th`` / ``schism_temp.th`` / ``schism_salt.th``.
+    # Legacy Fortran (and ``river_clim.py``) extend the model-dt grid by
+    # 1 hour past the forecast end so SCHISM has a safe interpolation
+    # buffer at the simulation tail. Default 1 matches production for
+    # both SECOFS and STOFS.
+    river_th_extra_hours: int = 1
     # River climatology for fallback
     river_clim_file: Optional[Path] = None
     # Default river temperature and salinity
     # Fortran nos_ofs_create_forcing_river uses 10.0 for msource.th temperature
     river_default_temp: float = 10.0
     river_default_salt: float = 0.0
+    # Default river volume flow (m^3/s) for the climatology fallback when a
+    # river has no per-source climatology. STOFS sources.json maps element
+    # ids to NWM feature_id groups but carries no Q estimate, so without
+    # this default the fallback would write zeros (V18 SECOFS-UFS bug).
+    # 1.0 m^3/s keeps the model moving without dominating the dynamics.
+    river_default_flow: float = 1.0
     # NWM product type (STOFS uses medium_range_mem1, SECOFS uses analysis_assim)
     nwm_product: str = "analysis_assim"
     # Target and minimum NWM file counts for STOFS-style assembly
@@ -246,6 +270,10 @@ class ForcingConfig:
             met_num=2,
             obc_ssh_offset=1.25,  # Geoid-to-MSL datum offset for SECOFS
             nudging_enabled=True,  # COMF Fortran generates TEM_nu/SAL_nu
+            # Production ``nos_ofs_create_forcing_river.sh`` extends the
+            # NWM hourly window to ``time_hotstart + 72h`` (= sim_duration
+            # + 18h for nowcast=6, forecast=48). 73 hourly rows total.
+            river_hourly_extra_hours=18,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -276,6 +304,12 @@ class ForcingConfig:
             ufs_total_tasks=1200,
             ufs_nhours_fcst=48,
             ufs_dt_atmos=720,
+            # Production ``nos_ofs_create_forcing_river.sh`` extends the
+            # NWM hourly window to ``time_hotstart + 72h``. For SECOFS-UFS
+            # this is 18h past the forecast end → 73 hourly rows. Without
+            # this, ``vsource/vsink/msource.th`` ends 18h short and SCHISM
+            # interpolation aborts on runs that exceed the nowcast window.
+            river_hourly_extra_hours=18,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -532,6 +566,15 @@ class ForcingConfig:
                 kwargs["nwm_n_list_target"] = int(n_target)
             if n_min:
                 kwargs["nwm_n_list_min"] = int(n_min)
+            # River time-grid buffers (hours past forecast end). See the
+            # ``river_hourly_extra_hours`` / ``river_th_extra_hours``
+            # docstrings on ``ForcingConfig`` for the production rule
+            # (SECOFS shell extends NWM window to ``time_hotstart + 72h``;
+            # legacy Fortran extends ``schism_*.th`` by 1h).
+            if "hourly_extra_hours" in river:
+                kwargs["river_hourly_extra_hours"] = int(river["hourly_extra_hours"])
+            if "th_extra_hours" in river:
+                kwargs["river_th_extra_hours"] = int(river["th_extra_hours"])
 
         # St. Lawrence River climatology flag
         if isinstance(river, dict):

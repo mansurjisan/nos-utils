@@ -63,6 +63,48 @@ class TestNWMClimatology:
         avg = sum(MONTHLY_FLOW_FACTOR.values()) / 12
         assert 0.9 < avg < 1.1
 
+    def test_stofs_mode_climatology_non_zero(self, tmp_path):
+        """STOFS sources.json carries no clim_flows — fallback must still
+        produce non-zero flows so SCHISM doesn't run with dead rivers when
+        NWM file discovery fails (V18 SECOFS-UFS regression)."""
+        rc = RiverConfig(
+            feature_ids=[111, 222, 333],
+            node_indices=[10, 20, 30],
+            clim_flows=[0.0, 0.0, 0.0],  # STOFS-mode loads zeros
+            feature_id_groups=[[111], [222], [333]],
+        )
+        cfg = ForcingConfig(
+            lon_min=-80, lon_max=-70, lat_min=25, lat_max=35,
+            pdy="20260507", cyc=0,
+            river_default_flow=1.5,
+        )
+        proc = NWMProcessor(cfg, tmp_path, tmp_path / "out", river_config=rc)
+        flows, times = proc._generate_climatology(55)
+
+        assert flows.shape == (55, 3)
+        # May factor = 1.30, so each river gets 1.5 * 1.30 = 1.95 m^3/s
+        assert flows.min() > 0.0, "STOFS climatology must not be all zeros"
+        assert flows[0, 0] == pytest.approx(1.5 * 1.30)
+
+    def test_clim_flows_preserved_when_positive(self, tmp_path):
+        """COMF rivers with non-zero clim_flows should keep their value;
+        the default fallback applies only to zero/missing entries."""
+        rc = RiverConfig(
+            feature_ids=[111, 222],
+            node_indices=[10, 20],
+            clim_flows=[100.0, 0.0],  # second is missing
+        )
+        cfg = ForcingConfig(
+            lon_min=-80, lon_max=-70, lat_min=25, lat_max=35,
+            pdy="20260401", cyc=12,
+            river_default_flow=2.0,
+        )
+        proc = NWMProcessor(cfg, tmp_path, tmp_path / "out", river_config=rc)
+        flows, _ = proc._generate_climatology(10)
+
+        assert flows[0, 0] == pytest.approx(100.0 * 1.5)  # April factor
+        assert flows[0, 1] == pytest.approx(2.0 * 1.5)
+
 
 class TestNWMProcess:
     def test_no_config_returns_failure(self, mock_config, tmp_path):

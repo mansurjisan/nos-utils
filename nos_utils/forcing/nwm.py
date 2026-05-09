@@ -458,8 +458,24 @@ class NWMProcessor(ForcingProcessor):
         n_rivers = self.river_config.n_rivers
         log.info(f"Processing {n_rivers} rivers")
 
-        # Target time steps
-        total_hours = self.config.nowcast_hours + self.config.forecast_hours
+        # Target time steps (hourly grid for vsource/vsink/msource).
+        #
+        # Production reference: ``nos_ofs_create_forcing_river.sh`` writes
+        # the NWM source/sink time window as
+        # ``time_end = NDATE 72 ${time_hotstart}`` (line 86), regardless of
+        # the simulation length. For SECOFS-UFS (nowcast=6, forecast=48,
+        # sim=54h) that is 18h past the forecast end → 73 hourly rows.
+        # The extension matters because SCHISM uses these rows for source
+        # interpolation; a too-short grid aborts the run on
+        # ``rnday > nowcast_hours``.
+        #
+        # ``river_hourly_extra_hours`` is set per-OFS in the factories
+        # (SECOFS / SECOFS-UFS = 18) and via the ``river.hourly_extra_hours``
+        # YAML knob; default 0 preserves prior behavior for STOFS, which
+        # uses the medium-range 121-file path with its own length.
+        total_hours = (self.config.nowcast_hours
+                       + self.config.forecast_hours
+                       + max(0, int(self.config.river_hourly_extra_hours)))
         n_target = total_hours + 1  # hourly
 
         # Try NWM data first
@@ -849,14 +865,38 @@ class NWMProcessor(ForcingProcessor):
         return path
 
     def _generate_climatology(self, n_steps: int) -> Tuple[np.ndarray, List[float]]:
-        """Generate climatology-based river forcing."""
+        """Generate climatology-based river forcing.
+
+        For STOFS-mode (sources.json), ``clim_flows`` is filled with zeros at
+        load time because the JSON only carries element->feature_id maps with
+        no flow estimate. Returning all-zeros for every source produced the
+        V18 SECOFS-UFS bug where ``vsource.th`` / ``vsink.th`` were entirely
+        0.0 when NWM file discovery failed (and SCHISM ran with no river
+        forcing at all). Fall back to ``config.river_default_flow`` for any
+        source whose per-river climatology is non-positive so the run still
+        gets a sensible (small) inflow signal.
+        """
         n_rivers = self.river_config.n_rivers
         month = int(self.config.pdy[4:6])
         factor = MONTHLY_FLOW_FACTOR.get(month, 1.0)
+        default_flow = float(getattr(self.config, "river_default_flow", 1.0))
 
+        clim = self.river_config.clim_flows
         flows = np.zeros((n_steps, n_rivers), dtype=np.float32)
+        n_default = 0
         for r_idx in range(n_rivers):
-            flows[:, r_idx] = self.river_config.clim_flows[r_idx] * factor
+            base = clim[r_idx] if r_idx < len(clim) else 0.0
+            if base is None or base <= 0.0:
+                base = default_flow
+                n_default += 1
+            flows[:, r_idx] = base * factor
+
+        if n_default:
+            log.info(
+                f"Climatology fallback: {n_default}/{n_rivers} rivers used "
+                f"river_default_flow={default_flow:.2f} m^3/s "
+                f"(× monthly factor {factor:.2f})"
+            )
 
         times = [float(i) for i in range(n_steps)]  # hourly
         return flows, times
@@ -1079,10 +1119,18 @@ class NWMProcessor(ForcingProcessor):
         # production cadence) instead of an hourly 55-row one. Q/T values
         # are constant across rows (climatology over the run window) so
         # the only effect is to give SCHISM denser interpolation points.
-        if times:
-            end_sec = max(0.0, float(times[-1]) * 3600.0)
-        else:
-            end_sec = 0.0
+        #
+        # Endpoint rule: legacy Fortran extends ``schism_flux.th`` by 1
+        # hour past the forecast end (``end = forecast_hours + 1``), giving
+        # SCHISM a safe interpolation buffer at the simulation tail. The
+        # hourly ``times`` grid above carries a different buffer
+        # (``time_hotstart + 72h`` for SECOFS) so we anchor the schism_*.th
+        # end on ``nowcast_hours + forecast_hours + river_th_extra_hours``
+        # rather than ``times[-1]`` to avoid overshooting to 73h.
+        sim_hours = (self.config.nowcast_hours
+                     + self.config.forecast_hours
+                     + max(0, int(self.config.river_th_extra_hours)))
+        end_sec = max(0.0, float(sim_hours) * 3600.0)
         dt = max(1.0, float(self.config.schism_dt))
         # Build [0, dt, 2dt, ..., end_sec] inclusive
         n_steps = int(round(end_sec / dt)) + 1
