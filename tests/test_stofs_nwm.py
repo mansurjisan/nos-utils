@@ -2,12 +2,13 @@
 
 import json
 import pytest
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
 from nos_utils.config import ForcingConfig
-from nos_utils.forcing.nwm import NWMProcessor, RiverConfig
+from nos_utils.forcing.nwm import NWMProcessor, RiverConfig, _nwm_valid_time
 
 
 class TestSourcesJSON:
@@ -177,6 +178,162 @@ class TestDispatchByProduct:
 
         files = proc.find_input_files()
         assert len(files) == 1
+
+
+class TestValidTimeSort:
+    """Files must be ordered by valid time, not by filename.
+
+    Within an analysis_assim cycle the ``tmHH`` lookback runs *backwards*
+    in valid time (tm00 = cycle hour, tm01 = 1h earlier, …). Lexicographic
+    sort produces a non-monotonic time axis once multiple cycles are
+    staged, which SCHISM rejects.
+    """
+
+    def test_parse_analysis_assim_lookback(self, tmp_path):
+        d = tmp_path / "nwm.20260506" / "analysis_assim"
+        d.mkdir(parents=True)
+        # t18z lookback: tm00 = 18z, tm01 = 17z, tm02 = 16z
+        f00 = d / "nwm.t18z.analysis_assim.channel_rt.tm00.conus.nc"
+        f01 = d / "nwm.t18z.analysis_assim.channel_rt.tm01.conus.nc"
+        f02 = d / "nwm.t18z.analysis_assim.channel_rt.tm02.conus.nc"
+        for f in (f00, f01, f02):
+            f.write_bytes(b"")
+        assert _nwm_valid_time(f00) == datetime(2026, 5, 6, 18)
+        assert _nwm_valid_time(f01) == datetime(2026, 5, 6, 17)
+        assert _nwm_valid_time(f02) == datetime(2026, 5, 6, 16)
+
+    def test_parse_forecast_lead(self, tmp_path):
+        d = tmp_path / "nwm.20260506" / "short_range"
+        d.mkdir(parents=True)
+        f01 = d / "nwm.t12z.short_range.channel_rt.f001.conus.nc"
+        f18 = d / "nwm.t12z.short_range.channel_rt.f018.conus.nc"
+        for f in (f01, f18):
+            f.write_bytes(b"")
+        assert _nwm_valid_time(f01) == datetime(2026, 5, 6, 13)
+        assert _nwm_valid_time(f18) == datetime(2026, 5, 7, 6)
+
+    def test_parse_medium_range_member(self, tmp_path):
+        d = tmp_path / "nwm.20260506" / "medium_range_mem1"
+        d.mkdir(parents=True)
+        f = d / "nwm.t06z.medium_range.channel_rt_1.f120.conus.nc"
+        f.write_bytes(b"")
+        assert _nwm_valid_time(f) == datetime(2026, 5, 11, 6)
+
+    def test_parse_unparseable(self, tmp_path):
+        f = tmp_path / "garbage.nc"
+        f.write_bytes(b"")
+        # Sentinel — sorts to start, doesn't crash.
+        assert _nwm_valid_time(f) == datetime.min
+
+    def test_find_input_files_sorted_by_valid_time(self, tmp_path):
+        """Multi-cycle analysis_assim must come out monotonic in valid time."""
+        cfg = ForcingConfig.for_secofs(pdy="20260506", cyc=18)
+        sources = tmp_path / "sources.json"
+        sources.write_text(json.dumps({"100": [123]}))
+        rc = RiverConfig.from_sources_json(sources)
+
+        # Stage 4 cycles × 3 lookbacks = 12 files spanning a 14h window.
+        d = tmp_path / "nwm.20260506" / "analysis_assim"
+        d.mkdir(parents=True)
+        for cyc in (0, 6, 12, 18):
+            for tm in (0, 1, 2):
+                fname = (f"nwm.t{cyc:02d}z.analysis_assim.channel_rt."
+                         f"tm{tm:02d}.conus.nc")
+                (d / fname).write_bytes(b"")
+
+        proc = NWMProcessor(cfg, tmp_path, tmp_path, river_config=rc)
+        files = proc.find_input_files()
+        assert len(files) == 12
+
+        # Valid times must be strictly non-decreasing.
+        times = [_nwm_valid_time(f) for f in files]
+        assert times == sorted(times), \
+            f"Time grid not monotonic: {[t.strftime('%H') for t in times]}"
+
+        # Spot-check the contract: first file is the earliest valid time
+        # (t00z/tm02 = day-2h = 22z prior day in this case is unreachable,
+        # earliest valid in this fixture is t00z/tm02 = 2026-05-05 22z).
+        assert files[0].name.endswith("t00z.analysis_assim.channel_rt.tm02.conus.nc")
+        # Last is t18z/tm00 = 2026-05-06 18z (the cycle hour itself).
+        assert files[-1].name.endswith("t18z.analysis_assim.channel_rt.tm00.conus.nc")
+
+
+class TestNormalizeToSimulationGrid:
+    """The output time axis must be monotonic, hourly, and start at 0.
+
+    NWM extract returns ``times`` in *hours from start_time*
+    (= cycle - nowcast_hours). Analysis_assim cycles routinely include
+    pre-nowcast lookback, and consecutive cycles leave 4h gaps between
+    in-cycle 1h steps — both produce a non-monotonic / sparse axis that
+    SCHISM rejects.
+    """
+
+    @staticmethod
+    def _proc(tmp_path):
+        cfg = ForcingConfig.for_secofs(pdy="20260506", cyc=18)
+        sources = tmp_path / "sources.json"
+        sources.write_text(json.dumps({"100": [123]}))
+        rc = RiverConfig.from_sources_json(sources)
+        return NWMProcessor(cfg, tmp_path, tmp_path, river_config=rc)
+
+    def test_drops_pre_nowcast_lookback(self, tmp_path):
+        proc = self._proc(tmp_path)
+        # Pre-nowcast hours (-14..-1) must be dropped; cycle hour onward kept.
+        flows = np.arange(20).reshape(20, 1).astype(float)  # 20 rivers col, but we'll treat each row as a timestep
+        flows = np.repeat(flows, 1, axis=1)  # (20, 1)
+        times = list(range(-14, 6))  # -14, -13, ..., +5
+        out_flows, out_times = proc._normalize_to_simulation_grid(flows, times, n_target=73)
+        assert all(t >= 0 for t in out_times)
+        assert out_times[0] == 0.0  # starts at 0 (forward-filled if needed)
+        # First 6 hours (0..5) come from raw input rows at indices 14..19
+        # (rows 14..19 had times 0..5).
+        assert out_flows[0, 0] == 14.0  # row index 14 was time=0
+        assert out_flows[5, 0] == 19.0  # row index 19 was time=5
+
+    def test_forward_fills_gaps(self, tmp_path):
+        proc = self._proc(tmp_path)
+        # Sparse hours (0, 4, 5) must dense-fill to 0,1,2,3,4,5 with the
+        # most-recent prior flow.
+        flows = np.array([[10.0], [40.0], [50.0]])  # 3 rivers (cols), 3 timesteps (rows)
+        times = [0.0, 4.0, 5.0]
+        out_flows, out_times = proc._normalize_to_simulation_grid(flows, times, n_target=6)
+        assert out_times == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        # h=0,1,2,3 all forward-fill from h=0 (value 10.0)
+        # h=4 has its own value (40.0), h=5 its own (50.0)
+        assert out_flows[:, 0].tolist() == [10.0, 10.0, 10.0, 10.0, 40.0, 50.0]
+
+    def test_dedup_keeps_first(self, tmp_path):
+        proc = self._proc(tmp_path)
+        # If two files map to the same integer hour (e.g. analysis_assim
+        # and short_range overlap), keep the first (analysis sort-wins
+        # before forecast products).
+        flows = np.array([[100.0], [200.0]])
+        times = [3.0, 3.4]  # both round to 3
+        out_flows, out_times = proc._normalize_to_simulation_grid(flows, times, n_target=10)
+        # Hour 3 entry comes from the FIRST occurrence (100.0)
+        assert out_flows[out_times.index(3.0), 0] == 100.0
+
+    def test_monotonic_after_normalize(self, tmp_path):
+        proc = self._proc(tmp_path)
+        # Construct a deliberately pathological input: out-of-order
+        # hours from multiple cycles. Output must be strictly monotonic.
+        flows = np.arange(24).reshape(24, 1).astype(float)
+        times = [-14, -13, -12, -8, -7, -6, -2, -1, 0, 4, 5, 6,
+                 16, 17, 18, 22, 23, 24, 28, 29, 30, 34, 35, 36]
+        out_flows, out_times = proc._normalize_to_simulation_grid(flows, times, n_target=73)
+        diffs = np.diff(out_times)
+        assert (diffs > 0).all(), f"Non-monotonic: {out_times[:10]}"
+        assert all(d == 1.0 for d in diffs), f"Not hourly: unique diffs = {set(diffs)}"
+
+    def test_empty_when_all_outside_window(self, tmp_path):
+        proc = self._proc(tmp_path)
+        # All times before nowcast or after end → empty result, climatology
+        # path takes over via _pad_to_target.
+        flows = np.array([[1.0], [2.0]])
+        times = [-50.0, -40.0]
+        out_flows, out_times = proc._normalize_to_simulation_grid(flows, times, n_target=10)
+        assert out_times == []
+        assert out_flows.shape == (0, 1)
 
 
 class TestAutoDetectSourcesJSON:

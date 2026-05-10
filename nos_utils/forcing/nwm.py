@@ -14,6 +14,7 @@ Fallback: Monthly climatology when NWM data is unavailable.
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -24,6 +25,56 @@ from ..config import ForcingConfig
 from .base import ForcingProcessor, ForcingResult
 
 log = logging.getLogger(__name__)
+
+
+# NWM channel_rt filename: cycle hour HH and lead-time tag (tmNN lookback or
+# fNNN forecast). Optional `_<member>` suffix on channel_rt for medium_range
+# ensemble members (`channel_rt_1` etc.). The parent dir is ``nwm.YYYYMMDD``.
+_NWM_FNAME_RE = re.compile(
+    r"nwm\.t(?P<cyc>\d{2})z\.\w+\.channel_rt(?:_\d+)?\."
+    r"(?P<lead_kind>tm|f)(?P<lead>\d+)\.conus\.nc$"
+)
+
+
+def _nwm_valid_time(path: Path) -> datetime:
+    """Compute valid time for an NWM channel_rt file from its name + parent dir.
+
+    Files within a single analysis_assim cycle are named by *lookback hours*
+    (``tm00`` is the cycle hour, ``tm01`` is one hour earlier, …), so a
+    plain lexicographic sort of `nwm.t00z.…tm00`, `…tm01`, `…tm02` walks
+    valid time *backwards* and yields a non-monotonic time axis when fed
+    to SCHISM. Sorting by this key fixes that for both the lookback (`tm`)
+    and forecast (`f`) products without opening the NetCDF.
+
+    Returns ``datetime.min`` for unparseable names so they sort to the start
+    rather than crashing the pipeline.
+    """
+    m = _NWM_FNAME_RE.search(path.name)
+    if not m:
+        return datetime.min
+
+    # Walk up to find the ``nwm.YYYYMMDD`` ancestor (parent or grandparent
+    # depending on whether the file lives under a per-product subdir).
+    parent = path.parent
+    date_str: Optional[str] = None
+    for _ in range(3):
+        if parent.name.startswith("nwm.") and len(parent.name) == 12:
+            date_str = parent.name[4:]
+            break
+        parent = parent.parent
+    if date_str is None:
+        return datetime.min
+
+    try:
+        cycle = datetime.strptime(date_str, "%Y%m%d") + \
+                timedelta(hours=int(m.group("cyc")))
+    except ValueError:
+        return datetime.min
+
+    lead = int(m.group("lead"))
+    if m.group("lead_kind") == "tm":
+        return cycle - timedelta(hours=lead)
+    return cycle + timedelta(hours=lead)
 
 try:
     from netCDF4 import Dataset
@@ -490,7 +541,18 @@ class NWMProcessor(ForcingProcessor):
             log.warning("No NWM files found — using climatology")
             flows, times = self._generate_climatology(n_target)
 
-        # Pad to target length if needed
+        # Snap to a uniform hourly grid covering [0, n_target) hours from
+        # start_time. Drops pre-nowcast lookback (analysis_assim cycles
+        # commonly span -14h..+0h around the cycle hour, but only the
+        # nowcast window is part of the simulation), keeps the first
+        # (earliest-cycle) flow when two products report the same hour
+        # (analysis preferred over forecast for past hours), and
+        # forward-fills any missing hours so the time axis is dense
+        # and monotonic — SCHISM aborts otherwise.
+        flows, times = self._normalize_to_simulation_grid(flows, times, n_target)
+
+        # Pad to target length if needed (covers the case where NWM data
+        # ends before n_target — pads with the last value, hourly grid).
         if len(times) < n_target:
             flows, times = self._pad_to_target(flows, times, n_target)
 
@@ -556,10 +618,19 @@ class NWMProcessor(ForcingProcessor):
         climatology (1 m³/s × 3522 rivers replacing real streamflow).
         Aggregation per source group is independent and is correctly
         triggered by is_stofs_mode at extract time.
+
+        Returned list is sorted by valid time, not filename. Within an
+        analysis_assim cycle the ``tmHH`` lookback runs backwards in
+        valid time, so a lexicographic sort produces a non-monotonic
+        time axis once multiple cycles are staged. SCHISM rejects that.
         """
         if self.config.nwm_product == "medium_range_mem1":
-            return self._find_stofs_nwm_files()
-        return self._find_secofs_nwm_files()
+            files = self._find_stofs_nwm_files()
+        else:
+            files = self._find_secofs_nwm_files()
+        # Secondary key on path string keeps the order deterministic for
+        # files that share a valid time (same cycle revisited, etc.).
+        return sorted(files, key=lambda p: (_nwm_valid_time(p), str(p)))
 
     def _find_secofs_nwm_files(self) -> List[Path]:
         """Find NWM files using SECOFS product search.
@@ -945,6 +1016,76 @@ class NWMProcessor(ForcingProcessor):
         times = [float(i) for i in range(n_steps)]  # hourly
         return flows, times
 
+    def _normalize_to_simulation_grid(
+        self, flows: np.ndarray, times: List[float], n_target: int,
+    ) -> Tuple[np.ndarray, List[float]]:
+        """Snap raw extracted flows onto a dense hourly simulation grid.
+
+        ``_extract_streamflow*`` returns ``times`` in *hours from start_time*
+        (= cycle - nowcast_hours). Two issues if used directly:
+
+        1. **Pre-nowcast lookback.** Analysis_assim cycles include lookback
+           hours (tm00..tm02) that span ~14h before the latest cycle. For
+           a 6h SECOFS-UFS nowcast that's 8h of pre-window data. SCHISM
+           expects a time axis starting at 0.
+        2. **Cycle gaps.** Files exist at irregular intervals (within-cycle
+           1h steps + 4h gaps between cycles). The output must be dense
+           hourly so the SCHISM source-interp doesn't stall.
+
+        Strategy: snap each (time, flow) pair to its integer hour, drop
+        anything outside ``[0, n_target)``, keep the first occurrence of
+        any duplicate hour (analysis_assim sorted before short_range when
+        they share a valid hour, which is the right preference for
+        observed past), then forward-fill missing hours from the most
+        recent prior flow. Returns at most ``n_target`` rows; the caller
+        still pads to ``n_target`` if NWM data ends short of the window.
+        """
+        if flows.size == 0 or not times:
+            return flows, times
+
+        hour_to_flow: Dict[int, np.ndarray] = {}
+        for i, t_h in enumerate(times):
+            h = int(round(float(t_h)))
+            if h < 0 or h >= n_target:
+                continue
+            if h not in hour_to_flow:
+                hour_to_flow[h] = flows[i]
+
+        if not hour_to_flow:
+            log.warning(
+                "All extracted NWM times fell outside the simulation window "
+                f"[0, {n_target}h); falling through to climatology pad"
+            )
+            return flows[:0], []
+
+        sorted_hours = sorted(hour_to_flow)
+        first_hour = sorted_hours[0]
+
+        # Forward-fill from first available hour to n_target - 1.
+        out_flows: List[np.ndarray] = []
+        out_times: List[float] = []
+        last_flow = hour_to_flow[first_hour]
+        for h in range(first_hour, n_target):
+            if h in hour_to_flow:
+                last_flow = hour_to_flow[h]
+            out_flows.append(last_flow)
+            out_times.append(float(h))
+
+        n_filled = sum(1 for h in range(first_hour, n_target) if h not in hour_to_flow)
+        if n_filled:
+            log.info(
+                f"NWM grid normalize: {len(hour_to_flow)} unique-hour rows from "
+                f"{len(times)} files, forward-filled {n_filled} gap hours, "
+                f"output starts at h={first_hour}"
+            )
+        else:
+            log.info(
+                f"NWM grid normalize: {len(hour_to_flow)} unique-hour rows, "
+                f"no gaps, output starts at h={first_hour}"
+            )
+
+        return np.stack(out_flows, axis=0), out_times
+
     def _pad_to_target(self, flows: np.ndarray, times: List[float],
                        n_target: int) -> Tuple[np.ndarray, List[float]]:
         """Pad flow data to target number of time steps by repeating last row."""
@@ -975,20 +1116,15 @@ class NWMProcessor(ForcingProcessor):
             f"{relative_time_seconds:G} {flow_1:.4e} {flow_2:.4e} ..."
 
         i.e., general-scientific time + 4-digit scientific values per
-        source. STOFS convention forces the first two time stamps to
-        0 and 3600 sec so SCHISM starts cleanly at t=0.
+        source. ``times`` arrives already conditioned to a dense hourly
+        grid starting at 0 by ``_normalize_to_simulation_grid``; the
+        writer just emits ``t_hours * 3600`` per row.
         """
         output_file = self.output_path / "vsource.th"
         try:
             with open(output_file, "w") as f:
                 for t_idx, t_hours in enumerate(times):
                     t_seconds = t_hours * 3600.0
-                    # STOFS: force first two time tags (shell script post-processing)
-                    if self.is_stofs_mode:
-                        if t_idx == 0:
-                            t_seconds = 0.0
-                        elif t_idx == 1:
-                            t_seconds = 3600.0
                     values = " ".join(f"{flows[t_idx, r]:.4e}"
                                       for r in range(flows.shape[1]))
                     f.write(f"{t_seconds:G} {values}\n")
