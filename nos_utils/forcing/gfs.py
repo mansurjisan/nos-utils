@@ -217,8 +217,12 @@ class GFSProcessor(ForcingProcessor):
             )
         log.info(f"Found {len(gfs_files)} GFS files")
 
-        # Write met_files_used log for traceability
-        self.write_files_used(gfs_files, self.output_path.parent, "GFS", self.phase)
+        # Write met_files_used log for traceability inside the per-job DATA dir.
+        # Earlier code used `self.output_path.parent`, which dropped this file
+        # one directory above the working dir (e.g. /work/secofs_ufs/ instead
+        # of /work/secofs_ufs/secofs_ufs_prep_00_dev.<jobid>/), polluting the
+        # parent dir with stale logs from every cycle.
+        self.write_files_used(gfs_files, self.output_path, "GFS", self.phase)
 
         # Step 2: Extract variables from GRIB2
         extracted = self._extract_all(gfs_files)
