@@ -547,15 +547,44 @@ class NWMProcessor(ForcingProcessor):
         )
 
     def find_input_files(self) -> List[Path]:
-        """Find NWM channel_rt files for the run window."""
-        if self.is_stofs_mode or self.config.nwm_product == "medium_range_mem1":
+        """Find NWM channel_rt files for the run window.
+
+        Dispatch is *product*-driven, not is_stofs_mode-driven: SECOFS-UFS
+        loads STOFS-style sources.json (so is_stofs_mode=True) but its
+        nwm_product is "analysis_assim" — routing it through the medium_range
+        multi-cycle assembler returned 0 files and silently fell back to
+        climatology (1 m³/s × 3522 rivers replacing real streamflow).
+        Aggregation per source group is independent and is correctly
+        triggered by is_stofs_mode at extract time.
+        """
+        if self.config.nwm_product == "medium_range_mem1":
             return self._find_stofs_nwm_files()
         return self._find_secofs_nwm_files()
 
     def _find_secofs_nwm_files(self) -> List[Path]:
-        """Find NWM files using SECOFS product search (analysis_assim, short/medium_range)."""
+        """Find NWM files using SECOFS product search.
+
+        NWM v3.0 production layout (`/lfs/h1/ops/prod/com/nwm/v3.0/`):
+            nwm.YYYYMMDD/<product>/nwm.tHHz.<product>.channel_rt.<lead>.conus.nc
+
+        Lead-time tag varies by product:
+            - analysis_assim: ``tmHH`` (lookback hours; tm00 is on-the-hour)
+            - short_range / medium_range: ``fHHH`` (forecast hours)
+
+        If `nwm_product` is set explicitly (e.g. "analysis_assim"), only
+        that product is searched. Otherwise the priority order is
+        ``analysis_assim → short_range → medium_range`` — first non-empty
+        product wins.
+        """
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
-        nwm_files = []
+        nwm_files: List[Path] = []
+
+        # Honor explicit product config; otherwise fall back to priority list.
+        configured = self.config.nwm_product
+        if configured and configured in self.PRODUCTS:
+            search_products = [configured]
+        else:
+            search_products = list(self.PRODUCTS)
 
         for date in [base_date, base_date - timedelta(days=1)]:
             date_str = date.strftime("%Y%m%d")
@@ -563,10 +592,25 @@ class NWMProcessor(ForcingProcessor):
             if not nwm_dir.exists():
                 continue
 
-            for product in self.PRODUCTS:
-                pattern = f"nwm.t*z.{product}.channel_rt.f*.conus.nc"
-                found = sorted(nwm_dir.glob(pattern))
-                nwm_files.extend(found)
+            for product in search_products:
+                # analysis_assim uses tmHH lookback; forecast products use fHHH
+                lead_glob = "tm*" if product == "analysis_assim" else "f*"
+                pattern = (
+                    f"nwm.t*z.{product}.channel_rt.{lead_glob}.conus.nc"
+                )
+                # Production layout has a per-product subdirectory; older
+                # caches may have flat files. Try both, dedup by path.
+                found = sorted(
+                    set(
+                        list((nwm_dir / product).glob(pattern))
+                        + list(nwm_dir.glob(pattern))
+                    )
+                )
+                if found:
+                    nwm_files.extend(found)
+                    # Stop at first product that returns files so we don't
+                    # mix analysis with forecast on the same time grid.
+                    break
 
             if nwm_files:
                 break
