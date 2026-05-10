@@ -1,5 +1,6 @@
 """Tests for HotstartProcessor."""
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,22 @@ from nos_utils.config import ForcingConfig
 from nos_utils.forcing.hotstart import HotstartProcessor, HotstartInfo
 
 netCDF4 = pytest.importorskip("netCDF4")
+
+
+def _make_rst(path: Path, fmt: str = "NETCDF4", time_seconds: float = 21600.0):
+    """Write a minimal SCHISM-shaped restart file in the given NetCDF format."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ds = netCDF4.Dataset(str(path), "w", format=fmt)
+    ds.createDimension("node", 10)
+    ds.createDimension("nVert", 5)
+    t = ds.createVariable("time", "f8")
+    t[:] = time_seconds
+    iths = ds.createVariable("iths", "i4")
+    iths[:] = 180
+    eta = ds.createVariable("eta2", "f8", ("node",))
+    eta[:] = 0.0
+    ds.test_marker = "rst-from-test"
+    ds.close()
 
 
 @pytest.fixture
@@ -79,3 +96,111 @@ class TestHotstartInfo:
         s = repr(info)
         assert "21600" in s
         assert "180" in s
+
+
+class TestStageInitToComout:
+    """stage_init_to_comout: previous-cycle restart → COMOUT init.nowcast.nc.
+
+    The auto-stage step must produce a NETCDF4_CLASSIC file at the operational
+    name regardless of whether the source restart is HDF5 or already classic.
+    SECOFS production runs every 6h, so a 00z cycle picks up the previous
+    18z cycle's rst.nowcast.nc; older cycles are accepted as fallback.
+    """
+
+    @staticmethod
+    def _restart_at(comout_root: Path, run: str, pdy: str, cyc: int,
+                    fmt: str = "NETCDF4") -> Path:
+        """Lay down a previous-cycle restart in the operational COMOUT layout."""
+        path = (comout_root / f"{run}.{pdy}" /
+                f"{run}.t{cyc:02d}z.{pdy}.rst.nowcast.nc")
+        _make_rst(path, fmt=fmt)
+        return path
+
+    def test_picks_6h_prior_cycle(self, tmp_path):
+        """SECOFS runs every 6h: 00z today should pick up 18z yesterday."""
+        run = "secofs"
+        comout_root = tmp_path / "com" / "nos"
+        # Stage the 18z-yesterday cycle's rst (the natural 6h-prior pick).
+        src = self._restart_at(comout_root, run, "20260506", 18)
+        # Add an older 12z cycle to confirm the newer 18z wins.
+        _ = self._restart_at(comout_root, run, "20260506", 12)
+
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        # restart_dir = COMOUT root so HotstartProcessor's per-day glob
+        # walks `nos.20260506/` etc.
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+
+        target_dir = comout_root / "secofs.20260507"
+        staged = proc.stage_init_to_comout(
+            target_dir, "secofs.t00z.20260507.init.nowcast.nc",
+        )
+        assert staged is not None
+        assert staged.name == "secofs.t00z.20260507.init.nowcast.nc"
+        assert staged.exists()
+
+    def test_converts_hdf5_to_classic(self, tmp_path):
+        """HDF5 (NETCDF4) source must come out as NETCDF4_CLASSIC."""
+        run = "secofs"
+        comout_root = tmp_path / "com" / "nos"
+        src = self._restart_at(comout_root, run, "20260506", 18, fmt="NETCDF4")
+        # Confirm test fixture really is HDF5
+        with netCDF4.Dataset(str(src)) as ds:
+            assert ds.file_format == "NETCDF4"
+
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+        target_dir = comout_root / "secofs.20260507"
+        staged = proc.stage_init_to_comout(
+            target_dir, "secofs.t00z.20260507.init.nowcast.nc",
+        )
+        assert staged is not None
+        with netCDF4.Dataset(str(staged)) as ds:
+            assert ds.file_format == "NETCDF4_CLASSIC"
+            assert ds.test_marker == "rst-from-test"  # data preserved
+
+    def test_classic_source_is_just_copied(self, tmp_path):
+        """Already-classic source should not be re-converted (copy is fine)."""
+        run = "secofs"
+        comout_root = tmp_path / "com" / "nos"
+        src = self._restart_at(
+            comout_root, run, "20260506", 18, fmt="NETCDF4_CLASSIC",
+        )
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+        target_dir = comout_root / "secofs.20260507"
+        staged = proc.stage_init_to_comout(
+            target_dir, "secofs.t00z.20260507.init.nowcast.nc",
+        )
+        assert staged is not None
+        with netCDF4.Dataset(str(staged)) as ds:
+            assert ds.file_format == "NETCDF4_CLASSIC"
+
+    def test_no_restart_returns_none(self, tmp_path):
+        """No previous-cycle restart anywhere → None (caller cold-starts)."""
+        run = "secofs"
+        comout_root = tmp_path / "empty"; comout_root.mkdir()
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+        target_dir = tmp_path / "out_comout"
+        staged = proc.stage_init_to_comout(
+            target_dir, "secofs.t00z.20260507.init.nowcast.nc",
+        )
+        assert staged is None
+
+    def test_falls_back_when_6h_prior_missing(self, tmp_path):
+        """If 18z-yesterday is missing, pick the next-most-recent valid restart."""
+        run = "secofs"
+        comout_root = tmp_path / "com" / "nos"
+        # Only 12z-yesterday exists (12h prior — bigger gap than 6h)
+        src = self._restart_at(comout_root, run, "20260506", 12)
+
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+        target_dir = comout_root / "secofs.20260507"
+        staged = proc.stage_init_to_comout(
+            target_dir, "secofs.t00z.20260507.init.nowcast.nc",
+        )
+        assert staged is not None
+        # Check the source was the 12z file (we only staged one)
+        with netCDF4.Dataset(str(staged)) as ds:
+            assert ds.test_marker == "rst-from-test"

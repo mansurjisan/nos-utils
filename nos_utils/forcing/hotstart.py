@@ -18,6 +18,8 @@ Key SCHISM hotstart.nc variables:
 """
 
 import logging
+import shutil
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -156,6 +158,136 @@ class HotstartProcessor(ForcingProcessor):
                 "source_file": str(hotstart_file),
             },
         )
+
+    def stage_init_to_comout(
+        self,
+        comout_dir: Path,
+        init_filename: str,
+    ) -> Optional[Path]:
+        """Stage the previous-cycle restart as today's COMOUT init file.
+
+        Removes the manual ``nccopy`` hand-off operators have been doing each
+        cycle: walks back through previous SECOFS cycles (the existing
+        ``_find_hotstart`` already orders by datetime, so we just consume
+        its result) and lands a NETCDF4_CLASSIC copy at
+        ``comout_dir/init_filename``. SECOFS production cycles every 6h
+        (00z, 06z, 12z, 18z), so the natural pick is the cycle 6h prior;
+        when that's missing the next-most-recent valid restart is used.
+
+        Format conversion is mandatory because every restart produced by
+        ``combine_hotstart7.exe`` is HDF5 (NF90_NETCDF4) and parallel-IO
+        collective open at the SCHISM init scale (2794 ranks for SECOFS-UFS)
+        segfaults inside libpnetcdf on HDF5 files. Conversion uses ``nccopy``
+        when available (operational standard), with a netCDF4-Python
+        fallback for environments that don't ship it.
+
+        Args:
+            comout_dir: Target ``$COMOUT`` directory (created if missing).
+            init_filename: Operational init name, typically
+                ``f"{prefix}.t{cyc:02d}z.{pdy}.init.nowcast.nc"``.
+
+        Returns:
+            Path to the staged init file, or ``None`` if no valid restart
+            was found within the lookback window.
+        """
+        source = self._find_hotstart()
+        if source is None:
+            log.warning(
+                "No previous-cycle restart found for COMOUT init staging; "
+                "downstream nowcast will need to cold-start"
+            )
+            return None
+
+        comout_dir = Path(comout_dir)
+        comout_dir.mkdir(parents=True, exist_ok=True)
+        target = comout_dir / init_filename
+
+        # Skip work if the target already exists and points at the same
+        # source — operators sometimes pre-stage manually.
+        if target.exists():
+            try:
+                if target.resolve() == source.resolve():
+                    log.info(f"Init already staged at {target} (matches source)")
+                    return target
+            except OSError:
+                pass
+
+        src_format = self._netcdf_format(source)
+        if src_format == "NETCDF4_CLASSIC":
+            shutil.copy2(source, target)
+            log.info(f"Staged init.nowcast.nc (already classic): {source.name} → {target}")
+            return target
+
+        if not self._nccopy_to_classic(source, target):
+            log.error(f"Failed to convert {source} to NETCDF4_CLASSIC; init not staged")
+            return None
+
+        log.info(
+            f"Staged init.nowcast.nc (converted {src_format or '?'} "
+            f"→ NETCDF4_CLASSIC): {source.name} → {target}"
+        )
+        return target
+
+    @staticmethod
+    def _netcdf_format(path: Path) -> Optional[str]:
+        """Best-effort NetCDF format probe — returns None if unreadable."""
+        if not HAS_NETCDF4:
+            return None
+        try:
+            ds = Dataset(str(path), "r")
+            try:
+                return ds.file_format  # e.g. "NETCDF4", "NETCDF4_CLASSIC"
+            finally:
+                ds.close()
+        except Exception as e:
+            log.warning(f"Could not probe NetCDF format of {path}: {e}")
+            return None
+
+    @staticmethod
+    def _nccopy_to_classic(src: Path, dst: Path) -> bool:
+        """Convert ``src`` to NETCDF4_CLASSIC at ``dst``.
+
+        Tries the operational ``nccopy -k 'netCDF-4 classic model'`` first;
+        falls back to a pure netCDF4-Python rewrite when the binary isn't
+        on PATH. Both produce a byte-identical SCHISM-readable file as far
+        as the model's pnetcdf reader is concerned.
+        """
+        if shutil.which("nccopy"):
+            try:
+                subprocess.run(
+                    ["nccopy", "-k", "netCDF-4 classic model", str(src), str(dst)],
+                    check=True, capture_output=True,
+                )
+                return True
+            except subprocess.CalledProcessError as e:
+                log.warning(
+                    f"nccopy failed (rc={e.returncode}); falling back to "
+                    f"Python conversion. stderr: {e.stderr.decode(errors='replace')[:200]}"
+                )
+
+        if not HAS_NETCDF4:
+            log.error("Neither nccopy nor netCDF4-Python available for format conversion")
+            return False
+
+        try:
+            with Dataset(str(src), "r") as src_ds, \
+                 Dataset(str(dst), "w", format="NETCDF4_CLASSIC") as dst_ds:
+                # Global attrs
+                dst_ds.setncatts({k: src_ds.getncattr(k) for k in src_ds.ncattrs()})
+                # Dims
+                for name, dim in src_ds.dimensions.items():
+                    dst_ds.createDimension(name, len(dim) if not dim.isunlimited() else None)
+                # Vars
+                for name, var in src_ds.variables.items():
+                    new_var = dst_ds.createVariable(
+                        name, var.dtype, var.dimensions,
+                    )
+                    new_var.setncatts({k: var.getncattr(k) for k in var.ncattrs()})
+                    new_var[:] = var[:]
+            return True
+        except Exception as e:
+            log.error(f"Python NetCDF format conversion failed: {e}")
+            return False
 
     def find_input_files(self) -> List[Path]:
         """Find all candidate hotstart files."""

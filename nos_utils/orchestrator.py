@@ -309,7 +309,17 @@ class PrepOrchestrator:
         return prep_result
 
     def _run_hotstart(self, output_dir: Path) -> ForcingResult:
-        """Step 1: Find and validate hotstart file."""
+        """Step 1: Find and validate hotstart file.
+
+        Side effect: when a ``comout`` path is configured, also stages
+        a NETCDF4_CLASSIC copy of the previous-cycle restart at the
+        operational ``$COMOUT/{prefix}.t{cyc}z.{pdy}.init.nowcast.nc``
+        location. SECOFS production cycles every 6h, so the natural pick
+        is the cycle 6h prior; the existing find_hotstart logic handles
+        further fallback when the 6h-prior cycle is missing. Removes the
+        manual ``nccopy -k 'netCDF-4 classic model'`` operators have
+        been running each cycle.
+        """
         from .forcing.hotstart import HotstartProcessor
 
         restart_dir = self.paths.get("restart", self.paths.get("comout", output_dir))
@@ -317,7 +327,22 @@ class PrepOrchestrator:
             self.config, restart_dir, output_dir,
             run_name=self.run_name,
         )
-        return proc.process()
+        result = proc.process()
+
+        comout = self.paths.get("comout")
+        if comout is not None:
+            init_filename = (
+                f"{self.run_name}.t{self.config.cyc:02d}z."
+                f"{self.config.pdy}.init.nowcast.nc"
+            )
+            staged = proc.stage_init_to_comout(Path(comout), init_filename)
+            if staged is not None:
+                # Surface the staged path on the result so downstream
+                # steps (and the J-job archive logic) can pick it up.
+                result.metadata["comout_init_path"] = str(staged)
+                result.output_files.append(staged)
+
+        return result
 
     def _run_gfs(self, output_dir: Path, phase: str,
                  time_hotstart=None) -> ForcingResult:
