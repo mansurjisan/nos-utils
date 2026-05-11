@@ -156,14 +156,19 @@ def main():
 
     print("\n--- Test 1 PASSED ---")
 
-    # --- Test 2: DATM output ---
-    print("\n--- Test 2: DATM output (nws=4) ---")
+    # --- Test 2: DATM output (direct, no blender) ---
+    # GFSProcessor with direct_datm=True bypasses sflux + the
+    # orchestrator's BlenderProcessor and writes a narrow-domain
+    # datm_forcing.nc straight from extracted GFS arrays. Used here
+    # to exercise DATMWriter end-to-end. UFS-Coastal production runs
+    # through the orchestrator (which uses sflux + blender).
+    print("\n--- Test 2: DATM output (direct, narrow domain) ---")
 
     datm_dir = OUTPUT_DIR / "datm_test"
     datm_dir.mkdir(parents=True, exist_ok=True)
 
     config_datm = ForcingConfig.for_secofs(pdy=PDY, cyc=CYC, nws=4)
-    proc_datm = GFSProcessor(config_datm, GFS_ROOT, datm_dir)
+    proc_datm = GFSProcessor(config_datm, GFS_ROOT, datm_dir, direct_datm=True)
     proc_datm.MIN_FILE_SIZE = 400_000_000
 
     result_datm = proc_datm.process()

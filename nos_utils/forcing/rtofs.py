@@ -185,6 +185,12 @@ class RTOFSProcessor(ForcingProcessor):
             )
 
         files_2d, files_3d = self.find_input_files_by_type()
+        from ._log import log_input_files
+        log_input_files(
+            "RTOFS", (files_2d or []) + (files_3d or []),
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} mode=SECOFS "
+                 f"n_2d={len(files_2d or [])} n_3d={len(files_3d or [])}",
+        )
         if not files_2d and not files_3d:
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
@@ -230,6 +236,12 @@ class RTOFSProcessor(ForcingProcessor):
     def _process_stofs(self) -> ForcingResult:
         """STOFS mode: ROI subsetting → data prep → Fortran exe (or Python fallback)."""
         files_2d, files_3d = self.find_input_files_by_type()
+        from ._log import log_input_files
+        log_input_files(
+            "RTOFS", (files_2d or []) + (files_3d or []),
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} mode=STOFS "
+                 f"n_2d={len(files_2d or [])} n_3d={len(files_3d or [])}",
+        )
         if not files_2d and not files_3d:
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
@@ -278,7 +290,14 @@ class RTOFSProcessor(ForcingProcessor):
             fortran_ok = self._call_fortran_gen_3dth(work_dir, ssh_path, tsuv_path)
 
             if fortran_ok:
-                # Copy Fortran outputs to final output directory
+                # Copy Fortran outputs to final output directory.
+                # NOTE: do NOT apply obc_ssh_offset here — the Fortran exe
+                # (nos_ofs_create_forcing_obc_schism / gen_3Dth_from_hycom)
+                # already adds the geoid-to-MSL offset internally. See the
+                # note at _call_fortran_gen_3dth and commit ca16ad5 which
+                # removed a double-offset bug. The Python fallback path
+                # (_interpolate_2d) does apply it inline, but only because
+                # that path doesn't call the Fortran.
                 for fname in ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]:
                     src = work_dir / fname
                     if src.exists():
@@ -1017,8 +1036,13 @@ class RTOFSProcessor(ForcingProcessor):
 
             cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                        timedelta(hours=self.config.cyc)
-            sim_start = self.time_hotstart if self.time_hotstart else \
-                        cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            # Anchor the OBC window to the YAML run config, not to the
+            # legacy `time_hotstart` env var. For SECOFS-UFS the env var
+            # can point to a 24h-old hotstart while the actual model run
+            # window is the YAML-declared `nowcast_hours + forecast_hours`
+            # (6 + 48 = 54h for SECOFS). Using time_hotstart caused
+            # elev2D.th.nc to overshoot to 72h vs production's 54h.
+            sim_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
             sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
             sim_duration = (sim_end - sim_start).total_seconds()
 
@@ -1040,6 +1064,13 @@ class RTOFSProcessor(ForcingProcessor):
                 try:
                     from scipy.interpolate import interp1d
                     model_times = np.arange(n_model_steps) * model_dt
+                    # Clip to BOTH the run window (sim_duration) AND what
+                    # RTOFS files actually cover. Production trims to
+                    # sim_duration so SCHISM doesn't read past the
+                    # configured run-end (V12 had elev2D extending to
+                    # 259200s vs production 194400s — caused the
+                    # MISC: nc dt1 abort).
+                    model_times = model_times[model_times <= sim_duration]
                     model_times = model_times[model_times <= rtofs_times[-1]]
 
                     ssh_interp = np.zeros((len(model_times), n_bnd), dtype=np.float32)
@@ -1059,17 +1090,26 @@ class RTOFSProcessor(ForcingProcessor):
             else:
                 dt_out = (rtofs_times[1] - rtofs_times[0]) if n_rtofs > 1 else 3600.0
 
-            # Write SCHISM format
-            nc = Dataset(str(output_file), "w", format="NETCDF4")
+            # Write SCHISM format. NETCDF4_CLASSIC (not NETCDF4): SCHISM's
+            # NUOPC cap opens these via collective parallel-NetCDF at 2794-rank
+            # scale; HDF5-flavored files segfault during MPI-IO collective open
+            # *before* partition_hgrid runs. Production v3.9 writes classic.
+            nc = Dataset(str(output_file), "w", format="NETCDF4_CLASSIC")
             nt = ssh_array.shape[0]
 
+            # Dimension declaration order matches v3.9 production header layout
+            # (nComponents *before* nOpenBndNodes). Parallel pnetcdf readers can
+            # consult dim records by header offset, so the order matters even
+            # though variables reference dims by name.
             nc.createDimension("time", nt)
+            nc.createDimension("nComponents", 1)
             nc.createDimension("nOpenBndNodes", n_bnd)
             nc.createDimension("nLevels", 1)
-            nc.createDimension("nComponents", 1)
             nc.createDimension("one", 1)
 
-            time_var = nc.createVariable("time", "f8", ("time",))
+            # Production elev2D uses time as f4 (not f8). Match for byte-format
+            # parity with v3.9 production output.
+            time_var = nc.createVariable("time", "f4", ("time",))
             if dt_out == model_dt and nt > n_rtofs:
                 # Temporally interpolated: uniform 120s steps
                 time_var[:] = [i * dt_out for i in range(nt)]
@@ -1077,13 +1117,24 @@ class RTOFSProcessor(ForcingProcessor):
                 # No interpolation: use actual file valid times
                 time_var[:] = rtofs_times[:nt]
 
+            # SCHISM-required scalar for `nc dt1` consistency check.
+            # Without this variable, model init aborts with `MISC: nc dt1`.
+            ts_step = nc.createVariable("time_step", "f4", ("one",))
+            ts_step[0] = float(dt_out)
+
+            # Production omits _FillValue on time_series (no fill cells exist
+            # because all RTOFS-interpolated boundary points are valid). Match
+            # production by not setting fill_value here.
+            # Last dim is `one` (not `nComponents`) for elev2D — matches
+            # production. Both dims are size 1 so shape is unchanged but the
+            # binding name affects file layout.
             ts = nc.createVariable("time_series", "f4",
-                                   ("time", "nOpenBndNodes", "nLevels", "nComponents"),
-                                   fill_value=-30000.0)
+                                   ("time", "nOpenBndNodes", "nLevels", "one"))
             ts[:, :, 0, 0] = ssh_array
 
             nc.close()
-            log.info(f"Created elev2D.th.nc: ({nt}, {n_bnd}) boundary nodes")
+            log.info(f"Created elev2D.th.nc: ({nt}, {n_bnd}) boundary nodes, "
+                     f"time_step={dt_out}s")
             return output_file
 
         except Exception as e:
@@ -1303,11 +1354,12 @@ class RTOFSProcessor(ForcingProcessor):
             rtofs_dt_3d = 21600.0  # 6-hourly RTOFS input
             target_dt_3d = 10800.0  # 3-hourly output (matches Fortran DELT_TS)
 
-            # Compute simulation duration for clipping
+            # Compute simulation duration for clipping. Anchor to YAML
+            # run config — see elev2D path for rationale on ignoring
+            # time_hotstart env var here.
             cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                        timedelta(hours=self.config.cyc)
-            sim_start = self.time_hotstart if self.time_hotstart else \
-                        cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            sim_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
             sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
             sim_duration_3d = (sim_end - sim_start).total_seconds()
 
@@ -1454,46 +1506,76 @@ class RTOFSProcessor(ForcingProcessor):
 
     def _write_3d_th(self, output_path: Path, data: np.ndarray,
                      var_name: str, units: str, dt: float, n_bnd: int) -> None:
-        """Write TEM_3D.th.nc or SAL_3D.th.nc in SCHISM format."""
-        nc = Dataset(str(output_path), "w", format="NETCDF4")
+        """Write TEM_3D.th.nc or SAL_3D.th.nc in SCHISM format.
+
+        Schema matches v3.9.1 production (variables: time, time_step,
+        time_series). The ``time_step`` scalar is what SCHISM reads first
+        for its ``nc dt1`` consistency check — without it SCHISM aborts
+        with ``MISC: nc dt1`` during OBC init.
+
+        Dtypes match production: time_step and time_series are float64,
+        time is float64. No ``_FillValue`` attribute (production omits it).
+
+        Format is NETCDF4_CLASSIC (not NETCDF4): SCHISM's NUOPC cap opens
+        these via collective parallel-NetCDF at 2794-rank scale. HDF5-flavored
+        files segfault during MPI-IO collective open *before* partition_hgrid
+        runs. Production v3.9 writes classic.
+        """
+        nc = Dataset(str(output_path), "w", format="NETCDF4_CLASSIC")
         nt = data.shape[0]
         n_levels = data.shape[2]
 
+        # Dimension declaration order matches v3.9 production:
+        # time, nComponents, nOpenBndNodes, nLevels, one.
         nc.createDimension("time", nt)
+        nc.createDimension("nComponents", 1)
         nc.createDimension("nOpenBndNodes", n_bnd)
         nc.createDimension("nLevels", n_levels)
-        nc.createDimension("nComponents", 1)
         nc.createDimension("one", 1)
 
         time_var = nc.createVariable("time", "f8", ("time",))
         time_var[:] = [i * dt for i in range(nt)]
 
-        ts = nc.createVariable("time_series", "f4",
-                               ("time", "nOpenBndNodes", "nLevels", "nComponents"),
-                               fill_value=-30000.0)
+        # Production uses f8 for time_step on 3D OBC files (f4 only for elev2D).
+        ts_step = nc.createVariable("time_step", "f8", ("one",))
+        ts_step[0] = float(dt)
+
+        # Production: time_series is float64 on 3D OBC files (f4 only on elev2D)
+        # and has no _FillValue attribute. Last dim is `one` (not `nComponents`)
+        # for scalar tracers — both are size 1, but production binds to `one`.
+        ts = nc.createVariable("time_series", "f8",
+                               ("time", "nOpenBndNodes", "nLevels", "one"))
         ts[:, :, :, 0] = data
 
         nc.close()
 
     def _write_uv3d_th(self, output_path: Path, u: np.ndarray,
                        v: np.ndarray, dt: float, n_bnd: int) -> None:
-        """Write uv3D.th.nc in SCHISM format."""
-        nc = Dataset(str(output_path), "w", format="NETCDF4")
+        """Write uv3D.th.nc in SCHISM format (with time_step scalar).
+
+        Production dtype: time_step and time_series are float64; no
+        _FillValue attribute. See _write_3d_th docstring for rationale.
+        Format is NETCDF4_CLASSIC and dim order matches v3.9 production.
+        Last dim of time_series stays as `nComponents` (size 2 for u,v).
+        """
+        nc = Dataset(str(output_path), "w", format="NETCDF4_CLASSIC")
         nt = u.shape[0]
         n_levels = u.shape[2]
 
         nc.createDimension("time", nt)
+        nc.createDimension("nComponents", 2)
         nc.createDimension("nOpenBndNodes", n_bnd)
         nc.createDimension("nLevels", n_levels)
-        nc.createDimension("nComponents", 2)
         nc.createDimension("one", 1)
 
         time_var = nc.createVariable("time", "f8", ("time",))
         time_var[:] = [i * dt for i in range(nt)]
 
-        ts = nc.createVariable("time_series", "f4",
-                               ("time", "nOpenBndNodes", "nLevels", "nComponents"),
-                               fill_value=-30000.0)
+        ts_step = nc.createVariable("time_step", "f8", ("one",))
+        ts_step[0] = float(dt)
+
+        ts = nc.createVariable("time_series", "f8",
+                               ("time", "nOpenBndNodes", "nLevels", "nComponents"))
         ts[:, :, :, 0] = u
         ts[:, :, :, 1] = v
 

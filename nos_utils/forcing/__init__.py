@@ -7,11 +7,13 @@ Atmospheric:
     GEFSProcessor - Global Ensemble Forecast System (0.25/0.50°, 3-hourly)
 
 Ocean Boundary:
-    RTOFSProcessor - Real-Time Ocean Forecast System (SSH, T/S/UV boundaries)
+    RTOFSProcessor         - Real-Time Ocean Forecast System (SSH, T/S/UV boundaries)
+    DynamicAdjustProcessor - NOAA tide-gauge bias correction for SSH boundary
 
 River:
     NWMProcessor        - National Water Model (streamflow → vsource/msource)
     RiverClimProcessor  - USGS daily climatology (when NWM/BUFR unavailable)
+    StLawrenceProcessor - St. Lawrence River (Canadian hydrometric + GFS-rad temp)
 
 Tidal:
     TidalProcessor - Tidal constituents (bctides.in generation)
@@ -25,8 +27,10 @@ Model Config:
     PartitionProcessor - Generate partition.prop for MPI decomposition
 
 UFS-Coastal:
-    ESMFMeshProcessor - ESMF mesh file for DATM coupling
-    BlenderProcessor  - HRRR+GFS Delaunay blending for DATM
+    ESMFMeshProcessor   - ESMF mesh file for DATM coupling
+    BlenderProcessor    - HRRR+GFS Delaunay blending for DATM
+    UFSConfigProcessor  - Generate model_configure / datm_in / datm.streams
+                          / ufs.configure / fd_ufs.yaml / noahmptable.tbl
 
 Writers:
     SfluxWriter    - SCHISM sflux NetCDF output (nws=2)
@@ -38,8 +42,10 @@ from .gfs import GFSProcessor
 from .hrrr import HRRRProcessor
 from .gefs import GEFSProcessor
 from .rtofs import RTOFSProcessor
+from .dynamic_adjust import DynamicAdjustProcessor
 from .nwm import NWMProcessor, RiverConfig
 from .river_clim import RiverClimProcessor
+from .st_lawrence import StLawrenceProcessor
 from .tidal import TidalProcessor, compute_nodal_corrections
 from .nudging import NudgingProcessor
 from .param_nml import ParamNmlProcessor
@@ -47,8 +53,10 @@ from .hotstart import HotstartProcessor, HotstartInfo
 from .partition import PartitionProcessor
 from .esmf_mesh import ESMFMeshProcessor
 from .blender import BlenderProcessor
+from .ufs_config import UFSConfigProcessor
 from .sflux_writer import SfluxWriter
 from .datm_writer import DATMWriter
+from .forcing_writer import ForcingNcWriter
 
 __all__ = [
     "ForcingProcessor",
@@ -59,10 +67,12 @@ __all__ = [
     "GEFSProcessor",
     # Ocean boundary
     "RTOFSProcessor",
+    "DynamicAdjustProcessor",
     # River
     "NWMProcessor",
     "RiverConfig",
     "RiverClimProcessor",
+    "StLawrenceProcessor",
     # Tidal
     "TidalProcessor",
     "compute_nodal_corrections",
@@ -76,7 +86,9 @@ __all__ = [
     # UFS-Coastal
     "ESMFMeshProcessor",
     "BlenderProcessor",
+    "UFSConfigProcessor",
     # Writers
     "SfluxWriter",
     "DATMWriter",
+    "ForcingNcWriter",
 ]

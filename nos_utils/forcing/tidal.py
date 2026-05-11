@@ -216,21 +216,31 @@ class TidalProcessor(ForcingProcessor):
             return False
 
         start_time = self._compute_start_time()
-        run_days = (self.config.nowcast_hours + self.config.forecast_hours) / 24.0
+        # Match production COMF (nos_ofs_prep_schism_ctl.sh): per-phase fractional days
+        # via `bc scale=4`. Nowcast = nowcast_hours/24, forecast = forecast_hours/24.
+        # Previous implementation used int((nowcast+forecast)/24), which produced
+        # nodal factors evaluated at a midpoint ~1 day off from production and
+        # broke byte-parity with the static FIX bctides used in V16 success runs.
+        if self.phase == "forecast":
+            phase_hours = self.config.forecast_hours
+        else:
+            phase_hours = self.config.nowcast_hours
+        run_days = phase_hours / 24.0
 
         try:
             work_template = output_path.parent / "bctides.in_template"
             shutil.copy2(template_path, work_template)
 
             # Fortran input: N_days, hh,dd,mm,yyyy, y (confirmation)
+            # Production uses `bc scale=4` (4 decimals); match that format exactly.
             input_text = (
-                f"{int(run_days)}\n"
+                f"{run_days:.4f}\n"
                 f"{start_time.strftime('%H,%d,%m,%Y')}\n"
                 "y\n"
             )
 
             log.info(f"Running Fortran tide_fac: {exe}")
-            log.info(f"  phase={self.phase}, start_time={start_time}, run_days={int(run_days)}")
+            log.info(f"  phase={self.phase}, start_time={start_time}, run_days={run_days:.4f}")
 
             result = subprocess.run(
                 [str(exe)],

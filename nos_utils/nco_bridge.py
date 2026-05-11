@@ -98,6 +98,21 @@ def config_from_env(
         if val:
             paths[key] = val
 
+    # Fallback: some launchers (run_secofs_ufs.sh, certain WCOSS2 J-jobs) only
+    # export COMINrtofs_2d / COMINrtofs_3d, not COMINrtofs. Both 2D and 3D
+    # RTOFS data live at the same root, so accept either as the rtofs path.
+    # Without this fallback, the orchestrator silently skips the entire
+    # RTOFS+nudging stage and produces no OBC NetCDFs.
+    if "rtofs" not in paths:
+        for fallback_var in ("COMINrtofs_2d", "COMINrtofs_3d"):
+            val = os.environ.get(fallback_var, "")
+            if val:
+                paths["rtofs"] = val
+                log.info(
+                    f"COMINrtofs not set; using {fallback_var}={val} as rtofs path"
+                )
+                break
+
     # Hotstart search directory.
     # Priority: RESTART_DIR (explicit) > COMIN (previous cycle) > COMOUT parent (heuristic)
     restart_dir = os.environ.get("RESTART_DIR", "")
@@ -134,6 +149,30 @@ def config_from_env(
             if resolved.exists():
                 config.river_config_file = resolved
                 log.info(f"Resolved river_config_file: {resolved}")
+        # Sinks config file (paired with sources_json)
+        if config.sinks_config_file and not Path(config.sinks_config_file).is_absolute():
+            resolved = fix_path / config.sinks_config_file
+            if resolved.exists():
+                config.sinks_config_file = resolved
+                log.info(f"Resolved sinks_config_file: {resolved}")
+        # River .ctl file (open-boundary USGS rivers, separate from sources.json)
+        if config.river_ctl_file and not Path(config.river_ctl_file).is_absolute():
+            resolved = fix_path / config.river_ctl_file
+            if resolved.exists():
+                config.river_ctl_file = resolved
+                log.info(f"Resolved river_ctl_file: {resolved}")
+        # River daily climatology netCDF (Q/T fallback when no live USGS).
+        # Production stores it in $FIXofs/shared/, so check there too.
+        if config.river_clim_file and not Path(config.river_clim_file).is_absolute():
+            for candidate in (
+                fix_path / config.river_clim_file,
+                fix_path / "shared" / config.river_clim_file,
+                fix_path.parent / "shared" / config.river_clim_file,
+            ):
+                if candidate.exists():
+                    config.river_clim_file = candidate
+                    log.info(f"Resolved river_clim_file: {candidate}")
+                    break
         # Bctides template
         if config.bctides_template and not Path(config.bctides_template).is_absolute():
             resolved = fix_path / config.bctides_template

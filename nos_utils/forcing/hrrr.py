@@ -30,6 +30,7 @@ from ..config import ForcingConfig
 from ..io.grib_extract import GRIBExtractor, get_extractor
 from .base import ForcingProcessor, ForcingResult
 from .sflux_writer import SfluxWriter
+from .forcing_writer import ForcingNcWriter
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +115,11 @@ class HRRRProcessor(ForcingProcessor):
         try:
             # Step 1: Find files
             hrrr_files = self.find_input_files()
+            from ._log import log_input_files
+            log_input_files(
+                "HRRR", hrrr_files or [],
+                note=f"pdy={self.config.pdy} cyc={self.config.cyc} phase={self.phase}",
+            )
             if not hrrr_files:
                 return ForcingResult(
                     success=True, source=self.SOURCE_NAME,
@@ -121,8 +127,9 @@ class HRRRProcessor(ForcingProcessor):
                 )
             log.info(f"Found {len(hrrr_files)} HRRR files")
 
-            # Write met_files_used log for traceability
-            self.write_files_used(hrrr_files, self.output_path.parent, "HRRR", self.phase)
+            # Write met_files_used log inside the per-job DATA dir, not its
+            # parent (legacy bug — see gfs.py for details).
+            self.write_files_used(hrrr_files, self.output_path, "HRRR", self.phase)
 
             # Step 2: Extract data
             # igrd_met=0: pass native LCC grid (matches Fortran behavior)
@@ -140,13 +147,32 @@ class HRRRProcessor(ForcingProcessor):
             # Step 3: Filter to phase-specific time window
             extracted = self._filter_to_time_window(extracted)
 
-            # Step 4: Write sflux (source_index=2 for secondary)
-            writer = SfluxWriter(self.output_path, source_index=2)
-            base_date = self._compute_base_date()
-            files = writer.write_all(
-                extracted["data"], extracted["times"],
-                extracted["lons"], extracted["lats"], base_date,
-            )
+            # Step 4: Write output.
+            # nws=4 (UFS-Coastal): write a single hrrr_forcing.nc consumed
+            # by BlenderProcessor (matches the shell pipeline architecture).
+            # nws=2 (standalone): write 3 sflux files (source_index=2 for secondary).
+            if self.config.nws == 4:
+                writer = ForcingNcWriter()
+                forcing_path = self.output_path / "hrrr_forcing.nc"
+                lats_arr = extracted["lats"]
+                lons_arr = extracted["lons"]
+                if lats_arr.ndim == 2:
+                    files = [writer.write_2d(
+                        extracted["data"], extracted["times"],
+                        lons_arr, lats_arr, forcing_path, source_name="HRRR",
+                    )]
+                else:
+                    files = [writer.write_1d(
+                        extracted["data"], extracted["times"],
+                        lons_arr, lats_arr, forcing_path, source_name="HRRR",
+                    )]
+            else:
+                writer = SfluxWriter(self.output_path, source_index=2)
+                base_date = self._compute_base_date()
+                files = writer.write_all(
+                    extracted["data"], extracted["times"],
+                    extracted["lons"], extracted["lats"], base_date,
+                )
 
             return ForcingResult(
                 success=True, source=self.SOURCE_NAME,
@@ -238,7 +264,8 @@ class HRRRProcessor(ForcingProcessor):
         for var in self.variables:
             result["data"][var] = []
 
-        domain = self.config.domain
+        # Use forcing_domain so nws=4 extracts over the wide DATM grid.
+        domain = self.config.forcing_domain
         lon_min, lon_max, lat_min, lat_max = domain
         # Compute nx/ny exactly as wgrib2 -new_grid does: nx = round((max-min)/dx) + 1
         nx = int(round((lon_max - lon_min) / self.regrid_dx)) + 1
@@ -470,9 +497,10 @@ class HRRRProcessor(ForcingProcessor):
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-        # Subset to domain bounds (match Fortran subdomain selection)
+        # Subset to domain bounds (match Fortran subdomain selection).
+        # Use forcing_domain so nws=4 extracts over the wide DATM grid.
         if native_lons is not None:
-            lon_min, lon_max, lat_min, lat_max = self.config.domain
+            lon_min, lon_max, lat_min, lat_max = self.config.forcing_domain
             # Find bounding box in grid indices
             in_domain = (
                 (native_lons >= lon_min) & (native_lons <= lon_max) &
@@ -651,7 +679,13 @@ class HRRRProcessor(ForcingProcessor):
                 t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=3)
             t_end = cycle_dt + timedelta(hours=3)
         elif self.phase == "forecast":
-            t_start = cycle_dt - timedelta(hours=3)
+            # UFS-coupled (nws=4): forecast prep's datm_forcing.nc is reused
+            # by the nowcast SCHISM execution. Extend t_start back to cover
+            # the nowcast window — see gfs.py:_get_time_window for details.
+            if self.config.nws == 4:
+                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            else:
+                t_start = cycle_dt - timedelta(hours=3)
             t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=3)
         else:
             if self.time_hotstart:

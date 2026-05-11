@@ -69,6 +69,32 @@ class ForcingConfig:
     hrrr_lat_min: Optional[float] = None
     hrrr_lat_max: Optional[float] = None
 
+    # --- DATM input grid (UFS-Coastal nws=4) ---
+    # Wide DATM forcing grid for blended HRRR+GFS input to CDEPS.
+    # Different from `domain` (model mesh). DATM grid covers a halo around
+    # the mesh extent so atmospheric forcing reaches all coupled boundaries.
+    # When set, GFS/HRRR processors extract over this wider domain (in nws=4
+    # mode) and the BlenderProcessor builds output on this grid.
+    # All four must be set together or all None (falls back to `domain`).
+    datm_lon_min: Optional[float] = None
+    datm_lon_max: Optional[float] = None
+    datm_lat_min: Optional[float] = None
+    datm_lat_max: Optional[float] = None
+    # DATM grid resolution in degrees (for blender output).
+    datm_dx: float = 0.025
+
+    # UFS-Coastal coupling resource layout (nws=4 only).
+    # datm_tasks: PETs assigned to MED+ATM (DATM)
+    # schism_tasks: PETs assigned to OCN (SCHISM)
+    # total_tasks: should equal datm_tasks + schism_tasks
+    ufs_datm_tasks: int = 120
+    ufs_schism_tasks: int = 1080
+    ufs_total_tasks: int = 1200
+    # Forecast length in hours (for model_configure NHOURS)
+    ufs_nhours_fcst: int = 48
+    # Atmospheric coupling timestep (seconds, for model_configure DT_ATMOS)
+    ufs_dt_atmos: int = 720
+
     # --- OBC (ocean boundary) settings ---
     # RTOFS ROI indices for 2D (ssh) extraction
     obc_roi_2d: Optional[dict] = None  # {x1, x2, y1, y2}
@@ -89,19 +115,95 @@ class ForcingConfig:
     n_levels: int = 51
 
     # --- River settings ---
-    # River config file mapping NWM reach IDs to SCHISM nodes
+    # River config file mapping NWM reach IDs to SCHISM source elements
     river_config_file: Optional[Path] = None
+    # Optional STOFS-style sinks file ({elem_id: [fid, ...]}) — when set,
+    # NWMProcessor includes a sink list in source_sink.in. Required for
+    # SCHISM domains with diversion sinks (SECOFS, STOFS-3D-ATL).
+    sinks_config_file: Optional[Path] = None
+    # COMF-style river.ctl listing USGS-named open-boundary rivers (Savannah,
+    # Fraser, Columbia, etc. for SECOFS). Loaded separately from
+    # river_config_file because SECOFS-UFS uses BOTH mechanisms in parallel:
+    # sources.json drives the 3522 interior NWM sources via source_sink.in,
+    # while river.ctl drives the 6 boundary-flux rivers via flux.th /
+    # temp.th / salt.th. Legacy nos_ofs_create_forcing_river produces the
+    # latter; Python now writes them too when this field is set.
+    river_ctl_file: Optional[Path] = None
+    # Daily climatology netCDF used by the legacy Fortran when USGS BUFR
+    # observations are unavailable. Stores discharge/temperature/salinity
+    # per station for 366 days of the year. When set, NWMProcessor's
+    # _write_river_th_files reads daily climatology Q/T (with 3-day
+    # centered average matching legacy behavior) instead of the annual
+    # Q_mean/T_mean from river.ctl Section 1 — closes most of the value
+    # gap to production output.
+    river_clim_file: Optional[Path] = None
+    # SCHISM model time step (seconds). Used by `_write_river_th_files`
+    # to generate the time grid for ``schism_flux/temp/salt.th``. Default
+    # 120s matches typical SECOFS production. Set higher (e.g. 3600) for
+    # an hourly grid; SCHISM linearly interpolates between supplied times.
+    schism_dt: float = 120.0
+    # Extra hours of buffer appended to the *hourly* time grid for
+    # ``vsource.th`` / ``vsink.th`` / ``msource.th``. Production
+    # ``nos_ofs_create_forcing_river.sh`` writes
+    # ``time_end = time_hotstart + 72h``, which for SECOFS / SECOFS-UFS
+    # (nowcast=6h, forecast=48h, sim=54h) is 18h past the forecast end —
+    # i.e. 73 hourly rows, not 55. SCHISM uses these rows for source-term
+    # interpolation; running short can cause the time-axis check to abort
+    # longer-than-nowcast runs. Default 0 keeps prior behavior for STOFS
+    # (which has its own 121-file medium-range path); the SECOFS factories
+    # override to 18 to match production.
+    river_hourly_extra_hours: int = 0
+    # Extra hours of buffer appended to the *sub-hourly* time grid for
+    # ``schism_flux.th`` / ``schism_temp.th`` / ``schism_salt.th``.
+    # Legacy Fortran (and ``river_clim.py``) extend the model-dt grid by
+    # 1 hour past the forecast end so SCHISM has a safe interpolation
+    # buffer at the simulation tail. Default 1 matches production for
+    # both SECOFS and STOFS.
+    river_th_extra_hours: int = 1
     # River climatology for fallback
     river_clim_file: Optional[Path] = None
     # Default river temperature and salinity
     # Fortran nos_ofs_create_forcing_river uses 10.0 for msource.th temperature
     river_default_temp: float = 10.0
     river_default_salt: float = 0.0
+    # Default river volume flow (m^3/s) for the climatology fallback when a
+    # river has no per-source climatology. STOFS sources.json maps element
+    # ids to NWM feature_id groups but carries no Q estimate, so without
+    # this default the fallback would write zeros (V18 SECOFS-UFS bug).
+    # 1.0 m^3/s keeps the model moving without dominating the dynamics.
+    river_default_flow: float = 1.0
     # NWM product type (STOFS uses medium_range_mem1, SECOFS uses analysis_assim)
     nwm_product: str = "analysis_assim"
     # Target and minimum NWM file counts for STOFS-style assembly
     nwm_n_list_target: int = 55
     nwm_n_list_min: int = 31
+
+    # St. Lawrence River climatology (STOFS-3D-ATL only).
+    # When True, the orchestrator runs StLawrenceProcessor which reads the
+    # Environment Canada hydrometric CSV at $COMINlaw/<pdy>/can_streamgauge/
+    # and produces flux.th / TEM_1.th. Falls back to previous-day CSV and
+    # then to the previous cycle's archived .riv.obs.* files.
+    st_lawrence_enabled: bool = False
+    st_lawrence_csv_name: str = "02OA016_hydrometric.csv"
+
+    # Dynamic SSH adjustment (STOFS-3D-ATL NOAA tide-gauge bias correction).
+    # When True, the orchestrator runs DynamicAdjustProcessor after RTOFS
+    # to subtract a per-cycle bias from elev2D.th.nc using 11 NOAA
+    # reference stations. Needs the previous cycle's staout_1, param.nml,
+    # and average_bias file in $COMOUT_PREV; degrades gracefully otherwise.
+    dynamic_adjust_enabled: bool = False
+    dynamic_adjust_window_days: int = 2
+
+    # Minimum number of time records required in RTOFS-derived OBC files
+    # (elev2D.th.nc, TEM_3D.th.nc, SAL_3D.th.nc, uv3D.th.nc). When any
+    # file falls short, the orchestrator copies the previous cycle's
+    # archived OBC from `$COMOUT_PREV/rerun/`. Set to 0 (default) to disable.
+    # Operational STOFS-3D-ATL gates on N_dim_cr_max=21 (see
+    # stofs_3d_atl_create_obc_3d_th_non_adjust.sh:688); that value is set by
+    # the STOFS factories and from_yaml for STOFS-like configs. Non-STOFS
+    # OFSes have shorter OBC windows (typically ~10 records for 54h runs)
+    # and would be wrongly flagged if this defaulted to 21.
+    obc_min_timesteps: int = 0
 
     # --- Tidal settings ---
     # Tidal constituents to use
@@ -132,6 +234,31 @@ class ForcingConfig:
                     self.hrrr_lat_min, self.hrrr_lat_max)
         return self.domain
 
+    @property
+    def datm_domain(self):
+        """DATM forcing grid bounds (falls back to main domain if not set).
+
+        Used by BlenderProcessor as the output grid extent. When all four
+        ``datm_*`` fields are set, returns those; otherwise returns ``domain``.
+        """
+        if self.datm_lon_min is not None:
+            return (self.datm_lon_min, self.datm_lon_max,
+                    self.datm_lat_min, self.datm_lat_max)
+        return self.domain
+
+    @property
+    def forcing_domain(self):
+        """Domain used by atmospheric forcing extraction (GFS, HRRR).
+
+        - nws=4 (UFS-Coastal): returns ``datm_domain`` so the inputs cover
+          the wider DATM grid the blender will write onto.
+        - nws=2 (standalone SCHISM): returns ``domain`` (model mesh extent),
+          unchanged from prior behavior.
+        """
+        if self.nws == 4:
+            return self.datm_domain
+        return self.domain
+
     @classmethod
     def for_secofs(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
         """Factory with SECOFS defaults (SE Coastal Ocean Forecast System)."""
@@ -143,20 +270,46 @@ class ForcingConfig:
             met_num=2,
             obc_ssh_offset=1.25,  # Geoid-to-MSL datum offset for SECOFS
             nudging_enabled=True,  # COMF Fortran generates TEM_nu/SAL_nu
+            # Production ``nos_ofs_create_forcing_river.sh`` extends the
+            # NWM hourly window to ``time_hotstart + 72h`` (= sim_duration
+            # + 18h for nowcast=6, forecast=48). 73 hourly rows total.
+            river_hourly_extra_hours=18,
         )
         defaults.update(overrides)
         return cls(**defaults)
 
     @classmethod
     def for_secofs_ufs(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
-        """Factory with SECOFS UFS-Coastal defaults (nws=4, DATM coupling)."""
+        """Factory with SECOFS UFS-Coastal defaults (nws=4, DATM coupling).
+
+        DATM forcing grid is the ATLANTIC preset (-98 to -55, 10 to 53)
+        at 0.025° to match the operational shell pipeline (1721x1721).
+        GFS resolution is 0p25 for hourly cadence (was 0p50 default = 3-hourly).
+        """
         defaults = dict(
             lon_min=-88.0, lon_max=-63.0,
             lat_min=17.0, lat_max=40.0,
             pdy=pdy, cyc=cyc,
             nowcast_hours=6, forecast_hours=48,
             met_num=2, nws=4,
+            gfs_resolution="0p25",
             obc_ssh_offset=1.25,
+            # DATM forcing grid (ATLANTIC preset)
+            datm_lon_min=-98.0, datm_lon_max=-55.0,
+            datm_lat_min=10.0, datm_lat_max=53.0,
+            datm_dx=0.025,
+            # UFS-Coastal resource layout (default SECOFS V15 layout)
+            ufs_datm_tasks=120,
+            ufs_schism_tasks=1080,
+            ufs_total_tasks=1200,
+            ufs_nhours_fcst=48,
+            ufs_dt_atmos=720,
+            # Production ``nos_ofs_create_forcing_river.sh`` extends the
+            # NWM hourly window to ``time_hotstart + 72h``. For SECOFS-UFS
+            # this is 18h past the forecast end → 73 hourly rows. Without
+            # this, ``vsource/vsink/msource.th`` ends 18h short and SCHISM
+            # interpolation aborts on runs that exceed the nowcast window.
+            river_hourly_extra_hours=18,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -187,13 +340,24 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
+            # St. Lawrence climatology — always on for STOFS-3D-ATL.
+            st_lawrence_enabled=True,
+            # Dynamic SSH adjust — operational default for STOFS-3D-ATL.
+            dynamic_adjust_enabled=True,
+            # OBC dim QC threshold (operational N_dim_cr_max).
+            obc_min_timesteps=21,
         )
         defaults.update(overrides)
         return cls(**defaults)
 
     @classmethod
     def for_stofs_3d_atl_ufs(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
-        """Factory with STOFS-3D-ATL UFS-Coastal defaults (nws=4, DATM coupling)."""
+        """Factory with STOFS-3D-ATL UFS-Coastal defaults (nws=4, DATM coupling).
+
+        DATM forcing grid uses the ATLANTIC preset bounds at 0.025° to match
+        the operational shell pipeline. The STOFS model domain is slightly
+        wider, but DATM input data is bounded to ATLANTIC by convention.
+        """
         defaults = dict(
             lon_min=-98.5035, lon_max=-52.4867,
             lat_min=7.347, lat_max=52.5904,
@@ -213,6 +377,19 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
+            st_lawrence_enabled=True,
+            dynamic_adjust_enabled=True,
+            obc_min_timesteps=21,
+            # DATM forcing grid (ATLANTIC preset, slightly narrower than model)
+            datm_lon_min=-98.0, datm_lon_max=-55.0,
+            datm_lat_min=10.0, datm_lat_max=53.0,
+            datm_dx=0.025,
+            # UFS-Coastal resource layout (nowcast 24h + forecast 108h = 132h)
+            ufs_datm_tasks=120,
+            ufs_schism_tasks=1080,
+            ufs_total_tasks=1200,
+            ufs_nhours_fcst=132,
+            ufs_dt_atmos=720,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -389,6 +566,106 @@ class ForcingConfig:
                 kwargs["nwm_n_list_target"] = int(n_target)
             if n_min:
                 kwargs["nwm_n_list_min"] = int(n_min)
+            # River time-grid buffers (hours past forecast end). See the
+            # ``river_hourly_extra_hours`` / ``river_th_extra_hours``
+            # docstrings on ``ForcingConfig`` for the production rule
+            # (SECOFS shell extends NWM window to ``time_hotstart + 72h``;
+            # legacy Fortran extends ``schism_*.th`` by 1h).
+            if "hourly_extra_hours" in river:
+                kwargs["river_hourly_extra_hours"] = int(river["hourly_extra_hours"])
+            if "th_extra_hours" in river:
+                kwargs["river_th_extra_hours"] = int(river["th_extra_hours"])
+
+        # St. Lawrence River climatology flag
+        if isinstance(river, dict):
+            stl = river.get("st_lawrence", {})
+            if isinstance(stl, dict):
+                kwargs["st_lawrence_enabled"] = bool(stl.get("enabled", False))
+                csv_name = stl.get("csv_name")
+                if csv_name:
+                    kwargs["st_lawrence_csv_name"] = str(csv_name)
+
+        # STOFS-like YAMLs are identified by the presence of OBC ROI indices
+        # (index-based RTOFS subsetting is STOFS-only).
+        is_stofs_like = bool(roi_2ds or roi_3dz)
+
+        # Dynamic SSH adjust: explicitly controlled by obc.obc_mode, or by
+        # obc.dynamic_adjust.enabled if specified. For STOFS-like YAMLs
+        # that omit both (including `_base` inheritance), default to True
+        # so from_yaml matches the operational semantics of the
+        # for_stofs_3d_atl() factory. Non-STOFS OFSes leave it False.
+        obc_mode = obc.get("obc_mode") if isinstance(obc, dict) else None
+        dyn_cfg = obc.get("dynamic_adjust", {}) if isinstance(obc, dict) else {}
+        if isinstance(dyn_cfg, dict) and "enabled" in dyn_cfg:
+            kwargs["dynamic_adjust_enabled"] = bool(dyn_cfg["enabled"])
+        elif obc_mode is not None:
+            kwargs["dynamic_adjust_enabled"] = (str(obc_mode) == "dynamic_adjust")
+        else:
+            kwargs["dynamic_adjust_enabled"] = is_stofs_like
+
+        # OBC dim QC threshold: operational STOFS gates on N_dim_cr_max=21.
+        # Non-STOFS OFSes have shorter OBC windows (typically ~10 records for
+        # a 54h run) and would be wrongly flagged if this ran against them;
+        # keep the dataclass default of 0 (disabled) for non-STOFS.
+        if is_stofs_like:
+            kwargs["obc_min_timesteps"] = 21
+
+        # UFS-Coastal DATM grid configuration. The DATM grid covers a halo
+        # around the SCHISM mesh extent so atmospheric forcing reaches all
+        # coupled boundaries. Two YAML forms supported:
+        #
+        #   ufs_coastal:
+        #     datm_bounds: {lon_min: ..., lon_max: ..., lat_min: ..., lat_max: ...}
+        #     blend_resolution: 0.025
+        #
+        # or via preset name (legacy, mirrors ush/python/nos_ofs/datm/blend_hrrr_gfs.py):
+        #
+        #   ufs_coastal:
+        #     datm_domain: ATLANTIC
+        #
+        # Explicit datm_bounds wins over the preset name if both are set.
+        ufs_coastal = data.get("ufs_coastal", {})
+        if isinstance(ufs_coastal, dict) and ufs_coastal.get("enabled", True):
+            datm_bounds_yaml = ufs_coastal.get("datm_bounds", {})
+            if isinstance(datm_bounds_yaml, dict) and datm_bounds_yaml:
+                kwargs["datm_lon_min"] = float(datm_bounds_yaml["lon_min"])
+                kwargs["datm_lon_max"] = float(datm_bounds_yaml["lon_max"])
+                kwargs["datm_lat_min"] = float(datm_bounds_yaml["lat_min"])
+                kwargs["datm_lat_max"] = float(datm_bounds_yaml["lat_max"])
+            elif ufs_coastal.get("datm_domain"):
+                # Preset name lookup. Mirrors the table in
+                # ush/python/nos_ofs/datm/blend_hrrr_gfs.py:52-55.
+                DATM_PRESETS = {
+                    "ATLANTIC":    (-98.0, -55.0, 10.0, 53.0),
+                    "SECOFS":      (-90.0, -61.0, 15.0, 42.0),
+                    "STOFS3D_ATL": (-99.0, -52.0,  7.0, 53.0),
+                }
+                preset = str(ufs_coastal["datm_domain"]).upper()
+                if preset in DATM_PRESETS:
+                    lon_min, lon_max, lat_min, lat_max = DATM_PRESETS[preset]
+                    kwargs["datm_lon_min"] = lon_min
+                    kwargs["datm_lon_max"] = lon_max
+                    kwargs["datm_lat_min"] = lat_min
+                    kwargs["datm_lat_max"] = lat_max
+                else:
+                    log.warning(
+                        f"Unknown ufs_coastal.datm_domain preset '{preset}'. "
+                        f"Known: {sorted(DATM_PRESETS)}. Falling back to model domain."
+                    )
+            if "blend_resolution" in ufs_coastal:
+                kwargs["datm_dx"] = float(ufs_coastal["blend_resolution"])
+            # UFS resource layout (used by UFSConfigProcessor to patch
+            # ufs.configure PET bounds and model_configure NHOURS/DT_ATMOS).
+            if "datm_tasks" in ufs_coastal:
+                kwargs["ufs_datm_tasks"] = int(ufs_coastal["datm_tasks"])
+            if "schism_tasks" in ufs_coastal:
+                kwargs["ufs_schism_tasks"] = int(ufs_coastal["schism_tasks"])
+            if "total_tasks" in ufs_coastal:
+                kwargs["ufs_total_tasks"] = int(ufs_coastal["total_tasks"])
+            if "nhours_fcst" in ufs_coastal:
+                kwargs["ufs_nhours_fcst"] = int(ufs_coastal["nhours_fcst"])
+            if "dt_atmos" in ufs_coastal:
+                kwargs["ufs_dt_atmos"] = int(ufs_coastal["dt_atmos"])
 
         # Optional Path fields — only set if value is non-empty
         # River config: try sources_json first (STOFS), then ctl_file (SECOFS)
@@ -398,6 +675,19 @@ class ForcingConfig:
                            river_files.get("nwm_reach")
         if river_config_file:
             kwargs["river_config_file"] = Path(river_config_file)
+        sinks_config_file = river_files.get("sinks_json")
+        if sinks_config_file:
+            kwargs["sinks_config_file"] = Path(sinks_config_file)
+        # river.ctl is loaded separately (in addition to sources.json) so
+        # boundary-flux rivers and interior NWM sources can coexist.
+        ctl_file = river_files.get("ctl_file")
+        if ctl_file:
+            kwargs["river_ctl_file"] = Path(ctl_file)
+        # Daily climatology netCDF — used as Q/T fallback when USGS BUFR
+        # observations are unavailable.
+        clim_file = river_files.get("clim_file")
+        if clim_file:
+            kwargs["river_clim_file"] = Path(clim_file)
         if bctides_template:
             kwargs["bctides_template"] = Path(bctides_template)
         if grid_file:

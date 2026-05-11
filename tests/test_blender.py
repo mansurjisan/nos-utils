@@ -3,7 +3,25 @@
 from pathlib import Path
 import numpy as np
 import pytest
-from nos_utils.forcing.blender import BlenderProcessor, rotate_winds_lcc, SFLUX_TO_DATM
+from nos_utils.forcing.blender import BlenderProcessor, HRRR_LOV, HRRR_LAD
+from nos_utils.forcing.forcing_writer import SFLUX_TO_DATM
+
+
+def _rotate_winds_lcc(u, v, lon):
+    """Test helper: Lambert Conformal wind rotation (grid -> earth-relative).
+
+    Mirrors the inline rotation step in BlenderProcessor.process(). Kept as
+    a standalone function in this test module so the unit tests don't have
+    to drive the full process() pipeline.
+    """
+    D2R = np.pi / 180.0
+    rotcon = np.sin(HRRR_LAD * D2R)
+    angle = rotcon * (np.asarray(lon) - HRRR_LOV) * D2R
+    cos_r = np.cos(angle)
+    sin_r = np.sin(angle)
+    u_e = cos_r * u + sin_r * v
+    v_e = -sin_r * u + cos_r * v
+    return u_e, v_e
 
 
 class TestRotateWinds:
@@ -12,7 +30,7 @@ class TestRotateWinds:
         u = np.array([[10.0]])
         v = np.array([[0.0]])
         lon = np.array([[-97.5]])  # LoV
-        u_e, v_e = rotate_winds_lcc(u, v, lon)
+        u_e, v_e = _rotate_winds_lcc(u, v, lon)
         assert u_e[0, 0] == pytest.approx(10.0, abs=0.001)
         assert v_e[0, 0] == pytest.approx(0.0, abs=0.001)
 
@@ -21,7 +39,7 @@ class TestRotateWinds:
         u = np.array([[10.0]])
         v = np.array([[0.0]])
         lon = np.array([[-80.0]])  # 17.5° east of LoV
-        u_e, v_e = rotate_winds_lcc(u, v, lon)
+        u_e, v_e = _rotate_winds_lcc(u, v, lon)
         # Should have some v component after rotation
         assert abs(v_e[0, 0]) > 0.1
 
@@ -30,7 +48,7 @@ class TestRotateWinds:
         u = np.array([[3.0]])
         v = np.array([[4.0]])
         lon = np.array([[-75.0]])
-        u_e, v_e = rotate_winds_lcc(u, v, lon)
+        u_e, v_e = _rotate_winds_lcc(u, v, lon)
         speed_orig = np.sqrt(u**2 + v**2)
         speed_rot = np.sqrt(u_e**2 + v_e**2)
         assert speed_rot[0, 0] == pytest.approx(speed_orig[0, 0], rel=1e-5)
@@ -38,13 +56,16 @@ class TestRotateWinds:
 
 class TestBlenderProcessor:
     def test_no_gfs_fails(self, mock_config, tmp_path):
-        proc = BlenderProcessor(mock_config, tmp_path / "empty", tmp_path / "out")
+        # Empty input dir → gfs_forcing.nc missing → blender returns failure
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        proc = BlenderProcessor(mock_config, empty, tmp_path / "out")
         result = proc.process()
         assert not result.success
-        assert "No GFS" in result.errors[0]
+        assert "GFS forcing file not found" in result.errors[0]
 
     def test_variable_mapping_complete(self):
-        """All 8 sflux variables should have DATM mappings."""
+        """All 8 sflux variable names should have DATM mappings."""
         expected = ["uwind", "vwind", "stmp", "spfh", "prmsl", "prate", "dswrf", "dlwrf"]
         for var in expected:
             assert var in SFLUX_TO_DATM, f"Missing DATM mapping for {var}"

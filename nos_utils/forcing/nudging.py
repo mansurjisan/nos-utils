@@ -1013,7 +1013,10 @@ class NudgingProcessor(ForcingProcessor):
             log.info(f"Filling {n_nan} NaN values in {label}_nu with {fill_val}")
             data = np.where(nan_mask, fill_val, data)
 
-        nc = Dataset(str(output_path), "w", format="NETCDF4")
+        # NETCDF4_CLASSIC (not NETCDF4): SCHISM's NUOPC cap opens these via
+        # collective parallel-NetCDF at 2794-rank scale; HDF5-flavored files
+        # segfault during MPI-IO collective open. Production v3.9 writes classic.
+        nc = Dataset(str(output_path), "w", format="NETCDF4_CLASSIC")
 
         nc.createDimension("time", nt)
         nc.createDimension("node", n_nodes)

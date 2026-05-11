@@ -26,6 +26,7 @@ from ..io.grib_extract import GRIBExtractor, get_extractor
 from .base import ForcingProcessor, ForcingResult
 from .sflux_writer import SfluxWriter
 from .datm_writer import DATMWriter
+from .forcing_writer import ForcingNcWriter
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ class GFSProcessor(ForcingProcessor):
         extractor: Optional[GRIBExtractor] = None,
         phase: str = "nowcast",
         time_hotstart: Optional[datetime] = None,
+        direct_datm: bool = False,
     ):
         """
         Args:
@@ -96,6 +98,10 @@ class GFSProcessor(ForcingProcessor):
             extractor: GRIB2 extractor (auto-detected if None)
             phase: "nowcast" or "forecast" — determines time window
             time_hotstart: Hotstart datetime (nowcast starts from here)
+            direct_datm: Write datm_forcing.nc directly via DATMWriter
+                instead of sflux files. Standalone-DATM only — for
+                UFS-Coastal coupled runs leave False so the orchestrator
+                can blend GFS+HRRR sflux into a wide DATM grid.
         """
         super().__init__(config, input_path, output_path)
         self.variables = variables or (config.variables if config.variables else self.DEFAULT_VARIABLES)
@@ -103,6 +109,7 @@ class GFSProcessor(ForcingProcessor):
         self._extractor = extractor
         self.phase = phase
         self.time_hotstart = time_hotstart
+        self.direct_datm = direct_datm
         # Set resolution-appropriate file size threshold
         self.MIN_FILE_SIZE = self.MIN_FILE_SIZE_BY_RES.get(resolution, 40_000_000)
 
@@ -132,7 +139,23 @@ class GFSProcessor(ForcingProcessor):
                 t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours) - timedelta(hours=3)
             t_end = cycle_dt + timedelta(hours=3)  # buffer past nowcast end
         elif self.phase == "forecast":
-            t_start = cycle_dt - timedelta(hours=3)  # buffer before forecast start
+            # For UFS-coupled runs (nws=4), the SAME datm_forcing.nc is read
+            # by both the nowcast and forecast SCHISM executions, because
+            # the forecast prep overwrites the nowcast prep's archived file.
+            # Extend t_start back to cover the nowcast window so CDEPS DATM
+            # has data at the nowcast SCHISM start (cycle - nowcast_hours).
+            # Otherwise CDEPS aborts with
+            #   (shr_stream_findBounds) ERROR: rDateIn lt rDatelvd limit true
+            #
+            # No additional 3h buffer here: _compute_search_cycles only walks
+            # back to prev cycle (cycle - 6h), so requesting earlier data is
+            # an empty promise. The CDEPS check is strict `<`, so first record
+            # at exactly cycle-nowcast_hours equals SCHISM start time and the
+            # check passes (rDateIn < rDatelvd is false on equality).
+            if self.config.nws == 4:
+                t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            else:
+                t_start = cycle_dt - timedelta(hours=3)
             t_end = cycle_dt + timedelta(hours=self.config.forecast_hours) + timedelta(hours=3)
         else:
             # Full
@@ -181,12 +204,17 @@ class GFSProcessor(ForcingProcessor):
         Pipeline: discover files -> extract GRIB2 -> filter to time window -> write sflux or DATM
         """
         log.info(f"GFS processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z "
-                 f"phase={self.phase} domain={self.config.domain} res={self.resolution}")
+                 f"phase={self.phase} domain={self.config.forcing_domain} res={self.resolution}")
 
         self.create_output_dir()
 
         # Step 1: Find input files
         gfs_files = self.find_input_files()
+        from ._log import log_input_files
+        log_input_files(
+            "GFS", gfs_files or [],
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc} phase={self.phase}",
+        )
         if not gfs_files:
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
@@ -194,8 +222,12 @@ class GFSProcessor(ForcingProcessor):
             )
         log.info(f"Found {len(gfs_files)} GFS files")
 
-        # Write met_files_used log for traceability
-        self.write_files_used(gfs_files, self.output_path.parent, "GFS", self.phase)
+        # Write met_files_used log for traceability inside the per-job DATA dir.
+        # Earlier code used `self.output_path.parent`, which dropped this file
+        # one directory above the working dir (e.g. /work/secofs_ufs/ instead
+        # of /work/secofs_ufs/secofs_ufs_prep_00_dev.<jobid>/), polluting the
+        # parent dir with stale logs from every cycle.
+        self.write_files_used(gfs_files, self.output_path, "GFS", self.phase)
 
         # Step 2: Extract variables from GRIB2
         extracted = self._extract_all(gfs_files)
@@ -212,8 +244,16 @@ class GFSProcessor(ForcingProcessor):
         output_files = []
         warnings = []
 
-        if self.config.nws == 4:
-            # DATM output
+        # Output mode:
+        #   direct_datm=True  → write datm_forcing.nc directly via DATMWriter.
+        #     Produces narrow-domain DATM (no HRRR blend). Used by tests
+        #     and standalone-DATM callers.
+        #   nws=4 (UFS-Coastal) and not direct_datm → write a single
+        #     gfs_forcing.nc via ForcingNcWriter. The orchestrator's
+        #     BlenderProcessor merges this with hrrr_forcing.nc into a
+        #     wide DATM grid (matches the shell pipeline architecture).
+        #   nws=2 (standalone SCHISM) → write 3 sflux files via SfluxWriter.
+        if self.direct_datm:
             writer = DATMWriter()
             datm_path = self.output_path / "datm_forcing.nc"
             writer.write(
@@ -221,8 +261,16 @@ class GFSProcessor(ForcingProcessor):
                 extracted["lons"], extracted["lats"], datm_path,
             )
             output_files.append(datm_path)
+        elif self.config.nws == 4:
+            writer = ForcingNcWriter()
+            forcing_path = self.output_path / "gfs_forcing.nc"
+            writer.write_1d(
+                extracted["data"], extracted["times"],
+                extracted["lons"], extracted["lats"], forcing_path,
+                source_name="GFS",
+            )
+            output_files.append(forcing_path)
         else:
-            # sflux output (default)
             writer = SfluxWriter(self.output_path, source_index=1)
             base_date = self._compute_base_date()
             files = writer.write_all(
@@ -283,19 +331,25 @@ class GFSProcessor(ForcingProcessor):
         cycles = self._compute_search_cycles()
         gfs_files = []
 
-        # Compute max forecast hour needed from a single cycle
-        # For forecast: cycle may be 6h before forecast end, so need longer leads
+        # Compute max forecast hour needed from a single cycle.
+        # forecast_end includes the +3h buffer so files reaching past the
+        # nominal forecast endpoint are included (CDEPS interpolation needs
+        # forcing values slightly past the model stop time).
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
         cycle_dt = base_date + timedelta(hours=self.config.cyc)
-        forecast_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
+        forecast_end = (
+            cycle_dt
+            + timedelta(hours=self.config.forecast_hours)
+            + timedelta(hours=3)  # buffer
+        )
 
         for date, cyc in cycles:
             date_str = date.strftime("%Y%m%d")
             cycle_start = date + timedelta(hours=cyc)
 
-            # Max lead = hours from this cycle to the end of the forecast window
+            # Max lead = hours from this cycle to the buffered forecast end
             max_fhr = int((forecast_end - cycle_start).total_seconds() / 3600)
-            max_fhr = max(max_fhr, self.config.forecast_hours)
+            max_fhr = max(max_fhr, self.config.forecast_hours + 3)
 
             # Try standard path structures
             for path_fmt in [
@@ -392,9 +446,16 @@ class GFSProcessor(ForcingProcessor):
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
         cycle_dt = base_date + timedelta(hours=self.config.cyc)
 
-        if self.phase == "nowcast":
-            # Nowcast: multi-cycle, walk backward to cover nowcast window
-            nowcast_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        if self.phase == "nowcast" or self.phase == "full":
+            # Nowcast (or full nowcast+forecast): multi-cycle, walk backward
+            # to cover nowcast window with +3h buffer (matches CDEPS DATM
+            # interpolation requirements; missing buffer hours show up as
+            # 6 missing timesteps in datm_forcing.nc — 3 at each end).
+            nowcast_start = (
+                cycle_dt
+                - timedelta(hours=self.config.nowcast_hours)
+                - timedelta(hours=3)  # buffer
+            )
             cycles = []
             t = cycle_dt
             while t >= nowcast_start - timedelta(hours=6):
@@ -436,7 +497,9 @@ class GFSProcessor(ForcingProcessor):
         for var in self.variables:
             result["data"][var] = []
 
-        domain = self.config.domain
+        # Use forcing_domain so nws=4 (UFS-Coastal) extracts over the
+        # wide DATM grid; nws=2 still extracts over model domain.
+        domain = self.config.forcing_domain
 
         # Get grid coordinates from first file
         result["lons"], result["lats"] = self.extractor.get_grid(gfs_files[0], domain)

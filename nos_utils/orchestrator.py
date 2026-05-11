@@ -97,10 +97,15 @@ class PrepOrchestrator:
     6. Tidal — tidal constituents (bctides.in)
     7. param.nml — model configuration with runtime parameters
     8. (UFS only) DATM blending + ESMF mesh generation
+    9. (UFS only) UFS-Coastal config files (model_configure, datm_in,
+       datm.streams, ufs.configure, fd_ufs.yaml, noahmptable.tbl)
     """
 
     # Steps that can be handled by Python vs legacy shell
-    PYTHON_STEPS = {"hotstart", "gfs", "hrrr", "tidal", "param_nml", "datm"}
+    PYTHON_STEPS = {
+        "hotstart", "gfs", "hrrr", "tidal", "param_nml",
+        "datm", "ufs_config",
+    }
     LEGACY_STEPS = {"nwm", "rtofs", "nudging"}  # Need Fortran/shell for production
 
     def __init__(
@@ -168,15 +173,32 @@ class PrepOrchestrator:
                                      output_dir, run_name=self.run_name)
             time_hotstart = proc._parse_file_datetime(hs_info.filepath)
 
-        # Fallback: read time_hotstart from environment (set by shell prep)
+        # No hotstart file (cold-start or coupled-mode): derive time_hotstart
+        # from cycle - nowcast_hours. This is REQUIRED so the nowcast
+        # launcher's sim_start aligns with the OBC/forcing time axes, which
+        # rtofs.py anchors to cycle - nowcast_hours (see commit 576ec5b).
+        #
+        # We deliberately ignore the environment variable here: upstream
+        # J-jobs may set $time_hotstart to a different convention (e.g.
+        # 24h-back instead of 6h-back), which creates an 18h misalignment
+        # between param.nml's start_{year,month,day,hour} and OBC[t=0].
+        # That misalignment manifests as partition_hgrid heap corruption
+        # in SCHISM init.
         if time_hotstart is None:
+            from datetime import timedelta as _td
+            cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                       _td(hours=self.config.cyc)
+            time_hotstart = cycle_dt - _td(hours=self.config.nowcast_hours)
             env_ths = os.environ.get("time_hotstart", "")
-            if env_ths and len(env_ths) >= 10:
-                try:
-                    time_hotstart = datetime.strptime(env_ths[:10], "%Y%m%d%H")
-                    log.info(f"Using time_hotstart from environment: {time_hotstart}")
-                except ValueError:
-                    pass
+            if env_ths and env_ths[:10] != time_hotstart.strftime("%Y%m%d%H"):
+                log.info(
+                    f"Overriding env time_hotstart={env_ths[:10]} with "
+                    f"YAML-derived {time_hotstart.strftime('%Y%m%d%H')} "
+                    f"(cycle - nowcast_hours) to align with OBC time axis"
+                )
+            else:
+                log.info(f"Derived time_hotstart from cycle - nowcast_hours: "
+                         f"{time_hotstart}")
 
         # ---- Phase 1: Lightweight steps in parallel ----
         # GFS, HRRR, NWM, Tidal are fast (subprocess/IO-bound, ~90s max).
@@ -219,11 +241,34 @@ class PrepOrchestrator:
 
         # ---- Phase 2: Heavy and dependent steps (sequential) ----
 
+        # St. Lawrence River (STOFS only): needs GFS rad.nc from Phase 1.
+        if self.config.st_lawrence_enabled and "law" in self.paths:
+            results.append(self._run_st_lawrence(output_dir))
+        elif self.config.st_lawrence_enabled:
+            log.info(
+                "st_lawrence_enabled but 'law' path not provided — skipping "
+                "St. Lawrence River forcing"
+            )
+
         # RTOFS OBC: heavy NetCDF I/O + Delaunay interpolation
         if "rtofs" in self.paths and (self.is_stofs or not self.skip_legacy):
             results.append(self._run_rtofs(output_dir, phase, time_hotstart))
+
+            # After RTOFS runs, QC the OBC file time dimensions. If any file
+            # has fewer than obc_min_timesteps records, fall back to the
+            # previous cycle's archive. This guards against partial RTOFS
+            # coverage at cycle boundaries.
+            if self.config.obc_min_timesteps > 0:
+                qc_result = self._qc_obc_dimensions(output_dir)
+                if qc_result is not None:
+                    results.append(qc_result)
         elif self.skip_legacy:
             log.info("Skipping RTOFS OBC (handled by legacy shell)")
+
+        # Dynamic SSH adjust: NOAA tide-gauge bias correction on elev2D.th.nc.
+        # Must run after RTOFS has produced the non-adjusted file.
+        if self.config.dynamic_adjust_enabled:
+            results.append(self._run_dynamic_adjust(output_dir))
 
         # Nudging needs RTOFS to have completed
         if self.config.nudging_enabled and "rtofs" in self.paths:
@@ -236,6 +281,7 @@ class PrepOrchestrator:
         # UFS-specific (DATM) needs GFS + HRRR sflux
         if self.config.nws == 4:
             results.append(self._run_datm(output_dir))
+            results.append(self._run_ufs_config(output_dir))
 
         # Step 9: Write time marker files (matches ORG behavior)
         self._write_time_markers(output_dir, phase, time_hotstart)
@@ -263,7 +309,17 @@ class PrepOrchestrator:
         return prep_result
 
     def _run_hotstart(self, output_dir: Path) -> ForcingResult:
-        """Step 1: Find and validate hotstart file."""
+        """Step 1: Find and validate hotstart file.
+
+        Side effect: when a ``comout`` path is configured, also stages
+        a NETCDF4_CLASSIC copy of the previous-cycle restart at the
+        operational ``$COMOUT/{prefix}.t{cyc}z.{pdy}.init.nowcast.nc``
+        location. SECOFS production cycles every 6h, so the natural pick
+        is the cycle 6h prior; the existing find_hotstart logic handles
+        further fallback when the 6h-prior cycle is missing. Removes the
+        manual ``nccopy -k 'netCDF-4 classic model'`` operators have
+        been running each cycle.
+        """
         from .forcing.hotstart import HotstartProcessor
 
         restart_dir = self.paths.get("restart", self.paths.get("comout", output_dir))
@@ -271,16 +327,36 @@ class PrepOrchestrator:
             self.config, restart_dir, output_dir,
             run_name=self.run_name,
         )
-        return proc.process()
+        result = proc.process()
+
+        comout = self.paths.get("comout")
+        if comout is not None:
+            init_filename = (
+                f"{self.run_name}.t{self.config.cyc:02d}z."
+                f"{self.config.pdy}.init.nowcast.nc"
+            )
+            staged = proc.stage_init_to_comout(Path(comout), init_filename)
+            if staged is not None:
+                # Surface the staged path on the result so downstream
+                # steps (and the J-job archive logic) can pick it up.
+                result.metadata["comout_init_path"] = str(staged)
+                result.output_files.append(staged)
+
+        return result
 
     def _run_gfs(self, output_dir: Path, phase: str,
                  time_hotstart=None) -> ForcingResult:
-        """Step 2: GFS atmospheric forcing."""
+        """Step 2: GFS atmospheric forcing.
+
+        - nws=2 (standalone SCHISM): writes 3 sflux files to ``output_dir/sflux/``.
+        - nws=4 (UFS-Coastal): writes a single ``gfs_forcing.nc`` to
+          ``output_dir/`` for the BlenderProcessor.
+        """
         from .forcing.gfs import GFSProcessor
 
-        sflux_dir = output_dir / "sflux" if self.config.nws == 2 else output_dir
+        proc_dir = output_dir if self.config.nws == 4 else (output_dir / "sflux")
         proc = GFSProcessor(
-            self.config, self.paths["gfs"], sflux_dir,
+            self.config, self.paths["gfs"], proc_dir,
             resolution=self.config.gfs_resolution,
             phase=phase, time_hotstart=time_hotstart,
         )
@@ -288,12 +364,17 @@ class PrepOrchestrator:
 
     def _run_hrrr(self, output_dir: Path, phase: str,
                   time_hotstart=None) -> ForcingResult:
-        """Step 3: HRRR secondary atmospheric (optional)."""
+        """Step 3: HRRR secondary atmospheric (optional).
+
+        - nws=2: writes 3 sflux files to ``output_dir/sflux/``.
+        - nws=4: writes a single ``hrrr_forcing.nc`` to ``output_dir/``
+          for the BlenderProcessor.
+        """
         from .forcing.hrrr import HRRRProcessor
 
-        sflux_dir = output_dir / "sflux" if self.config.nws == 2 else output_dir
+        proc_dir = output_dir if self.config.nws == 4 else (output_dir / "sflux")
         proc = HRRRProcessor(
-            self.config, self.paths["hrrr"], sflux_dir,
+            self.config, self.paths["hrrr"], proc_dir,
             phase=phase, time_hotstart=time_hotstart,
         )
         return proc.process()
@@ -306,6 +387,43 @@ class PrepOrchestrator:
         proc = NWMProcessor(
             self.config, self.paths["nwm"], output_dir,
             phase=phase, time_hotstart=time_hotstart,
+        )
+        return proc.process()
+
+    def _run_st_lawrence(self, output_dir: Path) -> ForcingResult:
+        """St. Lawrence River: Canadian hydrometric CSV + GFS-rad temperature.
+
+        Reads the Environment Canada CSV from ``$COMINlaw/<pdy>/can_streamgauge/``
+        and the matching GFS sflux radiation file (for air-temp regression).
+        Falls back to the previous day's CSV and then to the previous cycle's
+        archive directory (``prev_rerun`` path).
+        """
+        from .forcing.st_lawrence import StLawrenceProcessor
+
+        sflux_dir = output_dir / "sflux"
+        # Look for the operational rad.nc (``<prefix>.tHHz.gfs.rad.nc``) or
+        # the standard sflux naming (``sflux_rad_1.1.nc``).
+        sflux_rad = None
+        archive_prefix = f"{self.run_name}.t{self.config.cyc:02d}z"
+        rad_candidates = [
+            sflux_dir / f"{archive_prefix}.gfs.rad.nc",
+            sflux_dir / "sflux_rad_1.1.nc",
+            sflux_dir / "sflux_rad_1.0001.nc",
+        ]
+        for p in rad_candidates:
+            if p.exists():
+                sflux_rad = p
+                break
+
+        prev_rerun = self.paths.get("prev_rerun")
+        proc = StLawrenceProcessor(
+            self.config,
+            self.paths["law"],
+            output_dir,
+            csv_name=self.config.st_lawrence_csv_name,
+            sflux_rad_file=sflux_rad,
+            prev_rerun_dir=prev_rerun,
+            archive_prefix=archive_prefix,
         )
         return proc.process()
 
@@ -353,6 +471,206 @@ class PrepOrchestrator:
             vgrid_file=vgrid,
             phase=phase,
             time_hotstart=time_hotstart,
+        )
+        return proc.process()
+
+    # Mapping from the active OBC filename (what SCHISM reads) to the
+    # standard archive basename under $COMOUT_PREV/rerun/ (see
+    # stofs_3d_atl_create_obc_3d_th_non_adjust.sh:641-642). The archive
+    # file is stored as `<run>.<cycle>.<archive_base>.nc`.
+    _OBC_ARCHIVE_NAMES: Dict[str, str] = {
+        "elev2D.th.nc": "elev2dth_non_adj",
+        "TEM_3D.th.nc": "tem3dth",
+        "SAL_3D.th.nc": "sal3dth",
+        "uv3D.th.nc": "uv3dth",
+    }
+
+    def _qc_obc_dimensions(self, output_dir: Path) -> Optional[ForcingResult]:
+        """Validate OBC time dims and fall back to COMOUT_PREV on short files.
+
+        Returns None (no QC event) when every file satisfies the minimum,
+        otherwise a ForcingResult describing the fallback outcome.
+
+        The operational convention (see stofs_3d_atl_create_obc_3d_th_non_adjust.sh
+        lines 650-710) is to use the file directly when its time dim is
+        >= N_dim_cr_max (21) and otherwise copy the previous cycle's
+        archive file, which is stored under a DIFFERENT name
+        (``<run>.<cycle>.elev2dth_non_adj.nc`` for ``elev2D.th.nc``, etc.).
+        """
+        import shutil
+
+        try:
+            from netCDF4 import Dataset
+        except ImportError:
+            log.info("netCDF4 unavailable; skipping OBC dimension QC")
+            return None
+
+        min_t = self.config.obc_min_timesteps
+        obc_files = list(self._OBC_ARCHIVE_NAMES.keys())
+        short_files: List[str] = []
+        file_dims: Dict[str, int] = {}
+        for name in obc_files:
+            p = output_dir / name
+            if not p.exists():
+                continue
+            try:
+                with Dataset(str(p)) as ds:
+                    if "time" in ds.dimensions:
+                        n_t = len(ds.dimensions["time"])
+                    elif "time" in ds.variables:
+                        n_t = int(ds.variables["time"].shape[0])
+                    else:
+                        continue
+                file_dims[name] = n_t
+                if n_t < min_t:
+                    short_files.append(name)
+            except Exception as exc:
+                log.warning(f"OBC QC: failed to read {p}: {exc}")
+                continue
+
+        if not short_files:
+            return None
+
+        prev_rerun = self.paths.get("prev_rerun")
+        warnings: List[str] = [
+            f"OBC QC: {name} has {file_dims[name]} records < "
+            f"{min_t} (operational N_dim_cr_max)" for name in short_files
+        ]
+        errors: List[str] = []
+        copied: List[Path] = []
+
+        if not prev_rerun:
+            errors.append(
+                "obc_min_timesteps not satisfied and 'prev_rerun' path "
+                "not provided — OBC files may be invalid"
+            )
+            return ForcingResult(
+                success=False, source="OBC_QC",
+                errors=errors, warnings=warnings,
+                metadata={"short_files": short_files, "file_dims": file_dims},
+            )
+
+        prev = Path(prev_rerun)
+        cycle_tag = f"t{self.config.cyc:02d}z"
+        for name in short_files:
+            archive_base = self._OBC_ARCHIVE_NAMES.get(name)
+            # Try the operational archive name first, then common alternatives.
+            candidates: List[Path] = []
+            if archive_base is not None:
+                candidates.append(
+                    prev / f"{self.run_name}.{cycle_tag}.{archive_base}.nc"
+                )
+            candidates.extend([
+                prev / f"{self.run_name}.{cycle_tag}.{name}",
+                prev / name,
+            ])
+            for src in candidates:
+                if src.exists():
+                    dst = output_dir / name
+                    try:
+                        shutil.copy2(src, dst)
+                        copied.append(dst)
+                        log.info(
+                            f"OBC QC: replaced short {name} with {src}"
+                        )
+                    except OSError as exc:
+                        errors.append(
+                            f"OBC QC: failed to copy {src} -> {dst}: {exc}"
+                        )
+                    break
+            else:
+                errors.append(
+                    f"OBC QC: no archive fallback found for {name} in {prev} "
+                    f"(tried {len(candidates)} candidate names)"
+                )
+
+        return ForcingResult(
+            success=len(errors) == 0,
+            source="OBC_QC",
+            output_files=copied,
+            errors=errors,
+            warnings=warnings,
+            metadata={
+                "short_files": short_files,
+                "file_dims": file_dims,
+                "n_fallback_copied": len(copied),
+            },
+        )
+
+    def _run_dynamic_adjust(self, output_dir: Path) -> ForcingResult:
+        """Apply NOAA tide-gauge bias correction to elev2D.th.nc.
+
+        Resolves the several supporting paths required by the operational
+        script (NOAA obs, previous cycle staout_1, param.nml, avg bias,
+        FIX .bp files) from ``self.paths``:
+          * ``noaa_obs``  -> ``$DCOMROOT/<pdy>/coops_waterlvlobs`` directory
+          * ``prev_rerun`` -> ``$COMOUT_PREV/rerun`` directory
+          * ``fix``        -> directory containing station.bp + diff.bp
+        Any missing path causes the processor to degrade to a zero-bias
+        correction (see DynamicAdjustProcessor for details).
+        """
+        from .forcing.dynamic_adjust import DynamicAdjustProcessor
+
+        fix_dir = self.paths.get("fix")
+        obs_dir = self.paths.get("noaa_obs")
+        prev_rerun = self.paths.get("prev_rerun")
+
+        # Resolve FIX inputs — search for the STOFS-3D-ATL naming first
+        # then any matching pattern.
+        station_bp = None
+        diff_bp = None
+        if fix_dir:
+            fix_path = Path(fix_dir)
+            for name in (
+                "stofs_3d_atl_obc_adjust_station.bp",
+                f"{self.run_name}_station.in",
+                "station.bp",
+            ):
+                cand = fix_path / name
+                if cand.exists():
+                    station_bp = cand
+                    break
+            for name in (
+                "stofs_3d_atl_obc_adjust_msl_geoid.bp",
+                "OBC_stofs_3d_atl_obc_adjust_msl_geoid.bp",
+                "diff.bp",
+            ):
+                cand = fix_path / name
+                if cand.exists():
+                    diff_bp = cand
+                    break
+
+        prev_staout_1 = None
+        prev_param_nml = None
+        prev_avg_bias = None
+        if prev_rerun:
+            prev = Path(prev_rerun)
+            if (prev / "staout_1").exists():
+                prev_staout_1 = prev / "staout_1"
+            cycle_tag = f"t{self.config.cyc:02d}z"
+            for pnl in (prev / f"{self.run_name}.{cycle_tag}.param.nml",
+                        prev / "param.nml"):
+                if pnl.exists():
+                    prev_param_nml = pnl
+                    break
+            for ab in (prev / f"{self.run_name}.{cycle_tag}.avg_bias",
+                       prev / "average_bias_today"):
+                if ab.exists():
+                    prev_avg_bias = ab
+                    break
+
+        proc = DynamicAdjustProcessor(
+            self.config,
+            input_path=output_dir,
+            output_path=output_dir,
+            obs_dir=obs_dir,
+            prev_staout_1=prev_staout_1,
+            prev_param_nml=prev_param_nml,
+            station_bp=station_bp,
+            diff_bp=diff_bp,
+            prev_avg_bias_file=prev_avg_bias,
+            elev2d_th_nc=output_dir / "elev2D.th.nc",
+            bias_window_days=self.config.dynamic_adjust_window_days,
         )
         return proc.process()
 
@@ -435,28 +753,45 @@ class PrepOrchestrator:
         return proc.process()
 
     def _run_datm(self, output_dir: Path) -> ForcingResult:
-        """Step 8: DATM blending + ESMF mesh for UFS-Coastal."""
+        """Step 8: DATM blending + ESMF mesh for UFS-Coastal.
+
+        Reads ``gfs_forcing.nc`` and (optionally) ``hrrr_forcing.nc`` from
+        ``output_dir/`` (written by GFSProcessor/HRRRProcessor in nws=4
+        mode via ForcingNcWriter), blends them onto the wide ATLANTIC
+        DATM grid, and emits ``datm_forcing.nc`` + ``datm_esmf_mesh.nc``.
+
+        Then stages both files into ``output_dir/INPUT/`` to match the
+        legacy ``nos_ofs_create_datm_forcing_blended.sh`` layout — DATM
+        at runtime reads them from ``$DATA/INPUT/`` per the
+        ``model_meshfile = "INPUT/datm_esmf_mesh.nc"`` reference in
+        ``datm_in.template``.
+        """
         output_files = []
         warnings = []
+        errors = []
+        blend_ok = False
 
-        # 8a: Blend GFS+HRRR sflux into datm_forcing.nc (if sflux dir has both sources)
-        sflux_dir = output_dir / "sflux"
-        if sflux_dir.exists():
-            gfs_sflux = list(sflux_dir.glob("sflux_air_1.*.nc"))
-            hrrr_sflux = list(sflux_dir.glob("sflux_air_2.*.nc"))
-
-            if gfs_sflux:
-                from .forcing.blender import BlenderProcessor
-                blender = BlenderProcessor(self.config, sflux_dir, output_dir)
-                blend_result = blender.process()
-                if blend_result.success:
-                    output_files.extend(blend_result.output_files)
-                    log.info(f"DATM blending: {len(blend_result.output_files)} files")
-                else:
-                    warnings.extend(blend_result.errors)
+        # 8a: Blend GFS + HRRR forcing.nc files into datm_forcing.nc.
+        gfs_forcing = output_dir / "gfs_forcing.nc"
+        if gfs_forcing.exists():
+            from .forcing.blender import BlenderProcessor
+            blender = BlenderProcessor(
+                self.config, output_dir, output_dir,
+                target_dx=self.config.datm_dx,
+            )
+            blend_result = blender.process()
+            if blend_result.success:
+                output_files.extend(blend_result.output_files)
+                log.info(f"DATM blending: {len(blend_result.output_files)} files")
+                blend_ok = True
+            else:
+                errors.extend(blend_result.errors)
+        else:
+            errors.append(f"gfs_forcing.nc not found at {gfs_forcing} — blender skipped")
 
         # 8b: Generate ESMF mesh from the datm_forcing.nc
         datm_file = output_dir / "datm_forcing.nc"
+        mesh_ok = False
         if datm_file.exists():
             from .forcing.esmf_mesh import ESMFMeshProcessor
             mesh_proc = ESMFMeshProcessor(
@@ -466,16 +801,52 @@ class PrepOrchestrator:
             mesh_result = mesh_proc.process()
             if mesh_result.success:
                 output_files.extend(mesh_result.output_files)
+                mesh_ok = True
             else:
-                warnings.extend(mesh_result.errors)
+                errors.extend(mesh_result.errors)
         else:
             warnings.append("datm_forcing.nc not found — ESMF mesh not generated")
 
+        # 8c: Stage datm_forcing.nc + datm_esmf_mesh.nc into $DATA/INPUT/
+        # to match the legacy nos_ofs_create_datm_forcing_blended.sh layout.
+        # CDEPS DATM at runtime reads them from there per datm_in.template.
+        if blend_ok and mesh_ok:
+            import shutil
+            input_dir = output_dir / "INPUT"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            for nc_name in ("datm_forcing.nc", "datm_esmf_mesh.nc"):
+                src = output_dir / nc_name
+                if src.exists():
+                    shutil.copy2(src, input_dir / nc_name)
+                    log.info(f"  Staged INPUT/{nc_name}")
+
+        # _run_datm is only called when nws=4 (orchestrator gates the call),
+        # so we expect both blend and mesh to succeed.
+        success = blend_ok and mesh_ok
         return ForcingResult(
-            success=True, source="DATM",
+            success=success, source="DATM",
             output_files=output_files,
             warnings=warnings,
+            errors=errors,
         )
+
+    def _run_ufs_config(self, output_dir: Path) -> ForcingResult:
+        """Step 9: UFS-Coastal config files for nws=4 runs.
+
+        Mirrors ``ush/nosofs/nos_ofs_gen_ufs_config.sh`` to emit
+        model_configure, datm_in, datm.streams, ufs.configure (with PET
+        bounds patched), fd_ufs.yaml, and noahmptable.tbl. NX/NY come
+        from the just-written datm_forcing.nc when it is available.
+        """
+        from .forcing.ufs_config import UFSConfigProcessor
+
+        fix_dir = self.paths.get("ufs_fix") or self.paths.get("fix")
+        datm_path = output_dir / "datm_forcing.nc"
+        proc = UFSConfigProcessor(
+            self.config, fix_dir, output_dir,
+            datm_forcing_path=datm_path if datm_path.exists() else None,
+        )
+        return proc.process()
 
     def archive_to_comout(self, result: PrepResult, comout: Path) -> List[Path]:
         """
@@ -578,6 +949,28 @@ class PrepOrchestrator:
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 log.warning(f"  Failed to tar OBC (combined): {e}")
 
+        # SECOFS-UFS boundary-flux river forcing — schism_flux/temp/salt.th
+        # tarred together as ${prefix}.${cycle}.${pdy}.river.th.tar. Matches
+        # legacy `nos_ofs_create_forcing_river.sh` output so
+        # `nos_ofs_model_run.sh` nowcast staging extracts and renames
+        # schism_flux.th -> flux.th etc. with no shell change.
+        river_th_files = ["schism_flux.th", "schism_temp.th", "schism_salt.th"]
+        existing_river_th = [work_dir / f for f in river_th_files
+                             if (work_dir / f).exists()]
+        if existing_river_th:
+            river_tar_name = f"{prefix}.{cycle}.{pdy}.river.th.tar"
+            river_tar_path = comout / river_tar_name
+            try:
+                file_list = [f.name for f in existing_river_th]
+                subprocess.run(
+                    ["tar", "-cf", str(river_tar_path), "-C", str(work_dir)] + file_list,
+                    check=True, capture_output=True,
+                )
+                archived.append(river_tar_path)
+                log.info(f"  Archived river.th -> {river_tar_name}")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                log.warning(f"  Failed to tar river.th: {e}")
+
         # Tar NWM source/sink files (COMF convention)
         # COMF produces: nwm.source.sink.now.tar / nwm.source.sink.fore.tar
         nwm_files = ["vsource.th", "msource.th", "source_sink.in", "vsink.th"]
@@ -597,7 +990,10 @@ class PrepOrchestrator:
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 log.warning(f"  Failed to tar NWM: {e}")
 
-        # Copy individual files
+        # Copy individual files. UFS-Coastal (nws=4) entries match the
+        # legacy archive layout in scripts/nosofs/exnos_ofs_prep.sh so
+        # downstream consumers (model_configure et al. in COMOUT) work
+        # whether prep ran via legacy shell or Python.
         copy_map = {
             "param.nml": f"{prefix}.{cycle}.{pdy}.{phase}.in",
             "bctides.in": f"{prefix}.{cycle}.{pdy}.bctides.in.{phase}",
@@ -605,9 +1001,16 @@ class PrepOrchestrator:
             "vsource.th": f"{prefix}.{cycle}.{pdy}.river.vsource.th",
             "msource.th": f"{prefix}.{cycle}.{pdy}.river.msource.th",
             "sflux_inputs.txt": "sflux_inputs.txt",
-            "datm_forcing.nc": f"{prefix}.{cycle}.datm_forcing.nc",
-            "esmf_mesh.nc": f"{prefix}.{cycle}.esmf_mesh.nc",
             "partition.prop": "partition.prop",
+            # UFS-Coastal config files (nws=4). Names match what the
+            # legacy exnos_ofs_prep.sh archives (lines 361-363):
+            # `cp $DATA/<f> $COMOUT/${RUN}.${cycle}.<f>`.
+            "model_configure": f"{prefix}.{cycle}.model_configure",
+            "datm_in":         f"{prefix}.{cycle}.datm_in",
+            "datm.streams":    f"{prefix}.{cycle}.datm.streams",
+            "ufs.configure":   f"{prefix}.{cycle}.ufs.configure",
+            "fd_ufs.yaml":     f"{prefix}.{cycle}.fd_ufs.yaml",
+            "noahmptable.tbl": f"{prefix}.{cycle}.noahmptable.tbl",
         }
 
         for src_name, dst_name in copy_map.items():
@@ -620,6 +1023,21 @@ class PrepOrchestrator:
                 shutil.copy2(src, dst)
                 archived.append(dst)
                 log.info(f"  Copied {src_name} -> {dst_name}")
+
+        # UFS-Coastal DATM artifacts: match legacy exnos_ofs_prep.sh:355-360.
+        # `mkdir -p $COMOUT/${RUN}.${cycle}.datm_input` and
+        # `cp -p ${DATA}/${DATM_DIR}/*.nc $COMOUT/${RUN}.${cycle}.datm_input/`.
+        # nos_ofs_model_run.sh:599 reads from this exact subdir at runtime.
+        datm_input_src = work_dir / "INPUT"
+        if datm_input_src.is_dir():
+            datm_input_dst = comout / f"{prefix}.{cycle}.datm_input"
+            datm_input_dst.mkdir(parents=True, exist_ok=True)
+            for nc in sorted(datm_input_src.glob("*.nc")):
+                dst = datm_input_dst / nc.name
+                shutil.copy2(nc, dst)
+                archived.append(dst)
+                log.info(f"  Copied INPUT/{nc.name} -> "
+                         f"{prefix}.{cycle}.datm_input/{nc.name}")
 
         # Time marker files
         for marker in [f"time_hotstart.{cycle}", f"time_nowcastend.{cycle}",
