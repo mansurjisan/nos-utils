@@ -531,6 +531,14 @@ class NWMProcessor(ForcingProcessor):
 
         # Try NWM data first
         nwm_files = self.find_input_files()
+        from ._log import log_input_files
+        n_reaches = len(self.river_config.feature_ids) if self.river_config else 0
+        log_input_files(
+            "NWM", nwm_files,
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc} "
+                 f"stofs_mode={self.is_stofs_mode} reaches={n_reaches} "
+                 f"target_hours={n_target}",
+        )
         if nwm_files:
             log.info(f"Found {len(nwm_files)} NWM files")
             if self.is_stofs_mode:

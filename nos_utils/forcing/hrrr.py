@@ -115,6 +115,11 @@ class HRRRProcessor(ForcingProcessor):
         try:
             # Step 1: Find files
             hrrr_files = self.find_input_files()
+            from ._log import log_input_files
+            log_input_files(
+                "HRRR", hrrr_files or [],
+                note=f"pdy={self.config.pdy} cyc={self.config.cyc} phase={self.phase}",
+            )
             if not hrrr_files:
                 return ForcingResult(
                     success=True, source=self.SOURCE_NAME,

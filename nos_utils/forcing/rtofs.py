@@ -185,6 +185,12 @@ class RTOFSProcessor(ForcingProcessor):
             )
 
         files_2d, files_3d = self.find_input_files_by_type()
+        from ._log import log_input_files
+        log_input_files(
+            "RTOFS", (files_2d or []) + (files_3d or []),
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} mode=SECOFS "
+                 f"n_2d={len(files_2d or [])} n_3d={len(files_3d or [])}",
+        )
         if not files_2d and not files_3d:
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
@@ -230,6 +236,12 @@ class RTOFSProcessor(ForcingProcessor):
     def _process_stofs(self) -> ForcingResult:
         """STOFS mode: ROI subsetting → data prep → Fortran exe (or Python fallback)."""
         files_2d, files_3d = self.find_input_files_by_type()
+        from ._log import log_input_files
+        log_input_files(
+            "RTOFS", (files_2d or []) + (files_3d or []),
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} mode=STOFS "
+                 f"n_2d={len(files_2d or [])} n_3d={len(files_3d or [])}",
+        )
         if not files_2d and not files_3d:
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,

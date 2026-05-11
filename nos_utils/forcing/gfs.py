@@ -210,6 +210,11 @@ class GFSProcessor(ForcingProcessor):
 
         # Step 1: Find input files
         gfs_files = self.find_input_files()
+        from ._log import log_input_files
+        log_input_files(
+            "GFS", gfs_files or [],
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc} phase={self.phase}",
+        )
         if not gfs_files:
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,

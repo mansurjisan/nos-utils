@@ -330,6 +330,13 @@ class HotstartProcessor(ForcingProcessor):
         COMF naming: secofs.t{cyc}z.YYYYMMDD.rst.nowcast.nc
         """
         candidates = self.find_input_files()
+        from ._log import log_input_files
+        log_input_files(
+            "HOTSTART", candidates,
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} "
+                 f"input_path={self.input_path} run={self.run_name} "
+                 f"lookback_days={self.max_lookback_days}",
+        )
 
         # Filter by size
         valid = []
