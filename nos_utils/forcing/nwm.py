@@ -1061,27 +1061,40 @@ class NWMProcessor(ForcingProcessor):
         sorted_hours = sorted(hour_to_flow)
         first_hour = sorted_hours[0]
 
-        # Forward-fill from first available hour to n_target - 1.
+        # SCHISM source-input readers require the time axis to start at 0.
+        # If the earliest available data is at hour first_hour > 0 (e.g.,
+        # the cycle's analysis_assim window didn't include tm00 or the
+        # earliest available product was after start_time), back-fill
+        # hours [0, first_hour) with the flow from hour first_hour. The
+        # forward-fill loop below does this automatically: for h <
+        # first_hour, `h not in hour_to_flow` is True so `last_flow`
+        # stays at its initial value (= hour_to_flow[first_hour]) and
+        # gets appended verbatim.
         out_flows: List[np.ndarray] = []
         out_times: List[float] = []
         last_flow = hour_to_flow[first_hour]
-        for h in range(first_hour, n_target):
+        for h in range(0, n_target):
             if h in hour_to_flow:
                 last_flow = hour_to_flow[h]
             out_flows.append(last_flow)
             out_times.append(float(h))
 
-        n_filled = sum(1 for h in range(first_hour, n_target) if h not in hour_to_flow)
+        n_back_filled = first_hour  # hours [0, first_hour) all use hour_to_flow[first_hour]
+        n_forward_filled = sum(
+            1 for h in range(first_hour, n_target) if h not in hour_to_flow
+        )
+        n_filled = n_back_filled + n_forward_filled
         if n_filled:
             log.info(
                 f"NWM grid normalize: {len(hour_to_flow)} unique-hour rows from "
-                f"{len(times)} files, forward-filled {n_filled} gap hours, "
-                f"output starts at h={first_hour}"
+                f"{len(times)} files, back-filled {n_back_filled} pre-window "
+                f"hours [0, {first_hour}), forward-filled {n_forward_filled} "
+                f"intra-window gap hours, output starts at h=0"
             )
         else:
             log.info(
                 f"NWM grid normalize: {len(hour_to_flow)} unique-hour rows, "
-                f"no gaps, output starts at h={first_hour}"
+                f"no gaps, output starts at h=0"
             )
 
         return np.stack(out_flows, axis=0), out_times

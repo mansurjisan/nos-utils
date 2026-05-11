@@ -163,3 +163,73 @@ class TestNWMProcess:
         lines = (out_dir / "source_sink.in").read_text().strip().split("\n")
         assert lines[0] == "3"  # 3 sources
         assert lines[-1] == "0"  # 0 sinks
+
+
+class TestNormalizeToSimulationGrid:
+    """Regression tests for _normalize_to_simulation_grid.
+
+    SCHISM source readers require the time axis to start at 0. When the
+    NWM cycle's earliest-available product is at hour first_hour > 0
+    (e.g., analysis_assim didn't include tm00), hours [0, first_hour)
+    must be back-filled with the flow from first_hour so the resulting
+    vsource.th doesn't start at 14400s and trigger
+    'ABORT: MISC: vsource.th start time wrong' at SCHISM init.
+    """
+
+    def _proc(self, tmp_path):
+        rc = RiverConfig(
+            feature_ids=[111], node_indices=[10], clim_flows=[50.0],
+        )
+        cfg = ForcingConfig(
+            lon_min=-80, lon_max=-70, lat_min=25, lat_max=35,
+            pdy="20260507", cyc=0, river_default_flow=2.0,
+        )
+        return NWMProcessor(cfg, tmp_path, tmp_path / "out", river_config=rc)
+
+    def test_first_hour_zero_passes_through(self, tmp_path):
+        proc = self._proc(tmp_path)
+        flows = np.array([[1.0], [2.0], [3.0]])
+        times = [0.0, 1.0, 2.0]
+        out_flows, out_times = proc._normalize_to_simulation_grid(flows, times, n_target=3)
+        assert out_times == [0.0, 1.0, 2.0]
+        assert out_flows.shape == (3, 1)
+        assert out_flows[0, 0] == 1.0
+
+    def test_first_hour_gt_zero_backfills_to_zero(self, tmp_path):
+        """The bug-fix regression: when earliest data is at hour 4, the output
+        time axis must still start at 0 (back-fill [0, 4) with flow at h=4).
+        """
+        proc = self._proc(tmp_path)
+        flows = np.array([[10.0], [20.0], [30.0]])
+        times = [4.0, 5.0, 6.0]
+        out_flows, out_times = proc._normalize_to_simulation_grid(flows, times, n_target=8)
+        # Output must start at 0, not at 4
+        assert out_times[0] == 0.0
+        assert out_times == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+        assert out_flows.shape == (8, 1)
+        # Hours [0, 4) back-filled with flow at first available hour (=10.0)
+        for h in range(4):
+            assert out_flows[h, 0] == 10.0, f"hour {h} should back-fill to 10.0"
+        # Hours [4, 7) match input
+        assert out_flows[4, 0] == 10.0
+        assert out_flows[5, 0] == 20.0
+        assert out_flows[6, 0] == 30.0
+        # Hour 7 forward-filled from hour 6
+        assert out_flows[7, 0] == 30.0
+
+    def test_empty_input_returns_empty(self, tmp_path):
+        proc = self._proc(tmp_path)
+        out_flows, out_times = proc._normalize_to_simulation_grid(
+            np.array([]).reshape(0, 1), [], n_target=10
+        )
+        assert out_flows.size == 0
+        assert out_times == []
+
+    def test_all_times_outside_window_returns_empty(self, tmp_path):
+        """All input hours >= n_target → climatology fallback signal."""
+        proc = self._proc(tmp_path)
+        flows = np.array([[1.0], [2.0]])
+        times = [10.0, 11.0]  # both beyond n_target=5
+        out_flows, out_times = proc._normalize_to_simulation_grid(flows, times, n_target=5)
+        assert out_flows.size == 0
+        assert out_times == []
