@@ -77,7 +77,7 @@ class TestTimeHotstartAnchor:
     restart's time origin; when today's own pre-staged init file gets
     selected, the parse returns cycle time and the launcher's sim_start
     misaligns with the OBC time axis by LEN_NOWCAST hours -- surfacing as
-    SCHISM partition_hgrid heap corruption (My-Workplan #230).
+    SCHISM partition_hgrid:534 ParMETIS heap corruption at 2914-rank scale.
     """
 
     def test_time_hotstart_equals_cycle_minus_nowcast_warm(self, mock_config,
