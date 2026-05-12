@@ -164,41 +164,46 @@ class PrepOrchestrator:
         hotstart_result = self._run_hotstart(output_dir)
         results.append(hotstart_result)
 
-        # Extract time_hotstart for param.nml
-        time_hotstart = None
-        hs_info = hotstart_result.metadata.get("hotstart_info")
-        if hs_info and hasattr(hs_info, "filepath"):
-            from .forcing.hotstart import HotstartProcessor
-            proc = HotstartProcessor(self.config, Path(self.paths.get("restart", "")),
-                                     output_dir, run_name=self.run_name)
-            time_hotstart = proc._parse_file_datetime(hs_info.filepath)
-
-        # No hotstart file (cold-start or coupled-mode): derive time_hotstart
-        # from cycle - nowcast_hours. This is REQUIRED so the nowcast
-        # launcher's sim_start aligns with the OBC/forcing time axes, which
-        # rtofs.py anchors to cycle - nowcast_hours (see commit 576ec5b).
+        # Anchor time_hotstart to cycle - nowcast_hours unconditionally.
         #
-        # We deliberately ignore the environment variable here: upstream
-        # J-jobs may set $time_hotstart to a different convention (e.g.
-        # 24h-back instead of 6h-back), which creates an 18h misalignment
-        # between param.nml's start_{year,month,day,hour} and OBC[t=0].
-        # That misalignment manifests as partition_hgrid heap corruption
-        # in SCHISM init.
-        if time_hotstart is None:
-            from datetime import timedelta as _td
-            cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
-                       _td(hours=self.config.cyc)
-            time_hotstart = cycle_dt - _td(hours=self.config.nowcast_hours)
-            env_ths = os.environ.get("time_hotstart", "")
-            if env_ths and env_ths[:10] != time_hotstart.strftime("%Y%m%d%H"):
-                log.info(
-                    f"Overriding env time_hotstart={env_ths[:10]} with "
-                    f"YAML-derived {time_hotstart.strftime('%Y%m%d%H')} "
-                    f"(cycle - nowcast_hours) to align with OBC time axis"
-                )
-            else:
-                log.info(f"Derived time_hotstart from cycle - nowcast_hours: "
-                         f"{time_hotstart}")
+        # This matches the operational COMF convention (shell
+        # _schism_find_hotstart in nos_run.sh) and MEMORY.md
+        # feedback_time_hotstart_anchor.md, which require the same anchor
+        # for both warm-start and cold-start so OBC/forcing/hotstart time
+        # axes all align at the launcher's sim_start.
+        #
+        # DO NOT parse time_hotstart from the hotstart filename's tHHz.YYYYMMDD
+        # tag.  That tag encodes the cycle that PRODUCED the restart, not the
+        # restart's time origin -- they only coincide because operational COMF
+        # itself anchors time_hotstart = cycle - LEN_NOWCAST on every cycle.
+        # Today's pre-staged init file (e.g. secofs.t00z.20260510.init.nowcast.nc)
+        # carries today's cycle in its name even though its physical
+        # time_hotstart is still cycle - 6h; parsing the filename gives an
+        # 18h-wrong sim_start.  That misalignment puts param.nml's
+        # start_{year,month,day,hour} out of sync with OBC[t=0] and triggers
+        # partition_hgrid heap corruption in SCHISM init at scale (see
+        # My-Workplan #230).
+        #
+        # We deliberately ignore the environment $time_hotstart for the same
+        # reason: upstream J-jobs may export a different convention (e.g.
+        # 24h-back instead of 6h-back); ignore that and let the YAML
+        # nowcast_hours drive the anchor.
+        from datetime import timedelta as _td
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   _td(hours=self.config.cyc)
+        time_hotstart = cycle_dt - _td(hours=self.config.nowcast_hours)
+        log.info(
+            f"time_hotstart anchor = {time_hotstart.strftime('%Y%m%d%H')} "
+            f"(cycle {cycle_dt.strftime('%Y%m%d%H')} - "
+            f"nowcast_hours={self.config.nowcast_hours})"
+        )
+        env_ths = os.environ.get("time_hotstart", "")
+        if env_ths and env_ths[:10] != time_hotstart.strftime("%Y%m%d%H"):
+            log.info(
+                f"Ignoring env time_hotstart={env_ths[:10]} (J-job override); "
+                f"YAML-derived {time_hotstart.strftime('%Y%m%d%H')} "
+                f"is authoritative to keep OBC time axis aligned"
+            )
 
         # ---- Phase 1: Lightweight steps in parallel ----
         # GFS, HRRR, NWM, Tidal are fast (subprocess/IO-bound, ~90s max).
