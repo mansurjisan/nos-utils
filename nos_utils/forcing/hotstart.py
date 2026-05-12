@@ -368,11 +368,32 @@ class HotstartProcessor(ForcingProcessor):
                      f"(valid {scored[0][0]}, current cycle {cycle_dt})")
             return best
 
-        # Fallback: sort by mtime if no cycle time could be parsed
-        valid.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        # Fallback: mtime sort over files whose filename did NOT parse to a
+        # datetime.  Explicitly EXCLUDE files whose filename parsed to a
+        # cycle-time-or-later date (e.g. today's own pre-staged init file
+        # secofs.t00z.YYYYMMDD.init.nowcast.nc which gets dropped into
+        # $COMOUT by stage_init_to_comout earlier in the same prep run).
+        # Returning that future-dated file would let the upstream caller
+        # derive a wrong time_hotstart from its filename tag and produce
+        # a sim_start misaligned with OBC[t=0].
+        unparsable = [
+            f for f in valid
+            if self._parse_file_datetime(f) is None
+        ]
+        if not unparsable:
+            log.info(
+                f"No usable hotstart in {len(valid)} candidates "
+                f"(all parsed to cycle-time-or-later); caller should "
+                f"derive cold-start anchor from cycle - nowcast_hours."
+            )
+            return None
 
-        log.info(f"Found {len(valid)} hotstart candidates, using newest: {valid[0].name}")
-        return valid[0]
+        unparsable.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        log.info(
+            f"Found {len(unparsable)} unparsable-filename hotstart "
+            f"candidates, using newest by mtime: {unparsable[0].name}"
+        )
+        return unparsable[0]
 
     def _parse_file_datetime(self, filepath: Path) -> Optional[datetime]:
         """

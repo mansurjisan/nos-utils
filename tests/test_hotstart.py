@@ -80,6 +80,99 @@ class TestHotstartProcessor:
         assert (out_dir / "hotstart.nc").exists()
 
 
+class TestFindHotstartFallback:
+    """Regression suite for the _find_hotstart mtime fallback that used to
+    return today's own pre-staged init file when only future-dated
+    candidates were available.
+
+    The bug: _find_hotstart's "fallback if no cycle time could be parsed"
+    branch sorted ALL valid files by mtime, including ones whose filename
+    parsed to cycle_dt or later (e.g. today's own init dropped into COMOUT
+    by stage_init_to_comout earlier in the same prep run).  When picked,
+    that filename's tHHz.YYYYMMDD tag was fed back through the orchestrator
+    and produced a wrong time_hotstart anchor.  The orchestrator fix
+    (#PR 8/9 chain) prevents the misuse, but this is the belt-and-suspenders
+    at the source.
+    """
+
+    @staticmethod
+    def _make_rst(path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ds = netCDF4.Dataset(str(path), "w")
+        ds.createDimension("node", 10)
+        # File needs to exceed MIN_HOTSTART_SIZE (1 MB) to pass size filter
+        big = ds.createVariable("padding", "f8", ("node",))
+        big[:] = 0.0
+        # Pad up to ~1.5 MB via a chunky variable
+        ds.createDimension("pad", 200_000)
+        pad = ds.createVariable("pad_var", "f8", ("pad",))
+        pad[:] = 0.0
+        ds.close()
+        return path
+
+    def test_only_todays_init_present_returns_none(self, tmp_path):
+        """If only today's own t00z.20260507.init.nowcast.nc is present
+        (file_dt == cycle_dt), _find_hotstart returns None so the
+        orchestrator falls back to its cold-start cycle - nowcast_hours
+        anchor.  Previously the mtime fallback would have returned the
+        today-init file and the orchestrator would have parsed cycle time
+        from its name."""
+        run = "secofs"
+        cycle_dir = tmp_path / f"{run}.20260507"
+        self._make_rst(
+            cycle_dir / f"{run}.t00z.20260507.init.nowcast.nc",
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        proc = HotstartProcessor(cfg, tmp_path, tmp_path / "out", run_name=run)
+
+        result = proc._find_hotstart()
+        assert result is None
+
+    def test_yesterday_rst_still_selected_when_today_init_also_present(
+            self, tmp_path,
+    ):
+        """When yesterday's rst.nowcast.nc AND today's pre-staged init both
+        exist, _find_hotstart must select yesterday's (parses to
+        2026-05-06 18z < 2026-05-07 00z cycle).  The today-init must not
+        win via the mtime fallback even if it was written more recently."""
+        run = "secofs"
+        # Yesterday's 18z rst (the canonical pick)
+        yest = self._make_rst(
+            tmp_path / f"{run}.20260506" /
+            f"{run}.t18z.20260506.rst.nowcast.nc",
+        )
+        # Today's own t00z init -- mtime is newer (just-written above ↑)
+        self._make_rst(
+            tmp_path / f"{run}.20260507" /
+            f"{run}.t00z.20260507.init.nowcast.nc",
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        proc = HotstartProcessor(cfg, tmp_path, tmp_path / "out", run_name=run)
+
+        result = proc._find_hotstart()
+        assert result == yest, (
+            "must select yesterday's rst by parsed cycle time, "
+            "NOT today's init by mtime"
+        )
+
+    def test_unparsable_filename_still_falls_back_via_mtime(self, tmp_path):
+        """Backward-compat: files whose filename doesn't parse (e.g. the
+        legacy `hotstart_*.nc` pattern from old SCHISM versions) ARE still
+        selectable via the mtime fallback.  The bug fix only excludes
+        files that parse to a future date, not files that don't parse."""
+        run = "secofs"
+        # An unparsable hotstart_*.nc (no tHHz.YYYYMMDD tag in name)
+        legacy = self._make_rst(tmp_path / "hotstart_001.nc")
+
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        proc = HotstartProcessor(cfg, tmp_path, tmp_path / "out", run_name=run)
+
+        result = proc._find_hotstart()
+        assert result == legacy
+
+
 class TestHotstartInfo:
     def test_time_days(self):
         info = HotstartInfo(
