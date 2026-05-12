@@ -124,6 +124,23 @@ class BlenderProcessor(ForcingProcessor):
                 errors=[f"GFS forcing file not found: {gfs_path}"],
             )
 
+        # Log the intermediate files we're about to consume.  These are
+        # the GFS + HRRR forcing NetCDFs produced upstream by GFSProcessor
+        # and HRRRProcessor in nws=4 mode -- without this line the prep
+        # log shows NO indication of what the blender actually read.
+        from ._log import log_input_files
+        _datm_inputs = [gfs_path]
+        if hrrr_path.exists():
+            _datm_inputs.append(hrrr_path)
+        log_input_files(
+            "DATM", _datm_inputs,
+            note=(
+                f"target_dx={self.target_dx} "
+                f"domain={self.config.datm_domain} "
+                f"hrrr_present={hrrr_path.exists()}"
+            ),
+        )
+
         # Target grid (ATLANTIC for UFS-Coastal SECOFS)
         lon_min, lon_max, lat_min, lat_max = self.config.datm_domain
         target_lon = np.arange(

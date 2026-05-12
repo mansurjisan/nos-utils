@@ -163,6 +163,12 @@ class NudgingProcessor(ForcingProcessor):
             self.config, self.rtofs_input_path, work_dir,
         )
         _, files_3d = rtofs_proc.find_input_files_by_type()
+        from ._log import log_input_files
+        log_input_files(
+            "NUDGE_RTOFS_3D", files_3d or [],
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} "
+                 f"target=TEM_nu/SAL_nu fortran_path",
+        )
         if not files_3d:
             log.warning("No RTOFS 3D files found for nudge data prep")
             return None
@@ -346,6 +352,13 @@ class NudgingProcessor(ForcingProcessor):
             # Transfer the cycle date for valid-time calculation
             if hasattr(rtofs_proc_nophase, '_rtofs_cycle_date'):
                 rtofs_proc._rtofs_cycle_date = rtofs_proc_nophase._rtofs_cycle_date
+
+        from ._log import log_input_files
+        log_input_files(
+            "NUDGE_RTOFS_3D", files_3d or [],
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} "
+                 f"target=TEM_nu/SAL_nu python_path",
+        )
 
         if not files_3d:
             return ForcingResult(
