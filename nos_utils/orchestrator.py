@@ -179,10 +179,10 @@ class PrepOrchestrator:
         # Today's pre-staged init file (e.g. secofs.t00z.20260510.init.nowcast.nc)
         # carries today's cycle in its name even though its physical
         # time_hotstart is still cycle - 6h; parsing the filename gives an
-        # 18h-wrong sim_start.  That misalignment puts param.nml's
-        # start_{year,month,day,hour} out of sync with OBC[t=0] and triggers
-        # partition_hgrid heap corruption in SCHISM init at scale (see
-        # My-Workplan #230).
+        # 6h-wrong sim_start.  That misalignment puts param.nml's
+        # start_{year,month,day,hour} out of sync with OBC[t=0] and
+        # triggers ParMETIS heap corruption in SCHISM partition_hgrid:534
+        # at 2914-rank scale.
         #
         # We deliberately ignore the environment $time_hotstart for the same
         # reason: upstream J-jobs may export a different convention (e.g.
