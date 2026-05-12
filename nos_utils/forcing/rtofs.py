@@ -266,10 +266,18 @@ class RTOFSProcessor(ForcingProcessor):
 
         files_2d, files_3d = self.find_input_files_by_type()
         from ._log import log_input_files
+        # Split 2D/3D so operators can see distinctly which files feed
+        # elev2D vs TEM_3D/SAL_3D/uv3D (otherwise the combined first/last
+        # span hides which product each file belongs to).
         log_input_files(
-            "RTOFS", (files_2d or []) + (files_3d or []),
+            "RTOFS_2D", files_2d or [],
             note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} mode=SECOFS "
-                 f"n_2d={len(files_2d or [])} n_3d={len(files_3d or [])}",
+                 f"product=elev2D",
+        )
+        log_input_files(
+            "RTOFS_3D", files_3d or [],
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} mode=SECOFS "
+                 f"product=TEM/SAL/uv3D",
         )
         if not files_2d and not files_3d:
             return ForcingResult(
@@ -318,9 +326,14 @@ class RTOFSProcessor(ForcingProcessor):
         files_2d, files_3d = self.find_input_files_by_type()
         from ._log import log_input_files
         log_input_files(
-            "RTOFS", (files_2d or []) + (files_3d or []),
+            "RTOFS_2D", files_2d or [],
             note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} mode=STOFS "
-                 f"n_2d={len(files_2d or [])} n_3d={len(files_3d or [])}",
+                 f"product=elev2D",
+        )
+        log_input_files(
+            "RTOFS_3D", files_3d or [],
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} mode=STOFS "
+                 f"product=TEM/SAL/uv3D",
         )
         if not files_2d and not files_3d:
             return ForcingResult(
