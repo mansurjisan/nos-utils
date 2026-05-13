@@ -187,6 +187,118 @@ class TestRTOFSTimeAxis:
         assert real_span_h < old_bug_span_h  # fix is smaller
 
 
+class TestRTOFSRouteBAnchoring:
+    """Verify the OBC time axis is anchored at model_t0 = cycle - nowcast_hours
+    and that backward/forward gaps are filled by hold-constant backfill."""
+
+    def _anchored_rtofs_times(self, file_hours, rtofs_cycle, model_t0):
+        return np.array(
+            [(rtofs_cycle + timedelta(hours=h) - model_t0).total_seconds()
+             for h in file_hours],
+            dtype=np.float64,
+        )
+
+    def test_model_t0_is_cycle_minus_nowcast(self):
+        """model_t0 = cycle - nowcast_hours, regardless of time_hotstart."""
+        cycle_dt = datetime(2026, 4, 1, 12)
+        nowcast_hours = 6
+        model_t0 = cycle_dt - timedelta(hours=nowcast_hours)
+        assert model_t0 == datetime(2026, 4, 1, 6)
+
+    def test_sim_duration_covers_nowcast_plus_forecast(self):
+        """sim_duration = (nowcast_hours + forecast_hours) * 3600 seconds.
+
+        For SECOFS (6 + 48 = 54h) this gives 54 * 3600 = 194400s; at the
+        SCHISM model_dt of 120s the output dimension is 194400/120 + 1 = 1621.
+        """
+        nowcast_hours = 6
+        forecast_hours = 48
+        cycle_dt = datetime(2026, 4, 1, 12)
+        model_t0 = cycle_dt - timedelta(hours=nowcast_hours)
+        sim_end = cycle_dt + timedelta(hours=forecast_hours)
+        sim_duration = (sim_end - model_t0).total_seconds()
+        assert sim_duration == 54 * 3600
+
+        model_dt = 120.0
+        n_model_steps = int(sim_duration / model_dt) + 1
+        assert n_model_steps == 1621
+
+    def test_rtofs_times_anchored_at_model_t0(self):
+        """rtofs_time = (rtofs_cycle + h hours) - model_t0, in seconds.
+
+        With cycle = PDY 12z, nowcast = 6h, model_t0 = PDY 06z, and
+        rtofs_cycle = PDY-1 midnight:
+          - h=24 -> PDY 00z -> rtofs_time = -6*3600 (6h before model_t0)
+          - h=30 -> PDY 06z = model_t0 -> rtofs_time = 0
+          - h=36 -> PDY 12z = cycle -> rtofs_time = +6*3600
+        Files with negative rtofs_time fall outside the run window and
+        are clipped by the interp1d's fill_value=(first, last) on the
+        leading edge.
+        """
+        cycle_dt = datetime(2026, 4, 1, 12)
+        model_t0 = cycle_dt - timedelta(hours=6)  # PDY 06z
+        rtofs_cycle = datetime(2026, 3, 31)  # PDY-1 midnight
+
+        rtofs_times = self._anchored_rtofs_times(
+            [24, 30, 36], rtofs_cycle, model_t0
+        )
+        assert rtofs_times[0] == -6 * 3600.0
+        assert rtofs_times[1] == 0.0
+        assert rtofs_times[2] == 6 * 3600.0
+
+    def test_window_starts_after_rtofs_triggers_pre_backfill(self):
+        """When the first RTOFS file is AFTER model_t0, output times in
+        [0, rtofs_times[0]] are filled by holding the first value constant."""
+        from scipy.interpolate import interp1d
+
+        # RTOFS data starts at +3h (i.e. file at cycle, while model_t0 is
+        # cycle - 6h means the first RTOFS file is 3h into the run window
+        # if model_t0 = cycle - 3h... this test just checks the math).
+        rtofs_times = np.array([3 * 3600.0, 6 * 3600.0, 12 * 3600.0])
+        rtofs_vals = np.array([1.0, 2.0, 3.0])
+
+        # Mimic the Route B fill-value selection
+        f = interp1d(
+            rtofs_times, rtofs_vals, kind="linear",
+            bounds_error=False,
+            fill_value=(float(rtofs_vals[0]), float(rtofs_vals[-1])),
+        )
+        model_times = np.arange(0, 13 * 3600, 3600)
+        out = f(model_times)
+
+        # Before rtofs_times[0]: hold first value (1.0)
+        assert out[0] == 1.0
+        assert out[1] == 1.0
+        assert out[2] == 1.0
+        # At rtofs_times[0]=3h: exactly 1.0
+        assert out[3] == 1.0
+        # Linear interp between 3h (1.0) and 6h (2.0) at 4h: 1.333
+        assert abs(out[4] - 4.0 / 3.0) < 1e-6
+
+    def test_window_ends_before_rtofs_triggers_post_backfill(self):
+        """When RTOFS ends BEFORE sim_end, the trailing gap is filled by
+        holding the last value constant (not extrapolated)."""
+        from scipy.interpolate import interp1d
+
+        rtofs_times = np.array([0.0, 3 * 3600.0, 6 * 3600.0])
+        rtofs_vals = np.array([10.0, 20.0, 30.0])
+
+        f = interp1d(
+            rtofs_times, rtofs_vals, kind="linear",
+            bounds_error=False,
+            fill_value=(float(rtofs_vals[0]), float(rtofs_vals[-1])),
+        )
+
+        # Sample past the end of available data
+        model_times = np.array([0.0, 3 * 3600.0, 6 * 3600.0, 9 * 3600.0, 12 * 3600.0])
+        out = f(model_times)
+        assert out[0] == 10.0
+        assert out[2] == 30.0
+        # Past rtofs_times[-1]: hold last value (30.0), NOT linear-extrapolated (40, 50)
+        assert out[3] == 30.0
+        assert out[4] == 30.0
+
+
 class TestRTOFSFind3DWeights:
     """Test _find_3d_weights() discovery of precomputed 3D weight NPZ files."""
 

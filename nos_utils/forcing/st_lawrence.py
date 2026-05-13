@@ -120,7 +120,11 @@ class StLawrenceProcessor(ForcingProcessor):
 
         self.create_output_dir()
 
+        # ``start`` anchors the in-file time axis at SCHISM's ``model_t0``
+        # (= ``cycle - nowcast_hours``). CSV/sflux discovery uses the cycle's
+        # PDY directory, not model_t0, to match the operational layout.
         start = self._cycle_datetime()
+        pdy_dt = self._pdy_datetime()
         n_days_total = self._n_days_total()
         datevectors_hindcast = self._daily_range(start, days=1)
         datevectors_full = self._daily_range(start, days=n_days_total)
@@ -128,7 +132,7 @@ class StLawrenceProcessor(ForcingProcessor):
         warnings: List[str] = []
         output_files: List[Path] = []
 
-        csv_path = self._find_csv(start)
+        csv_path = self._find_csv(pdy_dt)
         series: Optional[_StLawrenceSeries] = None
 
         if csv_path is not None:
@@ -197,10 +201,10 @@ class StLawrenceProcessor(ForcingProcessor):
 
     def find_input_files(self) -> List[Path]:
         """CSV candidates in priority order (today, then yesterday)."""
-        start = self._cycle_datetime()
+        pdy_dt = self._pdy_datetime()
         found: List[Path] = []
         for days_back in (0, 1):
-            day = start - timedelta(days=days_back)
+            day = pdy_dt - timedelta(days=days_back)
             p = self._csv_path_for(day)
             if p.exists():
                 found.append(p)
@@ -488,6 +492,23 @@ class StLawrenceProcessor(ForcingProcessor):
     # ---------------------------------------------------------------- Helpers
 
     def _cycle_datetime(self) -> datetime:
+        """SCHISM ``model_t0`` (= ``cycle - nowcast_hours``) for time-axis anchoring.
+
+        Matches the operational shell that sets
+        ``PDYHH_NCAST_BEGIN=$($NDATE -<nowcast_hours> $PDYHH)`` and passes
+        that as ``startdate`` to ``gen_fluxth_st_lawrence_riv.py`` /
+        ``gen_temp_1_st_lawrence_riv.py``. SCHISM reads ``flux.th`` /
+        ``TEM_1.th`` with relative seconds-from-model-start, so row ``t=0``
+        must correspond to ``model_t0`` — not the cycle hour.
+
+        Note: input CSV/sflux discovery uses ``_pdy_datetime`` (the cycle's
+        own date) so the operational ``$COMINlaw/<PDY>/can_streamgauge/``
+        layout still resolves; only the in-file time axis is shifted.
+        """
+        return self._pdy_datetime() - timedelta(hours=self.config.nowcast_hours)
+
+    def _pdy_datetime(self) -> datetime:
+        """Cycle hour ``pdy + cyc`` — used for file discovery only."""
         base = datetime.strptime(self.config.pdy, "%Y%m%d")
         return base + timedelta(hours=self.config.cyc)
 

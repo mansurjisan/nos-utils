@@ -1021,14 +1021,16 @@ class RTOFSProcessor(ForcingProcessor):
                 log.info(f"Filled {n_nan} NaN boundary nodes from nearest valid nodes")
 
             # Temporally interpolate to model dt (120s)
-            # Clip to the actual simulation window (nowcast + forecast)
+            # Anchor t=0 to model_t0 = cycle - nowcast_hours, cover full sim window
             n_rtofs = ssh_array.shape[0]
 
             # Build actual time axis from file valid times (NOT uniform 6h).
             # RTOFS 2D diag files are hourly (f001-f048) then 3-hourly
             # (f051+), so assuming uniform spacing is wrong.
-            # Time axis is relative to sim_start (t=0 = model start),
-            # matching the Fortran convention where day_start=0.
+            # Time axis is relative to model_t0 = cycle - nowcast_hours,
+            # matching production-COMF semantics where the model clock
+            # starts at the nowcast origin (param.nml start_year/start_hour
+            # already anchored to that point).
             file_hours = []
             for f in files_2d:
                 hour, _ = self._parse_rtofs_hour(f)
@@ -1036,55 +1038,71 @@ class RTOFSProcessor(ForcingProcessor):
 
             cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                        timedelta(hours=self.config.cyc)
-            # Anchor the OBC window to the YAML run config, not to the
-            # legacy `time_hotstart` env var. For SECOFS-UFS the env var
-            # can point to a 24h-old hotstart while the actual model run
-            # window is the YAML-declared `nowcast_hours + forecast_hours`
-            # (6 + 48 = 54h for SECOFS). Using time_hotstart caused
-            # elev2D.th.nc to overshoot to 72h vs production's 54h.
-            sim_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            # model_t0 is the actual model clock origin (t=0 in the output).
+            # For SECOFS this is cycle - 6h; for STOFS-3D-ATL cycle - 24h.
+            # The SCHISM-side files (param.nml, bctides.in, time markers)
+            # all assume this anchor, so the OBC time axis must match.
+            model_t0 = cycle_dt - timedelta(hours=self.config.nowcast_hours)
             sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
-            sim_duration = (sim_end - sim_start).total_seconds()
+            sim_duration = (sim_end - model_t0).total_seconds()
 
-            # Compute time of each file relative to sim_start (model t=0).
-            # Files before sim_start have negative times (buffer).
+            # Compute time of each file relative to model_t0.
+            # Files at the nowcast origin have time=0; files before it
+            # have negative times (ignored by interp clipping below).
             rtofs_cycle = getattr(self, '_rtofs_cycle_date', None)
             if rtofs_cycle is None:
                 rtofs_cycle = datetime.strptime(self.config.pdy, "%Y%m%d")
             rtofs_times = np.array(
-                [(rtofs_cycle + timedelta(hours=h) - sim_start).total_seconds()
+                [(rtofs_cycle + timedelta(hours=h) - model_t0).total_seconds()
                  for h in file_hours],
                 dtype=np.float64,
             )
 
-            # Model output covers [0, sim_duration] at model_dt intervals
+            # Route B coverage strategy (backfill, not previous-cycle reload):
+            #   - Output must span [0, sim_duration] at model_dt intervals.
+            #   - If RTOFS data starts AFTER model_t0 (rtofs_times[0] > 0),
+            #     the backward gap [0, rtofs_times[0]] is filled by holding
+            #     the first available RTOFS value constant.
+            #   - If RTOFS data ends BEFORE sim_end (rtofs_times[-1] < sim_duration),
+            #     the forward gap is filled by holding the last value constant.
+            # We use bounds_error=False + explicit fill_value to avoid scipy's
+            # linear extrapolation, which can produce unphysical SSH at the
+            # window edges when the data slope is steep.
             n_model_steps = int(sim_duration / model_dt) + 1
 
-            if n_model_steps > n_rtofs and n_rtofs > 1:
+            if n_rtofs > 1:
                 try:
                     from scipy.interpolate import interp1d
                     model_times = np.arange(n_model_steps) * model_dt
-                    # Clip to BOTH the run window (sim_duration) AND what
-                    # RTOFS files actually cover. Production trims to
-                    # sim_duration so SCHISM doesn't read past the
-                    # configured run-end (V12 had elev2D extending to
-                    # 259200s vs production 194400s — caused the
-                    # MISC: nc dt1 abort).
+                    # Cover the full run window without truncation; backfill
+                    # handles gaps at either end.
                     model_times = model_times[model_times <= sim_duration]
-                    model_times = model_times[model_times <= rtofs_times[-1]]
 
                     ssh_interp = np.zeros((len(model_times), n_bnd), dtype=np.float32)
                     for node in range(n_bnd):
-                        f_interp = interp1d(rtofs_times, ssh_array[:, node],
-                                           kind="linear", fill_value="extrapolate")
+                        f_interp = interp1d(
+                            rtofs_times, ssh_array[:, node],
+                            kind="linear",
+                            bounds_error=False,
+                            fill_value=(
+                                float(ssh_array[0, node]),
+                                float(ssh_array[-1, node]),
+                            ),
+                        )
                         ssh_interp[:, node] = f_interp(model_times)
 
                     ssh_array = ssh_interp
                     dt_out = model_dt
                     avg_dt_h = (rtofs_times[-1] - rtofs_times[0]) / 3600.0 / max(n_rtofs - 1, 1)
-                    log.info(f"Temporally interpolated SSH: {n_rtofs} steps "
-                             f"(avg {avg_dt_h:.1f}h, t0={rtofs_times[0]/3600:.1f}h) → "
-                             f"{len(model_times)} steps at dt={model_dt}s")
+                    n_backfill_pre = int(np.sum(model_times < rtofs_times[0]))
+                    n_backfill_post = int(np.sum(model_times > rtofs_times[-1]))
+                    log.info(
+                        f"Temporally interpolated SSH: {n_rtofs} steps "
+                        f"(avg {avg_dt_h:.1f}h, t0={rtofs_times[0]/3600:.1f}h, "
+                        f"tN={rtofs_times[-1]/3600:.1f}h) -> "
+                        f"{len(model_times)} steps at dt={model_dt}s "
+                        f"[backfill pre={n_backfill_pre}, post={n_backfill_post}]"
+                    )
                 except ImportError:
                     dt_out = (rtofs_times[1] - rtofs_times[0]) if n_rtofs > 1 else 3600.0
             else:
@@ -1111,11 +1129,19 @@ class RTOFSProcessor(ForcingProcessor):
             # parity with v3.9 production output.
             time_var = nc.createVariable("time", "f4", ("time",))
             if dt_out == model_dt and nt > n_rtofs:
-                # Temporally interpolated: uniform 120s steps
+                # Temporally interpolated: uniform 120s steps anchored at
+                # t=0 = model_t0 (cycle - nowcast_hours).
                 time_var[:] = [i * dt_out for i in range(nt)]
             else:
-                # No interpolation: use actual file valid times
-                time_var[:] = rtofs_times[:nt]
+                # No-interpolation fallback (scipy missing, or n_rtofs >=
+                # n_model_steps). Production never hits this for SECOFS
+                # (~60 files vs 1621 model steps). Clamp the leading entry
+                # to 0 so SCHISM's model clock stays anchored at model_t0
+                # even if the first RTOFS file is slightly before/after.
+                axis = rtofs_times[:nt].copy()
+                if len(axis) > 0:
+                    axis[0] = 0.0
+                time_var[:] = axis
 
             # SCHISM-required scalar for `nc dt1` consistency check.
             # Without this variable, model init aborts with `MISC: nc dt1`.
@@ -1351,39 +1377,73 @@ class RTOFSProcessor(ForcingProcessor):
 
                 ds.close()
 
-            rtofs_dt_3d = 21600.0  # 6-hourly RTOFS input
+            rtofs_dt_3d = 21600.0  # 6-hourly RTOFS input (nominal fallback)
             target_dt_3d = 10800.0  # 3-hourly output (matches Fortran DELT_TS)
 
-            # Compute simulation duration for clipping. Anchor to YAML
-            # run config — see elev2D path for rationale on ignoring
-            # time_hotstart env var here.
+            # Compute simulation duration for the OBC window.
+            # model_t0 = cycle - nowcast_hours: matches the SCHISM-side
+            # files (param.nml, bctides, time markers) which all assume
+            # the model clock starts at the nowcast origin. The 3D OBC
+            # files must use the same anchor so SCHISM can index correctly.
             cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                        timedelta(hours=self.config.cyc)
-            sim_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            model_t0 = cycle_dt - timedelta(hours=self.config.nowcast_hours)
             sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
-            sim_duration_3d = (sim_end - sim_start).total_seconds()
+            sim_duration_3d = (sim_end - model_t0).total_seconds()
 
-            # Temporally interpolate 3D fields from 6h to 3h, clipped to simulation
+            # Build actual 3D-file time axis relative to model_t0, matching
+            # the 2D path. Earlier this assumed `np.arange(n) * 21600s`
+            # starting at t=0 — which silently labelled the first 3D file
+            # as model_t0 regardless of its true valid time. With Route B
+            # the anchor must be explicit.
+            file_hours_3d = [self._parse_rtofs_hour(f)[0] for f in files_3d]
+            rtofs_cycle = getattr(self, '_rtofs_cycle_date', None)
+            if rtofs_cycle is None:
+                rtofs_cycle = datetime.strptime(self.config.pdy, "%Y%m%d")
+            rtofs_times_3d = np.array(
+                [(rtofs_cycle + timedelta(hours=h) - model_t0).total_seconds()
+                 for h in file_hours_3d],
+                dtype=np.float64,
+            )
+
+            # Temporally interpolate 3D fields onto the 3h SCHISM output grid.
+            # Same Route B backfill rule as the 2D path: hold first/last value
+            # constant outside the available RTOFS window to fill any backward
+            # gap (e.g. data starts at cycle but model_t0 = cycle - 6h).
             for var_list in [all_temp, all_salt]:
-                if len(var_list) > 1:
+                if len(var_list) > 1 and len(rtofs_times_3d) == len(var_list):
                     try:
                         from scipy.interpolate import interp1d
-                        n_in = len(var_list)
-                        rtofs_times = np.arange(n_in) * rtofs_dt_3d
-                        n_out = int((n_in - 1) * rtofs_dt_3d / target_dt_3d) + 1
+                        n_out = int(sim_duration_3d / target_dt_3d) + 1
                         target_times = np.arange(n_out) * target_dt_3d
-                        target_times = target_times[target_times <= min(rtofs_times[-1], sim_duration_3d)]
+                        target_times = target_times[target_times <= sim_duration_3d]
 
                         stacked = np.stack(var_list, axis=0)  # (n_in, n_bnd, n_levels)
                         interp_out = np.zeros((len(target_times),) + stacked.shape[1:],
                                               dtype=np.float32)
                         for node in range(stacked.shape[1]):
                             for lev in range(stacked.shape[2]):
-                                f_i = interp1d(rtofs_times, stacked[:, node, lev],
-                                               kind="linear", fill_value="extrapolate")
+                                f_i = interp1d(
+                                    rtofs_times_3d, stacked[:, node, lev],
+                                    kind="linear",
+                                    bounds_error=False,
+                                    fill_value=(
+                                        float(stacked[0, node, lev]),
+                                        float(stacked[-1, node, lev]),
+                                    ),
+                                )
                                 interp_out[:, node, lev] = f_i(target_times)
                         var_list.clear()
                         var_list.extend([interp_out[t] for t in range(len(target_times))])
+                        n_backfill_pre_3d = int(np.sum(target_times < rtofs_times_3d[0]))
+                        n_backfill_post_3d = int(np.sum(target_times > rtofs_times_3d[-1]))
+                        log.info(
+                            f"Temporally interpolated 3D T/S: {len(rtofs_times_3d)} steps "
+                            f"(t0={rtofs_times_3d[0]/3600:.1f}h, "
+                            f"tN={rtofs_times_3d[-1]/3600:.1f}h) -> "
+                            f"{len(target_times)} steps at dt={target_dt_3d}s "
+                            f"[backfill pre={n_backfill_pre_3d}, post={n_backfill_post_3d}]"
+                        )
                     except ImportError:
                         pass
 

@@ -1,5 +1,6 @@
 """Tests for UFSConfigProcessor (Stage 2b)."""
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -76,7 +77,13 @@ def ufs_config():
 
 
 def test_basic_substitution(ufs_config, tmp_path):
-    """All @[TOKEN] markers must be replaced with real values."""
+    """All @[TOKEN] markers must be replaced with real values.
+
+    Start time is anchored at ``model_t0 = cycle - nowcast_hours``.  For
+    SECOFS-UFS (cyc=12, nowcast_hours=6) that is 2026-04-01 06:00, not the
+    raw cycle time.  ``nhours_fcst`` correspondingly covers the full
+    nowcast + forecast = 54h window from model_t0.
+    """
     fix = tmp_path / "fix"
     out = tmp_path / "out"
     _write_full_fix(fix)
@@ -92,14 +99,14 @@ def test_basic_substitution(ufs_config, tmp_path):
     ):
         assert (out / name).exists(), f"Missing output: {name}"
 
-    # model_configure substitutions.
+    # model_configure substitutions.  model_t0 = cycle 12z - 6h = 06z same day.
     mc = (out / "model_configure").read_text()
     assert "start_year:              2026" in mc
     assert "start_month:             04" in mc
     assert "start_day:               01" in mc
-    assert "start_hour:              12" in mc
-    # Default ufs_nhours_fcst for SECOFS UFS is 48.
-    assert "nhours_fcst:             48" in mc
+    assert "start_hour:              06" in mc
+    # nhours_fcst covers nowcast_hours + forecast_hours = 6 + 48 = 54.
+    assert "nhours_fcst:             54" in mc
     assert "dt_atmos:                720" in mc
     assert "@[" not in mc, "Unsubstituted token in model_configure"
 
@@ -200,6 +207,145 @@ def test_auto_resolve_sibling_ufs_dir(ufs_config, tmp_path):
     assert result.success, result.errors
     assert (out / "model_configure").exists()
     assert (out / "ufs.configure").exists()
+
+
+def test_model_t0_day_rollback(tmp_path):
+    """model_t0 = cycle - nowcast_hours must roll back across midnight.
+
+    SECOFS 00z cycle with nowcast_hours=6 anchors at 18z the previous day.
+    The model_configure start_* fields and the datm.streams year tokens
+    must reflect that rolled-back date, otherwise CMEPS/DATM stream
+    indexing would start 6h ahead of SCHISM.
+    """
+    fix = tmp_path / "fix"
+    out = tmp_path / "out"
+    _write_full_fix(fix)
+
+    cfg = ForcingConfig.for_secofs_ufs(pdy="20260510", cyc=0)
+    proc = UFSConfigProcessor(cfg, fix, out)
+    result = proc.process()
+    assert result.success, result.errors
+
+    mc = (out / "model_configure").read_text()
+    # cycle 2026-05-10 00z - 6h = 2026-05-09 18z
+    assert "start_year:              2026" in mc
+    assert "start_month:             05" in mc
+    assert "start_day:               09" in mc
+    assert "start_hour:              18" in mc
+    # nhours_fcst still covers the full 6 + 48 = 54h window.
+    assert "nhours_fcst:             54" in mc
+
+    # datm.streams year tokens must come from the rolled-back model_t0
+    # (still 2026, but if the cycle were on Jan 1 we would need 2025).
+    ds = (out / "datm.streams").read_text()
+    assert "yearFirst01:               2026" in ds
+
+
+def test_model_t0_year_rollback(tmp_path):
+    """model_t0 must roll back across a year boundary cleanly.
+
+    Cycle on 2026-01-01 00z with nowcast_hours=6 anchors at 2025-12-31 18z.
+    The datm.streams ``yearFirst/Last/Align`` tokens must reflect 2025,
+    not 2026, otherwise stream timestamps would mismatch the actual DATM
+    forcing time axis.
+    """
+    fix = tmp_path / "fix"
+    out = tmp_path / "out"
+    _write_full_fix(fix)
+
+    cfg = ForcingConfig.for_secofs_ufs(pdy="20260101", cyc=0)
+    proc = UFSConfigProcessor(cfg, fix, out)
+    result = proc.process()
+    assert result.success, result.errors
+
+    mc = (out / "model_configure").read_text()
+    assert "start_year:              2025" in mc
+    assert "start_month:             12" in mc
+    assert "start_day:               31" in mc
+    assert "start_hour:              18" in mc
+
+    ds = (out / "datm.streams").read_text()
+    assert "yearFirst01:               2025" in ds
+    assert "yearLast01:                2025" in ds
+    assert "yearAlign01:               2025" in ds
+
+
+def test_time_hotstart_override(tmp_path):
+    """Caller-provided time_hotstart wins over the derived cycle - nowcast.
+
+    Orchestrators that have already pinned the model_t0 anchor (e.g. from
+    a ``time_hotstart`` marker file or a hotstart NetCDF) can pass that
+    datetime in to keep every component of the prep bundle in lockstep.
+    """
+    fix = tmp_path / "fix"
+    out = tmp_path / "out"
+    _write_full_fix(fix)
+
+    cfg = ForcingConfig.for_secofs_ufs(pdy="20260510", cyc=12)
+    # Pin model_t0 to 2026-05-10 09z (3h back from cycle, not the default 6h).
+    pinned = datetime(2026, 5, 10, 9, 0)
+    proc = UFSConfigProcessor(cfg, fix, out, time_hotstart=pinned)
+    result = proc.process()
+    assert result.success, result.errors
+
+    mc = (out / "model_configure").read_text()
+    assert "start_year:              2026" in mc
+    assert "start_month:             05" in mc
+    assert "start_day:               10" in mc
+    assert "start_hour:              09" in mc
+
+
+def test_stofs_ufs_nhours_covers_full_run(tmp_path):
+    """STOFS-UFS factory (132 = 24+108) anchors at model_t0 too.
+
+    Verifies that the long-window STOFS-3D-ATL UFS layout (nowcast=24,
+    forecast=108) keeps producing nhours_fcst=132 with the new anchor;
+    132 already covers the full coupled run from model_t0 so the explicit
+    factory value passes through unchanged.
+    """
+    fix = tmp_path / "fix"
+    out = tmp_path / "out"
+    _write_full_fix(fix)
+
+    cfg = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260510", cyc=12)
+    proc = UFSConfigProcessor(cfg, fix, out)
+    result = proc.process()
+    assert result.success, result.errors
+
+    mc = (out / "model_configure").read_text()
+    # cycle 2026-05-10 12z - 24h = 2026-05-09 12z
+    assert "start_year:              2026" in mc
+    assert "start_month:             05" in mc
+    assert "start_day:               09" in mc
+    assert "start_hour:              12" in mc
+    # STOFS-UFS factory sets ufs_nhours_fcst=132 (= 24 + 108).
+    assert "nhours_fcst:             132" in mc
+
+
+def test_nhours_fcst_bumped_when_factory_value_too_short(tmp_path):
+    """SECOFS factory's legacy ufs_nhours_fcst=48 must be bumped to 54.
+
+    The factory still emits ``ufs_nhours_fcst=48`` (matches forecast_hours
+    only) for backward compatibility.  With the model_t0 anchor we MUST
+    extend that to ``nowcast_hours + forecast_hours = 54`` so SCHISM does
+    not stop short of the forecast end.
+    """
+    fix = tmp_path / "fix"
+    out = tmp_path / "out"
+    _write_full_fix(fix)
+
+    cfg = ForcingConfig.for_secofs_ufs(pdy="20260510", cyc=12)
+    # Factory default is 48 (forecast-only).
+    assert cfg.ufs_nhours_fcst == 48
+
+    proc = UFSConfigProcessor(cfg, fix, out)
+    result = proc.process()
+    assert result.success, result.errors
+
+    mc = (out / "model_configure").read_text()
+    # Must be bumped up to 54 (full run from model_t0).
+    assert "nhours_fcst:             54" in mc
+    assert "nhours_fcst:             48" not in mc
 
 
 def test_nx_ny_from_datm(ufs_config, tmp_path):

@@ -233,3 +233,81 @@ class TestNormalizeToSimulationGrid:
         out_flows, out_times = proc._normalize_to_simulation_grid(flows, times, n_target=5)
         assert out_flows.size == 0
         assert out_times == []
+
+
+class TestExtractStreamflowTimeAnchor:
+    """``_extract_streamflow`` must report ``times`` as hours-from-model_t0,
+    not as file-index, so the downstream normalize/write stages anchor the
+    output ``vsource.th`` at SCHISM's ``model_t0 = cycle - nowcast_hours``.
+
+    Earlier code labelled file 0 as ``t=0`` regardless of its actual valid
+    time. For analysis_assim with pre-cycle lookback (tmHH > 0) this shifted
+    the cycle-hour flow to a positive offset.
+    """
+
+    def _write_nwm_file(self, dir_path, cyc, tm, feature_ids, flows,
+                        valid_time_attr=True):
+        """Write a minimal NWM channel_rt netCDF the processor can read."""
+        from netCDF4 import Dataset
+        from datetime import datetime, timedelta
+        fname = f"nwm.t{cyc:02d}z.analysis_assim.channel_rt.tm{tm:02d}.conus.nc"
+        path = dir_path / fname
+        ds = Dataset(str(path), "w", format="NETCDF4")
+        ds.createDimension("feature_id", len(feature_ids))
+        v_fid = ds.createVariable("feature_id", "i8", ("feature_id",))
+        v_q = ds.createVariable("streamflow", "f4", ("feature_id",))
+        v_fid[:] = np.array(feature_ids, dtype=np.int64)
+        v_q[:] = np.array(flows, dtype=np.float32)
+        if valid_time_attr:
+            cycle = datetime(2026, 5, 7, cyc) - timedelta(hours=tm)
+            ds.model_output_valid_time = cycle.strftime("%Y-%m-%d_%H:%M:%S")
+        ds.close()
+        return path
+
+    def test_time_anchored_at_cycle_minus_nowcast(self, tmp_path):
+        """Files at valid_time = cycle should map to t_hours = nowcast_hours.
+
+        SECOFS-UFS: nowcast_hours=6, cycle=2026-05-07 00z, model_t0 = 2026-05-06
+        18z. An analysis_assim tm00 file (valid at cycle) should report
+        ``t_hours = 6``, not ``t_hours = 0``.
+        """
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        rc = RiverConfig(feature_ids=[111], node_indices=[10], clim_flows=[50.0])
+        nwm_dir = tmp_path / "nwm.20260507" / "analysis_assim"
+        nwm_dir.mkdir(parents=True)
+        # Three lookback hours: tm02 (valid 22z prior day), tm01 (23z), tm00 (00z cycle)
+        for tm in (2, 1, 0):
+            self._write_nwm_file(nwm_dir, cyc=0, tm=tm,
+                                 feature_ids=[111], flows=[10.0 + tm])
+        proc = NWMProcessor(cfg, tmp_path, tmp_path / "out", river_config=rc)
+        files = sorted(nwm_dir.glob("*.nc"))
+        # Hand the files in valid-time order (tm02, tm01, tm00).
+        from nos_utils.forcing.nwm import _nwm_valid_time
+        files = sorted(files, key=_nwm_valid_time)
+        flows, times = proc._extract_streamflow(files)
+        # model_t0 = cycle - 6h = 2026-05-06 18z
+        # tm02 valid 22z prior day = 2026-05-06 22z → t=4
+        # tm01 valid 23z prior day = 2026-05-06 23z → t=5
+        # tm00 valid 00z cycle    = 2026-05-07 00z → t=6
+        assert times == [4.0, 5.0, 6.0], (
+            f"Expected times [4,5,6] = hours from model_t0; got {times}"
+        )
+
+    def test_time_axis_falls_back_to_filename_without_attribute(self, tmp_path):
+        """When NetCDF lacks ``model_output_valid_time``, derive from filename."""
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        rc = RiverConfig(feature_ids=[111], node_indices=[10], clim_flows=[50.0])
+        nwm_dir = tmp_path / "nwm.20260507" / "analysis_assim"
+        nwm_dir.mkdir(parents=True)
+        # Build files without model_output_valid_time attribute.
+        for tm in (1, 0):
+            self._write_nwm_file(nwm_dir, cyc=0, tm=tm,
+                                 feature_ids=[111], flows=[10.0],
+                                 valid_time_attr=False)
+        proc = NWMProcessor(cfg, tmp_path, tmp_path / "out", river_config=rc)
+        files = sorted(nwm_dir.glob("*.nc"))
+        from nos_utils.forcing.nwm import _nwm_valid_time
+        files = sorted(files, key=_nwm_valid_time)
+        flows, times = proc._extract_streamflow(files)
+        # tm01 → 23z prior day = t=5; tm00 → 00z cycle = t=6
+        assert times == [5.0, 6.0]

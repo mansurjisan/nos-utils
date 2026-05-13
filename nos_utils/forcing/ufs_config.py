@@ -15,9 +15,14 @@ Replaces ``ush/nosofs/nos_ofs_gen_ufs_config.sh`` (~250 lines of bash sed).
 
 Token substitution mirrors the shell ``sed -e "s/@\\[TOKEN\\]/value/g"``:
 
-    @[YYYY], @[MM], @[DD], @[HH]      -> from config.pdy + config.cyc
-    @[NHOURS]                          -> config.ufs_nhours_fcst (or sum of
-                                          nowcast_hours + forecast_hours)
+    @[YYYY], @[MM], @[DD], @[HH]      -> model_t0 = cycle - nowcast_hours
+                                          (full coupled run anchor); pulled
+                                          from ``time_hotstart`` when caller
+                                          passes it, otherwise derived from
+                                          ``config.pdy + cyc - nowcast_hours``.
+    @[NHOURS]                          -> nowcast_hours + forecast_hours
+                                          (covers nowcast + forecast from
+                                          model_t0).
     @[DT_ATMOS]                        -> config.ufs_dt_atmos
     @[DATM_INPUT_DIR]                  -> "INPUT" (default)
     @[DATM_MESH_FILE]                  -> "datm_esmf_mesh.nc" (default)
@@ -30,12 +35,19 @@ on ``config.ufs_datm_tasks`` and ``config.ufs_total_tasks`` so the v3.9
 SECOFS mesh (compute=2794) gets correct OCN PETs (120-2913) instead of the
 hardcoded template value (120-1199).
 
+The model_t0 anchor matches the operational COMF convention used by
+``param_nml.py`` and ``tidal.py``: every component of the coupled run --
+SCHISM start, DATM stream alignment, OBC time axis, hotstart -- shares the
+same cycle - nowcast_hours origin, which is required so CMEPS' ATM->OCN
+clock stays in sync.
+
 Style mirrors ``param_nml.py`` and ``tidal.py``.
 """
 
 import logging
 import re
 import shutil
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -81,6 +93,7 @@ class UFSConfigProcessor(ForcingProcessor):
         datm_input_dir: str = "INPUT",
         datm_mesh_file: str = "datm_esmf_mesh.nc",
         datm_forcing_file: str = "datm_forcing.nc",
+        time_hotstart: Optional[datetime] = None,
     ):
         """
         Args:
@@ -96,6 +109,12 @@ class UFSConfigProcessor(ForcingProcessor):
             datm_input_dir: Substituted for ``@[DATM_INPUT_DIR]``.
             datm_mesh_file: Substituted for ``@[DATM_MESH_FILE]``.
             datm_forcing_file: Substituted for ``@[DATM_FORCING_FILE]``.
+            time_hotstart: Datetime origin for the coupled run.  When None,
+                the processor derives it as ``cycle - nowcast_hours`` (the
+                operational COMF anchor).  Provide this when the caller has
+                already pinned the anchor (e.g. from a hotstart file or a
+                ``time_hotstart`` marker) so every component of the prep
+                bundle agrees on the same model_t0.
         """
         super().__init__(config, fix_dir, output_dir)
         self.fix_dir = Path(fix_dir) if fix_dir is not None else None
@@ -105,6 +124,7 @@ class UFSConfigProcessor(ForcingProcessor):
         self.datm_input_dir = datm_input_dir
         self.datm_mesh_file = datm_mesh_file
         self.datm_forcing_file = datm_forcing_file
+        self.time_hotstart = time_hotstart
 
     def find_input_files(self) -> List[Path]:
         if self.fix_dir is None or not self.fix_dir.exists():
@@ -276,25 +296,46 @@ class UFSConfigProcessor(ForcingProcessor):
     # ------------------------------------------------------------------ #
 
     def _compute_substitutions(self) -> Dict[str, str]:
-        """Build the @[TOKEN] -> value substitution map."""
-        pdy = self.config.pdy
-        cyc = int(self.config.cyc)
+        """Build the @[TOKEN] -> value substitution map.
 
-        yyyy = pdy[0:4]
-        mm = pdy[4:6]
-        dd = pdy[6:8]
-        hh = f"{cyc:02d}"
+        Start time is anchored at ``model_t0 = cycle - nowcast_hours``, not
+        the cycle itself.  This matches the operational COMF anchor used by
+        ``param_nml.py`` / ``tidal.py``: SCHISM begins at model_t0, runs
+        through the nowcast window, and ends ``forecast_hours`` past the
+        cycle.  ``nhours_fcst`` therefore covers ``nowcast_hours +
+        forecast_hours`` so the coupled stop_n reaches the forecast end.
 
-        # NHOURS: prefer the explicit ufs_nhours_fcst; otherwise the sum of
-        # nowcast + forecast (matches what ``stop_n`` would represent for the
-        # full coupled run).
-        nhours = getattr(self.config, "ufs_nhours_fcst", None)
-        if nhours is None:
-            nhours = (
-                int(self.config.nowcast_hours)
-                + int(self.config.forecast_hours)
-            )
-        nhours = int(nhours)
+        When the caller passes ``time_hotstart`` it wins outright (the
+        orchestrator may have pinned the anchor from a hotstart marker);
+        otherwise we derive it from ``pdy + cyc - nowcast_hours``.
+        """
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=int(self.config.cyc))
+        if self.time_hotstart is not None:
+            model_t0 = self.time_hotstart
+        else:
+            model_t0 = cycle_dt - timedelta(hours=int(self.config.nowcast_hours))
+
+        yyyy = f"{model_t0.year:04d}"
+        mm = f"{model_t0.month:02d}"
+        dd = f"{model_t0.day:02d}"
+        hh = f"{model_t0.hour:02d}"
+
+        # NHOURS covers the full coupled run from model_t0 to the end of
+        # the forecast window.  Anchoring at model_t0 means we MUST extend
+        # the run length to include the nowcast hours, otherwise SCHISM
+        # would stop short of the cycle.  Use ``ufs_nhours_fcst`` only
+        # when it represents the full coverage (factory default sums both
+        # phases); fall back to the explicit sum so we never under-shoot.
+        nhours_full = (
+            int(self.config.nowcast_hours)
+            + int(self.config.forecast_hours)
+        )
+        nhours_attr = getattr(self.config, "ufs_nhours_fcst", None)
+        if nhours_attr is None or int(nhours_attr) < nhours_full:
+            nhours = nhours_full
+        else:
+            nhours = int(nhours_attr)
 
         dt_atmos = int(getattr(self.config, "ufs_dt_atmos", 720))
 

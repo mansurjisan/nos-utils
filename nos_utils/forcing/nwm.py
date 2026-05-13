@@ -786,9 +786,29 @@ class NWMProcessor(ForcingProcessor):
         return result
 
     def _extract_streamflow(self, nwm_files: List[Path]) -> Tuple[np.ndarray, List[float]]:
-        """Extract streamflow for configured rivers from NWM files."""
+        """Extract streamflow for configured rivers from NWM files.
+
+        Time axis anchor: ``t=0`` is ``cycle - nowcast_hours`` (= ``model_t0``,
+        matching SCHISM's simulation start). For each file we resolve the
+        actual valid time -- from the ``model_output_valid_time`` NetCDF
+        attribute when present, otherwise from the filename via
+        ``_nwm_valid_time`` -- and convert to ``hours from model_t0``.
+
+        The earlier file-index fallback (``len(all_times) * 1.0``) silently
+        labelled file 0 as ``t=0`` regardless of its actual valid time. For
+        analysis_assim runs that include pre-cycle lookback (tmHH > 0) this
+        placed the cycle-hour flow at a positive offset and shifted every
+        downstream row by the lookback depth, producing a vsource.th
+        misaligned with SCHISM's ``model_t0``. Using actual valid times
+        anchors the axis at ``model_t0`` and lets ``_normalize_to_simulation_grid``
+        drop / back-fill correctly.
+        """
         n_rivers = self.river_config.n_rivers
         feature_ids = set(self.river_config.feature_ids)
+
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+        start_time = cycle_dt - timedelta(hours=self.config.nowcast_hours)
 
         all_flows = []
         all_times = []
@@ -813,9 +833,29 @@ class NWMProcessor(ForcingProcessor):
                     else:
                         flows[r_idx] = self.river_config.clim_flows[r_idx]
 
+                # Resolve valid time -> hours from model_t0
+                model_time: Optional[datetime] = None
+                if hasattr(ds, "model_output_valid_time"):
+                    try:
+                        model_time = datetime.strptime(
+                            ds.model_output_valid_time, "%Y-%m-%d_%H:%M:%S"
+                        )
+                    except (TypeError, ValueError):
+                        model_time = None
+                if model_time is None:
+                    fname_time = _nwm_valid_time(nwm_file)
+                    if fname_time != datetime.min:
+                        model_time = fname_time
+
+                if model_time is not None:
+                    t_hours = (model_time - start_time).total_seconds() / 3600.0
+                else:
+                    # Last-resort sequential fallback (matches prior behavior
+                    # for tests / fixtures that don't carry valid-time info).
+                    t_hours = float(len(all_times))
+
                 all_flows.append(flows)
-                # Time in hours from start (approximate)
-                all_times.append(len(all_times) * 1.0)  # hourly assumption
+                all_times.append(t_hours)
 
                 ds.close()
             except Exception as e:
@@ -1140,6 +1180,12 @@ class NWMProcessor(ForcingProcessor):
         source. ``times`` arrives already conditioned to a dense hourly
         grid starting at 0 by ``_normalize_to_simulation_grid``; the
         writer just emits ``t_hours * 3600`` per row.
+
+        Time-axis anchor: row ``t=0`` corresponds to SCHISM's ``model_t0``
+        (= ``cycle - nowcast_hours``). The extractors and the climatology
+        fallback both produce ``times`` in *hours from model_t0*, so the
+        relative seconds written here align with SCHISM's run start. For
+        SECOFS-UFS that means t=0 is ``cycle - 6h``.
         """
         output_file = self.output_path / "vsource.th"
         try:
@@ -1169,6 +1215,10 @@ class NWMProcessor(ForcingProcessor):
         Format matches v3.9.1 production (`pyschism`-derived
         `nwm_base.py:TimeHistoryFile.__str__`):
         ``{rel_time:G} {value:.4e} ...`` per row.
+
+        Time-axis anchor: same as vsource.th. Row ``t=0`` corresponds to
+        ``model_t0 = cycle - nowcast_hours`` so the sink/source axes are
+        co-aligned (SCHISM reads both inside the same source-term step).
         """
         output_file = self.output_path / "vsink.th"
         n_sinks = self.river_config.n_sinks
@@ -1378,6 +1428,12 @@ class NWMProcessor(ForcingProcessor):
         Production COMOUT confirms all-``-9999`` content; matching it
         avoids forcing artificial source-water properties that don't
         match the surrounding ambient cells.
+
+        Time-axis anchor: shares the ``times`` array with ``vsource.th``
+        so row ``t=0`` corresponds to ``model_t0 = cycle - nowcast_hours``.
+        Keeping the three source files (vsource/vsink/msource) on the same
+        axis is a SCHISM requirement -- the source-term reader allocates
+        one buffer for all of them.
         """
         output_file = self.output_path / "msource.th"
         n_rivers = self.river_config.n_rivers

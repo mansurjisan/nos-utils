@@ -331,7 +331,12 @@ class TestNudgingWithSyntheticRTOFS:
         rtofs_dir = tmp_path / "rtofs.20260331"
         rtofs_dir.mkdir()
 
-        for fhr in [0, 6]:
+        # Files placed under rtofs.20260331/ are parsed against
+        # rtofs_cycle_date=20260331. Forecast hours 24, 30, ..., 90 land
+        # on 20260401 00z, 06z, ..., 20260403 18z — covering the SECOFS
+        # simulation window [20260401 06z, 20260403 12z] = [sim_start,
+        # sim_end]. The window-filter retains all of these.
+        for fhr in [24, 30, 36, 48, 60, 72, 84, 90]:
             rtofs_file = rtofs_dir / f"rtofs_glo_3dz_f{fhr:03d}_6hrly_hvr_US_east.nc"
             self._make_rtofs_3d(
                 rtofs_file,
@@ -384,6 +389,21 @@ class TestNudgingWithSyntheticRTOFS:
 
             # Check time dimension
             assert ds.dimensions["time"].size >= 2
+
+            # Route B contract: t=0 anchors at cycle - nowcast_hours
+            # (i.e. SCHISM model t=0 = sim_start). Subsequent samples
+            # must cover [0, sim_duration] at the configured cadence.
+            time_vals = ds.variables["time"][:]
+            assert time_vals[0] == 0.0, (
+                f"t=0 must be the model anchor, got {time_vals[0]}"
+            )
+            sim_duration_s = (
+                config.nowcast_hours + config.forecast_hours
+            ) * 3600.0
+            assert time_vals[-1] <= sim_duration_s + 1.0, (
+                f"output extends past sim_duration: "
+                f"{time_vals[-1]} > {sim_duration_s}"
+            )
 
             # Check tracer has valid values (not all NaN)
             tracer = ds.variables["tracer_concentration"][:]

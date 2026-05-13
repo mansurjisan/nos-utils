@@ -374,12 +374,41 @@ class NudgingProcessor(ForcingProcessor):
         rtofs_proc._bnd_ids = nudge_node_ids.tolist()
         rtofs_proc._vgrid = vgrid
 
+        # Anchor the nudge output to YAML-declared simulation window.
+        # Model t=0 corresponds to ``cycle - nowcast_hours`` (the SCHISM
+        # hotstart time). The output time axis is therefore seconds from
+        # this anchor, NOT seconds from the first RTOFS file (which may
+        # sit before or after sim_start depending on availability).
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+        sim_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
+        sim_duration = (sim_end - sim_start).total_seconds()
+
+        # RTOFS cycle date drives the per-file valid-time calculation.
+        # Falls back to PDY when find_input_files_by_type didn't run
+        # (e.g., synthetic test data with no naming pattern that matches).
+        rtofs_cycle = getattr(rtofs_proc, '_rtofs_cycle_date', None)
+        if rtofs_cycle is None:
+            rtofs_cycle = datetime.strptime(self.config.pdy, "%Y%m%d")
+
         all_temp = []
         all_salt = []
+        # Seconds-from-sim_start for each appended timestep. Files
+        # sitting before sim_start produce negative entries; files after
+        # sim_end produce entries > sim_duration. These extra entries
+        # serve as endpoints for the temporal interpolation that follows.
+        all_times: List[float] = []
 
         # Precomputed weight state: computed once from first file's surface
         interp_weights = None  # Will hold _NudgeInterpWeights
         grid_validated = False  # For precomputed weights grid check
+
+        # RTOFS 3D files are 6-hourly. When a single file holds multiple
+        # time records (rare, but the reader supports it), they are
+        # treated as consecutive 6h steps starting at the file's stamped
+        # forecast hour.
+        rtofs_dt_input = 21600.0
 
         for fi, f in enumerate(files_3d):
             try:
@@ -397,6 +426,13 @@ class NudgingProcessor(ForcingProcessor):
                 depth_arr = depth_var[:] if depth_var is not None else np.arange(n_levels)
                 n_rtofs_levels = len(depth_arr)
 
+                # File valid time relative to sim_start (model t=0).
+                # Parses the f### or n### tag from the filename.
+                file_hour, _ = RTOFSProcessor._parse_rtofs_hour(f)
+                file_t0 = (
+                    rtofs_cycle + timedelta(hours=file_hour) - sim_start
+                ).total_seconds()
+
                 # Validate precomputed weights grid on first file
                 if use_precomputed and not grid_validated:
                     try:
@@ -408,6 +444,11 @@ class NudgingProcessor(ForcingProcessor):
                                     f"{ve}; falling back to Delaunay")
                         use_precomputed = False
                         nudge_weights_npz = None
+
+                # Track the number of timesteps actually appended from
+                # this file, so the corresponding entries in ``all_times``
+                # stay aligned with ``all_temp`` / ``all_salt``.
+                appended_per_var = {"temperature": 0, "salinity": 0}
 
                 for var_name, target_list in [
                     ("temperature", all_temp),
@@ -486,6 +527,15 @@ class NudgingProcessor(ForcingProcessor):
                             bnd_profile = bnd_profile_rtofs
 
                         target_list.append(bnd_profile)
+                        appended_per_var[var_name] += 1
+
+                # Record the time stamp for each timestep just appended.
+                # The two variables append the same set of timesteps
+                # (or one variable may be missing); take whichever count
+                # is larger.
+                n_appended = max(appended_per_var.values())
+                for k in range(n_appended):
+                    all_times.append(file_t0 + k * rtofs_dt_input)
 
                 ds.close()
             except Exception as e:
@@ -498,71 +548,101 @@ class NudgingProcessor(ForcingProcessor):
             )
 
         # --- 5. Temporal interpolation: 6-hourly RTOFS -> 3-hourly output ---
-        # Clip to simulation duration so output timesteps match COMF Fortran.
-        rtofs_dt = 21600.0   # 6-hourly input
+        # ``sim_start`` and ``sim_duration`` were computed above so the
+        # per-file valid times in ``all_times`` are already relative to
+        # the model t=0 anchor (= cycle - nowcast_hours).
         target_dt = 10800.0  # 3-hourly output (matches COMF Fortran)
 
-        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
-                   timedelta(hours=self.config.cyc)
-        sim_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
-        sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
-        sim_duration = (sim_end - sim_start).total_seconds()
+        # The output time axis covers [0, sim_duration] at ``target_dt``
+        # cadence — i.e. 0, 3h, 6h, ..., nowcast+forecast hours from the
+        # SCHISM hotstart anchor. For SECOFS (6h nowcast + 48h forecast)
+        # this yields 19 samples (0..194400s).
+        n_target = int(sim_duration / target_dt) + 1
+        target_times = (np.arange(n_target) * target_dt).astype(np.float64)
+
+        # Sanity-clamp to the input window: if RTOFS files don't reach
+        # sim_end, drop the trailing target samples that would be pure
+        # extrapolation. The first sample is allowed to predate the
+        # earliest RTOFS file slightly because RTOFS is hourly-stale at
+        # production cycle times.
+        rtofs_times_arr = np.asarray(all_times, dtype=np.float64)
+
+        # Final output time axis (seconds from model t=0 = sim_start).
+        # If interpolation runs, this becomes ``target_times`` clipped to
+        # the input coverage. If only a single input timestep is loaded
+        # (degenerate case), we fall back to the single raw file time.
+        output_times: Optional[np.ndarray] = None
 
         for var_list in [all_temp, all_salt]:
             if len(var_list) > 1:
                 n_in = len(var_list)
-                rtofs_times = np.arange(n_in) * rtofs_dt
-                n_out = int((n_in - 1) * rtofs_dt / target_dt) + 1
-                target_times = np.arange(n_out) * target_dt
-                target_times = target_times[
-                    target_times <= min(rtofs_times[-1], sim_duration)
-                ]
+                # Defensive: trim/repeat ``rtofs_times_arr`` to match
+                # ``n_in`` (the two variables append the same count, but
+                # if temperature was missing from one file the count
+                # could diverge from ``len(all_times)``).
+                if rtofs_times_arr.shape[0] >= n_in:
+                    rt = rtofs_times_arr[:n_in]
+                else:
+                    # Pad by extrapolating at the file cadence.
+                    pad = rtofs_times_arr[-1] + (
+                        np.arange(1, n_in - rtofs_times_arr.shape[0] + 1)
+                        * rtofs_dt_input
+                    )
+                    rt = np.concatenate([rtofs_times_arr, pad])
+
+                # Clip target_times to the actual RTOFS coverage so we
+                # never extrapolate past the last file.
+                tt = target_times[target_times <= rt[-1]]
+                if len(tt) == 0:
+                    # Degenerate window: at least keep t=0
+                    tt = np.array([0.0], dtype=np.float64)
 
                 stacked = np.stack(var_list, axis=0)  # (n_in, n_nodes, n_levels)
-
-                # Vectorized temporal interpolation using numpy.
-                # Reshape to (n_in, n_nodes*n_levels), interp along axis 0,
-                # then reshape back. np.interp is 1-D, so we transpose and
-                # use a single apply_along_axis-free loop over the flat dim.
-                orig_shape = stacked.shape[1:]  # (n_nodes, n_levels)
-                flat = stacked.reshape(n_in, -1)  # (n_in, N)
+                orig_shape = stacked.shape[1:]
+                flat = stacked.reshape(n_in, -1)
                 n_flat = flat.shape[1]
-                interp_out = np.empty(
-                    (len(target_times), n_flat), dtype=np.float32,
-                )
-                # np.interp is fast in C — one call per flat column is still
-                # much faster than scipy.interp1d per (node, level) pair,
-                # because we eliminated the Python overhead of 32K*63 interp1d
-                # constructor calls. For further speed, we vectorize by
-                # computing fractional indices and using linear combination.
-                if len(target_times) > 0 and n_in > 1:
-                    # Compute fractional indices into rtofs_times for each
-                    # target time. This avoids any scipy overhead.
-                    frac_idx = np.clip(
-                        target_times / rtofs_dt, 0, n_in - 1,
-                    )
-                    idx_lo = np.floor(frac_idx).astype(np.intp)
-                    idx_hi = np.minimum(idx_lo + 1, n_in - 1)
-                    alpha = (frac_idx - idx_lo).astype(np.float32)
+                interp_out = np.empty((len(tt), n_flat), dtype=np.float32)
 
-                    # Fully vectorized: gather + lerp
-                    # flat[idx_lo] has shape (n_target_times, N)
-                    val_lo = flat[idx_lo]  # (n_out, N)
-                    val_hi = flat[idx_hi]  # (n_out, N)
+                if n_in > 1 and rt[-1] > rt[0]:
+                    # Vectorized piecewise-linear lerp against the
+                    # actual (possibly non-uniform) RTOFS time series.
+                    idx_hi = np.searchsorted(rt, tt, side="right")
+                    idx_hi = np.clip(idx_hi, 1, n_in - 1)
+                    idx_lo = idx_hi - 1
+                    span = (rt[idx_hi] - rt[idx_lo])
+                    # Guard against zero-span (duplicate timestamps).
+                    span = np.where(span == 0, 1.0, span)
+                    alpha = ((tt - rt[idx_lo]) / span).astype(np.float32)
+                    # Extrapolate-at-edges = clamp alpha to [0, 1]
+                    alpha = np.clip(alpha, 0.0, 1.0)
+                    val_lo = flat[idx_lo]
+                    val_hi = flat[idx_hi]
                     interp_out[:] = val_lo + alpha[:, np.newaxis] * (val_hi - val_lo)
-                elif len(target_times) == 1:
-                    interp_out[0] = flat[0]
+                else:
+                    # Single input timestep: broadcast across target axis.
+                    interp_out[:] = flat[0]
 
-                interp_out = interp_out.reshape(
-                    (len(target_times),) + orig_shape,
-                )
+                interp_out = interp_out.reshape((len(tt),) + orig_shape)
                 var_list.clear()
-                var_list.extend(
-                    [interp_out[t] for t in range(len(target_times))],
+                var_list.extend([interp_out[t] for t in range(len(tt))])
+                output_times = tt
+                log.info(
+                    f"Temporally interpolated nudge field: "
+                    f"{n_in} -> {len(tt)} steps "
+                    f"(sim_duration={sim_duration:.0f}s, "
+                    f"t0={rt[0]:.0f}s, anchor=cycle-{self.config.nowcast_hours}h)"
                 )
-                log.info(f"Temporally interpolated nudge field: "
-                         f"{n_in} -> {len(target_times)} steps "
-                         f"(sim_duration={sim_duration:.0f}s)")
+
+        # If no interpolation ran (every var_list had <= 1 entry), the
+        # output is whatever raw timestamps came out of all_times.
+        if output_times is None:
+            n_raw = max(len(all_temp), len(all_salt))
+            if n_raw > 0 and rtofs_times_arr.shape[0] >= n_raw:
+                output_times = rtofs_times_arr[:n_raw]
+            else:
+                # Fallback: synthesise a single t=0 axis. The Fortran
+                # output for a 1-step nudge file uses 0s anyway.
+                output_times = np.zeros(max(n_raw, 1), dtype=np.float64)
 
         # --- 6. Filter to nodes with valid RTOFS coverage ---
         # A node is valid if it has non-NaN data at the surface level for the
@@ -591,7 +671,15 @@ class NudgingProcessor(ForcingProcessor):
 
         # --- 7. Write output files ---
         output_files = []
-        dt_out = target_dt if len(all_temp) > 1 else rtofs_dt
+
+        # Effective output cadence (for metadata only). When the time
+        # axis is uniform this equals the inter-sample gap; otherwise
+        # fall back to the target cadence so downstream consumers can
+        # still report a representative dt.
+        if len(output_times) > 1:
+            dt_out = float(output_times[1] - output_times[0])
+        else:
+            dt_out = float(target_dt)
 
         for var_list, label, out_name, units in [
             (all_temp, "TEM", "TEM_nu.nc", "degC"),
@@ -605,8 +693,14 @@ class NudgingProcessor(ForcingProcessor):
             # Subset to valid nodes
             stacked = stacked[:, valid_indices, :]
 
+            # Align the time axis with the data length. The two variables
+            # share ``output_times`` but defensive clipping keeps them
+            # honest if one variable has fewer raw timesteps.
+            times_for_var = output_times[: stacked.shape[0]]
+
             self._write_nudge_nc(
-                out_path, stacked, valid_node_ids, dt_out, label, units,
+                out_path, stacked, valid_node_ids, times_for_var,
+                label, units,
             )
             output_files.append(out_path)
 
@@ -984,7 +1078,7 @@ class NudgingProcessor(ForcingProcessor):
         output_path: Path,
         data: np.ndarray,
         node_ids: np.ndarray,
-        dt: float,
+        time_or_dt,
         label: str,
         units: str,
     ) -> None:
@@ -999,11 +1093,34 @@ class NudgingProcessor(ForcingProcessor):
             output_path: Path to write
             data: Array of shape (n_time, n_nodes, n_levels)
             node_ids: 1-based global node IDs
-            dt: Time step in seconds
+            time_or_dt: Either a 1-D array of absolute timestamps in
+                seconds from model t=0 (preferred — anchors the nudge
+                window to ``cycle - nowcast_hours``), or a scalar dt in
+                seconds (legacy: synthesises ``[0, dt, 2*dt, ...]``).
             label: "TEM" or "SAL"
             units: Variable units ("degC" or "PSU")
         """
         nt, n_nodes, n_levels = data.shape
+
+        # Resolve the time axis. Accept either a 1-D array (preferred
+        # explicit form, used by the processor pipeline) or a scalar dt
+        # (legacy form, kept for tests that exercise the writer in
+        # isolation).
+        time_arr = np.asarray(time_or_dt, dtype=np.float64)
+        if time_arr.ndim == 0:
+            time_values = np.arange(nt, dtype=np.float64) * float(time_arr)
+            dt_log = float(time_arr)
+        else:
+            time_values = time_arr.astype(np.float64, copy=False)
+            if time_values.shape[0] != nt:
+                raise ValueError(
+                    f"_write_nudge_nc: time axis length {time_values.shape[0]} "
+                    f"!= data time dimension {nt}"
+                )
+            dt_log = (
+                float(time_values[1] - time_values[0])
+                if nt > 1 else 0.0
+            )
 
         # Replace any remaining NaN with fill value
         fill_val = 15.0 if label == "TEM" else 35.0
@@ -1024,7 +1141,7 @@ class NudgingProcessor(ForcingProcessor):
         nc.createDimension("one", 1)
 
         time_var = nc.createVariable("time", "f8", ("time",))
-        time_var[:] = np.arange(nt, dtype=np.float64) * dt
+        time_var[:] = time_values
 
         map_var = nc.createVariable("map_to_global_node", "i4", ("node",))
         map_var[:] = node_ids.astype(np.int32)
@@ -1036,8 +1153,10 @@ class NudgingProcessor(ForcingProcessor):
         tracer[:, :, :, 0] = data.astype(np.float64)
 
         nc.close()
-        log.info(f"Created {output_path.name}: {nt} times, {n_nodes:,} nodes, "
-                 f"{n_levels} levels at dt={dt}s")
+        log.info(
+            f"Created {output_path.name}: {nt} times, {n_nodes:,} nodes, "
+            f"{n_levels} levels (t0={time_values[0]:.0f}s, dt~{dt_log:.0f}s)"
+        )
 
     def find_input_files(self) -> List[Path]:
         return sorted(self.input_path.glob("*temperature*.nc")) + \
