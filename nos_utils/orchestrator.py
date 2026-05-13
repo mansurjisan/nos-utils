@@ -164,45 +164,41 @@ class PrepOrchestrator:
         hotstart_result = self._run_hotstart(output_dir)
         results.append(hotstart_result)
 
-        # Anchor time_hotstart to cycle - nowcast_hours unconditionally.
+        # Anchor time_hotstart to cycle time unconditionally (Route A).
         #
-        # This matches the operational COMF convention (shell
-        # _schism_find_hotstart in nos_run.sh) and MEMORY.md
-        # feedback_time_hotstart_anchor.md, which require the same anchor
-        # for both warm-start and cold-start so OBC/forcing/hotstart time
-        # axes all align at the launcher's sim_start.
+        # The OBC NetCDFs, DATM forcing, sflux stack, and model_configure are
+        # all written with t=0 at cycle time.  SCHISM's param.nml start_*
+        # fields, bctides.in line 1, and the $COMOUT time markers must agree
+        # with that anchor or SCHISM crashes at partition_hgrid:534 with
+        # ParMETIS heap corruption -- 180-degree M2 phase mismatch plus
+        # boundary forcing time misalignment.
         #
-        # DO NOT parse time_hotstart from the hotstart filename's tHHz.YYYYMMDD
-        # tag.  That tag encodes the cycle that PRODUCED the restart, not the
-        # restart's time origin -- they only coincide because operational COMF
-        # itself anchors time_hotstart = cycle - LEN_NOWCAST on every cycle.
-        # Today's pre-staged init file (e.g. secofs.t00z.20260510.init.nowcast.nc)
-        # carries today's cycle in its name even though its physical
-        # time_hotstart is still cycle - 6h; parsing the filename gives an
-        # 6h-wrong sim_start.  That misalignment puts param.nml's
-        # start_{year,month,day,hour} out of sync with OBC[t=0] and
-        # triggers ParMETIS heap corruption in SCHISM partition_hgrid:534
-        # at 2914-rank scale.
+        # An earlier attempt (commit c0e232c) anchored time_hotstart to
+        # cycle - nowcast_hours to match the legacy shell, but only the
+        # SCHISM-side files were migrated -- the OBC/DATM/sflux side stayed
+        # on cycle time, producing the exact misalignment described above.
+        # Route A reverts to a single cycle-time anchor across both sides.
         #
         # We deliberately ignore the environment $time_hotstart for the same
         # reason: upstream J-jobs may export a different convention (e.g.
-        # 24h-back instead of 6h-back); ignore that and let the YAML
-        # nowcast_hours drive the anchor.
+        # 24h-back instead of 0h); ignore that and keep the SCHISM-side
+        # anchored to cycle so it matches the forcing time axis.
         from datetime import timedelta as _td
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                    _td(hours=self.config.cyc)
-        time_hotstart = cycle_dt - _td(hours=self.config.nowcast_hours)
+        time_hotstart = cycle_dt
         log.info(
             f"time_hotstart anchor = {time_hotstart.strftime('%Y%m%d%H')} "
-            f"(cycle {cycle_dt.strftime('%Y%m%d%H')} - "
-            f"nowcast_hours={self.config.nowcast_hours})"
+            f"(cycle time; nowcast leg uses rnday=nowcast_hours/24 "
+            f"with start at cycle)"
         )
         env_ths = os.environ.get("time_hotstart", "")
         if env_ths and env_ths[:10] != time_hotstart.strftime("%Y%m%d%H"):
             log.info(
                 f"Ignoring env time_hotstart={env_ths[:10]} (J-job override); "
                 f"YAML-derived {time_hotstart.strftime('%Y%m%d%H')} "
-                f"is authoritative to keep OBC time axis aligned"
+                f"is authoritative to keep SCHISM-side aligned with "
+                f"OBC/DATM/sflux cycle-time anchor"
             )
 
         # ---- Phase 1: Lightweight steps in parallel ----

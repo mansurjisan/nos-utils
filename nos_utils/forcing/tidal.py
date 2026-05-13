@@ -169,20 +169,21 @@ class TidalProcessor(ForcingProcessor):
         return files
 
     def _compute_start_time(self) -> datetime:
-        """Compute the model start time for this phase."""
+        """Compute the model start time for this phase.
+
+        Route A: both nowcast and forecast anchor at cycle time, matching the
+        OBC/DATM/sflux time axes.  The orchestrator passes
+        ``time_hotstart = cycle_dt``; when not provided, fall back to cycle.
+        """
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                    timedelta(hours=self.config.cyc)
 
         if self.phase == "nowcast":
-            if self.time_hotstart:
-                return self.time_hotstart
-            return cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            return self.time_hotstart if self.time_hotstart else cycle_dt
         elif self.phase == "forecast":
             return cycle_dt
         else:
-            if self.time_hotstart:
-                return self.time_hotstart
-            return cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            return self.time_hotstart if self.time_hotstart else cycle_dt
 
     def _call_fortran_tide_fac(self, template_path: Path, output_path: Path) -> bool:
         """

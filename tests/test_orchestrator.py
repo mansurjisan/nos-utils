@@ -68,25 +68,24 @@ class TestPrepOrchestrator:
 
 
 class TestTimeHotstartAnchor:
-    """time_hotstart must be derived as cycle - nowcast_hours, regardless of
-    whether _run_hotstart selected a restart file or not.
+    """time_hotstart must equal cycle time (Route A), regardless of whether
+    _run_hotstart selected a restart file or not.
 
-    Regression suite for the bug where PrepOrchestrator.run() was parsing
-    time_hotstart from the selected hotstart filename's ``tHHz.YYYYMMDD``
-    tag.  That tag encodes the cycle that produced the restart, not the
-    restart's time origin; when today's own pre-staged init file gets
-    selected, the parse returns cycle time and the launcher's sim_start
-    misaligns with the OBC time axis by LEN_NOWCAST hours -- surfacing as
-    SCHISM partition_hgrid:534 ParMETIS heap corruption at 2914-rank scale.
+    The OBC NetCDFs, DATM forcing, sflux stack, and model_configure all anchor
+    t=0 at cycle time.  SCHISM's param.nml start_*, bctides.in line 1, and
+    the $COMOUT time markers must agree with that anchor or the model crashes
+    at partition_hgrid:534 with ParMETIS heap corruption.
+
+    The previous anchor (cycle - nowcast_hours, commit c0e232c) only migrated
+    the SCHISM-side files and left the OBC/forcing side on cycle time,
+    producing the exact misalignment Route A is designed to avoid.
     """
 
-    def test_time_hotstart_equals_cycle_minus_nowcast_warm(self, mock_config,
-                                                            orch_paths):
-        """Even if _run_hotstart selected today's pre-staged init file,
-        the marker must anchor to cycle - nowcast_hours.
+    def test_time_hotstart_equals_cycle_warm(self, mock_config, orch_paths):
+        """time_hotstart marker must anchor to cycle time.
 
-        mock_config has pdy=20260401, cyc=12, nowcast_hours=6 ->
-        expected time_hotstart = 2026040106.
+        mock_config has pdy=20260401, cyc=12 ->
+        expected time_hotstart = 2026040112.
         """
         orch = PrepOrchestrator(mock_config, orch_paths)
         result = orch.run(phase="nowcast")
@@ -94,7 +93,7 @@ class TestTimeHotstartAnchor:
 
         marker = Path(orch_paths["output"]) / "time_hotstart.t12z"
         assert marker.is_file(), "_write_time_markers must emit time_hotstart"
-        assert marker.read_text().strip() == "2026040106"
+        assert marker.read_text().strip() == "2026040112"
 
     def test_base_date_matches_time_hotstart(self, mock_config, orch_paths):
         """base_date.${cycle} must byte-match time_hotstart.${cycle} -- the
@@ -119,18 +118,18 @@ class TestTimeHotstartAnchor:
     def test_env_time_hotstart_ignored(self, mock_config, orch_paths,
                                        monkeypatch):
         """An environment override of $time_hotstart must NOT change the
-        marker value -- the YAML nowcast_hours anchor is authoritative.
+        marker value -- the YAML-derived cycle anchor is authoritative.
 
         Upstream J-jobs sometimes export a 24h-back convention; tolerating
-        that here would re-introduce the OBC/sim_start misalignment.
+        that here would re-introduce SCHISM/forcing time-axis misalignment.
         """
-        monkeypatch.setenv("time_hotstart", "2026033112")  # 24h-back ALL wrong
+        monkeypatch.setenv("time_hotstart", "2026033112")  # ALL wrong
         orch = PrepOrchestrator(mock_config, orch_paths)
         orch.run(phase="nowcast")
 
         marker = Path(orch_paths["output"]) / "time_hotstart.t12z"
-        # Still cycle - nowcast_hours, not the env value.
-        assert marker.read_text().strip() == "2026040106"
+        # Still cycle time, not the env value.
+        assert marker.read_text().strip() == "2026040112"
 
 
 class TestPrepResult:

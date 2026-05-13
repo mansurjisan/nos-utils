@@ -133,36 +133,33 @@ class ParamNmlProcessor(ForcingProcessor):
         """
         Compute parameter values based on config, phase, and hotstart time.
 
-        Legacy shell behavior:
-          Nowcast:  start=time_hotstart, rnday=(nowcastend-hotstart)/24, ihot=1
-          Forecast: start=nowcastend,    rnday=forecast_hours/24,        ihot=2
+        Route A (cycle-time anchor for SCHISM-side, matching OBC/DATM/sflux):
+          Nowcast:  start=cycle,   rnday=nowcast_hours/24,  ihot=1
+          Forecast: start=cycle,   rnday=forecast_hours/24, ihot=2
+
+        Both legs anchor model t=0 at cycle time -- the same anchor used by
+        the OBC NetCDFs, DATM forcing, and sflux stack.  ``time_hotstart``
+        (when passed by the orchestrator) carries the cycle datetime, not
+        cycle - nowcast_hours.
         """
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                    timedelta(hours=self.config.cyc)
         nowcast_end = cycle_dt  # nowcastend = PDY + cyc
 
         if self.phase == "nowcast":
-            # Start from hotstart time if available, otherwise cycle - nowcast_hours
-            if self.time_hotstart:
-                start_dt = self.time_hotstart
-            else:
-                start_dt = cycle_dt - timedelta(hours=self.config.nowcast_hours)
-            end_dt = nowcast_end
-            run_hours = (end_dt - start_dt).total_seconds() / 3600.0
+            # Anchor at cycle (Route A); orchestrator passes
+            # time_hotstart = cycle_dt.  Fall back to cycle when not provided.
+            start_dt = self.time_hotstart if self.time_hotstart else cycle_dt
+            run_hours = float(self.config.nowcast_hours)
             ihot = 1
         elif self.phase == "forecast":
             start_dt = nowcast_end
-            end_dt = nowcast_end + timedelta(hours=self.config.forecast_hours)
-            run_hours = self.config.forecast_hours
+            run_hours = float(self.config.forecast_hours)
             ihot = 2  # Forecast continues from nowcast hotstart (don't reset clock)
         else:
             # Full run (nowcast + forecast)
-            if self.time_hotstart:
-                start_dt = self.time_hotstart
-            else:
-                start_dt = cycle_dt - timedelta(hours=self.config.nowcast_hours)
-            end_dt = nowcast_end + timedelta(hours=self.config.forecast_hours)
-            run_hours = (end_dt - start_dt).total_seconds() / 3600.0
+            start_dt = self.time_hotstart if self.time_hotstart else cycle_dt
+            run_hours = float(self.config.nowcast_hours + self.config.forecast_hours)
             ihot = 1
 
         rnday = run_hours / 24.0

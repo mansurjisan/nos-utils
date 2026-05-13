@@ -44,11 +44,12 @@ class TestParamNmlProcessor:
         # 6h nowcast -> rnday = .2500 (COMF bc-style: no leading zero)
         assert ".2500" in content
         assert "0.2500" not in content  # must NOT have leading zero
-        # Start time: 2026-04-01 12z - 6h = 06z
+        # Route A: nowcast start_dt = cycle (2026-04-01 12z), not cycle-6h.
+        # SCHISM-side now matches the OBC/DATM/sflux cycle-time anchor.
         assert "start_year = 2026" in content
         assert "start_month = 04" in content
         assert "start_day = 01" in content
-        assert "start_hour = 06" in content  # zero-padded to match COMF Fortran
+        assert "start_hour = 12" in content  # zero-padded; cycle time
         # Placeholders should be gone
         assert "rnday_value" not in content
         assert "start_year_value" not in content
