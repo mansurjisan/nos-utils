@@ -311,3 +311,169 @@ class TestExtractStreamflowTimeAnchor:
         flows, times = proc._extract_streamflow(files)
         # tm01 → 23z prior day = t=5; tm00 → 00z cycle = t=6
         assert times == [5.0, 6.0]
+
+
+class TestRoutePhaseNWM:
+    """Phase-aware output time windows for vsource / msource / vsink.
+
+    Two operational PBS jobs (nowcast + forecast) read NWM source/sink
+    forcing; each must receive vsource.th / msource.th / vsink.th
+    covering only the leg the job will simulate. nowcast leg is 6h
+    (anchored at cycle - nowcast_hours), forecast leg is 48h (anchored
+    at cycle).
+    """
+
+    def _rc(self):
+        return RiverConfig(
+            feature_ids=[111], node_indices=[10], clim_flows=[50.0],
+        )
+
+    def test_phase_total_hours_nowcast(self, mock_config, tmp_path):
+        """phase='nowcast' total_hours = nowcast_hours + extra."""
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="nowcast",
+        )
+        # mock_config: nowcast_hours=6, forecast_hours=48, extra=0
+        assert proc._phase_total_hours() == 6
+
+    def test_phase_total_hours_forecast(self, mock_config, tmp_path):
+        """phase='forecast' total_hours = forecast_hours + extra."""
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="forecast",
+        )
+        assert proc._phase_total_hours() == 48
+
+    def test_phase_total_hours_none_combined(self, mock_config, tmp_path):
+        """phase=None preserves combined nowcast+forecast window."""
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(),
+        )
+        assert proc._phase_total_hours() == 54
+
+    def test_phase_start_time_nowcast(self, mock_config, tmp_path):
+        from datetime import datetime
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="nowcast",
+        )
+        # cycle = 2026-04-01 12z, nowcast_hours=6 -> 06z same day
+        assert proc._phase_start_time() == datetime(2026, 4, 1, 6)
+
+    def test_phase_start_time_forecast(self, mock_config, tmp_path):
+        from datetime import datetime
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="forecast",
+        )
+        # cycle = 2026-04-01 12z -> forecast leg starts at cycle
+        assert proc._phase_start_time() == datetime(2026, 4, 1, 12)
+
+    def test_phase_start_time_none_matches_nowcast(self, mock_config, tmp_path):
+        """phase=None anchors at cycle - nowcast_hours (combined window)."""
+        from datetime import datetime
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(),
+        )
+        assert proc._phase_start_time() == datetime(2026, 4, 1, 6)
+
+    def test_nowcast_vsource_7_hourly_rows(self, mock_config, tmp_path):
+        """Nowcast vsource.th has 7 hourly steps for 6h leg (0..21600s)."""
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(), phase="nowcast",
+        )
+        result = proc.process()
+        assert result.success
+        # n_target = nowcast_hours + 1 = 7
+        assert result.metadata["n_timesteps"] == 7
+        lines = (out_dir / "vsource.th").read_text().strip().split("\n")
+        assert len(lines) == 7
+        # First row at t=0
+        assert float(lines[0].split()[0]) == 0.0
+        # Last row at t=6*3600 = 21600s
+        assert float(lines[-1].split()[0]) == 21600.0
+
+    def test_forecast_vsource_49_hourly_rows(self, mock_config, tmp_path):
+        """Forecast vsource.th has 49 hourly steps for 48h leg (0..172800s)."""
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(), phase="forecast",
+        )
+        result = proc.process()
+        assert result.success
+        # n_target = forecast_hours + 1 = 49
+        assert result.metadata["n_timesteps"] == 49
+        lines = (out_dir / "vsource.th").read_text().strip().split("\n")
+        assert len(lines) == 49
+        assert float(lines[0].split()[0]) == 0.0
+        # 48h = 172800s
+        assert float(lines[-1].split()[0]) == 172800.0
+
+    def test_none_combined_55_rows(self, mock_config, tmp_path):
+        """phase=None backward-compat: 55-row combined window."""
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(),
+        )
+        result = proc.process()
+        assert result.success
+        assert result.metadata["n_timesteps"] == 55
+        assert result.metadata["phase"] is None
+
+    def test_msource_matches_vsource_steps(self, mock_config, tmp_path):
+        """msource.th must have the same row count as vsource.th per phase.
+
+        SCHISM allocates a single buffer for both files; a mismatch causes
+        heap corruption at ``partition_hgrid_`` (V11 nowcast crash mode).
+        """
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(), phase="nowcast",
+        )
+        result = proc.process()
+        assert result.success
+        vsource_lines = (out_dir / "vsource.th").read_text().strip().split("\n")
+        msource_lines = (out_dir / "msource.th").read_text().strip().split("\n")
+        assert len(vsource_lines) == len(msource_lines) == 7
+
+    def test_phase_stored_on_processor(self, mock_config, tmp_path):
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="forecast",
+        )
+        assert proc.phase == "forecast"
+
+    def test_phase_default_is_none(self, mock_config, tmp_path):
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(),
+        )
+        assert proc.phase is None
+
+    def test_phase_with_river_hourly_extra_hours(self, tmp_path):
+        """river_hourly_extra_hours adds to the phase window length."""
+        cfg = ForcingConfig(
+            lon_min=-80, lon_max=-70, lat_min=25, lat_max=35,
+            pdy="20260401", cyc=12,
+            nowcast_hours=6, forecast_hours=48,
+            river_hourly_extra_hours=18,
+        )
+        proc = NWMProcessor(
+            cfg, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="nowcast",
+        )
+        # nowcast=6 + extra=18 = 24 hours
+        assert proc._phase_total_hours() == 24
+        proc_fore = NWMProcessor(
+            cfg, tmp_path, tmp_path / "out2",
+            river_config=self._rc(), phase="forecast",
+        )
+        assert proc_fore._phase_total_hours() == 66

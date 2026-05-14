@@ -299,6 +299,158 @@ class TestRTOFSRouteBAnchoring:
         assert out[4] == 30.0
 
 
+class TestRoutePhaseRTOFS:
+    """Phase-aware output time windows for RTOFS OBC files.
+
+    Two operational PBS jobs (nowcast + forecast) read from $COMOUT;
+    each must receive elev2D / TEM_3D / SAL_3D / uv3D files whose
+    physical time content matches the filename phase.
+
+      * nowcast: 6h window from cycle - nowcast_hours to cycle
+      * forecast: 48h window from cycle to cycle + forecast_hours
+      * None (backward-compat): combined 54h window
+
+    The window helper drives the temporal interpolation grid that
+    sizes ``elev2D.th.nc`` (dt=120s) and ``TEM_3D.th.nc`` /
+    ``SAL_3D.th.nc`` (dt=10800s).
+    """
+
+    def test_output_window_nowcast(self, mock_config, tmp_path):
+        proc = RTOFSProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="nowcast",
+        )
+        model_t0, sim_end, sim_duration = proc._get_output_window("nowcast")
+        # cycle = 2026-04-01 12z, nowcast_hours=6 -> [06z, 12z]
+        assert model_t0 == datetime(2026, 4, 1, 6)
+        assert sim_end == datetime(2026, 4, 1, 12)
+        assert sim_duration == 6 * 3600.0
+
+    def test_output_window_forecast(self, mock_config, tmp_path):
+        proc = RTOFSProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        model_t0, sim_end, sim_duration = proc._get_output_window("forecast")
+        # cycle = 2026-04-01 12z, forecast_hours=48 -> [12z, 12z + 2d]
+        assert model_t0 == datetime(2026, 4, 1, 12)
+        assert sim_end == datetime(2026, 4, 3, 12)
+        assert sim_duration == 48 * 3600.0
+
+    def test_output_window_none_combined(self, mock_config, tmp_path):
+        """phase=None must produce the existing Route B 54h combined window."""
+        proc = RTOFSProcessor(mock_config, tmp_path, tmp_path / "out")
+        model_t0, sim_end, sim_duration = proc._get_output_window(None)
+        # cycle - 6h .. cycle + 48h = 54h
+        assert model_t0 == datetime(2026, 4, 1, 6)
+        assert sim_end == datetime(2026, 4, 3, 12)
+        assert sim_duration == 54 * 3600.0
+
+    def test_nowcast_elev2d_step_count(self, mock_config, tmp_path):
+        """elev2D.th.nc covers 6h at dt=120s -> 51 records for nowcast leg.
+
+        Production SCHISM model_dt = 120s. With sim_duration = 21600s
+        (6h) the time axis is 0, 120, 240, ..., 21600 = 181 records
+        when including both endpoints. The +1 includes t=21600 because
+        the writer uses ``int(sim_duration/dt)+1`` inclusive.
+        """
+        proc = RTOFSProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="nowcast",
+        )
+        _, _, sim_duration = proc._get_output_window("nowcast")
+        model_dt = 120.0
+        n_steps = int(sim_duration / model_dt) + 1
+        # 6h * 3600 / 120 + 1 = 181
+        assert n_steps == 181
+        assert sim_duration == 21600.0
+
+    def test_forecast_elev2d_step_count(self, mock_config, tmp_path):
+        """elev2D.th.nc covers 48h at dt=120s -> 1441 records for forecast leg."""
+        proc = RTOFSProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        _, _, sim_duration = proc._get_output_window("forecast")
+        model_dt = 120.0
+        n_steps = int(sim_duration / model_dt) + 1
+        # 48h * 3600 / 120 + 1 = 1441
+        assert n_steps == 1441
+        assert sim_duration == 48 * 3600.0
+
+    def test_nowcast_3d_step_count(self, mock_config, tmp_path):
+        """TEM_3D.th.nc covers 6h at dt=10800s -> 3 records for nowcast leg.
+
+        3D OBC files use the COMF DELT_TS = 3h cadence. 6h / 3h + 1 = 3.
+        """
+        proc = RTOFSProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="nowcast",
+        )
+        _, _, sim_duration = proc._get_output_window("nowcast")
+        target_dt_3d = 10800.0
+        n_steps = int(sim_duration / target_dt_3d) + 1
+        assert n_steps == 3
+
+    def test_forecast_3d_step_count(self, mock_config, tmp_path):
+        """TEM_3D.th.nc covers 48h at dt=10800s -> 17 records for forecast leg.
+
+        48h / 3h + 1 = 17 inclusive of both endpoints.
+        """
+        proc = RTOFSProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        _, _, sim_duration = proc._get_output_window("forecast")
+        target_dt_3d = 10800.0
+        n_steps = int(sim_duration / target_dt_3d) + 1
+        assert n_steps == 17
+
+    def test_combined_step_count_backward_compat(self, mock_config, tmp_path):
+        """phase=None still produces 1621 elev2D and 19 TEM_3D records."""
+        proc = RTOFSProcessor(mock_config, tmp_path, tmp_path / "out")
+        _, _, sim_duration = proc._get_output_window(None)
+        assert sim_duration == 54 * 3600.0
+        # elev2D at 120s cadence: 54h/120s + 1 = 1621
+        n_2d = int(sim_duration / 120.0) + 1
+        assert n_2d == 1621
+        # TEM_3D at 3h cadence: 54h/3h + 1 = 19
+        n_3d = int(sim_duration / 10800.0) + 1
+        assert n_3d == 19
+
+    def test_nowcast_anchored_at_cycle_minus_nowcast_hours(self, mock_config, tmp_path):
+        """Nowcast model_t0 = cycle - nowcast_hours (SCHISM hotstart anchor)."""
+        proc = RTOFSProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="nowcast",
+        )
+        cycle_dt = datetime(2026, 4, 1, 12)
+        model_t0, _, _ = proc._get_output_window("nowcast")
+        nowcast_hours = mock_config.nowcast_hours
+        assert model_t0 == cycle_dt - timedelta(hours=nowcast_hours)
+
+    def test_forecast_anchored_at_cycle(self, mock_config, tmp_path):
+        """Forecast model_t0 = cycle (the operator's forecast leg start)."""
+        proc = RTOFSProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        cycle_dt = datetime(2026, 4, 1, 12)
+        model_t0, _, _ = proc._get_output_window("forecast")
+        assert model_t0 == cycle_dt
+
+    def test_stofs_24h_nowcast(self, stofs_config, tmp_path):
+        """STOFS-3D-ATL nowcast leg = 24h, forecast = 108h.
+
+        Verify the helper picks up factory-specific run hours, not just
+        the SECOFS defaults.
+        """
+        proc = RTOFSProcessor(
+            stofs_config, tmp_path, tmp_path / "out", phase="nowcast",
+        )
+        _, _, sim_duration = proc._get_output_window("nowcast")
+        assert sim_duration == 24 * 3600.0
+
+    def test_stofs_108h_forecast(self, stofs_config, tmp_path):
+        proc = RTOFSProcessor(
+            stofs_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        _, _, sim_duration = proc._get_output_window("forecast")
+        assert sim_duration == 108 * 3600.0
+
+
 class TestRTOFSFind3DWeights:
     """Test _find_3d_weights() discovery of precomputed 3D weight NPZ files."""
 

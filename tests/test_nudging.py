@@ -818,3 +818,90 @@ class TestPrecomputed3DWeights:
         wrong_field = np.zeros((3298, 4500), dtype=np.float32)
         with pytest.raises(ValueError, match="Grid shape mismatch"):
             apply_precomputed_ssh(npz, wrong_field)
+
+
+class TestRoutePhaseNudging:
+    """Phase-aware output time windows for nudge fields.
+
+    TEM_nu.nc / SAL_nu.nc carry the same phase split as the OBC files.
+    The operator's two PBS jobs read separate ``obc.{nowcast,forecast}.tar``
+    bundles; each bundle's TEM_nu / SAL_nu must cover only the leg the
+    job will simulate.
+    """
+
+    from datetime import datetime, timedelta
+
+    def test_get_output_window_nowcast(self, mock_config, tmp_path):
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        mock_config.nudging_enabled = True
+        proc = NudgingProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="nowcast",
+        )
+        sim_start, sim_end, sim_duration = proc._get_output_window()
+        # cycle = 2026-04-01 12z, nowcast_hours=6 -> [06z, 12z]
+        from datetime import datetime
+        assert sim_start == datetime(2026, 4, 1, 6)
+        assert sim_end == datetime(2026, 4, 1, 12)
+        assert sim_duration == 6 * 3600.0
+
+    def test_get_output_window_forecast(self, mock_config, tmp_path):
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        mock_config.nudging_enabled = True
+        proc = NudgingProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        sim_start, sim_end, sim_duration = proc._get_output_window()
+        # cycle = 2026-04-01 12z, forecast_hours=48 -> [12z, 12z + 2 days]
+        from datetime import datetime
+        assert sim_start == datetime(2026, 4, 1, 12)
+        assert sim_end == datetime(2026, 4, 3, 12)
+        assert sim_duration == 48 * 3600.0
+
+    def test_get_output_window_none_combined(self, mock_config, tmp_path):
+        """phase=None must produce the existing Route B 54h combined window."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        mock_config.nudging_enabled = True
+        proc = NudgingProcessor(mock_config, tmp_path, tmp_path / "out")
+        sim_start, sim_end, sim_duration = proc._get_output_window()
+        from datetime import datetime
+        assert sim_start == datetime(2026, 4, 1, 6)
+        assert sim_end == datetime(2026, 4, 3, 12)
+        assert sim_duration == 54 * 3600.0
+
+    def test_phase_stored_on_processor(self, mock_config, tmp_path):
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        assert proc.phase == "forecast"
+
+    def test_phase_default_is_none(self, mock_config, tmp_path):
+        """Default constructor (no phase kwarg) leaves phase=None."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(mock_config, tmp_path, tmp_path / "out")
+        assert proc.phase is None
+
+    def test_stofs_24h_nowcast_window(self, stofs_config, tmp_path):
+        """STOFS-3D-ATL nowcast = 24h."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(
+            stofs_config, tmp_path, tmp_path / "out", phase="nowcast",
+        )
+        _, _, sim_duration = proc._get_output_window()
+        assert sim_duration == 24 * 3600.0
+
+    def test_stofs_108h_forecast_window(self, stofs_config, tmp_path):
+        """STOFS-3D-ATL forecast = 108h."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(
+            stofs_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        _, _, sim_duration = proc._get_output_window()
+        assert sim_duration == 108 * 3600.0
