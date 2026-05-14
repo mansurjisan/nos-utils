@@ -21,7 +21,7 @@ import shutil
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -55,6 +55,7 @@ class NudgingProcessor(ForcingProcessor):
         output_path: Path,
         nudge_weight_file: Optional[Path] = None,
         rtofs_input_path: Optional[Path] = None,
+        phase: Optional[str] = None,
     ):
         """
         Args:
@@ -64,10 +65,55 @@ class NudgingProcessor(ForcingProcessor):
             nudge_weight_file: Path to nudging weight gr3 file (optional)
             rtofs_input_path: COMINrtofs root for STOFS nudge-specific data prep
                 (uses nudge_roi_3d instead of obc_roi_3d)
+            phase: "nowcast", "forecast", or None.
+                * "nowcast": nudge output spans ``[cycle - nowcast_hours, cycle]``
+                  with ``t=0`` at ``cycle - nowcast_hours``.
+                * "forecast": output spans ``[cycle, cycle + forecast_hours]``
+                  with ``t=0`` at ``cycle``.
+                * None (backward compat): combined 54h window starting at
+                  ``cycle - nowcast_hours``.
+                Operational COMOUT carries two separate tars
+                (``obc.nowcast.tar`` / ``obc.forecast.tar``); the phase
+                argument lets each tar's TEM_nu / SAL_nu match the leg
+                the operator's PBS job reads.
         """
         super().__init__(config, input_path, output_path)
         self.nudge_weight_file = nudge_weight_file
         self.rtofs_input_path = rtofs_input_path
+        self.phase = phase
+
+    def _get_output_window(self) -> Tuple[datetime, datetime, float]:
+        """Compute ``(sim_start, sim_end, sim_duration_seconds)`` for the phase.
+
+        Mirrors :meth:`RTOFSProcessor._get_output_window` so OBC and
+        nudging files share the same phase semantics:
+
+        * nowcast: ``[cycle - nowcast_hours, cycle]`` (duration =
+          ``nowcast_hours * 3600``).
+        * forecast: ``[cycle, cycle + forecast_hours]`` (duration =
+          ``forecast_hours * 3600``).
+        * None (default, backward-compat): combined 54h window
+          ``[cycle - nowcast_hours, cycle + forecast_hours]``.
+        """
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+        nowcast_hours = int(self.config.nowcast_hours)
+        forecast_hours = int(self.config.forecast_hours)
+
+        if self.phase == "nowcast":
+            sim_start = cycle_dt - timedelta(hours=nowcast_hours)
+            sim_end = cycle_dt
+            sim_duration = float(nowcast_hours) * 3600.0
+        elif self.phase == "forecast":
+            sim_start = cycle_dt
+            sim_end = cycle_dt + timedelta(hours=forecast_hours)
+            sim_duration = float(forecast_hours) * 3600.0
+        else:
+            sim_start = cycle_dt - timedelta(hours=nowcast_hours)
+            sim_end = cycle_dt + timedelta(hours=forecast_hours)
+            sim_duration = float(nowcast_hours + forecast_hours) * 3600.0
+
+        return sim_start, sim_end, sim_duration
 
     @property
     def is_stofs_mode(self) -> bool:
@@ -374,16 +420,15 @@ class NudgingProcessor(ForcingProcessor):
         rtofs_proc._bnd_ids = nudge_node_ids.tolist()
         rtofs_proc._vgrid = vgrid
 
-        # Anchor the nudge output to YAML-declared simulation window.
-        # Model t=0 corresponds to ``cycle - nowcast_hours`` (the SCHISM
-        # hotstart time). The output time axis is therefore seconds from
-        # this anchor, NOT seconds from the first RTOFS file (which may
-        # sit before or after sim_start depending on availability).
-        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
-                   timedelta(hours=self.config.cyc)
-        sim_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
-        sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
-        sim_duration = (sim_end - sim_start).total_seconds()
+        # Anchor the nudge output to the phase-specific window.
+        # Model t=0 corresponds to ``sim_start``:
+        #   * phase="nowcast":  cycle - nowcast_hours (the SCHISM hotstart time)
+        #   * phase="forecast": cycle (the operator's forecast leg start)
+        #   * phase=None:       cycle - nowcast_hours (combined window)
+        # The output time axis is therefore seconds from this anchor,
+        # NOT seconds from the first RTOFS file (which may sit before
+        # or after sim_start depending on availability).
+        sim_start, sim_end, sim_duration = self._get_output_window()
 
         # RTOFS cycle date drives the per-file valid-time calculation.
         # Falls back to PDY when find_input_files_by_type didn't run

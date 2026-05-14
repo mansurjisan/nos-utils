@@ -524,9 +524,16 @@ class NWMProcessor(ForcingProcessor):
         # (SECOFS / SECOFS-UFS = 18) and via the ``river.hourly_extra_hours``
         # YAML knob; default 0 preserves prior behavior for STOFS, which
         # uses the medium-range 121-file path with its own length.
-        total_hours = (self.config.nowcast_hours
-                       + self.config.forecast_hours
-                       + max(0, int(self.config.river_hourly_extra_hours)))
+        #
+        # Phase semantics for the OUTPUT axis:
+        #   * phase="nowcast":  total_hours = nowcast_hours + extra
+        #     (output covers [0, nowcast_hours] anchored at
+        #     ``cycle - nowcast_hours``)
+        #   * phase="forecast": total_hours = forecast_hours + extra
+        #     (output covers [0, forecast_hours] anchored at ``cycle``)
+        #   * phase=None (default, backward compat): total_hours =
+        #     nowcast_hours + forecast_hours + extra (combined 54h)
+        total_hours = self._phase_total_hours()
         n_target = total_hours + 1  # hourly
 
         # Try NWM data first
@@ -613,8 +620,51 @@ class NWMProcessor(ForcingProcessor):
                 "nwm_files_used": len(nwm_files),
                 "used_climatology": len(nwm_files) == 0,
                 "stofs_mode": self.is_stofs_mode,
+                "phase": self.phase,
             },
         )
+
+    # ------------------------------------------------------------------
+    # Phase helpers
+    # ------------------------------------------------------------------
+
+    def _phase_start_time(self) -> datetime:
+        """Return the absolute datetime of the row ``t=0`` in the output.
+
+        * phase="nowcast":  ``cycle - nowcast_hours`` (SCHISM hotstart anchor)
+        * phase="forecast": ``cycle`` (operator's forecast leg start)
+        * phase=None (default, backward compat): ``cycle - nowcast_hours``
+        """
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+        if self.phase == "forecast":
+            return cycle_dt
+        # nowcast or None: anchor at cycle - nowcast_hours (combined window
+        # starts here too, matching the pre-phase Route B behavior).
+        return cycle_dt - timedelta(hours=int(self.config.nowcast_hours))
+
+    def _phase_total_hours(self) -> int:
+        """Return the number of hours covered by the output window.
+
+        Hourly grid length is ``_phase_total_hours() + 1`` (0..N inclusive).
+
+        * phase="nowcast":  ``nowcast_hours + extra``
+        * phase="forecast": ``forecast_hours + extra``
+        * phase=None (default, backward compat):
+          ``nowcast_hours + forecast_hours + extra``
+
+        ``extra`` is ``max(0, river_hourly_extra_hours)`` — production
+        COMF extends the source axis past the simulation end so SCHISM
+        always has interpolation room at the tail.
+        """
+        extra = max(0, int(self.config.river_hourly_extra_hours))
+        if self.phase == "nowcast":
+            return int(self.config.nowcast_hours) + extra
+        if self.phase == "forecast":
+            return int(self.config.forecast_hours) + extra
+        return (int(self.config.nowcast_hours)
+                + int(self.config.forecast_hours)
+                + extra)
 
     def find_input_files(self) -> List[Path]:
         """Find NWM channel_rt files for the run window.
@@ -788,11 +838,11 @@ class NWMProcessor(ForcingProcessor):
     def _extract_streamflow(self, nwm_files: List[Path]) -> Tuple[np.ndarray, List[float]]:
         """Extract streamflow for configured rivers from NWM files.
 
-        Time axis anchor: ``t=0`` is ``cycle - nowcast_hours`` (= ``model_t0``,
-        matching SCHISM's simulation start). For each file we resolve the
-        actual valid time -- from the ``model_output_valid_time`` NetCDF
+        Time axis anchor: ``t=0`` is the phase start time (see
+        :meth:`_phase_start_time`). For each file we resolve the actual
+        valid time -- from the ``model_output_valid_time`` NetCDF
         attribute when present, otherwise from the filename via
-        ``_nwm_valid_time`` -- and convert to ``hours from model_t0``.
+        ``_nwm_valid_time`` -- and convert to ``hours from start_time``.
 
         The earlier file-index fallback (``len(all_times) * 1.0``) silently
         labelled file 0 as ``t=0`` regardless of its actual valid time. For
@@ -800,15 +850,13 @@ class NWMProcessor(ForcingProcessor):
         placed the cycle-hour flow at a positive offset and shifted every
         downstream row by the lookback depth, producing a vsource.th
         misaligned with SCHISM's ``model_t0``. Using actual valid times
-        anchors the axis at ``model_t0`` and lets ``_normalize_to_simulation_grid``
-        drop / back-fill correctly.
+        anchors the axis at the phase ``start_time`` and lets
+        ``_normalize_to_simulation_grid`` drop / back-fill correctly.
         """
         n_rivers = self.river_config.n_rivers
         feature_ids = set(self.river_config.feature_ids)
 
-        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
-                   timedelta(hours=self.config.cyc)
-        start_time = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        start_time = self._phase_start_time()
 
         all_flows = []
         all_times = []
@@ -885,9 +933,7 @@ class NWMProcessor(ForcingProcessor):
         ref_feature_ids = None  # feature_id array from first file (for index lookup)
         src_ncidxs = None  # index groups mapping into feature_id array
 
-        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
-                   timedelta(hours=self.config.cyc)
-        start_time = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        start_time = self._phase_start_time()
 
         for nwm_file in nwm_files:
             try:
@@ -1376,11 +1422,17 @@ class NWMProcessor(ForcingProcessor):
         # SCHISM a safe interpolation buffer at the simulation tail. The
         # hourly ``times`` grid above carries a different buffer
         # (``time_hotstart + 72h`` for SECOFS) so we anchor the schism_*.th
-        # end on ``nowcast_hours + forecast_hours + river_th_extra_hours``
-        # rather than ``times[-1]`` to avoid overshooting to 73h.
-        sim_hours = (self.config.nowcast_hours
-                     + self.config.forecast_hours
-                     + max(0, int(self.config.river_th_extra_hours)))
+        # end on the phase window + ``river_th_extra_hours`` rather than
+        # ``times[-1]`` to avoid overshooting.
+        extra = max(0, int(self.config.river_th_extra_hours))
+        if self.phase == "nowcast":
+            sim_hours = int(self.config.nowcast_hours) + extra
+        elif self.phase == "forecast":
+            sim_hours = int(self.config.forecast_hours) + extra
+        else:
+            sim_hours = (int(self.config.nowcast_hours)
+                         + int(self.config.forecast_hours)
+                         + extra)
         end_sec = max(0.0, float(sim_hours) * 3600.0)
         dt = max(1.0, float(self.config.schism_dt))
         # Build [0, dt, 2dt, ..., end_sec] inclusive

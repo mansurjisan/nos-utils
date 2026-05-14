@@ -122,6 +122,54 @@ class RTOFSProcessor(ForcingProcessor):
 
         return t_start, t_end
 
+    def _get_output_window(
+        self, phase: Optional[str] = None,
+    ) -> Tuple[datetime, datetime, float]:
+        """Compute the OBC output time window for the configured phase.
+
+        Returns ``(model_t0, sim_end, sim_duration_seconds)`` where the
+        OBC output files use ``time[0] = 0`` corresponding to ``model_t0``
+        and extend through ``sim_duration_seconds``.
+
+        Phase semantics:
+          * ``phase="nowcast"``: ``model_t0 = cycle - nowcast_hours``,
+            ``sim_end = cycle``, duration = ``nowcast_hours * 3600``.
+            Output files cover the 6h nowcast leg only.
+          * ``phase="forecast"``: ``model_t0 = cycle``,
+            ``sim_end = cycle + forecast_hours``, duration =
+            ``forecast_hours * 3600``. Output files cover the 48h
+            forecast leg only.
+          * ``phase=None`` (default, backward compat): combined window,
+            ``model_t0 = cycle - nowcast_hours``,
+            ``sim_end = cycle + forecast_hours``, duration =
+            ``(nowcast_hours + forecast_hours) * 3600``.
+
+        The phase argument lets prep emit two physically distinct file
+        sets (nowcast / forecast) so that operationally-separated PBS
+        jobs read forcing whose file content matches the filename phase.
+        """
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+        nowcast_hours = int(self.config.nowcast_hours)
+        forecast_hours = int(self.config.forecast_hours)
+
+        if phase == "nowcast":
+            model_t0 = cycle_dt - timedelta(hours=nowcast_hours)
+            sim_end = cycle_dt
+            sim_duration = float(nowcast_hours) * 3600.0
+        elif phase == "forecast":
+            model_t0 = cycle_dt
+            sim_end = cycle_dt + timedelta(hours=forecast_hours)
+            sim_duration = float(forecast_hours) * 3600.0
+        else:
+            # Backward-compat combined window: nowcast + forecast from
+            # ``cycle - nowcast_hours`` through ``cycle + forecast_hours``.
+            model_t0 = cycle_dt - timedelta(hours=nowcast_hours)
+            sim_end = cycle_dt + timedelta(hours=forecast_hours)
+            sim_duration = float(nowcast_hours + forecast_hours) * 3600.0
+
+        return model_t0, sim_end, sim_duration
+
     def _load_grid(self) -> bool:
         """Load SCHISM grid and extract boundary node coordinates."""
         if self._bnd_lons is not None:
@@ -1021,30 +1069,26 @@ class RTOFSProcessor(ForcingProcessor):
                 log.info(f"Filled {n_nan} NaN boundary nodes from nearest valid nodes")
 
             # Temporally interpolate to model dt (120s)
-            # Anchor t=0 to model_t0 = cycle - nowcast_hours, cover full sim window
+            # Anchor t=0 to model_t0, cover the phase window
             n_rtofs = ssh_array.shape[0]
 
             # Build actual time axis from file valid times (NOT uniform 6h).
             # RTOFS 2D diag files are hourly (f001-f048) then 3-hourly
             # (f051+), so assuming uniform spacing is wrong.
-            # Time axis is relative to model_t0 = cycle - nowcast_hours,
+            # Time axis is relative to model_t0 (= cycle - nowcast_hours
+            # for nowcast or combined; cycle for forecast phase),
             # matching production-COMF semantics where the model clock
-            # starts at the nowcast origin (param.nml start_year/start_hour
+            # starts at the run origin (param.nml start_year/start_hour
             # already anchored to that point).
             file_hours = []
             for f in files_2d:
                 hour, _ = self._parse_rtofs_hour(f)
                 file_hours.append(hour)
 
-            cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
-                       timedelta(hours=self.config.cyc)
-            # model_t0 is the actual model clock origin (t=0 in the output).
-            # For SECOFS this is cycle - 6h; for STOFS-3D-ATL cycle - 24h.
-            # The SCHISM-side files (param.nml, bctides.in, time markers)
-            # all assume this anchor, so the OBC time axis must match.
-            model_t0 = cycle_dt - timedelta(hours=self.config.nowcast_hours)
-            sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
-            sim_duration = (sim_end - model_t0).total_seconds()
+            # Phase-aware output window: nowcast emits only the 6h leg,
+            # forecast emits only the 48h leg, None gives the combined
+            # 54h window (backward-compat).
+            model_t0, sim_end, sim_duration = self._get_output_window(self.phase)
 
             # Compute time of each file relative to model_t0.
             # Files at the nowcast origin have time=0; files before it
@@ -1381,15 +1425,13 @@ class RTOFSProcessor(ForcingProcessor):
             target_dt_3d = 10800.0  # 3-hourly output (matches Fortran DELT_TS)
 
             # Compute simulation duration for the OBC window.
-            # model_t0 = cycle - nowcast_hours: matches the SCHISM-side
-            # files (param.nml, bctides, time markers) which all assume
-            # the model clock starts at the nowcast origin. The 3D OBC
-            # files must use the same anchor so SCHISM can index correctly.
-            cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
-                       timedelta(hours=self.config.cyc)
-            model_t0 = cycle_dt - timedelta(hours=self.config.nowcast_hours)
-            sim_end = cycle_dt + timedelta(hours=self.config.forecast_hours)
-            sim_duration_3d = (sim_end - model_t0).total_seconds()
+            # Phase-aware: nowcast = 6h from cycle-nowcast_hours,
+            # forecast = 48h from cycle, None = combined 54h window.
+            # The 3D OBC files must use the same anchor as the SCHISM-side
+            # files (param.nml, bctides, time markers) so SCHISM can index
+            # correctly when each PBS job (nowcast / forecast) reads its
+            # own phase-specific OBC tar.
+            model_t0, sim_end, sim_duration_3d = self._get_output_window(self.phase)
 
             # Build actual 3D-file time axis relative to model_t0, matching
             # the 2D path. Earlier this assumed `np.arange(n) * 21600s`
