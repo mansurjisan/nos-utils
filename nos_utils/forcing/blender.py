@@ -87,12 +87,23 @@ class BlenderProcessor(ForcingProcessor):
 
     SOURCE_NAME = "BLENDER"
 
+    # Default buffer (hours) appended past the forecast end so CDEPS
+    # taxmode=limit has interpolation headroom on its pre-load look-ahead.
+    # Matches the legacy COMF DATM window, which emits forcing through
+    # ``forecast_end + 3h``. CDEPS aborts with
+    # ``(shr_stream_findBounds) ERROR: rDateIn gt rDategvd limit true``
+    # if the requested model time falls outside the forcing time bounds,
+    # which happens near the end of the run when the DATM file stops
+    # exactly at ``forecast_end``.
+    DEFAULT_BUFFER_HOURS = 3
+
     def __init__(
         self,
         config: ForcingConfig,
         input_path: Path,
         output_path: Path,
         target_dx: float = 0.025,
+        buffer_hours: Optional[int] = None,
     ):
         """
         Args:
@@ -102,9 +113,20 @@ class BlenderProcessor(ForcingProcessor):
                 GFS/HRRR processors when nws=4.
             output_path: Output directory for datm_forcing.nc
             target_dx: Output grid resolution in degrees (default 0.025°)
+            buffer_hours: Extra hourly records appended past the forecast
+                end so CDEPS can interpolate without overrunning the
+                forcing time axis. Defaults to
+                ``config.datm_buffer_hours`` when set on the
+                ``ForcingConfig``, otherwise to
+                ``DEFAULT_BUFFER_HOURS`` (3h, matching legacy COMF).
         """
         super().__init__(config, input_path, output_path)
         self.target_dx = target_dx
+        if buffer_hours is None:
+            buffer_hours = getattr(
+                config, "datm_buffer_hours", self.DEFAULT_BUFFER_HOURS,
+            )
+        self.buffer_hours = int(buffer_hours)
 
     def process(self) -> ForcingResult:
         if not HAS_NETCDF4:
@@ -265,12 +287,22 @@ class BlenderProcessor(ForcingProcessor):
         # both phases write a file spanning the same model window:
         #
         #   model_t0     = cycle - nowcast_hours
-        #   model_t_end  = cycle + forecast_hours
-        #   duration     = nowcast_hours + forecast_hours
+        #   model_t_end  = cycle + forecast_hours + buffer_hours
+        #   duration     = nowcast_hours + forecast_hours + buffer_hours
         #   n_times      = duration + 1                (hourly cadence)
         #
-        # For SECOFS (nowcast=6h, forecast=48h) this is 55 hourly
-        # records anchored at cycle-6h, covering [cycle-6h, cycle+48h].
+        # ``buffer_hours`` (default 3) appends extra hourly records
+        # past the forecast end so CDEPS taxmode=limit has interpolation
+        # headroom for its pre-load look-ahead. Without it CDEPS aborts
+        # near the end of the run with
+        # ``(shr_stream_findBounds) ERROR: rDateIn gt rDategvd limit true``
+        # when the requested model time falls outside the forcing time
+        # bounds. Matches legacy COMF, which emits DATM through
+        # forecast_end + 3h.
+        #
+        # For SECOFS (nowcast=6h, forecast=48h, buffer=3h) this is 58
+        # hourly records anchored at cycle-6h, covering
+        # [cycle-6h, cycle+51h].
         #
         # Inputs (gfs_forcing.nc, hrrr_forcing.nc) may not span the
         # full window — e.g. nowcast-phase GFS only covers ~cycle-9h
@@ -282,7 +314,9 @@ class BlenderProcessor(ForcingProcessor):
         # mask (``hrrr_time_has``) only fires on exact hourly matches,
         # so points outside HRRR coverage automatically fall through
         # to the GFS path. Net result: target steps before the first
-        # input or after the last input reuse the nearest edge slab.
+        # input or after the last input reuse the nearest edge slab,
+        # which also covers the post-forecast buffer when GFS does not
+        # extend that far.
         if hrrr_time_raw is not None and len(hrrr_time_raw) >= 2:
             dt = float(hrrr_time_raw[1] - hrrr_time_raw[0])
         elif len(gfs_time) >= 2:
@@ -294,7 +328,9 @@ class BlenderProcessor(ForcingProcessor):
                    timedelta(hours=self.config.cyc)
         model_t0 = cycle_dt - timedelta(hours=self.config.nowcast_hours)
         sim_duration_hours = (
-            self.config.nowcast_hours + self.config.forecast_hours
+            self.config.nowcast_hours
+            + self.config.forecast_hours
+            + self.buffer_hours
         )
         t_start = _epoch_seconds(model_t0)
         t_end = t_start + sim_duration_hours * 3600.0
@@ -304,7 +340,10 @@ class BlenderProcessor(ForcingProcessor):
         log.info(
             f"DATM time grid: anchored at model_t0={model_t0.isoformat()} "
             f"(cycle-{self.config.nowcast_hours}h), "
-            f"covering {sim_duration_hours}h = {n_times} hourly steps"
+            f"covering {sim_duration_hours}h "
+            f"(nowcast={self.config.nowcast_hours}h + "
+            f"forecast={self.config.forecast_hours}h + "
+            f"buffer={self.buffer_hours}h) = {n_times} hourly steps"
         )
 
         # Diagnose input vs. target time coverage so silent
