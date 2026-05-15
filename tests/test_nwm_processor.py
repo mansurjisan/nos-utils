@@ -233,3 +233,305 @@ class TestNormalizeToSimulationGrid:
         out_flows, out_times = proc._normalize_to_simulation_grid(flows, times, n_target=5)
         assert out_flows.size == 0
         assert out_times == []
+
+
+class TestExtractStreamflowTimeAnchor:
+    """``_extract_streamflow`` must report ``times`` as hours-from-model_t0,
+    not as file-index, so the downstream normalize/write stages anchor the
+    output ``vsource.th`` at SCHISM's ``model_t0 = cycle - nowcast_hours``.
+
+    Earlier code labelled file 0 as ``t=0`` regardless of its actual valid
+    time. For analysis_assim with pre-cycle lookback (tmHH > 0) this shifted
+    the cycle-hour flow to a positive offset.
+    """
+
+    def _write_nwm_file(self, dir_path, cyc, tm, feature_ids, flows,
+                        valid_time_attr=True):
+        """Write a minimal NWM channel_rt netCDF the processor can read."""
+        from netCDF4 import Dataset
+        from datetime import datetime, timedelta
+        fname = f"nwm.t{cyc:02d}z.analysis_assim.channel_rt.tm{tm:02d}.conus.nc"
+        path = dir_path / fname
+        ds = Dataset(str(path), "w", format="NETCDF4")
+        ds.createDimension("feature_id", len(feature_ids))
+        v_fid = ds.createVariable("feature_id", "i8", ("feature_id",))
+        v_q = ds.createVariable("streamflow", "f4", ("feature_id",))
+        v_fid[:] = np.array(feature_ids, dtype=np.int64)
+        v_q[:] = np.array(flows, dtype=np.float32)
+        if valid_time_attr:
+            cycle = datetime(2026, 5, 7, cyc) - timedelta(hours=tm)
+            ds.model_output_valid_time = cycle.strftime("%Y-%m-%d_%H:%M:%S")
+        ds.close()
+        return path
+
+    def test_time_anchored_at_cycle_minus_nowcast(self, tmp_path):
+        """Files at valid_time = cycle should map to t_hours = nowcast_hours.
+
+        SECOFS-UFS: nowcast_hours=6, cycle=2026-05-07 00z, model_t0 = 2026-05-06
+        18z. An analysis_assim tm00 file (valid at cycle) should report
+        ``t_hours = 6``, not ``t_hours = 0``.
+        """
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        rc = RiverConfig(feature_ids=[111], node_indices=[10], clim_flows=[50.0])
+        nwm_dir = tmp_path / "nwm.20260507" / "analysis_assim"
+        nwm_dir.mkdir(parents=True)
+        # Three lookback hours: tm02 (valid 22z prior day), tm01 (23z), tm00 (00z cycle)
+        for tm in (2, 1, 0):
+            self._write_nwm_file(nwm_dir, cyc=0, tm=tm,
+                                 feature_ids=[111], flows=[10.0 + tm])
+        proc = NWMProcessor(cfg, tmp_path, tmp_path / "out", river_config=rc)
+        files = sorted(nwm_dir.glob("*.nc"))
+        # Hand the files in valid-time order (tm02, tm01, tm00).
+        from nos_utils.forcing.nwm import _nwm_valid_time
+        files = sorted(files, key=_nwm_valid_time)
+        flows, times = proc._extract_streamflow(files)
+        # model_t0 = cycle - 6h = 2026-05-06 18z
+        # tm02 valid 22z prior day = 2026-05-06 22z → t=4
+        # tm01 valid 23z prior day = 2026-05-06 23z → t=5
+        # tm00 valid 00z cycle    = 2026-05-07 00z → t=6
+        assert times == [4.0, 5.0, 6.0], (
+            f"Expected times [4,5,6] = hours from model_t0; got {times}"
+        )
+
+    def test_time_axis_falls_back_to_filename_without_attribute(self, tmp_path):
+        """When NetCDF lacks ``model_output_valid_time``, derive from filename."""
+        cfg = ForcingConfig.for_secofs(pdy="20260507", cyc=0)
+        rc = RiverConfig(feature_ids=[111], node_indices=[10], clim_flows=[50.0])
+        nwm_dir = tmp_path / "nwm.20260507" / "analysis_assim"
+        nwm_dir.mkdir(parents=True)
+        # Build files without model_output_valid_time attribute.
+        for tm in (1, 0):
+            self._write_nwm_file(nwm_dir, cyc=0, tm=tm,
+                                 feature_ids=[111], flows=[10.0],
+                                 valid_time_attr=False)
+        proc = NWMProcessor(cfg, tmp_path, tmp_path / "out", river_config=rc)
+        files = sorted(nwm_dir.glob("*.nc"))
+        from nos_utils.forcing.nwm import _nwm_valid_time
+        files = sorted(files, key=_nwm_valid_time)
+        flows, times = proc._extract_streamflow(files)
+        # tm01 → 23z prior day = t=5; tm00 → 00z cycle = t=6
+        assert times == [5.0, 6.0]
+
+
+class TestRoutePhaseNWM:
+    """Phase-aware output time windows for vsource / msource / vsink.
+
+    Two operational PBS jobs (nowcast + forecast) read NWM source/sink
+    forcing; each must receive vsource.th / msource.th / vsink.th
+    covering the leg the job will simulate plus a buffer past sim_end
+    so SCHISM's time-series reader has interpolation headroom. nowcast
+    leg is 6h + buffer (anchored at cycle - nowcast_hours), forecast
+    leg is 48h + buffer (anchored at cycle).
+    """
+
+    def _rc(self):
+        return RiverConfig(
+            feature_ids=[111], node_indices=[10], clim_flows=[50.0],
+        )
+
+    def test_phase_total_hours_nowcast(self, mock_config, tmp_path):
+        """phase='nowcast' total_hours = nowcast_hours + buffer + extra."""
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="nowcast",
+        )
+        # mock_config: nowcast_hours=6, forecast_hours=48, extra=0, buffer=3
+        assert proc._phase_total_hours() == 6 + 3
+
+    def test_phase_total_hours_forecast(self, mock_config, tmp_path):
+        """phase='forecast' total_hours = forecast_hours + buffer + extra."""
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="forecast",
+        )
+        assert proc._phase_total_hours() == 48 + 3
+
+    def test_phase_total_hours_none_combined(self, mock_config, tmp_path):
+        """phase=None preserves combined nowcast+forecast window
+        WITHOUT the phase buffer (backward-compat)."""
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(),
+        )
+        assert proc._phase_total_hours() == 54
+
+    def test_phase_start_time_nowcast(self, mock_config, tmp_path):
+        from datetime import datetime
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="nowcast",
+        )
+        # cycle = 2026-04-01 12z, nowcast_hours=6 -> 06z same day
+        assert proc._phase_start_time() == datetime(2026, 4, 1, 6)
+
+    def test_phase_start_time_forecast(self, mock_config, tmp_path):
+        from datetime import datetime
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="forecast",
+        )
+        # cycle = 2026-04-01 12z -> forecast leg starts at cycle
+        assert proc._phase_start_time() == datetime(2026, 4, 1, 12)
+
+    def test_phase_start_time_none_matches_nowcast(self, mock_config, tmp_path):
+        """phase=None anchors at cycle - nowcast_hours (combined window)."""
+        from datetime import datetime
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(),
+        )
+        assert proc._phase_start_time() == datetime(2026, 4, 1, 6)
+
+    def test_nowcast_vsource_10_hourly_rows(self, mock_config, tmp_path):
+        """Nowcast vsource.th has 10 hourly steps for 6h leg + 3h buffer (0..32400s)."""
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(), phase="nowcast",
+        )
+        result = proc.process()
+        assert result.success
+        # n_target = nowcast_hours + buffer + 1 = 6 + 3 + 1 = 10
+        assert result.metadata["n_timesteps"] == 10
+        lines = (out_dir / "vsource.th").read_text().strip().split("\n")
+        assert len(lines) == 10
+        # First row at t=0
+        assert float(lines[0].split()[0]) == 0.0
+        # Last row at t=(6+3)*3600 = 32400s
+        assert float(lines[-1].split()[0]) == 32400.0
+
+    def test_forecast_vsource_52_hourly_rows(self, mock_config, tmp_path):
+        """Forecast vsource.th has 52 hourly steps for 48h leg + 3h buffer (0..183600s)."""
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(), phase="forecast",
+        )
+        result = proc.process()
+        assert result.success
+        # n_target = forecast_hours + buffer + 1 = 48 + 3 + 1 = 52
+        assert result.metadata["n_timesteps"] == 52
+        lines = (out_dir / "vsource.th").read_text().strip().split("\n")
+        assert len(lines) == 52
+        assert float(lines[0].split()[0]) == 0.0
+        # (48+3)h = 183600s
+        assert float(lines[-1].split()[0]) == 183600.0
+
+    def test_none_combined_55_rows(self, mock_config, tmp_path):
+        """phase=None backward-compat: 55-row combined window (no buffer)."""
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(),
+        )
+        result = proc.process()
+        assert result.success
+        assert result.metadata["n_timesteps"] == 55
+        assert result.metadata["phase"] is None
+
+    def test_msource_matches_vsource_steps(self, mock_config, tmp_path):
+        """msource.th must have the same row count as vsource.th per phase.
+
+        SCHISM allocates a single buffer for both files; a mismatch causes
+        heap corruption at ``partition_hgrid_`` (V11 nowcast crash mode).
+        """
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(), phase="nowcast",
+        )
+        result = proc.process()
+        assert result.success
+        vsource_lines = (out_dir / "vsource.th").read_text().strip().split("\n")
+        msource_lines = (out_dir / "msource.th").read_text().strip().split("\n")
+        # 6h nowcast + 3h buffer + 1 = 10
+        assert len(vsource_lines) == len(msource_lines) == 10
+
+    def test_phase_stored_on_processor(self, mock_config, tmp_path):
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="forecast",
+        )
+        assert proc.phase == "forecast"
+
+    def test_phase_default_is_none(self, mock_config, tmp_path):
+        proc = NWMProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            river_config=self._rc(),
+        )
+        assert proc.phase is None
+
+    def test_phase_with_river_hourly_extra_hours(self, tmp_path):
+        """river_hourly_extra_hours adds to the phase window length,
+        on top of the default 3h buffer."""
+        cfg = ForcingConfig(
+            lon_min=-80, lon_max=-70, lat_min=25, lat_max=35,
+            pdy="20260401", cyc=12,
+            nowcast_hours=6, forecast_hours=48,
+            river_hourly_extra_hours=18,
+        )
+        proc = NWMProcessor(
+            cfg, tmp_path, tmp_path / "out",
+            river_config=self._rc(), phase="nowcast",
+        )
+        # nowcast=6 + buffer=3 + extra=18 = 27 hours
+        assert proc._phase_total_hours() == 6 + 3 + 18
+        proc_fore = NWMProcessor(
+            cfg, tmp_path, tmp_path / "out2",
+            river_config=self._rc(), phase="forecast",
+        )
+        # forecast=48 + buffer=3 + extra=18 = 69 hours
+        assert proc_fore._phase_total_hours() == 48 + 3 + 18
+
+    def test_buffer_extends_past_phase_end(self, mock_config, tmp_path):
+        """Default buffer_hours = 3 extends the hourly grid past sim_end."""
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(), phase="forecast",
+        )
+        assert proc.buffer_hours == NWMProcessor.DEFAULT_BUFFER_HOURS == 3
+        # forecast 48h + buffer 3h + extra 0 = 51h → 52 hourly rows
+        assert proc._phase_total_hours() == 48 + 3
+        result = proc.process()
+        assert result.success
+        assert result.metadata["n_timesteps"] == 52
+        lines = (out_dir / "vsource.th").read_text().strip().split("\n")
+        # Last hourly row at (48+3)*3600 = 183600s
+        assert float(lines[-1].split()[0]) == 183600.0
+
+    def test_buffer_hours_kwarg_overrides_default(self, mock_config, tmp_path):
+        """Explicit buffer_hours kwarg overrides class default and
+        config.obc_buffer_hours."""
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(), phase="nowcast", buffer_hours=6,
+        )
+        assert proc.buffer_hours == 6
+        # 6h nowcast + 6h buffer = 12h
+        assert proc._phase_total_hours() == 12
+        result = proc.process()
+        assert result.success
+        # 12 hourly rows + 1 = 13
+        assert result.metadata["n_timesteps"] == 13
+        lines = (out_dir / "vsource.th").read_text().strip().split("\n")
+        assert float(lines[-1].split()[0]) == 12 * 3600.0
+
+    def test_buffer_hours_zero_disables_buffer(self, mock_config, tmp_path):
+        """buffer_hours=0 restores the pre-buffer phase-window behavior
+        (7 rows for nowcast leg)."""
+        out_dir = tmp_path / "out"
+        proc = NWMProcessor(
+            mock_config, tmp_path / "empty_nwm", out_dir,
+            river_config=self._rc(), phase="nowcast", buffer_hours=0,
+        )
+        assert proc.buffer_hours == 0
+        # 6h nowcast + 0h buffer = 6h → 7 rows (prior behavior)
+        assert proc._phase_total_hours() == 6
+        result = proc.process()
+        assert result.success
+        assert result.metadata["n_timesteps"] == 7
+        lines = (out_dir / "vsource.th").read_text().strip().split("\n")
+        # Last hourly row at 6*3600 = 21600s
+        assert float(lines[-1].split()[0]) == 21600.0

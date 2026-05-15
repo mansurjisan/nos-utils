@@ -1,5 +1,6 @@
 """Tests for UFSConfigProcessor (Stage 2b)."""
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -76,7 +77,13 @@ def ufs_config():
 
 
 def test_basic_substitution(ufs_config, tmp_path):
-    """All @[TOKEN] markers must be replaced with real values."""
+    """All @[TOKEN] markers must be replaced with real values.
+
+    Start time is anchored at ``model_t0 = cycle - nowcast_hours``.  For
+    SECOFS-UFS (cyc=12, nowcast_hours=6) that is 2026-04-01 06:00, not the
+    raw cycle time.  ``nhours_fcst`` correspondingly covers the full
+    nowcast + forecast = 54h window from model_t0.
+    """
     fix = tmp_path / "fix"
     out = tmp_path / "out"
     _write_full_fix(fix)
@@ -92,14 +99,14 @@ def test_basic_substitution(ufs_config, tmp_path):
     ):
         assert (out / name).exists(), f"Missing output: {name}"
 
-    # model_configure substitutions.
+    # model_configure substitutions.  model_t0 = cycle 12z - 6h = 06z same day.
     mc = (out / "model_configure").read_text()
     assert "start_year:              2026" in mc
     assert "start_month:             04" in mc
     assert "start_day:               01" in mc
-    assert "start_hour:              12" in mc
-    # Default ufs_nhours_fcst for SECOFS UFS is 48.
-    assert "nhours_fcst:             48" in mc
+    assert "start_hour:              06" in mc
+    # nhours_fcst covers nowcast_hours + forecast_hours = 6 + 48 = 54.
+    assert "nhours_fcst:             54" in mc
     assert "dt_atmos:                720" in mc
     assert "@[" not in mc, "Unsubstituted token in model_configure"
 
@@ -200,6 +207,331 @@ def test_auto_resolve_sibling_ufs_dir(ufs_config, tmp_path):
     assert result.success, result.errors
     assert (out / "model_configure").exists()
     assert (out / "ufs.configure").exists()
+
+
+def test_model_t0_day_rollback(tmp_path):
+    """model_t0 = cycle - nowcast_hours must roll back across midnight.
+
+    SECOFS 00z cycle with nowcast_hours=6 anchors at 18z the previous day.
+    The model_configure start_* fields and the datm.streams year tokens
+    must reflect that rolled-back date, otherwise CMEPS/DATM stream
+    indexing would start 6h ahead of SCHISM.
+    """
+    fix = tmp_path / "fix"
+    out = tmp_path / "out"
+    _write_full_fix(fix)
+
+    cfg = ForcingConfig.for_secofs_ufs(pdy="20260510", cyc=0)
+    proc = UFSConfigProcessor(cfg, fix, out)
+    result = proc.process()
+    assert result.success, result.errors
+
+    mc = (out / "model_configure").read_text()
+    # cycle 2026-05-10 00z - 6h = 2026-05-09 18z
+    assert "start_year:              2026" in mc
+    assert "start_month:             05" in mc
+    assert "start_day:               09" in mc
+    assert "start_hour:              18" in mc
+    # nhours_fcst still covers the full 6 + 48 = 54h window.
+    assert "nhours_fcst:             54" in mc
+
+    # datm.streams year tokens must come from the rolled-back model_t0
+    # (still 2026, but if the cycle were on Jan 1 we would need 2025).
+    ds = (out / "datm.streams").read_text()
+    assert "yearFirst01:               2026" in ds
+
+
+def test_model_t0_year_rollback(tmp_path):
+    """model_t0 must roll back across a year boundary cleanly.
+
+    Cycle on 2026-01-01 00z with nowcast_hours=6 anchors at 2025-12-31 18z.
+    The datm.streams ``yearFirst/Last/Align`` tokens must reflect 2025,
+    not 2026, otherwise stream timestamps would mismatch the actual DATM
+    forcing time axis.
+    """
+    fix = tmp_path / "fix"
+    out = tmp_path / "out"
+    _write_full_fix(fix)
+
+    cfg = ForcingConfig.for_secofs_ufs(pdy="20260101", cyc=0)
+    proc = UFSConfigProcessor(cfg, fix, out)
+    result = proc.process()
+    assert result.success, result.errors
+
+    mc = (out / "model_configure").read_text()
+    assert "start_year:              2025" in mc
+    assert "start_month:             12" in mc
+    assert "start_day:               31" in mc
+    assert "start_hour:              18" in mc
+
+    ds = (out / "datm.streams").read_text()
+    assert "yearFirst01:               2025" in ds
+    assert "yearLast01:                2025" in ds
+    assert "yearAlign01:               2025" in ds
+
+
+def test_time_hotstart_override(tmp_path):
+    """Caller-provided time_hotstart wins over the derived cycle - nowcast.
+
+    Orchestrators that have already pinned the model_t0 anchor (e.g. from
+    a ``time_hotstart`` marker file or a hotstart NetCDF) can pass that
+    datetime in to keep every component of the prep bundle in lockstep.
+    """
+    fix = tmp_path / "fix"
+    out = tmp_path / "out"
+    _write_full_fix(fix)
+
+    cfg = ForcingConfig.for_secofs_ufs(pdy="20260510", cyc=12)
+    # Pin model_t0 to 2026-05-10 09z (3h back from cycle, not the default 6h).
+    pinned = datetime(2026, 5, 10, 9, 0)
+    proc = UFSConfigProcessor(cfg, fix, out, time_hotstart=pinned)
+    result = proc.process()
+    assert result.success, result.errors
+
+    mc = (out / "model_configure").read_text()
+    assert "start_year:              2026" in mc
+    assert "start_month:             05" in mc
+    assert "start_day:               10" in mc
+    assert "start_hour:              09" in mc
+
+
+def test_stofs_ufs_nhours_covers_full_run(tmp_path):
+    """STOFS-UFS factory (132 = 24+108) anchors at model_t0 too.
+
+    Verifies that the long-window STOFS-3D-ATL UFS layout (nowcast=24,
+    forecast=108) keeps producing nhours_fcst=132 with the new anchor;
+    132 already covers the full coupled run from model_t0 so the explicit
+    factory value passes through unchanged.
+    """
+    fix = tmp_path / "fix"
+    out = tmp_path / "out"
+    _write_full_fix(fix)
+
+    cfg = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260510", cyc=12)
+    proc = UFSConfigProcessor(cfg, fix, out)
+    result = proc.process()
+    assert result.success, result.errors
+
+    mc = (out / "model_configure").read_text()
+    # cycle 2026-05-10 12z - 24h = 2026-05-09 12z
+    assert "start_year:              2026" in mc
+    assert "start_month:             05" in mc
+    assert "start_day:               09" in mc
+    assert "start_hour:              12" in mc
+    # STOFS-UFS factory sets ufs_nhours_fcst=132 (= 24 + 108).
+    assert "nhours_fcst:             132" in mc
+
+
+def test_nhours_fcst_bumped_when_factory_value_too_short(tmp_path):
+    """SECOFS factory's legacy ufs_nhours_fcst=48 must be bumped to 54.
+
+    The factory still emits ``ufs_nhours_fcst=48`` (matches forecast_hours
+    only) for backward compatibility.  With the model_t0 anchor we MUST
+    extend that to ``nowcast_hours + forecast_hours = 54`` so SCHISM does
+    not stop short of the forecast end.
+    """
+    fix = tmp_path / "fix"
+    out = tmp_path / "out"
+    _write_full_fix(fix)
+
+    cfg = ForcingConfig.for_secofs_ufs(pdy="20260510", cyc=12)
+    # Factory default is 48 (forecast-only).
+    assert cfg.ufs_nhours_fcst == 48
+
+    proc = UFSConfigProcessor(cfg, fix, out)
+    result = proc.process()
+    assert result.success, result.errors
+
+    mc = (out / "model_configure").read_text()
+    # Must be bumped up to 54 (full run from model_t0).
+    assert "nhours_fcst:             54" in mc
+    assert "nhours_fcst:             48" not in mc
+
+
+class TestRoutePhaseUFSConfig:
+    """Phase-aware model_configure / NHOURS for the two-leg operational layout.
+
+    nowcast phase writes ``start_* = cycle - nowcast_hours`` and
+    ``nhours_fcst = nowcast_hours``; forecast phase writes
+    ``start_* = cycle`` and ``nhours_fcst = forecast_hours``.
+
+    The forecast call writes second and wins the on-disk
+    ``model_configure`` archive; the nos-workflow stage-time patcher
+    rewrites the nowcast leg's ``model_configure`` at PBS-job time.
+    """
+
+    def test_nowcast_phase_anchors_at_cycle_minus_nowcast(self, ufs_config, tmp_path):
+        """phase='nowcast': start_* = cycle - nowcast_hours, NHOURS=6."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        proc = UFSConfigProcessor(ufs_config, fix, out, phase="nowcast")
+        result = proc.process()
+        assert result.success, result.errors
+
+        mc = (out / "model_configure").read_text()
+        # cycle = 2026-04-01 12z, nowcast_hours=6 -> 2026-04-01 06z
+        assert "start_year:              2026" in mc
+        assert "start_month:             04" in mc
+        assert "start_day:               01" in mc
+        assert "start_hour:              06" in mc
+        # nhours_fcst = nowcast_hours = 6 (NOT 54)
+        assert "nhours_fcst:             6" in mc
+        assert "nhours_fcst:             54" not in mc
+
+    def test_forecast_phase_anchors_at_cycle(self, ufs_config, tmp_path):
+        """phase='forecast': start_* = cycle, NHOURS=48."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        proc = UFSConfigProcessor(ufs_config, fix, out, phase="forecast")
+        result = proc.process()
+        assert result.success, result.errors
+
+        mc = (out / "model_configure").read_text()
+        # cycle = 2026-04-01 12z, forecast_hours=48 -> start at cycle 12z
+        assert "start_year:              2026" in mc
+        assert "start_month:             04" in mc
+        assert "start_day:               01" in mc
+        assert "start_hour:              12" in mc
+        # nhours_fcst = forecast_hours = 48 (NOT 54)
+        assert "nhours_fcst:             48" in mc
+        assert "nhours_fcst:             54" not in mc
+
+    def test_phase_none_combined_backward_compat(self, ufs_config, tmp_path):
+        """phase=None preserves existing Route B Phase 1 behavior (54h combined)."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        proc = UFSConfigProcessor(ufs_config, fix, out)
+        result = proc.process()
+        assert result.success, result.errors
+
+        mc = (out / "model_configure").read_text()
+        # Default behavior unchanged: start = cycle - nowcast_hours
+        assert "start_hour:              06" in mc
+        assert "nhours_fcst:             54" in mc
+
+    def test_forecast_phase_year_intact_during_day(self, tmp_path):
+        """Forecast phase 00z cycle does NOT roll back (start = cycle itself)."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_secofs_ufs(pdy="20260510", cyc=0)
+        proc = UFSConfigProcessor(cfg, fix, out, phase="forecast")
+        result = proc.process()
+        assert result.success, result.errors
+
+        mc = (out / "model_configure").read_text()
+        # Forecast at 00z cycle: start = 2026-05-10 00z (no rollback)
+        assert "start_year:              2026" in mc
+        assert "start_month:             05" in mc
+        assert "start_day:               10" in mc
+        assert "start_hour:              00" in mc
+
+    def test_nowcast_phase_day_rollback_00z(self, tmp_path):
+        """Nowcast phase 00z cycle DOES roll back to prior day 18z."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_secofs_ufs(pdy="20260510", cyc=0)
+        proc = UFSConfigProcessor(cfg, fix, out, phase="nowcast")
+        result = proc.process()
+        assert result.success, result.errors
+
+        mc = (out / "model_configure").read_text()
+        # nowcast leg: cycle 2026-05-10 00z - 6h = 2026-05-09 18z
+        assert "start_day:               09" in mc
+        assert "start_hour:              18" in mc
+        # NHOURS = nowcast_hours only = 6
+        assert "nhours_fcst:             6" in mc
+
+    def test_phase_explicit_overrides_ufs_nhours_fcst(self, tmp_path):
+        """Explicit phase ignores config.ufs_nhours_fcst and uses leg length.
+
+        Backward-compat (phase=None) preserves the existing fallback rule:
+        bump up to combined-window length when the factory value is too low.
+        Explicit phase always uses exactly the phase length.
+        """
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_secofs_ufs(pdy="20260510", cyc=12)
+        # Factory default is 48 (forecast-only legacy value).
+        assert cfg.ufs_nhours_fcst == 48
+
+        # phase=forecast uses forecast_hours (48), matches factory default
+        proc_f = UFSConfigProcessor(cfg, fix, out, phase="forecast")
+        proc_f.process()
+        mc_f = (out / "model_configure").read_text()
+        assert "nhours_fcst:             48" in mc_f
+
+        # phase=nowcast uses nowcast_hours (6), NOT 48
+        out2 = tmp_path / "out2"
+        proc_n = UFSConfigProcessor(cfg, fix, out2, phase="nowcast")
+        proc_n.process()
+        mc_n = (out2 / "model_configure").read_text()
+        assert "nhours_fcst:             6" in mc_n
+        assert "nhours_fcst:             48" not in mc_n
+
+    def test_phase_metadata_in_result(self, ufs_config, tmp_path):
+        """nhours metadata should reflect the phase-specific length."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        proc = UFSConfigProcessor(ufs_config, fix, out, phase="nowcast")
+        result = proc.process()
+        assert result.success
+        assert result.metadata["nhours"] == 6
+
+        proc_f = UFSConfigProcessor(ufs_config, fix, tmp_path / "out2",
+                                    phase="forecast")
+        result_f = proc_f.process()
+        assert result_f.metadata["nhours"] == 48
+
+    def test_stofs_ufs_phase_nowcast_24h(self, tmp_path):
+        """STOFS-3D-ATL-UFS nowcast phase = 24h."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260510", cyc=12)
+        proc = UFSConfigProcessor(cfg, fix, out, phase="nowcast")
+        result = proc.process()
+        assert result.success
+
+        mc = (out / "model_configure").read_text()
+        # cycle 2026-05-10 12z - 24h = 2026-05-09 12z
+        assert "start_day:               09" in mc
+        assert "start_hour:              12" in mc
+        # NHOURS = 24 (NOT 132)
+        assert "nhours_fcst:             24" in mc
+        assert "nhours_fcst:             132" not in mc
+
+    def test_stofs_ufs_phase_forecast_108h(self, tmp_path):
+        """STOFS-3D-ATL-UFS forecast phase = 108h."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260510", cyc=12)
+        proc = UFSConfigProcessor(cfg, fix, out, phase="forecast")
+        result = proc.process()
+        assert result.success
+
+        mc = (out / "model_configure").read_text()
+        # forecast: start = cycle itself
+        assert "start_day:               10" in mc
+        assert "start_hour:              12" in mc
+        assert "nhours_fcst:             108" in mc
+        assert "nhours_fcst:             132" not in mc
 
 
 def test_nx_ny_from_datm(ufs_config, tmp_path):

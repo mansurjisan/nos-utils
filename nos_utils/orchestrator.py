@@ -286,7 +286,7 @@ class PrepOrchestrator:
         # UFS-specific (DATM) needs GFS + HRRR sflux
         if self.config.nws == 4:
             results.append(self._run_datm(output_dir))
-            results.append(self._run_ufs_config(output_dir))
+            results.append(self._run_ufs_config(output_dir, phase, time_hotstart))
 
         # Step 9: Write time marker files (matches ORG behavior)
         self._write_time_markers(output_dir, phase, time_hotstart)
@@ -681,7 +681,15 @@ class PrepOrchestrator:
 
     def _run_nudging(self, output_dir: Path, phase: str = "nowcast",
                      time_hotstart=None) -> ForcingResult:
-        """Step 5b: T/S interior nudging (STOFS + SECOFS)."""
+        """Step 5b: T/S interior nudging (STOFS + SECOFS).
+
+        ``phase`` controls the output time window: ``"nowcast"`` emits
+        TEM_nu/SAL_nu covering ``[cycle - nowcast_hours, cycle]``,
+        ``"forecast"`` emits the leg covering ``[cycle, cycle +
+        forecast_hours]``. Two prep calls (one per phase) produce two
+        physically distinct nudge files so the operator's nowcast /
+        forecast PBS jobs each read forcing matching their leg.
+        """
         from .forcing.nudging import NudgingProcessor
 
         # Nudging needs its own RTOFS data prep with nudge-specific ROI
@@ -703,6 +711,7 @@ class PrepOrchestrator:
             self.config, input_dir, output_dir,
             nudge_weight_file=nudge_weight_file,
             rtofs_input_path=rtofs_path,
+            phase=phase,
         )
         return proc.process()
 
@@ -835,13 +844,22 @@ class PrepOrchestrator:
             errors=errors,
         )
 
-    def _run_ufs_config(self, output_dir: Path) -> ForcingResult:
+    def _run_ufs_config(self, output_dir: Path, phase: str = "nowcast",
+                        time_hotstart=None) -> ForcingResult:
         """Step 9: UFS-Coastal config files for nws=4 runs.
 
         Mirrors ``ush/nosofs/nos_ofs_gen_ufs_config.sh`` to emit
         model_configure, datm_in, datm.streams, ufs.configure (with PET
         bounds patched), fd_ufs.yaml, and noahmptable.tbl. NX/NY come
         from the just-written datm_forcing.nc when it is available.
+
+        ``phase`` selects which leg the generated ``model_configure``
+        and ``ufs.configure`` describe. Operationally the forecast call
+        writes second and wins the on-disk copy; the nos-workflow
+        stage-time patcher rewrites the nowcast leg's ``model_configure``
+        at PBS-job time when the nowcast job stages forcing into
+        ``$DATA``. For backward-compat passing ``phase=None`` writes the
+        combined 54h shape.
         """
         from .forcing.ufs_config import UFSConfigProcessor
 
@@ -850,6 +868,8 @@ class PrepOrchestrator:
         proc = UFSConfigProcessor(
             self.config, fix_dir, output_dir,
             datm_forcing_path=datm_path if datm_path.exists() else None,
+            time_hotstart=time_hotstart,
+            phase=phase,
         )
         return proc.process()
 

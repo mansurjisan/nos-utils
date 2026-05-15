@@ -331,7 +331,12 @@ class TestNudgingWithSyntheticRTOFS:
         rtofs_dir = tmp_path / "rtofs.20260331"
         rtofs_dir.mkdir()
 
-        for fhr in [0, 6]:
+        # Files placed under rtofs.20260331/ are parsed against
+        # rtofs_cycle_date=20260331. Forecast hours 24, 30, ..., 90 land
+        # on 20260401 00z, 06z, ..., 20260403 18z — covering the SECOFS
+        # simulation window [20260401 06z, 20260403 12z] = [sim_start,
+        # sim_end]. The window-filter retains all of these.
+        for fhr in [24, 30, 36, 48, 60, 72, 84, 90]:
             rtofs_file = rtofs_dir / f"rtofs_glo_3dz_f{fhr:03d}_6hrly_hvr_US_east.nc"
             self._make_rtofs_3d(
                 rtofs_file,
@@ -384,6 +389,21 @@ class TestNudgingWithSyntheticRTOFS:
 
             # Check time dimension
             assert ds.dimensions["time"].size >= 2
+
+            # Route B contract: t=0 anchors at cycle - nowcast_hours
+            # (i.e. SCHISM model t=0 = sim_start). Subsequent samples
+            # must cover [0, sim_duration] at the configured cadence.
+            time_vals = ds.variables["time"][:]
+            assert time_vals[0] == 0.0, (
+                f"t=0 must be the model anchor, got {time_vals[0]}"
+            )
+            sim_duration_s = (
+                config.nowcast_hours + config.forecast_hours
+            ) * 3600.0
+            assert time_vals[-1] <= sim_duration_s + 1.0, (
+                f"output extends past sim_duration: "
+                f"{time_vals[-1]} > {sim_duration_s}"
+            )
 
             # Check tracer has valid values (not all NaN)
             tracer = ds.variables["tracer_concentration"][:]
@@ -798,3 +818,151 @@ class TestPrecomputed3DWeights:
         wrong_field = np.zeros((3298, 4500), dtype=np.float32)
         with pytest.raises(ValueError, match="Grid shape mismatch"):
             apply_precomputed_ssh(npz, wrong_field)
+
+
+class TestRoutePhaseNudging:
+    """Phase-aware output time windows for nudge fields.
+
+    TEM_nu.nc / SAL_nu.nc carry the same phase split as the OBC files.
+    The operator's two PBS jobs read separate ``obc.{nowcast,forecast}.tar``
+    bundles; each bundle's TEM_nu / SAL_nu must cover only the leg the
+    job will simulate, plus a buffer past ``sim_end`` so SCHISM's
+    time-series reader has interpolation headroom.
+    """
+
+    from datetime import datetime, timedelta
+
+    def test_get_output_window_nowcast(self, mock_config, tmp_path):
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        mock_config.nudging_enabled = True
+        proc = NudgingProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="nowcast",
+        )
+        sim_start, sim_end, sim_duration = proc._get_output_window()
+        # cycle = 2026-04-01 12z, nowcast_hours=6, buffer=3 -> [06z, 15z]
+        from datetime import datetime
+        assert sim_start == datetime(2026, 4, 1, 6)
+        assert sim_end == datetime(2026, 4, 1, 15)
+        assert sim_duration == (6 + 3) * 3600.0
+
+    def test_get_output_window_forecast(self, mock_config, tmp_path):
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        mock_config.nudging_enabled = True
+        proc = NudgingProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        sim_start, sim_end, sim_duration = proc._get_output_window()
+        # cycle = 2026-04-01 12z, forecast_hours=48, buffer=3 -> [12z, 12z+51h]
+        from datetime import datetime
+        assert sim_start == datetime(2026, 4, 1, 12)
+        assert sim_end == datetime(2026, 4, 3, 15)
+        assert sim_duration == (48 + 3) * 3600.0
+
+    def test_get_output_window_none_combined(self, mock_config, tmp_path):
+        """phase=None must produce the existing Route B 54h combined window
+        WITHOUT the phase buffer (backward-compat)."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        mock_config.nudging_enabled = True
+        proc = NudgingProcessor(mock_config, tmp_path, tmp_path / "out")
+        sim_start, sim_end, sim_duration = proc._get_output_window()
+        from datetime import datetime
+        assert sim_start == datetime(2026, 4, 1, 6)
+        assert sim_end == datetime(2026, 4, 3, 12)
+        assert sim_duration == 54 * 3600.0
+
+    def test_phase_stored_on_processor(self, mock_config, tmp_path):
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        assert proc.phase == "forecast"
+
+    def test_phase_default_is_none(self, mock_config, tmp_path):
+        """Default constructor (no phase kwarg) leaves phase=None."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(mock_config, tmp_path, tmp_path / "out")
+        assert proc.phase is None
+
+    def test_stofs_24h_nowcast_window(self, stofs_config, tmp_path):
+        """STOFS-3D-ATL nowcast = 24h + 3h buffer."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(
+            stofs_config, tmp_path, tmp_path / "out", phase="nowcast",
+        )
+        _, _, sim_duration = proc._get_output_window()
+        assert sim_duration == (24 + 3) * 3600.0
+
+    def test_stofs_108h_forecast_window(self, stofs_config, tmp_path):
+        """STOFS-3D-ATL forecast = 108h + 3h buffer."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(
+            stofs_config, tmp_path, tmp_path / "out", phase="forecast",
+        )
+        _, _, sim_duration = proc._get_output_window()
+        assert sim_duration == (108 + 3) * 3600.0
+
+    def test_buffer_extends_past_phase_end(self, mock_config, tmp_path):
+        """sim_end for phase != None equals raw phase end + default buffer_hours.
+
+        TEM_nu / SAL_nu uses dt=10800s (3h). 9h / 3h + 1 = 4 records for
+        nowcast leg, 51h / 3h + 1 = 18 records for forecast leg.
+        """
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(
+            mock_config, tmp_path, tmp_path / "out", phase="nowcast",
+        )
+        assert proc.buffer_hours == NudgingProcessor.DEFAULT_BUFFER_HOURS == 3
+        _, sim_end, sim_duration = proc._get_output_window()
+        from datetime import datetime, timedelta
+        cycle_dt = datetime(2026, 4, 1, 12)
+        assert sim_end == cycle_dt + timedelta(
+            hours=NudgingProcessor.DEFAULT_BUFFER_HOURS,
+        )
+        # nudge target dt = 10800s (3h); nowcast 6h + buffer 3h = 9h → 4 rows
+        n_target = int(sim_duration / 10800.0) + 1
+        assert n_target == 4
+
+    def test_buffer_hours_kwarg_overrides_default(self, mock_config, tmp_path):
+        """Explicit buffer_hours kwarg overrides class default and
+        config.obc_buffer_hours."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            phase="forecast", buffer_hours=6,
+        )
+        assert proc.buffer_hours == 6
+        _, sim_end, sim_duration = proc._get_output_window()
+        from datetime import datetime, timedelta
+        cycle_dt = datetime(2026, 4, 1, 12)
+        assert sim_end == cycle_dt + timedelta(
+            hours=mock_config.forecast_hours + 6,
+        )
+        # forecast 48h + buffer 6h = 54h → 19 rows at 3h cadence
+        n_target = int(sim_duration / 10800.0) + 1
+        assert n_target == 19
+
+    def test_buffer_hours_zero_disables_buffer(self, mock_config, tmp_path):
+        """buffer_hours=0 restores the pre-buffer phase-window behavior."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        proc = NudgingProcessor(
+            mock_config, tmp_path, tmp_path / "out",
+            phase="nowcast", buffer_hours=0,
+        )
+        assert proc.buffer_hours == 0
+        _, sim_end, sim_duration = proc._get_output_window()
+        from datetime import datetime
+        cycle_dt = datetime(2026, 4, 1, 12)
+        assert sim_end == cycle_dt
+        # 6h nowcast leg, no buffer → 3 rows at 3h cadence (prior behavior)
+        n_target = int(sim_duration / 10800.0) + 1
+        assert n_target == 3

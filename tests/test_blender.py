@@ -1,10 +1,42 @@
 """Tests for BlenderProcessor."""
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import numpy as np
 import pytest
+from nos_utils.config import ForcingConfig
 from nos_utils.forcing.blender import BlenderProcessor, HRRR_LOV, HRRR_LAD
-from nos_utils.forcing.forcing_writer import SFLUX_TO_DATM
+from nos_utils.forcing.forcing_writer import SFLUX_TO_DATM, ForcingNcWriter
+
+netCDF4 = pytest.importorskip("netCDF4")
+pytest.importorskip("scipy")
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _epoch(dt: datetime) -> float:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - _EPOCH).total_seconds()
+
+
+def _make_gfs_forcing(path: Path, times, lons, lats) -> None:
+    """Write a minimal gfs_forcing.nc with all 8 DATM vars on a regular grid."""
+    ny, nx = len(lats), len(lons)
+    data = {
+        "uwind": [np.full((ny, nx), 5.0, dtype=np.float32) for _ in times],
+        "vwind": [np.full((ny, nx), -1.0, dtype=np.float32) for _ in times],
+        "stmp":  [np.full((ny, nx), 290.0, dtype=np.float32) for _ in times],
+        "spfh":  [np.full((ny, nx), 0.01, dtype=np.float32) for _ in times],
+        "prmsl": [np.full((ny, nx), 101325.0, dtype=np.float32) for _ in times],
+        "prate": [np.zeros((ny, nx), dtype=np.float32) for _ in times],
+        "dswrf": [np.full((ny, nx), 100.0, dtype=np.float32) for _ in times],
+        "dlwrf": [np.full((ny, nx), 350.0, dtype=np.float32) for _ in times],
+    }
+    ForcingNcWriter().write_1d(
+        data, list(times), np.asarray(lons), np.asarray(lats),
+        path, source_name="GFS",
+    )
 
 
 def _rotate_winds_lcc(u, v, lon):
@@ -89,3 +121,258 @@ class TestNetCDFUtils:
         assert result[1] == -9999.0
         assert result[2] == -9999.0
         assert result[3] == 5.0
+
+
+class TestRouteBTimeAnchor:
+    """Route B: DATM output time axis is anchored at model_t0 = cycle - nowcast_hours.
+
+    The output must cover [model_t0, model_t0 + (nowcast_hours +
+    forecast_hours + buffer_hours)*3600] regardless of which prep
+    phase generated the input GFS/HRRR forcing files. The trailing
+    ``buffer_hours`` (default 3) gives CDEPS interpolation headroom
+    past the forecast end.
+    """
+
+    def _build_config(self, tmp_path: Path) -> ForcingConfig:
+        # Small DATM domain so the Delaunay/RegularGridInterp run fast.
+        return ForcingConfig(
+            lon_min=-80.0, lon_max=-70.0,
+            lat_min=25.0, lat_max=35.0,
+            pdy="20260401", cyc=12,
+            nowcast_hours=6, forecast_hours=48,
+            nws=4,
+            datm_lon_min=-80.0, datm_lon_max=-70.0,
+            datm_lat_min=25.0, datm_lat_max=35.0,
+            datm_dx=1.0,  # coarse so it's quick
+        )
+
+    def _cycle_dt(self, cfg: ForcingConfig) -> datetime:
+        return datetime.strptime(cfg.pdy, "%Y%m%d") + timedelta(hours=cfg.cyc)
+
+    def test_forecast_phase_input_spans_full_window(self, tmp_path):
+        """GFS forecast-phase output (cycle-6h..cycle+51h) produces 58-step DATM."""
+        cfg = self._build_config(tmp_path)
+        cycle_dt = self._cycle_dt(cfg)
+
+        in_dir = tmp_path / "in"
+        out_dir = tmp_path / "out"
+        in_dir.mkdir()
+
+        # Mimic GFSProcessor forecast-phase output: cycle-6h to cycle+51h.
+        gfs_times = [
+            cycle_dt - timedelta(hours=cfg.nowcast_hours) + timedelta(hours=h)
+            for h in range(cfg.nowcast_hours + cfg.forecast_hours + 3 + 1)
+        ]
+        gfs_lons = np.linspace(-82.0, -68.0, 15, dtype=np.float32)
+        gfs_lats = np.linspace(23.0, 37.0, 15, dtype=np.float32)
+        _make_gfs_forcing(in_dir / "gfs_forcing.nc", gfs_times, gfs_lons, gfs_lats)
+
+        proc = BlenderProcessor(cfg, in_dir, out_dir, target_dx=cfg.datm_dx)
+        result = proc.process()
+        assert result.success, result.errors
+
+        ds = netCDF4.Dataset(str(out_dir / "datm_forcing.nc"))
+        try:
+            t = ds.variables["time"][:]
+            # 58 hourly records for SECOFS (nowcast=6, forecast=48, buffer=3).
+            n_expected = (
+                cfg.nowcast_hours + cfg.forecast_hours
+                + BlenderProcessor.DEFAULT_BUFFER_HOURS + 1
+            )
+            assert len(t) == n_expected, (
+                f"expected {n_expected} steps, got {len(t)}"
+            )
+            # First step is model_t0 = cycle - nowcast_hours.
+            model_t0 = cycle_dt - timedelta(hours=cfg.nowcast_hours)
+            assert float(t[0]) == pytest.approx(_epoch(model_t0), abs=1.0)
+            # Last step is forecast_end + buffer_hours.
+            sim_end = model_t0 + timedelta(
+                hours=cfg.nowcast_hours + cfg.forecast_hours
+                + BlenderProcessor.DEFAULT_BUFFER_HOURS,
+            )
+            assert float(t[-1]) == pytest.approx(_epoch(sim_end), abs=1.0)
+            # Cadence is hourly.
+            assert np.allclose(np.diff(t), 3600.0)
+        finally:
+            ds.close()
+
+    def test_nowcast_phase_short_input_extends_to_full_window(self, tmp_path):
+        """GFS nowcast-phase input (cycle-9h..cycle+3h) still produces 58 steps.
+
+        Route B requires both prep phases to write a DATM file covering
+        the full coupled-run window plus a post-forecast buffer. The
+        nowcast prep's GFS input ends ~3h past cycle, so the blender
+        must extend the time axis forward and hold the last GFS slab
+        constant for the gap (including the buffer past forecast_end).
+        """
+        cfg = self._build_config(tmp_path)
+        cycle_dt = self._cycle_dt(cfg)
+
+        in_dir = tmp_path / "in"
+        out_dir = tmp_path / "out"
+        in_dir.mkdir()
+
+        # Mimic GFSProcessor nowcast-phase output: cycle-9h to cycle+3h.
+        gfs_times = [
+            cycle_dt - timedelta(hours=cfg.nowcast_hours + 3) + timedelta(hours=h)
+            for h in range(cfg.nowcast_hours + 3 + 3 + 1)
+        ]
+        gfs_lons = np.linspace(-82.0, -68.0, 15, dtype=np.float32)
+        gfs_lats = np.linspace(23.0, 37.0, 15, dtype=np.float32)
+        _make_gfs_forcing(in_dir / "gfs_forcing.nc", gfs_times, gfs_lons, gfs_lats)
+
+        proc = BlenderProcessor(cfg, in_dir, out_dir, target_dx=cfg.datm_dx)
+        result = proc.process()
+        assert result.success, result.errors
+
+        ds = netCDF4.Dataset(str(out_dir / "datm_forcing.nc"))
+        try:
+            t = ds.variables["time"][:]
+            # 58 hourly records regardless of input span.
+            n_expected = (
+                cfg.nowcast_hours + cfg.forecast_hours
+                + BlenderProcessor.DEFAULT_BUFFER_HOURS + 1
+            )
+            assert len(t) == n_expected
+            model_t0 = cycle_dt - timedelta(hours=cfg.nowcast_hours)
+            assert float(t[0]) == pytest.approx(_epoch(model_t0), abs=1.0)
+            # The held-constant tail: the last record exists and equals
+            # forecast_end + buffer_hours, not the GFS input end.
+            sim_end = model_t0 + timedelta(
+                hours=cfg.nowcast_hours + cfg.forecast_hours
+                + BlenderProcessor.DEFAULT_BUFFER_HOURS,
+            )
+            assert float(t[-1]) == pytest.approx(_epoch(sim_end), abs=1.0)
+            # Variable values at every step are finite (held-constant tail
+            # samples reuse the edge GFS slab, no NaNs / fill values).
+            u = ds.variables["UGRD_10maboveground"][:]
+            assert np.all(np.isfinite(u))
+            assert u.shape[0] == n_expected
+        finally:
+            ds.close()
+
+    def test_metadata_reflects_full_window(self, tmp_path):
+        """ForcingResult.metadata['ntime'] matches the anchored 58-step axis."""
+        cfg = self._build_config(tmp_path)
+        cycle_dt = self._cycle_dt(cfg)
+
+        in_dir = tmp_path / "in"
+        out_dir = tmp_path / "out"
+        in_dir.mkdir()
+
+        # Use a non-trivial input span so the metadata check is meaningful.
+        gfs_times = [
+            cycle_dt - timedelta(hours=cfg.nowcast_hours + 3) + timedelta(hours=h)
+            for h in range(20)
+        ]
+        gfs_lons = np.linspace(-82.0, -68.0, 15, dtype=np.float32)
+        gfs_lats = np.linspace(23.0, 37.0, 15, dtype=np.float32)
+        _make_gfs_forcing(in_dir / "gfs_forcing.nc", gfs_times, gfs_lons, gfs_lats)
+
+        proc = BlenderProcessor(cfg, in_dir, out_dir, target_dx=cfg.datm_dx)
+        result = proc.process()
+        assert result.success
+        assert result.metadata["ntime"] == (
+            cfg.nowcast_hours + cfg.forecast_hours
+            + BlenderProcessor.DEFAULT_BUFFER_HOURS + 1
+        )
+
+    def test_buffer_extends_past_forecast_end(self, tmp_path):
+        """Last DATM time = cycle + forecast_hours + default buffer_hours."""
+        cfg = self._build_config(tmp_path)
+        cycle_dt = self._cycle_dt(cfg)
+
+        in_dir = tmp_path / "in"
+        out_dir = tmp_path / "out"
+        in_dir.mkdir()
+
+        gfs_times = [
+            cycle_dt - timedelta(hours=cfg.nowcast_hours) + timedelta(hours=h)
+            for h in range(cfg.nowcast_hours + cfg.forecast_hours + 3 + 1)
+        ]
+        gfs_lons = np.linspace(-82.0, -68.0, 15, dtype=np.float32)
+        gfs_lats = np.linspace(23.0, 37.0, 15, dtype=np.float32)
+        _make_gfs_forcing(in_dir / "gfs_forcing.nc", gfs_times, gfs_lons, gfs_lats)
+
+        proc = BlenderProcessor(cfg, in_dir, out_dir, target_dx=cfg.datm_dx)
+        assert proc.buffer_hours == BlenderProcessor.DEFAULT_BUFFER_HOURS == 3
+        result = proc.process()
+        assert result.success, result.errors
+
+        ds = netCDF4.Dataset(str(out_dir / "datm_forcing.nc"))
+        try:
+            t = ds.variables["time"][:]
+            expected_last = cycle_dt + timedelta(
+                hours=cfg.forecast_hours + BlenderProcessor.DEFAULT_BUFFER_HOURS,
+            )
+            assert float(t[-1]) == pytest.approx(_epoch(expected_last), abs=1.0)
+        finally:
+            ds.close()
+
+    def test_buffer_hours_kwarg_overrides_default(self, tmp_path):
+        """Explicit buffer_hours kwarg overrides the class default."""
+        cfg = self._build_config(tmp_path)
+        cycle_dt = self._cycle_dt(cfg)
+
+        in_dir = tmp_path / "in"
+        out_dir = tmp_path / "out"
+        in_dir.mkdir()
+
+        gfs_times = [
+            cycle_dt - timedelta(hours=cfg.nowcast_hours) + timedelta(hours=h)
+            for h in range(cfg.nowcast_hours + cfg.forecast_hours + 6 + 1)
+        ]
+        gfs_lons = np.linspace(-82.0, -68.0, 15, dtype=np.float32)
+        gfs_lats = np.linspace(23.0, 37.0, 15, dtype=np.float32)
+        _make_gfs_forcing(in_dir / "gfs_forcing.nc", gfs_times, gfs_lons, gfs_lats)
+
+        proc = BlenderProcessor(
+            cfg, in_dir, out_dir, target_dx=cfg.datm_dx, buffer_hours=6,
+        )
+        assert proc.buffer_hours == 6
+        result = proc.process()
+        assert result.success, result.errors
+
+        ds = netCDF4.Dataset(str(out_dir / "datm_forcing.nc"))
+        try:
+            t = ds.variables["time"][:]
+            # 6h forecast buffer → 61 records (6 + 48 + 6 + 1).
+            n_expected = cfg.nowcast_hours + cfg.forecast_hours + 6 + 1
+            assert len(t) == n_expected
+            expected_last = cycle_dt + timedelta(hours=cfg.forecast_hours + 6)
+            assert float(t[-1]) == pytest.approx(_epoch(expected_last), abs=1.0)
+        finally:
+            ds.close()
+
+    def test_buffer_hours_zero_disables_buffer(self, tmp_path):
+        """buffer_hours=0 restores the prior 55-step combined window."""
+        cfg = self._build_config(tmp_path)
+        cycle_dt = self._cycle_dt(cfg)
+
+        in_dir = tmp_path / "in"
+        out_dir = tmp_path / "out"
+        in_dir.mkdir()
+
+        gfs_times = [
+            cycle_dt - timedelta(hours=cfg.nowcast_hours) + timedelta(hours=h)
+            for h in range(cfg.nowcast_hours + cfg.forecast_hours + 1)
+        ]
+        gfs_lons = np.linspace(-82.0, -68.0, 15, dtype=np.float32)
+        gfs_lats = np.linspace(23.0, 37.0, 15, dtype=np.float32)
+        _make_gfs_forcing(in_dir / "gfs_forcing.nc", gfs_times, gfs_lons, gfs_lats)
+
+        proc = BlenderProcessor(
+            cfg, in_dir, out_dir, target_dx=cfg.datm_dx, buffer_hours=0,
+        )
+        result = proc.process()
+        assert result.success, result.errors
+
+        ds = netCDF4.Dataset(str(out_dir / "datm_forcing.nc"))
+        try:
+            t = ds.variables["time"][:]
+            n_expected = cfg.nowcast_hours + cfg.forecast_hours + 1
+            assert len(t) == n_expected
+            expected_last = cycle_dt + timedelta(hours=cfg.forecast_hours)
+            assert float(t[-1]) == pytest.approx(_epoch(expected_last), abs=1.0)
+        finally:
+            ds.close()

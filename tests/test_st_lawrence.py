@@ -67,8 +67,10 @@ class TestStLawrenceFluxTh:
     def test_writes_7_day_discharge(self, tmp_path):
         pdy = "20260401"
         input_dir = tmp_path / "comin"
+        # CSV lives under the cycle's PDY (operational $COMINlaw/<PDY>/...)
+        # but must cover dates from model_t0 = 2026-03-31 12:00 onward.
         csv = input_dir / pdy / "can_streamgauge" / DEFAULT_CSV_NAME
-        _write_hydrometric_csv(csv, start_date="2026-04-01", n_days=7,
+        _write_hydrometric_csv(csv, start_date="2026-03-31", n_days=8,
                                flow_cms=8000.0)
 
         out_dir = tmp_path / "out"
@@ -84,7 +86,8 @@ class TestStLawrenceFluxTh:
         data = np.loadtxt(flux_path)
         # 6 days forecast + 1 -> 7 rows (132h/24 = 5.5 -> ceil=6, +1 = 7)
         assert data.shape == (7, 2)
-        # Time column starts at 0 and steps by 86400 seconds.
+        # Time column starts at 0 (= model_t0 = cycle - nowcast_hours) and
+        # steps by 86400 seconds.
         assert data[0, 0] == 0
         assert data[1, 0] == 86400
         # Negative sign = inflow in SCHISM.
@@ -108,7 +111,9 @@ class TestStLawrenceFluxTh:
     def test_previous_day_fallback(self, tmp_path):
         pdy = "20260402"
         input_dir = tmp_path / "comin"
-        # Only yesterday's CSV exists.
+        # Only yesterday's CSV exists. With nowcast_hours=24 the model_t0
+        # for today's cyc=12 run is 2026-04-01 12:00, so the CSV must
+        # include that anchor day.
         csv = input_dir / "20260401" / "can_streamgauge" / DEFAULT_CSV_NAME
         _write_hydrometric_csv(csv, start_date="2026-04-01", n_days=7,
                                flow_cms=7500.0)
@@ -119,9 +124,8 @@ class TestStLawrenceFluxTh:
         proc = StLawrenceProcessor(cfg, input_dir, out_dir)
 
         result = proc.process()
-        # The yesterday CSV starts at 2026-04-01 12:00, today's start is
-        # 2026-04-02 12:00. Yesterday's CSV has those rows too, so it
-        # should succeed.
+        # model_t0 = 2026-04-02 12:00 - 24h = 2026-04-01 12:00, which is the
+        # first row of yesterday's CSV — should succeed.
         assert result.success
         assert (out_dir / "flux.th").exists()
 
@@ -133,11 +137,13 @@ class TestStLawrenceTempFromSflux:
         pdy = "20260401"
         input_dir = tmp_path / "comin"
         csv = input_dir / pdy / "can_streamgauge" / DEFAULT_CSV_NAME
-        _write_hydrometric_csv(csv, start_date="2026-04-01", n_days=7)
+        # model_t0 = cycle - 24h = 2026-03-31 12:00; CSV must cover that.
+        _write_hydrometric_csv(csv, start_date="2026-03-31", n_days=8)
 
         sflux_file = tmp_path / "sflux" / "sflux_rad_1.1.nc"
+        # sflux must also extend back to model_t0 = 2026-03-31 12:00.
         _write_fake_sflux_rad(
-            sflux_file, datetime(2026, 4, 1, 12, 0, 0), n_times=168,
+            sflux_file, datetime(2026, 3, 31, 12, 0, 0), n_times=192,
         )
 
         out_dir = tmp_path / "out"

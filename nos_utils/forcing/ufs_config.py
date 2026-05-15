@@ -15,9 +15,14 @@ Replaces ``ush/nosofs/nos_ofs_gen_ufs_config.sh`` (~250 lines of bash sed).
 
 Token substitution mirrors the shell ``sed -e "s/@\\[TOKEN\\]/value/g"``:
 
-    @[YYYY], @[MM], @[DD], @[HH]      -> from config.pdy + config.cyc
-    @[NHOURS]                          -> config.ufs_nhours_fcst (or sum of
-                                          nowcast_hours + forecast_hours)
+    @[YYYY], @[MM], @[DD], @[HH]      -> model_t0 = cycle - nowcast_hours
+                                          (full coupled run anchor); pulled
+                                          from ``time_hotstart`` when caller
+                                          passes it, otherwise derived from
+                                          ``config.pdy + cyc - nowcast_hours``.
+    @[NHOURS]                          -> nowcast_hours + forecast_hours
+                                          (covers nowcast + forecast from
+                                          model_t0).
     @[DT_ATMOS]                        -> config.ufs_dt_atmos
     @[DATM_INPUT_DIR]                  -> "INPUT" (default)
     @[DATM_MESH_FILE]                  -> "datm_esmf_mesh.nc" (default)
@@ -30,12 +35,19 @@ on ``config.ufs_datm_tasks`` and ``config.ufs_total_tasks`` so the v3.9
 SECOFS mesh (compute=2794) gets correct OCN PETs (120-2913) instead of the
 hardcoded template value (120-1199).
 
+The model_t0 anchor matches the operational COMF convention used by
+``param_nml.py`` and ``tidal.py``: every component of the coupled run --
+SCHISM start, DATM stream alignment, OBC time axis, hotstart -- shares the
+same cycle - nowcast_hours origin, which is required so CMEPS' ATM->OCN
+clock stays in sync.
+
 Style mirrors ``param_nml.py`` and ``tidal.py``.
 """
 
 import logging
 import re
 import shutil
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -81,6 +93,8 @@ class UFSConfigProcessor(ForcingProcessor):
         datm_input_dir: str = "INPUT",
         datm_mesh_file: str = "datm_esmf_mesh.nc",
         datm_forcing_file: str = "datm_forcing.nc",
+        time_hotstart: Optional[datetime] = None,
+        phase: Optional[str] = None,
     ):
         """
         Args:
@@ -96,6 +110,30 @@ class UFSConfigProcessor(ForcingProcessor):
             datm_input_dir: Substituted for ``@[DATM_INPUT_DIR]``.
             datm_mesh_file: Substituted for ``@[DATM_MESH_FILE]``.
             datm_forcing_file: Substituted for ``@[DATM_FORCING_FILE]``.
+            time_hotstart: Datetime origin for the coupled run.  When None,
+                the processor derives it as ``cycle - nowcast_hours`` (the
+                operational COMF anchor).  Provide this when the caller has
+                already pinned the anchor (e.g. from a hotstart file or a
+                ``time_hotstart`` marker) so every component of the prep
+                bundle agrees on the same model_t0.
+            phase: "nowcast", "forecast", or None.
+                * ``phase="nowcast"``: ``start_*`` tokens anchor at
+                  ``cycle - nowcast_hours`` and ``NHOURS`` covers the
+                  6h nowcast leg only.
+                * ``phase="forecast"``: ``start_*`` tokens anchor at
+                  ``cycle`` (the forecast leg start) and ``NHOURS``
+                  covers ``forecast_hours``.
+                * ``phase=None`` (default, backward compat): the combined
+                  54h coupled-run anchor used by Route B Phase 1
+                  (``start_*`` at ``cycle - nowcast_hours``,
+                  ``NHOURS = nowcast_hours + forecast_hours``).
+
+                Operationally the forecast call wins via second-write
+                semantics in ``$COMOUT``, so on-disk
+                ``model_configure`` ends up forecast-shaped. The
+                stage-time patcher (``nos-workflow`` ``configure.patch_model_configure``)
+                rewrites the nowcast leg back to its own anchor when
+                the PBS nowcast job stages forcing into ``$DATA``.
         """
         super().__init__(config, fix_dir, output_dir)
         self.fix_dir = Path(fix_dir) if fix_dir is not None else None
@@ -105,6 +143,8 @@ class UFSConfigProcessor(ForcingProcessor):
         self.datm_input_dir = datm_input_dir
         self.datm_mesh_file = datm_mesh_file
         self.datm_forcing_file = datm_forcing_file
+        self.time_hotstart = time_hotstart
+        self.phase = phase
 
     def find_input_files(self) -> List[Path]:
         if self.fix_dir is None or not self.fix_dir.exists():
@@ -276,25 +316,69 @@ class UFSConfigProcessor(ForcingProcessor):
     # ------------------------------------------------------------------ #
 
     def _compute_substitutions(self) -> Dict[str, str]:
-        """Build the @[TOKEN] -> value substitution map."""
-        pdy = self.config.pdy
-        cyc = int(self.config.cyc)
+        """Build the @[TOKEN] -> value substitution map.
 
-        yyyy = pdy[0:4]
-        mm = pdy[4:6]
-        dd = pdy[6:8]
-        hh = f"{cyc:02d}"
+        Start time is anchored phase-aware:
 
-        # NHOURS: prefer the explicit ufs_nhours_fcst; otherwise the sum of
-        # nowcast + forecast (matches what ``stop_n`` would represent for the
-        # full coupled run).
-        nhours = getattr(self.config, "ufs_nhours_fcst", None)
-        if nhours is None:
-            nhours = (
-                int(self.config.nowcast_hours)
-                + int(self.config.forecast_hours)
-            )
-        nhours = int(nhours)
+        * ``phase="nowcast"``: ``start_* = cycle - nowcast_hours``,
+          ``nhours_fcst = nowcast_hours``. Covers only the nowcast leg.
+        * ``phase="forecast"``: ``start_* = cycle``,
+          ``nhours_fcst = forecast_hours``. Covers only the forecast leg.
+        * ``phase=None`` (default, backward compat): ``start_* = cycle -
+          nowcast_hours``, ``nhours_fcst = nowcast_hours +
+          forecast_hours``. Matches the operational COMF Phase-1 Route B
+          anchor used by ``param_nml.py`` / ``tidal.py``: SCHISM begins
+          at model_t0, runs through the nowcast window, and ends
+          ``forecast_hours`` past the cycle.
+
+        When the caller passes ``time_hotstart`` it wins outright over
+        the derived start (the orchestrator may have pinned the anchor
+        from a hotstart marker), but ``NHOURS`` still follows the phase
+        rule above. Operationally the forecast call writes second and
+        wins on-disk; the nos-workflow stage-time patcher rewrites the
+        nowcast leg's ``model_configure`` correctly at PBS-job time.
+        """
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=int(self.config.cyc))
+        nowcast_hours = int(self.config.nowcast_hours)
+        forecast_hours = int(self.config.forecast_hours)
+
+        if self.phase == "forecast":
+            phase_t0 = cycle_dt
+            phase_nhours = forecast_hours
+        elif self.phase == "nowcast":
+            phase_t0 = cycle_dt - timedelta(hours=nowcast_hours)
+            phase_nhours = nowcast_hours
+        else:
+            phase_t0 = cycle_dt - timedelta(hours=nowcast_hours)
+            phase_nhours = nowcast_hours + forecast_hours
+
+        if self.time_hotstart is not None:
+            model_t0 = self.time_hotstart
+        else:
+            model_t0 = phase_t0
+
+        yyyy = f"{model_t0.year:04d}"
+        mm = f"{model_t0.month:02d}"
+        dd = f"{model_t0.day:02d}"
+        hh = f"{model_t0.hour:02d}"
+
+        # NHOURS covers the phase window. For backward-compat (phase=None)
+        # this is the full coupled run from model_t0 to the end of the
+        # forecast window. Use ``ufs_nhours_fcst`` only when it represents
+        # the full coverage for the combined phase (factory default sums
+        # both phases); fall back to the explicit sum so we never under-shoot.
+        nhours_attr = getattr(self.config, "ufs_nhours_fcst", None)
+        if self.phase is None:
+            if nhours_attr is None or int(nhours_attr) < phase_nhours:
+                nhours = phase_nhours
+            else:
+                nhours = int(nhours_attr)
+        else:
+            # Explicit phase: always use the phase-specific length;
+            # ``ufs_nhours_fcst`` reflects the combined-window default
+            # and is not appropriate for a single leg.
+            nhours = phase_nhours
 
         dt_atmos = int(getattr(self.config, "ufs_dt_atmos", 720))
 

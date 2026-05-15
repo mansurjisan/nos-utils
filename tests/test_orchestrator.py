@@ -133,6 +133,80 @@ class TestTimeHotstartAnchor:
         assert marker.read_text().strip() == "2026040106"
 
 
+class TestRoutePhaseOrchestrator:
+    """Verify phase is threaded through to the phase-aware processors.
+
+    The orchestrator's ``run(phase=...)`` API must forward the phase
+    string to NWMProcessor / NudgingProcessor / RTOFSProcessor /
+    UFSConfigProcessor so each emits its phase-specific output window.
+    """
+
+    def test_orchestrator_forwards_phase_to_param_nml(self, mock_config, orch_paths):
+        """Smoke check: phase reaches param.nml processor (already wired)."""
+        orch = PrepOrchestrator(mock_config, orch_paths)
+        result = orch.run(phase="forecast")
+        assert result.phase == "forecast"
+
+    def test_run_ufs_config_signature_accepts_phase(self, mock_config, tmp_path):
+        """``_run_ufs_config`` must accept the phase kwarg (regression for
+        the orchestrator extension to pass phase to UFSConfigProcessor)."""
+        import inspect
+        orch = PrepOrchestrator(mock_config, {"output": str(tmp_path)})
+        sig = inspect.signature(orch._run_ufs_config)
+        assert "phase" in sig.parameters
+
+    def test_run_nudging_passes_phase(self, mock_config, tmp_path,
+                                       monkeypatch):
+        """NudgingProcessor instance receives the orchestrator's phase."""
+        from nos_utils.forcing.nudging import NudgingProcessor
+
+        captured = {}
+
+        original_init = NudgingProcessor.__init__
+
+        def spy_init(self, *args, **kwargs):
+            captured["phase"] = kwargs.get("phase")
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(NudgingProcessor, "__init__", spy_init)
+
+        mock_config.nudging_enabled = True
+        orch = PrepOrchestrator(
+            mock_config, {"output": str(tmp_path / "out"),
+                          "fix": str(tmp_path / "fix"),
+                          "rtofs": str(tmp_path / "rtofs")},
+        )
+        (tmp_path / "fix").mkdir()
+        (tmp_path / "rtofs").mkdir()
+        # nudging gate requires rtofs path + nudging_enabled — both set.
+        orch._run_nudging(tmp_path / "out", phase="forecast")
+        assert captured["phase"] == "forecast"
+
+    def test_run_ufs_config_passes_phase(self, mock_config, tmp_path,
+                                          monkeypatch):
+        """UFSConfigProcessor instance receives the orchestrator's phase."""
+        from nos_utils.forcing.ufs_config import UFSConfigProcessor
+
+        captured = {}
+        original_init = UFSConfigProcessor.__init__
+
+        def spy_init(self, *args, **kwargs):
+            captured["phase"] = kwargs.get("phase")
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(UFSConfigProcessor, "__init__", spy_init)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        fix_dir = tmp_path / "fix"
+        fix_dir.mkdir()
+        orch = PrepOrchestrator(
+            mock_config, {"output": str(out_dir), "fix": str(fix_dir)},
+        )
+        orch._run_ufs_config(out_dir, phase="nowcast")
+        assert captured["phase"] == "nowcast"
+
+
 class TestPrepResult:
     def test_all_output_files(self):
         from nos_utils.forcing.base import ForcingResult
