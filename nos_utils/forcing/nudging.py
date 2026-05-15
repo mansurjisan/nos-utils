@@ -48,6 +48,13 @@ class NudgingProcessor(ForcingProcessor):
 
     SOURCE_NAME = "NUDGING"
 
+    # Default buffer (hours) appended past the phase-window end so SCHISM's
+    # nudging time-series reader has interpolation headroom past the
+    # simulation tail. Matches legacy COMF, which emits nudging through
+    # ``sim_end + 3h``. Shared knob with RTOFSProcessor; see
+    # ``config.obc_buffer_hours``.
+    DEFAULT_BUFFER_HOURS = 3
+
     def __init__(
         self,
         config: ForcingConfig,
@@ -56,6 +63,7 @@ class NudgingProcessor(ForcingProcessor):
         nudge_weight_file: Optional[Path] = None,
         rtofs_input_path: Optional[Path] = None,
         phase: Optional[str] = None,
+        buffer_hours: Optional[int] = None,
     ):
         """
         Args:
@@ -66,21 +74,34 @@ class NudgingProcessor(ForcingProcessor):
             rtofs_input_path: COMINrtofs root for STOFS nudge-specific data prep
                 (uses nudge_roi_3d instead of obc_roi_3d)
             phase: "nowcast", "forecast", or None.
-                * "nowcast": nudge output spans ``[cycle - nowcast_hours, cycle]``
+                * "nowcast": nudge output spans
+                  ``[cycle - nowcast_hours, cycle + buffer_hours]``
                   with ``t=0`` at ``cycle - nowcast_hours``.
-                * "forecast": output spans ``[cycle, cycle + forecast_hours]``
+                * "forecast": output spans
+                  ``[cycle, cycle + forecast_hours + buffer_hours]``
                   with ``t=0`` at ``cycle``.
                 * None (backward compat): combined 54h window starting at
-                  ``cycle - nowcast_hours``.
+                  ``cycle - nowcast_hours``, WITHOUT buffer.
                 Operational COMOUT carries two separate tars
                 (``obc.nowcast.tar`` / ``obc.forecast.tar``); the phase
                 argument lets each tar's TEM_nu / SAL_nu match the leg
                 the operator's PBS job reads.
+            buffer_hours: Extra hours appended past the phase window end so
+                SCHISM's nudging time-series reader has interpolation
+                headroom past the simulation tail. Defaults to
+                ``config.obc_buffer_hours`` when set on the
+                ``ForcingConfig``, otherwise to ``DEFAULT_BUFFER_HOURS``
+                (3h, matching legacy COMF). Applies to phase != None only.
         """
         super().__init__(config, input_path, output_path)
         self.nudge_weight_file = nudge_weight_file
         self.rtofs_input_path = rtofs_input_path
         self.phase = phase
+        if buffer_hours is None:
+            buffer_hours = getattr(
+                config, "obc_buffer_hours", self.DEFAULT_BUFFER_HOURS,
+            )
+        self.buffer_hours = int(buffer_hours)
 
     def _get_output_window(self) -> Tuple[datetime, datetime, float]:
         """Compute ``(sim_start, sim_end, sim_duration_seconds)`` for the phase.
@@ -88,12 +109,19 @@ class NudgingProcessor(ForcingProcessor):
         Mirrors :meth:`RTOFSProcessor._get_output_window` so OBC and
         nudging files share the same phase semantics:
 
-        * nowcast: ``[cycle - nowcast_hours, cycle]`` (duration =
-          ``nowcast_hours * 3600``).
-        * forecast: ``[cycle, cycle + forecast_hours]`` (duration =
-          ``forecast_hours * 3600``).
+        * nowcast: ``[cycle - nowcast_hours, cycle + buffer_hours]``
+          (duration = ``(nowcast_hours + buffer_hours) * 3600``).
+        * forecast:
+          ``[cycle, cycle + forecast_hours + buffer_hours]``
+          (duration = ``(forecast_hours + buffer_hours) * 3600``).
         * None (default, backward-compat): combined 54h window
-          ``[cycle - nowcast_hours, cycle + forecast_hours]``.
+          ``[cycle - nowcast_hours, cycle + forecast_hours]``, WITHOUT
+          buffer.
+
+        ``self.buffer_hours`` (default 3h, override via ``buffer_hours``
+        kwarg or ``config.obc_buffer_hours``) is appended past
+        ``sim_end`` for phase != None so SCHISM's time-series reader
+        has interpolation headroom.
         """
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                    timedelta(hours=self.config.cyc)
@@ -102,13 +130,16 @@ class NudgingProcessor(ForcingProcessor):
 
         if self.phase == "nowcast":
             sim_start = cycle_dt - timedelta(hours=nowcast_hours)
-            sim_end = cycle_dt
-            sim_duration = float(nowcast_hours) * 3600.0
+            sim_end = cycle_dt + timedelta(hours=self.buffer_hours)
+            sim_duration = float(nowcast_hours + self.buffer_hours) * 3600.0
         elif self.phase == "forecast":
             sim_start = cycle_dt
-            sim_end = cycle_dt + timedelta(hours=forecast_hours)
-            sim_duration = float(forecast_hours) * 3600.0
+            sim_end = cycle_dt + timedelta(
+                hours=forecast_hours + self.buffer_hours,
+            )
+            sim_duration = float(forecast_hours + self.buffer_hours) * 3600.0
         else:
+            # Backward-compat combined window without buffer.
             sim_start = cycle_dt - timedelta(hours=nowcast_hours)
             sim_end = cycle_dt + timedelta(hours=forecast_hours)
             sim_duration = float(nowcast_hours + forecast_hours) * 3600.0

@@ -430,6 +430,19 @@ class NWMProcessor(ForcingProcessor):
     # NWM products in priority order
     PRODUCTS = ["analysis_assim", "short_range", "medium_range"]
 
+    # Default buffer (hours) appended past the phase-window end so SCHISM's
+    # source/sink time-series reader has interpolation headroom past the
+    # simulation tail. Shared knob with RTOFS/Nudging via
+    # ``config.obc_buffer_hours``. SCHISM aborts with
+    # ``ABORT: step: time_series in vsource.th`` if the requested model
+    # time falls outside the source-term time bounds, which happens near
+    # the end of the run when the phase file stops exactly at sim_end.
+    #
+    # Independent of ``config.river_hourly_extra_hours``: the legacy
+    # ``extra`` knob is the production-COMF ``time_hotstart + 72h``
+    # compatibility lever and is added on top of the buffer.
+    DEFAULT_BUFFER_HOURS = 3
+
     def __init__(
         self,
         config: ForcingConfig,
@@ -438,6 +451,7 @@ class NWMProcessor(ForcingProcessor):
         river_config: Optional[RiverConfig] = None,
         phase: Optional[str] = None,
         time_hotstart: Optional[datetime] = None,
+        buffer_hours: Optional[int] = None,
     ):
         """
         Args:
@@ -447,11 +461,22 @@ class NWMProcessor(ForcingProcessor):
             river_config: Pre-loaded river configuration (or loaded from config.river_config_file)
             phase: "nowcast" or "forecast" — determines time window for NWM files
             time_hotstart: Hotstart datetime (nowcast starts from here)
+            buffer_hours: Extra hours appended past the phase window end so
+                SCHISM's source/sink time-series reader has interpolation
+                headroom past the simulation tail. Defaults to
+                ``config.obc_buffer_hours`` when set on the
+                ``ForcingConfig``, otherwise to ``DEFAULT_BUFFER_HOURS``
+                (3h, matching legacy COMF). Applied to phase != None only.
         """
         super().__init__(config, input_path, output_path)
         self._river_config = river_config
         self.phase = phase
         self.time_hotstart = time_hotstart
+        if buffer_hours is None:
+            buffer_hours = getattr(
+                config, "obc_buffer_hours", self.DEFAULT_BUFFER_HOURS,
+            )
+        self.buffer_hours = int(buffer_hours)
 
     @property
     def river_config(self) -> Optional[RiverConfig]:
@@ -526,13 +551,15 @@ class NWMProcessor(ForcingProcessor):
         # uses the medium-range 121-file path with its own length.
         #
         # Phase semantics for the OUTPUT axis:
-        #   * phase="nowcast":  total_hours = nowcast_hours + extra
-        #     (output covers [0, nowcast_hours] anchored at
-        #     ``cycle - nowcast_hours``)
-        #   * phase="forecast": total_hours = forecast_hours + extra
-        #     (output covers [0, forecast_hours] anchored at ``cycle``)
+        #   * phase="nowcast":  total_hours = nowcast_hours + buffer + extra
+        #     (output covers [0, total_hours] anchored at
+        #     ``cycle - nowcast_hours``; buffer past sim_end gives
+        #     SCHISM time_series interpolation headroom)
+        #   * phase="forecast": total_hours = forecast_hours + buffer + extra
+        #     (output covers [0, total_hours] anchored at ``cycle``)
         #   * phase=None (default, backward compat): total_hours =
-        #     nowcast_hours + forecast_hours + extra (combined 54h)
+        #     nowcast_hours + forecast_hours + extra (combined 54h
+        #     without buffer)
         total_hours = self._phase_total_hours()
         n_target = total_hours + 1  # hourly
 
@@ -648,20 +675,28 @@ class NWMProcessor(ForcingProcessor):
 
         Hourly grid length is ``_phase_total_hours() + 1`` (0..N inclusive).
 
-        * phase="nowcast":  ``nowcast_hours + extra``
-        * phase="forecast": ``forecast_hours + extra``
+        * phase="nowcast":  ``nowcast_hours + buffer + extra``
+        * phase="forecast": ``forecast_hours + buffer + extra``
         * phase=None (default, backward compat):
-          ``nowcast_hours + forecast_hours + extra``
+          ``nowcast_hours + forecast_hours + extra`` (no buffer)
 
         ``extra`` is ``max(0, river_hourly_extra_hours)`` — production
         COMF extends the source axis past the simulation end so SCHISM
         always has interpolation room at the tail.
+
+        ``buffer`` is ``self.buffer_hours`` (default 3h, override via
+        ``buffer_hours`` kwarg or ``config.obc_buffer_hours``) and is
+        appended past ``sim_end`` for phase != None so the SCHISM
+        time_series reader has interpolation headroom even when
+        ``river_hourly_extra_hours`` is the default 0 (e.g. STOFS).
+        The combined ``phase=None`` window omits the buffer so existing
+        callers that depend on the exact 54h duration are unaffected.
         """
         extra = max(0, int(self.config.river_hourly_extra_hours))
         if self.phase == "nowcast":
-            return int(self.config.nowcast_hours) + extra
+            return int(self.config.nowcast_hours) + self.buffer_hours + extra
         if self.phase == "forecast":
-            return int(self.config.forecast_hours) + extra
+            return int(self.config.forecast_hours) + self.buffer_hours + extra
         return (int(self.config.nowcast_hours)
                 + int(self.config.forecast_hours)
                 + extra)

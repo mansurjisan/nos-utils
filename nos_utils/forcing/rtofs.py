@@ -63,6 +63,16 @@ class RTOFSProcessor(ForcingProcessor):
     MIN_FILE_SIZE_2D = 150_000_000
     MIN_FILE_SIZE_3D = 200_000_000
 
+    # Default buffer (hours) appended past the phase-window end so SCHISM's
+    # time-series reader has interpolation headroom on its pre-load look-ahead.
+    # Matches the legacy COMF OBC window, which emits boundary forcing
+    # through ``sim_end + 3h``. SCHISM aborts with
+    # ``ABORT: step: time_series in elev2D.th.nc (2)`` if the requested
+    # model time falls outside the boundary-forcing time bounds, which
+    # happens near the end of the run when the phase file stops exactly
+    # at ``sim_end``.
+    DEFAULT_BUFFER_HOURS = 3
+
     def __init__(
         self,
         config: ForcingConfig,
@@ -73,6 +83,7 @@ class RTOFSProcessor(ForcingProcessor):
         vgrid_file: Optional[Path] = None,
         phase: Optional[str] = None,
         time_hotstart: Optional[datetime] = None,
+        buffer_hours: Optional[int] = None,
     ):
         """
         Args:
@@ -84,6 +95,13 @@ class RTOFSProcessor(ForcingProcessor):
             vgrid_file: Vertical grid file (vgrid.in) for depth interpolation
             phase: "nowcast" or "forecast" — determines time window filter
             time_hotstart: Hotstart datetime (nowcast starts from here)
+            buffer_hours: Extra hours appended past the phase window end so
+                SCHISM's time-series reader has interpolation headroom past
+                the simulation tail. Defaults to ``config.obc_buffer_hours``
+                when set on the ``ForcingConfig``, otherwise to
+                ``DEFAULT_BUFFER_HOURS`` (3h, matching legacy COMF). The
+                buffer only applies to phase != None — the backward-compat
+                combined ``phase=None`` window is unchanged.
         """
         super().__init__(config, input_path, output_path)
         self.grid_file = grid_file or config.grid_file
@@ -91,6 +109,11 @@ class RTOFSProcessor(ForcingProcessor):
         self.vgrid_file = vgrid_file
         self.phase = phase
         self.time_hotstart = time_hotstart
+        if buffer_hours is None:
+            buffer_hours = getattr(
+                config, "obc_buffer_hours", self.DEFAULT_BUFFER_HOURS,
+            )
+        self.buffer_hours = int(buffer_hours)
         self._grid = None
         self._bnd_lons = None
         self._bnd_lats = None
@@ -133,20 +156,25 @@ class RTOFSProcessor(ForcingProcessor):
 
         Phase semantics:
           * ``phase="nowcast"``: ``model_t0 = cycle - nowcast_hours``,
-            ``sim_end = cycle``, duration = ``nowcast_hours * 3600``.
-            Output files cover the 6h nowcast leg only.
+            ``sim_end = cycle + buffer_hours``, duration =
+            ``(nowcast_hours + buffer_hours) * 3600``. Output files cover
+            the 6h nowcast leg plus a buffer past sim_end for SCHISM's
+            time-series interpolation headroom.
           * ``phase="forecast"``: ``model_t0 = cycle``,
-            ``sim_end = cycle + forecast_hours``, duration =
-            ``forecast_hours * 3600``. Output files cover the 48h
-            forecast leg only.
-          * ``phase=None`` (default, backward compat): combined window,
-            ``model_t0 = cycle - nowcast_hours``,
+            ``sim_end = cycle + forecast_hours + buffer_hours``,
+            duration = ``(forecast_hours + buffer_hours) * 3600``.
+          * ``phase=None`` (default, backward compat): combined window
+            WITHOUT buffer, ``model_t0 = cycle - nowcast_hours``,
             ``sim_end = cycle + forecast_hours``, duration =
             ``(nowcast_hours + forecast_hours) * 3600``.
 
         The phase argument lets prep emit two physically distinct file
         sets (nowcast / forecast) so that operationally-separated PBS
         jobs read forcing whose file content matches the filename phase.
+        For phase-aware files, ``self.buffer_hours`` (default 3h, override
+        via ``buffer_hours`` kwarg or ``config.obc_buffer_hours``) is
+        appended past the simulation end so SCHISM's time_series reader
+        has interpolation headroom.
         """
         cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
                    timedelta(hours=self.config.cyc)
@@ -155,15 +183,19 @@ class RTOFSProcessor(ForcingProcessor):
 
         if phase == "nowcast":
             model_t0 = cycle_dt - timedelta(hours=nowcast_hours)
-            sim_end = cycle_dt
-            sim_duration = float(nowcast_hours) * 3600.0
+            sim_end = cycle_dt + timedelta(hours=self.buffer_hours)
+            sim_duration = float(nowcast_hours + self.buffer_hours) * 3600.0
         elif phase == "forecast":
             model_t0 = cycle_dt
-            sim_end = cycle_dt + timedelta(hours=forecast_hours)
-            sim_duration = float(forecast_hours) * 3600.0
+            sim_end = cycle_dt + timedelta(
+                hours=forecast_hours + self.buffer_hours,
+            )
+            sim_duration = float(forecast_hours + self.buffer_hours) * 3600.0
         else:
             # Backward-compat combined window: nowcast + forecast from
-            # ``cycle - nowcast_hours`` through ``cycle + forecast_hours``.
+            # ``cycle - nowcast_hours`` through ``cycle + forecast_hours``
+            # WITHOUT buffer. Some upstream callers depend on the exact
+            # 54h combined duration; the buffer only applies to phase != None.
             model_t0 = cycle_dt - timedelta(hours=nowcast_hours)
             sim_end = cycle_dt + timedelta(hours=forecast_hours)
             sim_duration = float(nowcast_hours + forecast_hours) * 3600.0
@@ -1085,9 +1117,10 @@ class RTOFSProcessor(ForcingProcessor):
                 hour, _ = self._parse_rtofs_hour(f)
                 file_hours.append(hour)
 
-            # Phase-aware output window: nowcast emits only the 6h leg,
-            # forecast emits only the 48h leg, None gives the combined
-            # 54h window (backward-compat).
+            # Phase-aware output window: nowcast emits the 6h leg + buffer,
+            # forecast emits the 48h leg + buffer (buffer_hours past sim_end
+            # for SCHISM time_series interpolation headroom). None gives the
+            # combined 54h window without buffer (backward-compat).
             model_t0, sim_end, sim_duration = self._get_output_window(self.phase)
 
             # Compute time of each file relative to model_t0.
@@ -1425,8 +1458,9 @@ class RTOFSProcessor(ForcingProcessor):
             target_dt_3d = 10800.0  # 3-hourly output (matches Fortran DELT_TS)
 
             # Compute simulation duration for the OBC window.
-            # Phase-aware: nowcast = 6h from cycle-nowcast_hours,
-            # forecast = 48h from cycle, None = combined 54h window.
+            # Phase-aware: nowcast = 6h + buffer from cycle-nowcast_hours,
+            # forecast = 48h + buffer from cycle, None = combined 54h
+            # window without buffer (backward-compat).
             # The 3D OBC files must use the same anchor as the SCHISM-side
             # files (param.nml, bctides, time markers) so SCHISM can index
             # correctly when each PBS job (nowcast / forecast) reads its
