@@ -61,3 +61,194 @@ class TestForcingConfig:
         assert cfg.nws == 2
         assert cfg.grid_file is None
         assert cfg.variables == []
+
+
+# --- prep.extras declarative override (P1 prep-unification) ---------------
+#
+# `prep.extras` decouples "is this a STOFS-style YAML" (inferred from OBC
+# ROI indices) from "should prep run St-Lawrence / dynamic SSH adjust" (an
+# explicit operational choice). These tests guard:
+#   1. present  -> flags equal the declared values
+#   2. absent   -> identical to the pre-change is_stofs_like heuristic
+#                  (regression guard: SECOFS-derived stays False/False/0)
+#   3. drift    -> factory values == a YAML carrying the matching
+#                  prep.extras (factory/YAML can't silently diverge)
+
+# A SECOFS-shaped YAML: no OBC ROI indices -> is_stofs_like is False.
+_SECOFS_SHAPED_YAML = """\
+system:
+  name: secofs_shaped
+grid:
+  domain: {lon_min: -88.0, lon_max: -63.0, lat_min: 17.0, lat_max: 40.0}
+forcing:
+  atmospheric: {met_num: 2}
+model:
+  run: {nowcast_hours: 6, forecast_hours: 48}
+"""
+
+# A STOFS-shaped YAML: a faithful miniature of parm/systems/
+# stofs_3d_atl_ufs.yaml for the keys that feed the prep optionals.
+# Pre-change, this yields st_lawrence_enabled=True (river.st_lawrence.
+# enabled), dynamic_adjust_enabled=True (obc.obc_mode == dynamic_adjust),
+# obc_min_timesteps=21 (is_stofs_like via OBC ROI indices) -> the
+# True/True/21 STOFS baseline asserted by the regression guard.
+_STOFS_SHAPED_YAML = """\
+system:
+  name: stofs_shaped
+grid:
+  domain: {lon_min: -98.5035, lon_max: -52.4867, lat_min: 7.347, lat_max: 52.5904}
+forcing:
+  atmospheric: {met_num: 2}
+  river:
+    st_lawrence: {enabled: true}
+  ocean:
+    obc:
+      obc_mode: dynamic_adjust
+      roi_2ds: {x1: 2805, x2: 2923, y1: 1598, y2: 2325}
+      roi_3dz: {x1: 482, x2: 600, y1: 94, y2: 821}
+model:
+  run: {nowcast_hours: 24, forecast_hours: 108}
+"""
+
+# A bare STOFS-SHAPED YAML carrying ONLY the OBC ROI indices (no
+# river.st_lawrence, no obc_mode). This isolates the is_stofs_like
+# heuristic itself: pre-change it yields st_lawrence_enabled=False
+# (the heuristic never sets St-Lawrence), dynamic_adjust_enabled=True
+# and obc_min_timesteps=21 (both driven by is_stofs_like). Used to
+# document/guard the exact heuristic contract `prep.extras` overrides.
+_STOFS_ROI_ONLY_YAML = """\
+system:
+  name: stofs_roi_only
+grid:
+  domain: {lon_min: -98.5035, lon_max: -52.4867, lat_min: 7.347, lat_max: 52.5904}
+forcing:
+  atmospheric: {met_num: 2}
+  ocean:
+    obc:
+      roi_2ds: {x1: 2805, x2: 2923, y1: 1598, y2: 2325}
+      roi_3dz: {x1: 482, x2: 600, y1: 94, y2: 821}
+model:
+  run: {nowcast_hours: 24, forecast_hours: 108}
+"""
+
+_PREP_EXTRAS_BLOCK = """\
+prep:
+  extras:
+    st_lawrence: {st_lawrence}
+    obc_dynamic_adjust: {obc_dynamic_adjust}
+"""
+
+
+def _write_yaml(tmp_path, body, name="cfg.yaml"):
+    p = tmp_path / name
+    p.write_text(body)
+    return p
+
+
+class TestPrepExtras:
+    # 1. prep.extras present -> flags equal the declared values, regardless
+    #    of whether the YAML shape is SECOFS-like or STOFS-like.
+
+    def test_present_forces_on_for_secofs_shaped(self, tmp_path):
+        body = _SECOFS_SHAPED_YAML + _PREP_EXTRAS_BLOCK.format(
+            st_lawrence="true", obc_dynamic_adjust="true")
+        cfg = ForcingConfig.from_yaml(_write_yaml(tmp_path, body))
+        assert cfg.st_lawrence_enabled is True
+        assert cfg.dynamic_adjust_enabled is True
+        assert cfg.obc_min_timesteps == 21
+
+    def test_present_forces_off_for_stofs_shaped(self, tmp_path):
+        # prep.extras must override the is_stofs_like heuristic, which
+        # would otherwise have produced True/True/21 for this YAML shape.
+        body = _STOFS_SHAPED_YAML + _PREP_EXTRAS_BLOCK.format(
+            st_lawrence="false", obc_dynamic_adjust="false")
+        cfg = ForcingConfig.from_yaml(_write_yaml(tmp_path, body))
+        assert cfg.st_lawrence_enabled is False
+        assert cfg.dynamic_adjust_enabled is False
+        assert cfg.obc_min_timesteps == 0
+
+    def test_present_mixed_flags(self, tmp_path):
+        body = _STOFS_SHAPED_YAML + _PREP_EXTRAS_BLOCK.format(
+            st_lawrence="false", obc_dynamic_adjust="true")
+        cfg = ForcingConfig.from_yaml(_write_yaml(tmp_path, body))
+        assert cfg.st_lawrence_enabled is False
+        assert cfg.dynamic_adjust_enabled is True
+        assert cfg.obc_min_timesteps == 21
+
+    # 2. prep.extras absent -> identical to the pre-change heuristic.
+    #    This is the zero-behavior-change regression guard.
+
+    def test_absent_secofs_shaped_regression_guard(self, tmp_path):
+        cfg = ForcingConfig.from_yaml(
+            _write_yaml(tmp_path, _SECOFS_SHAPED_YAML))
+        assert cfg.st_lawrence_enabled is False
+        assert cfg.dynamic_adjust_enabled is False
+        assert cfg.obc_min_timesteps == 0
+
+    def test_absent_stofs_shaped_regression_guard(self, tmp_path):
+        cfg = ForcingConfig.from_yaml(
+            _write_yaml(tmp_path, _STOFS_SHAPED_YAML))
+        assert cfg.st_lawrence_enabled is True
+        assert cfg.dynamic_adjust_enabled is True
+        assert cfg.obc_min_timesteps == 21
+
+    def test_absent_roi_only_heuristic_baseline(self, tmp_path):
+        # Documents the exact pre-change is_stofs_like contract that
+        # `prep.extras` overrides: the heuristic drives dynamic_adjust
+        # and obc_min_timesteps from the OBC ROI indices, but NEVER
+        # touches st_lawrence_enabled (that comes only from
+        # river.st_lawrence.enabled or a factory). A ROI-only YAML
+        # therefore yields False/True/21, not True/True/21.
+        cfg = ForcingConfig.from_yaml(
+            _write_yaml(tmp_path, _STOFS_ROI_ONLY_YAML))
+        assert cfg.st_lawrence_enabled is False
+        assert cfg.dynamic_adjust_enabled is True
+        assert cfg.obc_min_timesteps == 21
+
+    def test_empty_extras_block_falls_back_to_heuristic(self, tmp_path):
+        # `prep:` with an empty `extras:` must not override the heuristic.
+        body = _STOFS_SHAPED_YAML + "prep:\n  extras: {}\n"
+        cfg = ForcingConfig.from_yaml(_write_yaml(tmp_path, body))
+        assert cfg.st_lawrence_enabled is True
+        assert cfg.dynamic_adjust_enabled is True
+        assert cfg.obc_min_timesteps == 21
+
+    # 3. Factory <-> YAML drift guard: the UFS factories hardcode these
+    #    flags; assert a YAML carrying the matching prep.extras yields the
+    #    same three values so the two sources can't silently diverge.
+
+    def test_secofs_ufs_factory_matches_yaml(self, tmp_path):
+        factory = ForcingConfig.for_secofs_ufs(pdy="20260401", cyc=12)
+        body = _SECOFS_SHAPED_YAML + _PREP_EXTRAS_BLOCK.format(
+            st_lawrence="false", obc_dynamic_adjust="false")
+        from_yaml = ForcingConfig.from_yaml(_write_yaml(tmp_path, body))
+        assert factory.st_lawrence_enabled is False
+        assert factory.dynamic_adjust_enabled is False
+        assert factory.obc_min_timesteps == 0
+        assert (
+            from_yaml.st_lawrence_enabled,
+            from_yaml.dynamic_adjust_enabled,
+            from_yaml.obc_min_timesteps,
+        ) == (
+            factory.st_lawrence_enabled,
+            factory.dynamic_adjust_enabled,
+            factory.obc_min_timesteps,
+        )
+
+    def test_stofs_3d_atl_ufs_factory_matches_yaml(self, tmp_path):
+        factory = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260401", cyc=12)
+        body = _STOFS_SHAPED_YAML + _PREP_EXTRAS_BLOCK.format(
+            st_lawrence="true", obc_dynamic_adjust="true")
+        from_yaml = ForcingConfig.from_yaml(_write_yaml(tmp_path, body))
+        assert factory.st_lawrence_enabled is True
+        assert factory.dynamic_adjust_enabled is True
+        assert factory.obc_min_timesteps == 21
+        assert (
+            from_yaml.st_lawrence_enabled,
+            from_yaml.dynamic_adjust_enabled,
+            from_yaml.obc_min_timesteps,
+        ) == (
+            factory.st_lawrence_enabled,
+            factory.dynamic_adjust_enabled,
+            factory.obc_min_timesteps,
+        )

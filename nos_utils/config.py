@@ -610,6 +610,35 @@ class ForcingConfig:
         if is_stofs_like:
             kwargs["obc_min_timesteps"] = 21
 
+        # Declarative prep extras override. When a root-level `prep.extras`
+        # block is present it is authoritative and supersedes the
+        # is_stofs_like heuristic above for the two prep optionals it
+        # covers. This decouples "is this a STOFS-style YAML" (inferred
+        # from OBC ROI indices) from "should prep run St-Lawrence /
+        # dynamic SSH adjust" (an explicit operational choice):
+        #
+        #   prep:
+        #     extras:
+        #       st_lawrence: <bool>          -> st_lawrence_enabled
+        #       obc_dynamic_adjust: <bool>   -> dynamic_adjust_enabled
+        #                                       AND obc_min_timesteps
+        #                                       (True -> 21, False -> 0,
+        #                                        mirroring the stofs-like
+        #                                        values set above)
+        #
+        # If `prep.extras` is absent the heuristic result above stands
+        # unchanged, so every existing config (and both factories) keeps
+        # byte-identical behavior.
+        prep = data.get("prep", {})
+        prep_extras = prep.get("extras", {}) if isinstance(prep, dict) else {}
+        if isinstance(prep_extras, dict) and prep_extras:
+            if "st_lawrence" in prep_extras:
+                kwargs["st_lawrence_enabled"] = bool(prep_extras["st_lawrence"])
+            if "obc_dynamic_adjust" in prep_extras:
+                obc_dyn = bool(prep_extras["obc_dynamic_adjust"])
+                kwargs["dynamic_adjust_enabled"] = obc_dyn
+                kwargs["obc_min_timesteps"] = 21 if obc_dyn else 0
+
         # UFS-Coastal DATM grid configuration. The DATM grid covers a halo
         # around the SCHISM mesh extent so atmospheric forcing reaches all
         # coupled boundaries. Two YAML forms supported:
