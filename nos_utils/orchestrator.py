@@ -873,12 +873,240 @@ class PrepOrchestrator:
         )
         return proc.process()
 
+    @staticmethod
+    def _archive_manifest_enabled() -> bool:
+        """Return True when the declarative archive manifest is opted in.
+
+        Gated behind ``NOS_ARCHIVE_MANIFEST`` (YES/1/TRUE). Default OFF so
+        the validated SECOFS-UFS prep archive path stays byte-identical:
+        when the flag is unset/false the original hardcoded tar blocks run
+        verbatim. When ON, the manifest path produces the identical
+        OBC/river/NWM tars PLUS the additive STOFS-only extras
+        (St. Lawrence flux.th/TEM_1.th and the OBC-QC artifacts).
+        """
+        return os.environ.get("NOS_ARCHIVE_MANIFEST", "").upper() in (
+            "YES", "1", "TRUE",
+        )
+
+    def _build_archive_manifest(
+        self, phase: str,
+    ) -> List[Dict[str, object]]:
+        """Declarative manifest of COMMON + per-OFS EXTRA tar entries.
+
+        Each entry is ``{"tar_name", "payload_files", "condition"}``:
+
+          * ``tar_name``      — basename of the tar written under $COMOUT.
+          * ``payload_files`` — ordered list of payload basenames (relative
+            to the prep work dir) to include.
+          * ``condition``     — bool; the entry is materialized only when
+            True (skipped entirely otherwise).
+
+        The COMMON entries (OBC phase + OBC combined, river.th, NWM) are
+        unconditional and replicate the exact tar names + payload ordering
+        of the legacy hardcoded blocks, so flag-ON with a SECOFS-shaped
+        config (st_lawrence_enabled=False, obc_min_timesteps=0) yields the
+        same $COMOUT file set as flag-OFF. The EXTRA entry (St. Lawrence)
+        is config-gated and additive — it never alters the COMMON tars.
+        """
+        prefix = self.run_name
+        cycle = f"t{self.config.cyc:02d}z"
+        pdy = self.config.pdy
+        phase_tag = "now" if phase == "nowcast" else "fore"
+
+        manifest: List[Dict[str, object]] = [
+            # --- COMMON: OBC (phase-specific, backward-compat) ---
+            {
+                "tar_name": f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar",
+                "payload_files": [
+                    "elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc",
+                    "uv3D.th.nc", "TEM_nu.nc", "SAL_nu.nc",
+                ],
+                "condition": True,
+                "label": "OBC",
+            },
+            # --- COMMON: OBC (combined, COMF convention) ---
+            {
+                "tar_name": f"{prefix}.{cycle}.{pdy}.obc.tar",
+                "payload_files": [
+                    "elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc",
+                    "uv3D.th.nc", "TEM_nu.nc", "SAL_nu.nc",
+                ],
+                "condition": True,
+                "label": "OBC (combined)",
+            },
+            # --- COMMON: SECOFS-UFS boundary-flux river forcing ---
+            {
+                "tar_name": f"{prefix}.{cycle}.{pdy}.river.th.tar",
+                "payload_files": [
+                    "schism_flux.th", "schism_temp.th", "schism_salt.th",
+                ],
+                "condition": True,
+                "label": "river.th",
+            },
+            # --- COMMON: NWM source/sink (phase-tagged) ---
+            {
+                "tar_name": (
+                    f"{prefix}.{cycle}.{pdy}.nwm.source.sink."
+                    f"{phase_tag}.tar"
+                ),
+                "payload_files": [
+                    "vsource.th", "msource.th", "source_sink.in",
+                    "vsink.th",
+                ],
+                "condition": True,
+                "label": "NWM",
+            },
+        ]
+
+        # --- EXTRA (STOFS-3D-ATL only): St. Lawrence River climatology ---
+        # StLawrenceProcessor writes flux.th + TEM_1.th to the prep work
+        # dir. The operational STOFS convention archives these as the
+        # INDIVIDUAL files ``{prefix}.{cycle}.riv.obs.flux.th`` /
+        # ``...riv.obs.tem_1.th`` (see
+        # stofs_3d_atl_create_river_st_lawrence.sh:64/92/145/157 and the
+        # run-side restage in exstofs_3d_atl_now_forecast.sh:182-225) —
+        # NOT a tar, and NOT folded into river.th.tar (whose schism_*.th
+        # payload is renamed to flux.th/TEM_1.th run-side and would clobber
+        # them). They are emitted as plain copies in the EXTRA copy map
+        # below; this manifest entry is recorded for traceability with an
+        # empty payload so the tar mechanism skips it.
+        manifest.append({
+            "tar_name": "",
+            "payload_files": [],
+            "condition": False,
+            "label": "st_lawrence (individual files, not a tar)",
+        })
+
+        return manifest
+
+    def _archive_via_manifest(
+        self, manifest: List[Dict[str, object]], work_dir: Path,
+        comout: Path, archived: List[Path],
+    ) -> None:
+        """Materialize manifest tar entries (COMMON OBC/river/NWM).
+
+        Mirrors the legacy hardcoded blocks exactly: same ``tar -cf
+        <tar> -C <work_dir> <payload...>`` mechanism, same
+        "skip the tar when no payload file exists" guard, same
+        warning-on-failure (non-fatal) semantics, same append order. Only
+        entries whose ``condition`` is True AND that have at least one
+        existing payload file produce a tar — matching the legacy
+        ``if existing_*:`` guards.
+        """
+        import subprocess
+
+        for entry in manifest:
+            if not entry.get("condition"):
+                continue
+            tar_name = str(entry["tar_name"])
+            if not tar_name:
+                continue
+            label = str(entry.get("label", tar_name))
+            payload = [
+                f for f in entry["payload_files"]  # type: ignore[union-attr]
+                if (work_dir / f).exists()
+            ]
+            if not payload:
+                continue
+            tar_path = comout / tar_name
+            try:
+                subprocess.run(
+                    ["tar", "-cf", str(tar_path), "-C", str(work_dir)]
+                    + payload,
+                    check=True, capture_output=True,
+                )
+                archived.append(tar_path)
+                log.info(f"  Archived {label} -> {tar_name}")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                log.warning(f"  Failed to tar {label}: {e}")
+
+    def _archive_st_lawrence_extra(
+        self, work_dir: Path, comout: Path, archived: List[Path],
+    ) -> None:
+        """Copy St. Lawrence flux.th / TEM_1.th to $COMOUT (STOFS only).
+
+        Gap #1 fix. Additive and config-gated on
+        ``st_lawrence_enabled``; a no-op for SECOFS. Uses the operational
+        archive basenames ``{prefix}.{cycle}.riv.obs.flux.th`` and
+        ``...riv.obs.tem_1.th`` (matches
+        stofs_3d_atl_create_river_st_lawrence.sh and the
+        ``_fallback_from_archive`` reader in forcing/st_lawrence.py).
+        """
+        import shutil
+
+        if not getattr(self.config, "st_lawrence_enabled", False):
+            return
+
+        prefix = self.run_name
+        cycle = f"t{self.config.cyc:02d}z"
+        stl_map = {
+            "flux.th": f"{prefix}.{cycle}.riv.obs.flux.th",
+            "TEM_1.th": f"{prefix}.{cycle}.riv.obs.tem_1.th",
+        }
+        for src_name, dst_name in stl_map.items():
+            src = work_dir / src_name
+            if src.exists():
+                dst = comout / dst_name
+                shutil.copy2(src, dst)
+                archived.append(dst)
+                log.info(
+                    f"  Copied St. Lawrence {src_name} -> {dst_name}"
+                )
+
+    def _archive_obc_qc_artifacts(
+        self, work_dir: Path, comout: Path, archived: List[Path],
+    ) -> None:
+        """Write OBC-QC fallback artifacts to $COMOUT (STOFS only).
+
+        Gap #2 fix. Additive and gated on ``obc_min_timesteps > 0``; a
+        no-op for SECOFS (default 0). Copies each active OBC file to its
+        standard archive basename ``{prefix}.{cycle}.<archive_base>.nc``
+        (from :attr:`_OBC_ARCHIVE_NAMES`) so the *next* cycle's
+        ``_qc_obc_dimensions`` COMOUT_PREV fallback can find them. Until
+        now ``archive_to_comout`` never WROTE these even though the QC
+        reader expected them.
+        """
+        import shutil
+
+        if getattr(self.config, "obc_min_timesteps", 0) <= 0:
+            return
+
+        prefix = self.run_name
+        cycle = f"t{self.config.cyc:02d}z"
+        for active_name, archive_base in self._OBC_ARCHIVE_NAMES.items():
+            src = work_dir / active_name
+            if src.exists():
+                dst = comout / f"{prefix}.{cycle}.{archive_base}.nc"
+                shutil.copy2(src, dst)
+                archived.append(dst)
+                log.info(
+                    f"  Archived OBC-QC artifact {active_name} -> "
+                    f"{dst.name}"
+                )
+
     def archive_to_comout(self, result: PrepResult, comout: Path) -> List[Path]:
         """
         Archive prep outputs to COMOUT with NCO naming convention.
 
         Creates tars for sflux and OBC, copies individual files for
         param.nml, bctides.in, source_sink.in, etc.
+
+        The OBC / river.th / NWM tar blocks have two implementations
+        selected by :meth:`_archive_manifest_enabled` (env
+        ``NOS_ARCHIVE_MANIFEST``):
+
+          * **OFF (default)** — the original hardcoded ``subprocess tar``
+            blocks run verbatim. This is the validated SECOFS-UFS prep
+            path and is byte-for-byte unchanged.
+          * **ON** — a declarative manifest
+            (:meth:`_build_archive_manifest`) drives the identical
+            COMMON tars and additionally emits the STOFS-only extras
+            (St. Lawrence individual files; OBC-QC artifacts). For a
+            SECOFS-shaped config the resulting $COMOUT file set is
+            identical to OFF.
+
+        The met tars, ``copy_map``, DATM-input copy, and time markers are
+        unchanged and run identically in both paths.
 
         Args:
             result: PrepResult from run()
@@ -903,7 +1131,11 @@ class PrepOrchestrator:
         if isinstance(work_dir, str):
             work_dir = Path(work_dir)
 
-        log.info(f"Archiving to {comout}")
+        manifest_on = self._archive_manifest_enabled()
+        log.info(
+            f"Archiving to {comout}"
+            f" (manifest={'ON' if manifest_on else 'OFF'})"
+        )
 
         # Tar sflux files — separate GFS (stack 1) and HRRR (stack 2) like ORG
         sflux_dir = work_dir / "sflux"
@@ -940,80 +1172,99 @@ class PrepOrchestrator:
                 except (subprocess.CalledProcessError, FileNotFoundError) as e:
                     log.warning(f"  Failed to tar HRRR sflux: {e}")
 
-        # Tar OBC files
-        # COMF convention: one combined obc.tar with all 6 files (boundary + nudging)
-        obc_files = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc",
-                     "TEM_nu.nc", "SAL_nu.nc"]
-        existing_obc = [work_dir / f for f in obc_files if (work_dir / f).exists()]
-        if existing_obc:
-            # Phase-specific tar (backward compat): obc.nowcast.tar / obc.forecast.tar
-            phase_tar_name = f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar"
-            phase_tar_path = comout / phase_tar_name
-            try:
-                file_list = [f.name for f in existing_obc]
-                subprocess.run(
-                    ["tar", "-cf", str(phase_tar_path), "-C", str(work_dir)] + file_list,
-                    check=True, capture_output=True,
-                )
-                archived.append(phase_tar_path)
-                log.info(f"  Archived OBC -> {phase_tar_name}")
-            except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                log.warning(f"  Failed to tar OBC (phase): {e}")
+        if manifest_on:
+            # --- Declarative manifest path (opt-in) ---
+            # Produces the identical COMMON OBC/river.th/NWM tars as the
+            # verbatim else-branch below, then the additive STOFS-only
+            # extras. For a SECOFS-shaped config the COMMON entries match
+            # exactly and the extras are no-ops, so $COMOUT is unchanged.
+            manifest = self._build_archive_manifest(phase)
+            self._archive_via_manifest(
+                manifest, work_dir, comout, archived,
+            )
+            # Gap #1: St. Lawrence individual files (st_lawrence_enabled).
+            self._archive_st_lawrence_extra(work_dir, comout, archived)
+            # Gap #2: OBC-QC fallback artifacts (obc_min_timesteps > 0).
+            self._archive_obc_qc_artifacts(work_dir, comout, archived)
+        else:
+            # --- Legacy hardcoded path (DEFAULT, byte-identical) ---
+            # Everything in this branch is the original implementation,
+            # unchanged, executed verbatim when the manifest flag is OFF.
 
-            # Combined obc.tar (COMF convention): single tar with all 6 files
-            combined_tar_name = f"{prefix}.{cycle}.{pdy}.obc.tar"
-            combined_tar_path = comout / combined_tar_name
-            try:
-                file_list = [f.name for f in existing_obc]
-                subprocess.run(
-                    ["tar", "-cf", str(combined_tar_path), "-C", str(work_dir)] + file_list,
-                    check=True, capture_output=True,
-                )
-                archived.append(combined_tar_path)
-                log.info(f"  Archived OBC (combined) -> {combined_tar_name}")
-            except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                log.warning(f"  Failed to tar OBC (combined): {e}")
+            # Tar OBC files
+            # COMF convention: one combined obc.tar with all 6 files (boundary + nudging)
+            obc_files = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc",
+                         "TEM_nu.nc", "SAL_nu.nc"]
+            existing_obc = [work_dir / f for f in obc_files if (work_dir / f).exists()]
+            if existing_obc:
+                # Phase-specific tar (backward compat): obc.nowcast.tar / obc.forecast.tar
+                phase_tar_name = f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar"
+                phase_tar_path = comout / phase_tar_name
+                try:
+                    file_list = [f.name for f in existing_obc]
+                    subprocess.run(
+                        ["tar", "-cf", str(phase_tar_path), "-C", str(work_dir)] + file_list,
+                        check=True, capture_output=True,
+                    )
+                    archived.append(phase_tar_path)
+                    log.info(f"  Archived OBC -> {phase_tar_name}")
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    log.warning(f"  Failed to tar OBC (phase): {e}")
 
-        # SECOFS-UFS boundary-flux river forcing — schism_flux/temp/salt.th
-        # tarred together as ${prefix}.${cycle}.${pdy}.river.th.tar. Matches
-        # legacy `nos_ofs_create_forcing_river.sh` output so
-        # `nos_ofs_model_run.sh` nowcast staging extracts and renames
-        # schism_flux.th -> flux.th etc. with no shell change.
-        river_th_files = ["schism_flux.th", "schism_temp.th", "schism_salt.th"]
-        existing_river_th = [work_dir / f for f in river_th_files
-                             if (work_dir / f).exists()]
-        if existing_river_th:
-            river_tar_name = f"{prefix}.{cycle}.{pdy}.river.th.tar"
-            river_tar_path = comout / river_tar_name
-            try:
-                file_list = [f.name for f in existing_river_th]
-                subprocess.run(
-                    ["tar", "-cf", str(river_tar_path), "-C", str(work_dir)] + file_list,
-                    check=True, capture_output=True,
-                )
-                archived.append(river_tar_path)
-                log.info(f"  Archived river.th -> {river_tar_name}")
-            except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                log.warning(f"  Failed to tar river.th: {e}")
+                # Combined obc.tar (COMF convention): single tar with all 6 files
+                combined_tar_name = f"{prefix}.{cycle}.{pdy}.obc.tar"
+                combined_tar_path = comout / combined_tar_name
+                try:
+                    file_list = [f.name for f in existing_obc]
+                    subprocess.run(
+                        ["tar", "-cf", str(combined_tar_path), "-C", str(work_dir)] + file_list,
+                        check=True, capture_output=True,
+                    )
+                    archived.append(combined_tar_path)
+                    log.info(f"  Archived OBC (combined) -> {combined_tar_name}")
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    log.warning(f"  Failed to tar OBC (combined): {e}")
 
-        # Tar NWM source/sink files (COMF convention)
-        # COMF produces: nwm.source.sink.now.tar / nwm.source.sink.fore.tar
-        nwm_files = ["vsource.th", "msource.th", "source_sink.in", "vsink.th"]
-        existing_nwm = [work_dir / f for f in nwm_files if (work_dir / f).exists()]
-        if existing_nwm:
-            phase_tag = "now" if phase == "nowcast" else "fore"
-            nwm_tar_name = f"{prefix}.{cycle}.{pdy}.nwm.source.sink.{phase_tag}.tar"
-            nwm_tar_path = comout / nwm_tar_name
-            try:
-                file_list = [f.name for f in existing_nwm]
-                subprocess.run(
-                    ["tar", "-cf", str(nwm_tar_path), "-C", str(work_dir)] + file_list,
-                    check=True, capture_output=True,
-                )
-                archived.append(nwm_tar_path)
-                log.info(f"  Archived NWM -> {nwm_tar_name}")
-            except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                log.warning(f"  Failed to tar NWM: {e}")
+            # SECOFS-UFS boundary-flux river forcing — schism_flux/temp/salt.th
+            # tarred together as ${prefix}.${cycle}.${pdy}.river.th.tar. Matches
+            # legacy `nos_ofs_create_forcing_river.sh` output so
+            # `nos_ofs_model_run.sh` nowcast staging extracts and renames
+            # schism_flux.th -> flux.th etc. with no shell change.
+            river_th_files = ["schism_flux.th", "schism_temp.th", "schism_salt.th"]
+            existing_river_th = [work_dir / f for f in river_th_files
+                                 if (work_dir / f).exists()]
+            if existing_river_th:
+                river_tar_name = f"{prefix}.{cycle}.{pdy}.river.th.tar"
+                river_tar_path = comout / river_tar_name
+                try:
+                    file_list = [f.name for f in existing_river_th]
+                    subprocess.run(
+                        ["tar", "-cf", str(river_tar_path), "-C", str(work_dir)] + file_list,
+                        check=True, capture_output=True,
+                    )
+                    archived.append(river_tar_path)
+                    log.info(f"  Archived river.th -> {river_tar_name}")
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    log.warning(f"  Failed to tar river.th: {e}")
+
+            # Tar NWM source/sink files (COMF convention)
+            # COMF produces: nwm.source.sink.now.tar / nwm.source.sink.fore.tar
+            nwm_files = ["vsource.th", "msource.th", "source_sink.in", "vsink.th"]
+            existing_nwm = [work_dir / f for f in nwm_files if (work_dir / f).exists()]
+            if existing_nwm:
+                phase_tag = "now" if phase == "nowcast" else "fore"
+                nwm_tar_name = f"{prefix}.{cycle}.{pdy}.nwm.source.sink.{phase_tag}.tar"
+                nwm_tar_path = comout / nwm_tar_name
+                try:
+                    file_list = [f.name for f in existing_nwm]
+                    subprocess.run(
+                        ["tar", "-cf", str(nwm_tar_path), "-C", str(work_dir)] + file_list,
+                        check=True, capture_output=True,
+                    )
+                    archived.append(nwm_tar_path)
+                    log.info(f"  Archived NWM -> {nwm_tar_name}")
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    log.warning(f"  Failed to tar NWM: {e}")
 
         # Copy individual files. UFS-Coastal (nws=4) entries match the
         # legacy archive layout in scripts/nosofs/exnos_ofs_prep.sh so
