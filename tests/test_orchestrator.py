@@ -207,6 +207,220 @@ class TestRoutePhaseOrchestrator:
         assert captured["phase"] == "nowcast"
 
 
+class TestArchiveManifest:
+    """archive_to_comout manifest refactor + flag gating (P2).
+
+    Invariants under test:
+
+      * Flag OFF (default) runs the legacy hardcoded blocks; the $COMOUT
+        file set is unchanged.
+      * Flag ON + SECOFS-shaped config (st_lawrence_enabled=False,
+        obc_min_timesteps=0) produces *exactly* the same $COMOUT file set
+        as flag OFF — the byte-identical guarantee.
+      * Flag ON + STOFS-shaped config additionally emits the St. Lawrence
+        individual files (riv.obs.flux.th / riv.obs.tem_1.th) and the
+        four OBC-QC archive artifacts, without altering the COMMON tars.
+    """
+
+    # The COMMON tar names every flag/config combination must produce
+    # when all payloads exist. {prefix}=stofs_3d_atl / secofs_ufs,
+    # cycle=t12z, pdy=20260401.
+    _OBC_PAYLOAD = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc",
+                    "uv3D.th.nc", "TEM_nu.nc", "SAL_nu.nc"]
+    _RIVER_PAYLOAD = ["schism_flux.th", "schism_temp.th", "schism_salt.th"]
+    _NWM_PAYLOAD = ["vsource.th", "msource.th", "source_sink.in",
+                    "vsink.th"]
+
+    def _seed_workdir(self, work: Path) -> None:
+        """Drop every payload file the COMMON + EXTRA entries reference."""
+        work.mkdir(parents=True, exist_ok=True)
+        sflux = work / "sflux"
+        sflux.mkdir(exist_ok=True)
+        # Met (unchanged path) — GFS stack 1 + HRRR stack 2.
+        (sflux / "sflux_air_1.0001.nc").write_bytes(b"gfs")
+        (sflux / "sflux_air_2.0001.nc").write_bytes(b"hrrr")
+        for name in (self._OBC_PAYLOAD + self._RIVER_PAYLOAD
+                     + self._NWM_PAYLOAD):
+            (work / name).write_bytes(b"x")
+        # St. Lawrence outputs (only consumed when st_lawrence_enabled).
+        (work / "flux.th").write_text("0 -1.0\n")
+        (work / "TEM_1.th").write_text("0 4.0\n")
+        # Misc copy_map / marker files (identical in both paths).
+        (work / "param.nml").write_text("&CORE\n/\n")
+        (work / "bctides.in").write_text("tides\n")
+
+    def _archive(self, cfg, run_name, tmp_path, monkeypatch,
+                 manifest):
+        """Run archive_to_comout once and return the set of basenames
+        written under $COMOUT (recursively, so datm_input/* is included).
+        """
+        work = tmp_path / "work"
+        comout = tmp_path / "comout"
+        self._seed_workdir(work)
+        if manifest is None:
+            monkeypatch.delenv("NOS_ARCHIVE_MANIFEST", raising=False)
+        else:
+            monkeypatch.setenv("NOS_ARCHIVE_MANIFEST", manifest)
+        orch = PrepOrchestrator(
+            cfg, {"output": str(work)}, run_name=run_name,
+            skip_legacy=True,
+        )
+        result = PrepResult(success=True, phase="nowcast")
+        orch.archive_to_comout(result, comout)
+        return {
+            p.relative_to(comout).as_posix()
+            for p in comout.rglob("*") if p.is_file()
+        }
+
+    def _secofs_cfg(self):
+        return ForcingConfig.for_secofs_ufs(pdy="20260401", cyc=12)
+
+    def _stofs_cfg(self):
+        return ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+
+    def test_flag_off_secofs_baseline_fileset(self, tmp_path,
+                                              monkeypatch):
+        """Flag OFF + SECOFS: the canonical legacy $COMOUT file set."""
+        files = self._archive(self._secofs_cfg(), "secofs_ufs",
+                              tmp_path, monkeypatch, manifest=None)
+        # COMMON tars + met tars + copied files. No St. Lawrence /
+        # OBC-QC artifacts (SECOFS config disables both).
+        expected = {
+            "secofs_ufs.t12z.20260401.met.nowcast.nc.tar",
+            "secofs_ufs.t12z.20260401.met.nowcast.nc.2.tar",
+            "secofs_ufs.t12z.20260401.obc.nowcast.tar",
+            "secofs_ufs.t12z.20260401.obc.tar",
+            "secofs_ufs.t12z.20260401.river.th.tar",
+            "secofs_ufs.t12z.20260401.nwm.source.sink.now.tar",
+            "secofs_ufs.t12z.20260401.nowcast.in",
+            "secofs_ufs.t12z.20260401.bctides.in.nowcast",
+            "secofs_ufs.source_sink.in",
+            "secofs_ufs.t12z.20260401.river.vsource.th",
+            "secofs_ufs.t12z.20260401.river.msource.th",
+        }
+        assert files == expected
+        # Negative: no St. Lawrence / OBC-QC artifacts under OFF.
+        assert not any("riv.obs" in f for f in files)
+        assert not any(f.endswith(".elev2dth_non_adj.nc")
+                       for f in files)
+
+    def test_flag_on_secofs_identical_to_flag_off(self, tmp_path,
+                                                  monkeypatch):
+        """Byte-identical guarantee: flag ON + SECOFS-shaped config must
+        yield *exactly* the same $COMOUT file set as flag OFF."""
+        off = self._archive(self._secofs_cfg(), "secofs_ufs",
+                            tmp_path / "off", monkeypatch,
+                            manifest=None)
+        on = self._archive(self._secofs_cfg(), "secofs_ufs",
+                           tmp_path / "on", monkeypatch,
+                           manifest="YES")
+        assert on == off, (
+            "manifest ON with SECOFS config diverged from OFF: "
+            f"only-ON={on - off} only-OFF={off - on}"
+        )
+
+    def test_flag_on_secofs_tar_payloads_match_off(self, tmp_path,
+                                                   monkeypatch):
+        """Not just names — the COMMON tar payloads must match too."""
+        import tarfile
+
+        def _payloads(root: Path):
+            work = root / "work"
+            comout = root / "comout"
+            self._seed_workdir(work)
+            orch = PrepOrchestrator(
+                self._secofs_cfg(), {"output": str(work)},
+                run_name="secofs_ufs", skip_legacy=True,
+            )
+            orch.archive_to_comout(
+                PrepResult(success=True, phase="nowcast"), comout,
+            )
+            out = {}
+            for tar in sorted(comout.glob("*.tar")):
+                with tarfile.open(tar) as tf:
+                    out[tar.name] = sorted(tf.getnames())
+            return out
+
+        monkeypatch.delenv("NOS_ARCHIVE_MANIFEST", raising=False)
+        off = _payloads(tmp_path / "off")
+        monkeypatch.setenv("NOS_ARCHIVE_MANIFEST", "1")
+        on = _payloads(tmp_path / "on")
+        assert on == off, f"tar payloads diverged: OFF={off} ON={on}"
+
+    def test_flag_on_stofs_adds_st_lawrence_and_qc(self, tmp_path,
+                                                   monkeypatch):
+        """Flag ON + STOFS-shaped config: COMMON set is the SECOFS set
+        (under the stofs_3d_atl prefix) PLUS the St. Lawrence individual
+        files and the four OBC-QC archive artifacts — additive only."""
+        files = self._archive(self._stofs_cfg(), "stofs_3d_atl",
+                              tmp_path, monkeypatch, manifest="TRUE")
+
+        common = {
+            "stofs_3d_atl.t12z.20260401.met.nowcast.nc.tar",
+            "stofs_3d_atl.t12z.20260401.met.nowcast.nc.2.tar",
+            "stofs_3d_atl.t12z.20260401.obc.nowcast.tar",
+            "stofs_3d_atl.t12z.20260401.obc.tar",
+            "stofs_3d_atl.t12z.20260401.river.th.tar",
+            "stofs_3d_atl.t12z.20260401.nwm.source.sink.now.tar",
+            "stofs_3d_atl.t12z.20260401.nowcast.in",
+            "stofs_3d_atl.t12z.20260401.bctides.in.nowcast",
+            "stofs_3d_atl.source_sink.in",
+            "stofs_3d_atl.t12z.20260401.river.vsource.th",
+            "stofs_3d_atl.t12z.20260401.river.msource.th",
+        }
+        st_lawrence = {
+            "stofs_3d_atl.t12z.riv.obs.flux.th",
+            "stofs_3d_atl.t12z.riv.obs.tem_1.th",
+        }
+        obc_qc = {
+            "stofs_3d_atl.t12z.elev2dth_non_adj.nc",
+            "stofs_3d_atl.t12z.tem3dth.nc",
+            "stofs_3d_atl.t12z.sal3dth.nc",
+            "stofs_3d_atl.t12z.uv3dth.nc",
+        }
+        assert common.issubset(files), (
+            f"missing COMMON entries: {common - files}"
+        )
+        assert st_lawrence.issubset(files), (
+            f"missing St. Lawrence files: {st_lawrence - files}"
+        )
+        assert obc_qc.issubset(files), (
+            f"missing OBC-QC artifacts: {obc_qc - files}"
+        )
+        # Exactly COMMON + extras, nothing stray.
+        assert files == common | st_lawrence | obc_qc
+
+    def test_flag_on_stofs_river_tar_not_clobbered_by_st_lawrence(
+            self, tmp_path, monkeypatch):
+        """St. Lawrence flux.th/TEM_1.th must NOT be folded into
+        river.th.tar (whose schism_*.th payload is renamed to
+        flux.th/TEM_1.th run-side and would clobber them)."""
+        import tarfile
+
+        files = self._archive(self._stofs_cfg(), "stofs_3d_atl",
+                              tmp_path, monkeypatch, manifest="YES")
+        assert ("stofs_3d_atl.t12z.20260401.river.th.tar" in files)
+        river_tar = (tmp_path / "comout"
+                     / "stofs_3d_atl.t12z.20260401.river.th.tar")
+        with tarfile.open(river_tar) as tf:
+            names = set(tf.getnames())
+        assert names == set(self._RIVER_PAYLOAD), (
+            f"river.th.tar payload polluted: {names}"
+        )
+        assert "flux.th" not in names and "TEM_1.th" not in names
+
+    def test_invalid_flag_values_treated_as_off(self, tmp_path,
+                                                monkeypatch):
+        """Only YES/1/TRUE (case-insensitive) enable the manifest;
+        anything else (NO, 0, garbage) stays OFF."""
+        for val in ("NO", "0", "false", "off", "maybe", ""):
+            monkeypatch.setenv("NOS_ARCHIVE_MANIFEST", val)
+            assert PrepOrchestrator._archive_manifest_enabled() is False
+        for val in ("YES", "yes", "1", "TRUE", "true", "True"):
+            monkeypatch.setenv("NOS_ARCHIVE_MANIFEST", val)
+            assert PrepOrchestrator._archive_manifest_enabled() is True
+
+
 class TestPrepResult:
     def test_all_output_files(self):
         from nos_utils.forcing.base import ForcingResult
