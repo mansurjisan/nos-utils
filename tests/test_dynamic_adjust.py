@@ -233,3 +233,68 @@ class TestProcessorIntegration:
         content = bias_file.read_text().strip()
         # With no obs, bias is NaN.
         assert content.lower() == "nan"
+
+
+class TestObsDirResolution:
+    """obs_dir auto-resolves from COMINwl/DCOMROOT, mirroring the
+    operational dynamic-adjust script: $DCOMROOT/<PDY>/coops_waterlvlobs,
+    cycle day preferred, previous day as fallback. Regression guard for
+    the STOFS-3D-ATL "obs_dir not provided -> zero bias" gap.
+    """
+
+    def _mkobs(self, root: Path, date_str: str) -> Path:
+        d = root / date_str / "coops_waterlvlobs"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_cominwl_today(self, tmp_path, monkeypatch):
+        wl = tmp_path / "wl"
+        expected = self._mkobs(wl, "20260401")
+        monkeypatch.setenv("COMINwl", str(wl))
+        monkeypatch.delenv("DCOMROOT", raising=False)
+        assert DynamicAdjustProcessor._resolve_obs_dir("20260401") == expected
+
+    def test_dcomroot_previous_day_fallback(self, tmp_path, monkeypatch):
+        dcom = tmp_path / "dcom"
+        # Only the previous day's dir exists.
+        expected = self._mkobs(dcom, "20260331")
+        monkeypatch.delenv("COMINwl", raising=False)
+        monkeypatch.setenv("DCOMROOT", str(dcom))
+        assert DynamicAdjustProcessor._resolve_obs_dir("20260401") == expected
+
+    def test_cominwl_takes_precedence(self, tmp_path, monkeypatch):
+        wl = tmp_path / "wl"
+        dcom = tmp_path / "dcom"
+        expected = self._mkobs(wl, "20260401")
+        self._mkobs(dcom, "20260401")  # wrong one, must be ignored
+        monkeypatch.setenv("COMINwl", str(wl))
+        monkeypatch.setenv("DCOMROOT", str(dcom))
+        assert DynamicAdjustProcessor._resolve_obs_dir("20260401") == expected
+
+    def test_missing_everywhere_returns_none(self, monkeypatch):
+        monkeypatch.delenv("COMINwl", raising=False)
+        monkeypatch.delenv("DCOMROOT", raising=False)
+        assert DynamicAdjustProcessor._resolve_obs_dir("20260401") is None
+
+    def test_init_auto_resolves_when_obs_dir_omitted(self, tmp_path, monkeypatch):
+        wl = tmp_path / "wl"
+        expected = self._mkobs(wl, "20260401")
+        monkeypatch.setenv("COMINwl", str(wl))
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+        proc = DynamicAdjustProcessor(
+            cfg, input_path=tmp_path, output_path=tmp_path,
+        )
+        assert proc.obs_dir == expected
+
+    def test_init_explicit_obs_dir_wins(self, tmp_path, monkeypatch):
+        wl = tmp_path / "wl"
+        self._mkobs(wl, "20260401")
+        monkeypatch.setenv("COMINwl", str(wl))
+        explicit = tmp_path / "explicit_obs"
+        explicit.mkdir()
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+        proc = DynamicAdjustProcessor(
+            cfg, input_path=tmp_path, output_path=tmp_path,
+            obs_dir=explicit,
+        )
+        assert proc.obs_dir == explicit
