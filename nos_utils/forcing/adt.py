@@ -105,8 +105,10 @@ class ADTBlender:
         """
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
 
-        # Check environment variable first
-        comin_adt = os.environ.get("COMINadt", "")
+        # Check environment variable first. Operational WCOSS2 J-jobs don't
+        # always export COMINadt; the CMEMS ADT files live under the same
+        # DCOM root ($DCOMROOT=/lfs/h1/ops/prod/dcom), so fall back to it.
+        comin_adt = os.environ.get("COMINadt") or os.environ.get("DCOMROOT", "")
 
         # Search today and previous day
         for offset in [0, -1]:

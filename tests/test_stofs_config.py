@@ -164,3 +164,42 @@ class TestSTOFSFromYAML:
         assert cfg.obc_ssh_offset == 0.04
         assert cfg.nudging_enabled is True
         assert cfg.nwm_n_list_target == 121
+
+
+class TestStLawrenceSubdirFromYAML:
+    """from_yaml() parses river.st_lawrence.subdir / csv_name."""
+
+    def _yaml(self, tmp_path, stl_block):
+        content = {
+            "grid": {
+                "domain": {
+                    "lon_min": -98.5035, "lon_max": -52.4867,
+                    "lat_min": 7.347, "lat_max": 52.5904,
+                },
+                "n_levels": 51,
+            },
+            "model": {"run": {"nowcast_hours": 24, "forecast_hours": 108}},
+            "forcing": {"river": {"primary": "nwm",
+                                  "st_lawrence": stl_block}},
+        }
+        import yaml
+        f = tmp_path / "stofs_3d_atl.yaml"
+        f.write_text(yaml.dump(content))
+        return f
+
+    def test_subdir_parsed(self, tmp_path):
+        f = self._yaml(tmp_path, {
+            "enabled": True,
+            "subdir": "canadian_water",
+            "csv_name": "QC_02OA016_hourly_hydrometric.csv",
+        })
+        cfg = ForcingConfig.from_yaml(f, pdy="20260401", cyc=12)
+        assert cfg.st_lawrence_enabled is True
+        assert cfg.st_lawrence_subdir == "canadian_water"
+        assert cfg.st_lawrence_csv_name == "QC_02OA016_hourly_hydrometric.csv"
+
+    def test_subdir_defaults_when_absent(self, tmp_path):
+        # Backward-compatible default when subdir not specified in YAML.
+        f = self._yaml(tmp_path, {"enabled": True})
+        cfg = ForcingConfig.from_yaml(f, pdy="20260401", cyc=12)
+        assert cfg.st_lawrence_subdir == "can_streamgauge"
