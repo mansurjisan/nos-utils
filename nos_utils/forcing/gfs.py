@@ -197,6 +197,90 @@ class GFSProcessor(ForcingProcessor):
 
         return filtered
 
+    def _parse_valid_time(self, gfs_file: Path) -> Optional[datetime]:
+        """Parse the valid time of a GFS file from its name and parent path.
+
+        This is the exact parsing previously inlined in ``_extract_all``;
+        factored out so the pre-extraction file selection and the extractor
+        derive valid times identically (parity by construction).
+        """
+        try:
+            fhr = int(gfs_file.name.split(".f")[-1])
+            # Determine cycle from filename: gfs.tHHz...
+            cyc_str = gfs_file.name.split(".t")[1][:2]
+            cyc_hour = int(cyc_str)
+            # Determine date from parent path
+            for parent in [gfs_file.parent, gfs_file.parent.parent,
+                           gfs_file.parent.parent.parent]:
+                if parent.name.startswith("gfs."):
+                    date_str = parent.name.split("gfs.")[1][:8]
+                    break
+            else:
+                date_str = self.config.pdy
+
+            base_time = datetime.strptime(date_str, "%Y%m%d") + \
+                timedelta(hours=cyc_hour)
+            return base_time + timedelta(hours=fhr)
+        except (ValueError, IndexError):
+            return None
+
+    def _select_files_for_window(self, gfs_files: List[Path]) -> List[Path]:
+        """Prune the discovered file list to exactly what reaches output.
+
+        Applies, on the *file list* (keyed by parsed valid time), the same
+        stable-sort + keep-first dedup + phase time-window filter that
+        ``_extract_all`` / ``_filter_to_time_window`` previously applied to
+        already-extracted arrays. Net effect: multi-cycle duplicate valid
+        times (an earlier cycle's leads superseded by a later cycle) and
+        out-of-window valid times are dropped *before* any GRIB2 decode,
+        instead of being fully decoded and then discarded.
+
+        Parity: input order is preserved from ``find_input_files``; Python's
+        ``sorted`` is stable, so for a repeated valid time the file earliest
+        in list order wins — identical to the old keep-first dedup. The
+        window bounds come from the same ``_get_time_window``. The surviving
+        (valid_time -> file) set is therefore byte-identical to before.
+        """
+        parsed = []
+        for f in gfs_files:
+            vt = self._parse_valid_time(f)
+            if vt is None:
+                log.warning(f"Cannot parse time from {f.name}, skipping")
+                continue
+            parsed.append((vt, f))
+
+        if not parsed:
+            return list(gfs_files)
+
+        # Stable sort by valid time (matches _extract_all's sort).
+        order = sorted(range(len(parsed)), key=lambda i: parsed[i][0])
+
+        # Keep first occurrence per valid time (matches _extract_all dedup:
+        # earliest in original list order — i.e. oldest cycle — wins).
+        seen = {}
+        for i in order:
+            vt = parsed[i][0]
+            if vt not in seen:
+                seen[vt] = i
+        unique_idx = sorted(seen.values())
+
+        # Phase time-window filter (matches _filter_to_time_window bounds).
+        t_start, t_end = self._get_time_window()
+        selected = [
+            parsed[i][1]
+            for i in unique_idx
+            if t_start <= parsed[i][0] <= t_end
+        ]
+
+        n_drop = len(gfs_files) - len(selected)
+        if n_drop > 0:
+            log.info(
+                f"Pruned {n_drop} GFS files before extraction "
+                f"({len(gfs_files)} discovered -> {len(selected)} kept; "
+                f"removed multi-cycle duplicates / out-of-window valid times)"
+            )
+        return selected
+
     def process(self) -> ForcingResult:
         """
         Process GFS forcing data.
@@ -221,6 +305,19 @@ class GFSProcessor(ForcingProcessor):
                 errors=["No GFS input files found"],
             )
         log.info(f"Found {len(gfs_files)} GFS files")
+
+        # Step 1b: Prune to the exact (valid_time -> file) set that reaches
+        # output BEFORE decoding. This drops multi-cycle duplicate valid
+        # times and out-of-window valid times that the old pipeline only
+        # discarded *after* fully decoding them (~700 wasted GRIB2 decodes
+        # for a 24h nowcast). Parity-preserving: identical dedup/window rule
+        # as the old post-extraction path, just applied to the file list.
+        gfs_files = self._select_files_for_window(gfs_files)
+        if not gfs_files:
+            return ForcingResult(
+                success=False, source=self.SOURCE_NAME,
+                errors=["No GFS files within the simulation time window"],
+            )
 
         # Write met_files_used log for traceability inside the per-job DATA dir.
         # Earlier code used `self.output_path.parent`, which dropped this file
@@ -504,40 +601,40 @@ class GFSProcessor(ForcingProcessor):
         # Get grid coordinates from first file
         result["lons"], result["lats"] = self.extractor.get_grid(gfs_files[0], domain)
 
-        for gfs_file in gfs_files:
-            # Compute valid time from filename
-            try:
-                fhr = int(gfs_file.name.split(".f")[-1])
-                # Determine cycle from filename: gfs.tHHz...
-                cyc_str = gfs_file.name.split(".t")[1][:2]
-                cyc_hour = int(cyc_str)
-                # Determine date from parent path
-                for parent in [gfs_file.parent, gfs_file.parent.parent, gfs_file.parent.parent.parent]:
-                    if parent.name.startswith("gfs."):
-                        date_str = parent.name.split("gfs.")[1][:8]
-                        break
-                else:
-                    date_str = self.config.pdy
+        # (var, level) pairs to pull from each file, in self.variables order.
+        var_levels = [
+            (var, self.GRIB2_VARIABLES[var][0], self.GRIB2_VARIABLES[var][1])
+            for var in self.variables
+            if var in self.GRIB2_VARIABLES
+        ]
 
-                base_time = datetime.strptime(date_str, "%Y%m%d") + timedelta(hours=cyc_hour)
-                valid_time = base_time + timedelta(hours=fhr)
-            except (ValueError, IndexError):
+        for gfs_file in gfs_files:
+            # Compute valid time from filename (same parser as the
+            # pre-extraction selection — parity by construction).
+            valid_time = self._parse_valid_time(gfs_file)
+            if valid_time is None:
                 log.warning(f"Cannot parse time from {gfs_file.name}, skipping")
                 continue
 
             result["times"].append(valid_time)
 
-            # Extract each variable — append fill array if missing to keep aligned with times
-            for var in self.variables:
-                if var not in self.GRIB2_VARIABLES:
-                    continue
-                grib_var, level = self.GRIB2_VARIABLES[var]
-                data = self.extractor.extract(gfs_file, grib_var, level, domain)
+            # One wgrib2 pass extracts every variable for this file. The
+            # records, levels and arrays are identical to the previous
+            # per-variable extraction; only the (large) file decode is
+            # shared instead of repeated per variable.
+            extracted_recs = self.extractor.extract_many(
+                gfs_file,
+                [(grib_var, level) for _, grib_var, level in var_levels],
+                domain,
+            )
+
+            # Append per variable — fill array if missing to keep aligned
+            # with times (e.g. dlwrf/dswrf absent in f000 analysis).
+            for var, grib_var, level in var_levels:
+                data = extracted_recs.get((grib_var, level))
                 if data is not None:
                     result["data"][var].append(data)
                 else:
-                    # Variable missing (e.g., dlwrf/dswrf absent in f000 analysis)
-                    # Append NaN-filled array to keep time alignment
                     if result["lons"] is not None and result["lats"] is not None:
                         ny, nx = len(result["lats"]), len(result["lons"])
                         result["data"][var].append(

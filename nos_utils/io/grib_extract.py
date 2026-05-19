@@ -50,6 +50,30 @@ class GRIBExtractor(ABC):
         """
         ...
 
+    def extract_many(
+        self,
+        grib_file: Path,
+        var_levels: "list[Tuple[str, str]]",
+        domain: Tuple[float, float, float, float],
+    ) -> "dict":
+        """
+        Extract several (variable, level) records from one GRIB2 file.
+
+        Default implementation simply calls :meth:`extract` once per
+        (variable, level) pair, so backends that do not override this are
+        behaviourally identical to the previous per-variable loop.
+        :class:`Wgrib2Extractor` overrides this to decode/subset the (large)
+        source file only once.
+
+        Returns:
+            ``{(variable, level): np.ndarray or None}`` for every requested
+            pair (missing records map to ``None``, exactly as ``extract``).
+        """
+        return {
+            (variable, level): self.extract(grib_file, variable, level, domain)
+            for variable, level in var_levels
+        }
+
     @abstractmethod
     def get_grid(
         self,
@@ -201,6 +225,135 @@ class Wgrib2Extractor(GRIBExtractor):
 
             log.warning(f"Grid dim mismatch: data.size={data.size}, nx={nx}, ny={ny}")
             return None
+
+    def extract_many(
+        self,
+        grib_file: Path,
+        var_levels: "list[Tuple[str, str]]",
+        domain: Tuple[float, float, float, float],
+    ) -> "dict":
+        """
+        Extract multiple (variable, level) records with a single decode of
+        the (large) source file.
+
+        Parity with the per-variable :meth:`extract` is by construction:
+
+        1. One combined ``-match`` + ``-small_grib`` pass writes every
+           requested record into a *small* combined GRIB2 file. wgrib2
+           ``-small_grib`` trims each record independently of how many
+           records share the file, so a record's grid is identical whether
+           subset alone or together.
+        2. Each (variable, level) is then pulled from that small combined
+           file with the *same* ``-match :VAR:LEVEL: -> -d 1 -> -bin`` +
+           ``-nxny`` sequence ``extract`` uses. Re-matching on the combined
+           subset selects the exact same record (and the same first record
+           for duplicate-record vars like PRATE) as matching on the full
+           file, so the returned array is byte-identical.
+
+        The expensive decode of the ~127 MB source happens once instead of
+        once per variable.
+        """
+        grib_file = Path(grib_file)
+        lon_min, lon_max, lat_min, lat_max = domain
+
+        results: dict = {}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            combined = tmpdir / "combined.grb2"
+
+            # One regex matching all requested records.
+            combined_match = self._build_combined_match(var_levels)
+            cmd = [
+                self.wgrib2, str(grib_file),
+                "-match", combined_match,
+                "-small_grib",
+                f"{lon_min}:{lon_max}",
+                f"{lat_min}:{lat_max}",
+                str(combined),
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0 or not combined.exists():
+                log.debug(
+                    f"wgrib2 combined match failed for {grib_file.name}: "
+                    f"{r.stderr[:200]}"
+                )
+                return {vl: None for vl in var_levels}
+
+            for variable, level in var_levels:
+                results[(variable, level)] = self._extract_record_from(
+                    combined, variable, level, tmpdir
+                )
+
+        return results
+
+    @staticmethod
+    def _build_combined_match(var_levels: "list[Tuple[str, str]]") -> str:
+        """Build a wgrib2 -match regex selecting exactly var_levels.
+
+        Produces ``:(VAR1:LEVEL1|VAR2:LEVEL2|...):`` — the union of the
+        per-variable ``:VAR:LEVEL:`` patterns ``extract`` uses, so the
+        combined match selects precisely the same record set (no more, no
+        fewer) as the previous per-variable calls combined.
+        """
+        # Preserve order, drop duplicate (var, level) pairs.
+        seen = set()
+        parts = []
+        for variable, level in var_levels:
+            key = (variable, level)
+            if key in seen:
+                continue
+            seen.add(key)
+            parts.append(f"{variable}:{level}")
+        return ":(" + "|".join(parts) + "):"
+
+    def _extract_record_from(
+        self,
+        combined_file: Path,
+        variable: str,
+        level: str,
+        tmpdir: Path,
+    ) -> Optional[np.ndarray]:
+        """Pull one record from an already-subset combined GRIB2 file.
+
+        Uses the identical match/-d 1/-bin/-nxny sequence as
+        :meth:`extract`, only on the small combined file rather than the
+        full source — yielding a byte-identical array.
+        """
+        match_str = f":{variable}:{level}:"
+        rec_file = tmpdir / "rec.grb2"
+        bin_file = tmpdir / "rec.bin"
+        rec_file.unlink(missing_ok=True)
+        bin_file.unlink(missing_ok=True)
+
+        cmd = [
+            self.wgrib2, str(combined_file),
+            "-match", match_str,
+            "-grib", str(rec_file),
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 or not rec_file.exists():
+            log.debug(f"wgrib2 match failed for {variable}:{level}")
+            return None
+
+        cmd2 = [
+            self.wgrib2, str(rec_file),
+            "-d", "1",
+            "-no_header", "-bin", str(bin_file),
+        ]
+        r2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=60)
+        if r2.returncode != 0 or not bin_file.exists():
+            return None
+
+        data = np.fromfile(bin_file, dtype=np.float32)
+        nx, ny = self._get_nxny(rec_file)
+        if nx and ny and data.size == nx * ny:
+            return data.reshape((ny, nx))
+
+        log.warning(
+            f"Grid dim mismatch: data.size={data.size}, nx={nx}, ny={ny}"
+        )
+        return None
 
     def get_grid(
         self,
