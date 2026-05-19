@@ -18,6 +18,7 @@ Key SCHISM hotstart.nc variables:
 """
 
 import logging
+import re
 import shutil
 import subprocess
 from datetime import datetime, timedelta
@@ -289,35 +290,67 @@ class HotstartProcessor(ForcingProcessor):
             log.error(f"Python NetCDF format conversion failed: {e}")
             return False
 
+    def _search_roots(self) -> List[Path]:
+        """Directories to anchor the per-day hotstart walk.
+
+        ``find_input_files`` builds ``{run}.{YYYYMMDD}`` subdirs back
+        ``max_lookback_days`` days, so it must be anchored at the
+        directory that *contains* the dated cycle dirs (the ``$COMOUT``
+        root). ``nco_bridge``, however, sets ``paths["restart"]`` from
+        ``$COMIN``, which in the SECOFS/STOFS-UFS J-jobs is the
+        *current* cycle's dated leaf (``$COMROOT/$NET/$RUN.$PDY``) —
+        empty at prep time. When handed such a leaf, also anchor at its
+        parent so the walk can cross the day boundary into the sibling
+        ``$RUN.$(PDY-1)/…rst.nowcast.nc`` produced by the prior cycle.
+        """
+        roots = [self.input_path]
+        name = self.input_path.name
+        if re.fullmatch(r".+\.\d{8}", name) or re.fullmatch(r"\d{8}", name):
+            parent = self.input_path.parent
+            if parent != self.input_path and parent not in roots:
+                roots.append(parent)
+        return roots
+
     def find_input_files(self) -> List[Path]:
         """Find all candidate hotstart files."""
-        candidates = []
+        candidates: List[Path] = []
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
+        search_roots = self._search_roots()
 
         for days_back in range(self.max_lookback_days + 1):
             date = base_date - timedelta(days=days_back)
             date_str = date.strftime("%Y%m%d")
 
-            # Search in date-specific directories
-            for dir_pattern in [
-                self.input_path / f"{self.run_name}.{date_str}",
-                self.input_path / date_str,
-                self.input_path / f"{self.run_name}.{date_str}" / "restart_outputs",
-                self.input_path,
-            ]:
-                if not dir_pattern.exists():
-                    continue
-
-                for file_pattern in [
-                    "hotstart*.nc",
-                    f"{self.run_name}*hotstart*.nc",
-                    f"{self.run_name}*.rst.nowcast.nc",   # COMF restart naming
-                    f"{self.run_name}*.init.nowcast.nc",   # COMF init naming
-                    f"{self.run_name}*restart*.nc",
+            for root in search_roots:
+                # Search in date-specific directories
+                for dir_pattern in [
+                    root / f"{self.run_name}.{date_str}",
+                    root / date_str,
+                    root / f"{self.run_name}.{date_str}" / "restart_outputs",
+                    root,
                 ]:
-                    candidates.extend(sorted(dir_pattern.glob(file_pattern)))
+                    if not dir_pattern.exists():
+                        continue
 
-        return candidates
+                    for file_pattern in [
+                        "hotstart*.nc",
+                        f"{self.run_name}*hotstart*.nc",
+                        f"{self.run_name}*.rst.nowcast.nc",   # COMF restart naming
+                        f"{self.run_name}*.init.nowcast.nc",   # COMF init naming
+                        f"{self.run_name}*restart*.nc",
+                    ]:
+                        candidates.extend(sorted(dir_pattern.glob(file_pattern)))
+
+        # Parent + leaf roots can glob the current-cycle dir twice; dedupe
+        # while preserving discovery order.
+        seen = set()
+        deduped: List[Path] = []
+        for c in candidates:
+            key = str(c)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(c)
+        return deduped
 
     def _find_hotstart(self) -> Optional[Path]:
         """
@@ -403,7 +436,6 @@ class HotstartProcessor(ForcingProcessor):
           secofs.t00z.20260402.rst.nowcast.nc → 2026-04-02 00:00
           secofs.t18z.20260401.rst.nowcast.nc → 2026-04-01 18:00
         """
-        import re
         name = filepath.name
         # Match: {ofs}.t{HH}z.{YYYYMMDD}.rst or .init
         m = re.search(r"\.t(\d{2})z\.(\d{8})\.", name)

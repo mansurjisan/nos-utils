@@ -297,3 +297,71 @@ class TestStageInitToComout:
         # Check the source was the 12z file (we only staged one)
         with netCDF4.Dataset(str(staged)) as ds:
             assert ds.test_marker == "rst-from-test"
+
+
+class TestSearchRootFromCycleLeaf:
+    """Regression: cold-start despite a valid prior-day restart.
+
+    nco_bridge sets ``paths["restart"]`` from ``$COMIN``, which in the
+    SECOFS/STOFS-UFS J-jobs is the *current* cycle's dated leaf
+    (``$COMROOT/$NET/$RUN.$PDY``) — created empty by prep itself.  A
+    t00z cycle cold-started because the per-day walk, anchored at that
+    empty leaf, never crossed into the sibling prior-day dir holding
+    ``$RUN.t18z.$(PDY-1).rst.nowcast.nc``.  HotstartProcessor must
+    additionally anchor the walk at the parent of a dated cycle leaf so
+    the prior-day restart is discovered.
+    """
+
+    def test_prior_day_restart_found_from_current_cycle_leaf(self, tmp_path):
+        run = "secofs_ufs"
+        com_root = tmp_path / "com" / "nos"
+        prior = (com_root / f"{run}.20260518" /
+                 f"{run}.t18z.20260518.rst.nowcast.nc")
+        _make_rst(prior)
+        # Current-cycle dir exists but is empty (prep just created it).
+        cur = com_root / f"{run}.20260519"
+        cur.mkdir(parents=True, exist_ok=True)
+
+        cfg = ForcingConfig.for_secofs(pdy="20260519", cyc=0)
+        # nco_bridge hands the CURRENT-CYCLE LEAF, not the COMOUT root.
+        proc = HotstartProcessor(cfg, cur, tmp_path / "out", run_name=run)
+
+        found = proc._find_hotstart()
+        assert found is not None, (
+            "must cross the day boundary into the sibling prior-day dir"
+        )
+        assert found == prior
+
+    def test_stage_init_from_current_cycle_leaf(self, tmp_path):
+        run = "secofs_ufs"
+        com_root = tmp_path / "com" / "nos"
+        _make_rst(
+            com_root / f"{run}.20260518" /
+            f"{run}.t18z.20260518.rst.nowcast.nc",
+            fmt="NETCDF4_CLASSIC",
+        )
+        cur = com_root / f"{run}.20260519"
+        cur.mkdir(parents=True, exist_ok=True)
+
+        cfg = ForcingConfig.for_secofs(pdy="20260519", cyc=0)
+        proc = HotstartProcessor(cfg, cur, tmp_path / "out", run_name=run)
+        staged = proc.stage_init_to_comout(
+            cur, f"{run}.t00z.20260519.init.nowcast.nc",
+        )
+        assert staged is not None
+        assert staged.name == f"{run}.t00z.20260519.init.nowcast.nc"
+        assert staged.exists()
+
+    def test_comout_root_input_still_works(self, tmp_path):
+        """Non-dated root input (the documented contract) is unchanged:
+        the parent is NOT added and discovery still works."""
+        run = "secofs_ufs"
+        com_root = tmp_path / "com" / "nos"
+        prior = (com_root / f"{run}.20260518" /
+                 f"{run}.t18z.20260518.rst.nowcast.nc")
+        _make_rst(prior)
+
+        cfg = ForcingConfig.for_secofs(pdy="20260519", cyc=0)
+        proc = HotstartProcessor(cfg, com_root, tmp_path / "out", run_name=run)
+        assert proc._search_roots() == [com_root]
+        assert proc._find_hotstart() == prior
