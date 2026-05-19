@@ -231,11 +231,20 @@ class StLawrenceProcessor(ForcingProcessor):
         Mirrors ``gen_fluxth_st_lawrence_riv.py``:
           * parameter 5  -> water temperature (°C)
           * parameter 47 -> discharge (m^3/s)
-        For each day in the hindcast window we look up the exact timestamp
-        in the CSV. If missing:
-          * day 0: raise (flow) or default to -9999 (temp)
-          * day >0: carry forward the previous day's value.
-        Days in the forecast window are padded with the last available value.
+
+        Timestamps are normalised to UTC (the column is named
+        ``date_local``; tz-aware values are converted, naive values are
+        assumed UTC). For each day in the hindcast window the value is
+        taken ``asof`` that instant — the last observation at-or-before
+        it — and, when the window starts before the CSV's first sample,
+        the earliest observation is carried backward. This replaces an
+        exact-timestamp lookup that raised on day 0 whenever the live
+        CSV's cadence, timezone, or coverage didn't land exactly on the
+        model time axis (discharge/temperature vary slowly, so a
+        nearest-prior sample is operationally faithful). A genuinely
+        empty discharge series still raises so the caller's archive /
+        previous-cycle fallback is used. Forecast-window days are padded
+        with the last available value.
         """
         df = pd.read_csv(csv_path, sep=",", na_values="")
         # CSV columns: STATION, date_local, parameter, value, and several
@@ -250,51 +259,54 @@ class StLawrenceProcessor(ForcingProcessor):
                 df.columns[2]: "value",
             }
         )
-        df["date_utc"] = pd.to_datetime(df["date_local"])
+        df["date_utc"] = pd.to_datetime(
+            df["date_local"], utc=True, errors="coerce"
+        )
+        df = df.dropna(subset=["date_utc"])
 
-        df_temp = df[df["parameter"] == PARAM_TEMPERATURE].copy().set_index("date_utc")
-        df_flow = df[df["parameter"] == PARAM_DISCHARGE].copy().set_index("date_utc")
+        def _param_series(param_code: int) -> "pd.Series":
+            sub = df[df["parameter"] == param_code]
+            return (
+                pd.Series(
+                    pd.to_numeric(sub["value"], errors="coerce").to_numpy(),
+                    index=pd.DatetimeIndex(sub["date_utc"]),
+                )
+                .dropna()
+                .sort_index()
+            )
 
-        data_flow: List[float] = []
-        last_flow_idx = -1
-        for i, dt in enumerate(datevectors_hindcast):
-            try:
-                value = float(df_flow.loc[dt]["value"])
-                data_flow.append(round(value, 3))
-                last_flow_idx = i
-            except KeyError:
-                if i == 0:
-                    raise KeyError(
-                        f"No discharge data for {dt} in {csv_path}; "
-                        "fallback to archived CSV or previous-cycle rerun "
-                        "should be used by the caller"
-                    )
-                data_flow.append(data_flow[-1])
-                last_flow_idx = i
+        flow_s = _param_series(PARAM_DISCHARGE)
+        if flow_s.empty:
+            raise KeyError(
+                f"No discharge (parameter {PARAM_DISCHARGE}) rows in "
+                f"{csv_path}; fallback to archived CSV or previous-cycle "
+                "rerun should be used by the caller"
+            )
+        temp_s = _param_series(PARAM_TEMPERATURE)
 
-        # Pad forecast days with last valid value.
-        tail_start = last_flow_idx + 1
-        for _ in datevectors_full[tail_start:]:
+        data_flow: List[float] = [
+            round(self._asof_value(flow_s, dt), 3)
+            for dt in datevectors_hindcast
+        ]
+        for _ in datevectors_full[len(data_flow):]:
             data_flow.append(data_flow[-1])
 
-        data_temp: List[float] = []
-        for i, dt in enumerate(datevectors_hindcast):
-            try:
-                value = float(df_temp.loc[dt]["value"])
-                data_temp.append(round(value, 3))
-            except KeyError:
-                if i == 0:
-                    log.info(
-                        "No temperature observation for %s; "
-                        "using sentinel -9999 (caller will overwrite with "
-                        "sflux regression if available)", dt,
-                    )
-                    data_temp.append(-9999.0)
-                else:
-                    data_temp.append(data_temp[-1])
-
-        tail_start = min(len(datevectors_hindcast), len(data_temp))
-        for _ in datevectors_full[tail_start:]:
+        if temp_s.empty:
+            log.info(
+                "No temperature observations (parameter %s) in %s; "
+                "using sentinel -9999 (caller will overwrite with "
+                "sflux regression if available)",
+                PARAM_TEMPERATURE, csv_path,
+            )
+            data_temp: List[float] = [
+                -9999.0 for _ in datevectors_hindcast
+            ]
+        else:
+            data_temp = [
+                round(self._asof_value(temp_s, dt), 3)
+                for dt in datevectors_hindcast
+            ]
+        for _ in datevectors_full[len(data_temp):]:
             data_temp.append(data_temp[-1])
 
         seconds_from_start = [
@@ -315,6 +327,20 @@ class StLawrenceProcessor(ForcingProcessor):
             flow_cms=data_flow,
             temp_c=data_temp,
         )
+
+    @staticmethod
+    def _asof_value(series: "pd.Series", when) -> float:
+        """Last observation at-or-before ``when``.
+
+        When ``when`` precedes the first sample (the live CSV doesn't
+        reach back to the model start), the earliest observation is
+        carried backward instead of failing. ``series`` is non-empty and
+        sorted by a tz-aware UTC index.
+        """
+        val = series.asof(when)
+        if pd.isna(val):
+            val = series.iloc[0]
+        return float(val)
 
     # ----------------------------------------------------- sflux temperature
 
