@@ -488,9 +488,11 @@ class ForcingConfig:
         vert = model.get("vertical", {})
         n_levels = int(vert.get("nvrt", grid.get("n_levels", 51)))
 
-        # NWS: check model.physics.nws
+        # execution.mode=standalone forces nws=2, overriding model.physics.nws.
         physics = model.get("physics", {})
         nws = int(physics.get("nws", 2))
+        if data.get("execution", {}).get("mode", "ufs") == "standalone":
+            nws = 2
 
         # River config file
         river_files = river.get("files", {}) if isinstance(river, dict) else {}

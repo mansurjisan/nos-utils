@@ -300,3 +300,60 @@ class TestNCOBridgePaths:
         _, paths = config_from_env()
         assert "law" not in paths
         assert "adt" not in paths
+
+
+# A STOFS-shaped YAML that, like the real stofs_3d_atl_ufs.yaml, declares
+# model.physics.nws=4 (UFS NUOPC coupling). Used to prove execution.mode
+# is the single source of truth: standalone forces nws=2 over this value,
+# while ufs/absent leaves model.physics.nws untouched.
+_NWS4_YAML = """\
+system:
+  name: execmode_nws
+grid:
+  domain: {lon_min: -98.5035, lon_max: -52.4867, lat_min: 7.347, lat_max: 52.5904}
+forcing:
+  atmospheric: {met_num: 2}
+model:
+  physics: {nws: 4}
+  run: {nowcast_hours: 24, forecast_hours: 108}
+"""
+
+_EXEC_BLOCK = "execution:\n  mode: {mode}\n"
+
+
+class TestExecutionModeNws:
+    """``execution.mode`` is the single source of truth for ``nws``.
+
+    Phase 1 parity contract on the nos-utils side: standalone forces
+    nws=2 regardless of model.physics.nws; ufs/absent must leave the
+    existing ``int(physics.get("nws", 2))`` path exactly as-is.
+    """
+
+    def test_standalone_forces_nws_2_over_physics(self, tmp_path):
+        body = _NWS4_YAML + _EXEC_BLOCK.format(mode="standalone")
+        cfg = ForcingConfig.from_yaml(_write_yaml(tmp_path, body))
+        assert cfg.nws == 2
+
+    def test_mode_ufs_leaves_physics_nws_untouched(self, tmp_path):
+        body = _NWS4_YAML + _EXEC_BLOCK.format(mode="ufs")
+        cfg = ForcingConfig.from_yaml(_write_yaml(tmp_path, body))
+        assert cfg.nws == 4
+
+    def test_mode_absent_leaves_physics_nws_untouched(self, tmp_path):
+        # Zero-behavior-change regression guard for the default path.
+        cfg = ForcingConfig.from_yaml(_write_yaml(tmp_path, _NWS4_YAML))
+        assert cfg.nws == 4
+
+    def test_real_stofs_ufs_yaml_nws_unchanged_in_ufs_mode(self):
+        # The shipped stofs_3d_atl_ufs.yaml carries execution.mode: ufs
+        # and model.physics.nws: 4 -> from_yaml must still yield nws=4.
+        from pathlib import Path
+
+        yaml_path = (
+            Path(__file__).resolve().parents[4]
+            / "parm" / "systems" / "stofs_3d_atl_ufs.yaml"
+        )
+        if not yaml_path.exists():
+            pytest.skip("stofs_3d_atl_ufs.yaml not found")
+        cfg = ForcingConfig.from_yaml(yaml_path, pdy="20260401", cyc=12)
+        assert cfg.nws == 4
