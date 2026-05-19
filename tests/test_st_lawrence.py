@@ -197,6 +197,42 @@ class TestArchiveFallback:
         assert (out_dir / "flux.th").exists()
         assert (out_dir / "TEM_1.th").exists()
 
+    def test_glob_fallback_operational_prefix(self, tmp_path):
+        """Bootstrapping from an operational STOFS rerun dir: the files
+        carry the production prefix (stofs_3d_atl.t12z.*) but the UFS
+        run's archive_prefix is stofs_3d_atl_ufs.t00z. The exact match
+        misses; the *.riv.obs.<kind>.th glob must still find them."""
+        pdy = "20260518"
+        input_dir = tmp_path / "comin"
+        (input_dir / pdy / "can_streamgauge").mkdir(parents=True)
+        # No CSV anywhere -> exact-lookup raises -> archive fallback.
+
+        rerun = tmp_path / "ops_rerun"
+        rerun.mkdir()
+        (rerun / "stofs_3d_atl.t12z.riv.obs.flux.th").write_text(
+            "\n".join(f"{i*86400} {-8000.0 - i*5:.3f}" for i in range(7)) + "\n"
+        )
+        (rerun / "stofs_3d_atl.t12z.riv.obs.tem_1.th").write_text(
+            "\n".join(f"{i*86400} {4.0:.3f}" for i in range(7)) + "\n"
+        )
+
+        out_dir = tmp_path / "out"
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy=pdy, cyc=0)
+        proc = StLawrenceProcessor(
+            cfg, input_dir, out_dir,
+            prev_rerun_dir=rerun,
+            archive_prefix="stofs_3d_atl_ufs.t00z",  # deliberately mismatched
+        )
+
+        result = proc.process()
+        assert result.success, result.errors
+        assert (out_dir / "flux.th").exists()
+        assert (out_dir / "TEM_1.th").exists()
+        # Shifted operational discharge made it through.
+        data = np.loadtxt(out_dir / "flux.th")
+        assert data.shape == (7, 2)
+        assert (data[:, 1] < 0).all()
+
 
 class TestStLawrenceCustomSubdir:
     """StLawrenceProcessor honors a custom CSV subdirectory.
