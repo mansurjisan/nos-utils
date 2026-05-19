@@ -463,16 +463,28 @@ class StLawrenceProcessor(ForcingProcessor):
         column by stepping one slot forward (time_k <- time_{k+1}), keeping
         the value column. That effectively advances the timeline by one
         day, leaving the trailing value duplicated.
+
+        The exact ``{archive_prefix}.riv.obs.<kind>.th`` is tried first
+        (self-sustaining cycles, where the prev rerun was written by an
+        earlier nos-workflow run with the same run_name/cyc). When that
+        is absent — e.g. bootstrapping from an operational STOFS rerun
+        dir whose files carry the production ``stofs_3d_atl.t12z.*``
+        prefix, not the UFS run_name/cyc — fall back to the unique
+        ``*.riv.obs.<kind>.th`` in the rerun dir.
         """
-        if self.archive_prefix is None or self.prev_rerun_dir is None:
+        if self.prev_rerun_dir is None:
             return None
-        archive_name = (
-            f"{self.archive_prefix}.riv.obs."
-            f"{'flux' if output_name == 'flux.th' else 'tem_1'}.th"
-        )
-        src = self.prev_rerun_dir / archive_name
-        if not src.exists():
-            return None
+        kind = "flux" if output_name == "flux.th" else "tem_1"
+        src = None
+        if self.archive_prefix is not None:
+            cand = self.prev_rerun_dir / f"{self.archive_prefix}.riv.obs.{kind}.th"
+            if cand.exists():
+                src = cand
+        if src is None:
+            matches = sorted(self.prev_rerun_dir.glob(f"*.riv.obs.{kind}.th"))
+            if not matches:
+                return None
+            src = matches[0]
         try:
             raw = np.loadtxt(src, dtype=float)
             if raw.ndim != 2 or raw.shape[1] < 2:

@@ -90,6 +90,7 @@ def config_from_env(
         "rtofs": "COMINrtofs",
         "law": "COMINlaw",
         "adt": "COMINadt",
+        "prev_rerun": "COMINrerun",
         "fix": "FIXofs",
         "output": "DATA",
         "comout": "COMOUT",
