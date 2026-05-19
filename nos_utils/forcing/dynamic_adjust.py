@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -609,7 +610,10 @@ class DynamicAdjustProcessor(ForcingProcessor):
         nan_threshold: float = DEFAULT_NAN_THRESHOLD,
     ) -> None:
         super().__init__(config, input_path, output_path)
-        self.obs_dir = Path(obs_dir) if obs_dir else None
+        self.obs_dir = (
+            Path(obs_dir) if obs_dir
+            else self._resolve_obs_dir(config.pdy)
+        )
         self.prev_staout_1 = Path(prev_staout_1) if prev_staout_1 else None
         self.prev_param_nml = Path(prev_param_nml) if prev_param_nml else None
         self.station_bp = Path(station_bp) if station_bp else None
@@ -626,6 +630,30 @@ class DynamicAdjustProcessor(ForcingProcessor):
         self.station_lats = list(station_lats)
         self.bias_window_days = bias_window_days
         self.nan_threshold = nan_threshold
+
+    @staticmethod
+    def _resolve_obs_dir(pdy: str) -> Optional[Path]:
+        """NOAA water-level obs dir, mirroring the operational script.
+
+        ``stofs_3d_atl_create_obc_3d_th_dynamic_adjust.sh`` reads
+        ``$DCOMROOT/<YYYYMMDD>/coops_waterlvlobs/<staID>.xml`` and
+        prefers the cycle day, falling back to the previous day. WCOSS2
+        J-jobs export ``COMINwl`` (defaulting to ``$DCOMROOT``); accept
+        either, the same env pattern as the ADT resolver. Returns None
+        when neither root is set or no dated dir exists (the processor
+        then degrades to a zero-bias correction, matching operational
+        cold-start behaviour).
+        """
+        root = os.environ.get("COMINwl") or os.environ.get("DCOMROOT", "")
+        if not root:
+            return None
+        base = datetime.strptime(pdy, "%Y%m%d")
+        for offset in (0, -1):
+            day = (base + timedelta(days=offset)).strftime("%Y%m%d")
+            cand = Path(root) / day / "coops_waterlvlobs"
+            if cand.is_dir():
+                return cand
+        return None
 
     # ------------------------------------------------------------------ API
 
