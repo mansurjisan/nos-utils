@@ -62,6 +62,10 @@ RIVER_MOUTH = (45.415, -73.623056)
 # Operational filename default.
 DEFAULT_CSV_NAME = "02OA016_hydrometric.csv"
 
+# Subdirectory under $COMINlaw/<pdy>/ holding the hydrometric CSV.
+# Legacy default; operational WCOSS2 uses "canadian_water".
+DEFAULT_SUBDIR = "can_streamgauge"
+
 
 @dataclass
 class _StLawrenceSeries:
@@ -97,12 +101,16 @@ class StLawrenceProcessor(ForcingProcessor):
         output_path: Path,
         *,
         csv_name: str = DEFAULT_CSV_NAME,
+        subdir: str = DEFAULT_SUBDIR,
         sflux_rad_file: Optional[Path] = None,
         prev_rerun_dir: Optional[Path] = None,
         archive_prefix: Optional[str] = None,
     ) -> None:
         super().__init__(config, input_path, output_path)
         self.csv_name = csv_name
+        # Subdirectory under <input_path>/<pdy>/ holding the CSV
+        # (operational WCOSS2: "canadian_water"; legacy: "can_streamgauge").
+        self.subdir = subdir
         self.sflux_rad_file = Path(sflux_rad_file) if sflux_rad_file else None
         self.prev_rerun_dir = Path(prev_rerun_dir) if prev_rerun_dir else None
         # Archive prefix like "stofs_3d_atl.t12z" — determines the fallback
@@ -541,7 +549,7 @@ class StLawrenceProcessor(ForcingProcessor):
         return (
             self.input_path
             / day.strftime("%Y%m%d")
-            / "can_streamgauge"
+            / self.subdir
             / self.csv_name
         )
 

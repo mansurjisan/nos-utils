@@ -426,6 +426,7 @@ class PrepOrchestrator:
             self.paths["law"],
             output_dir,
             csv_name=self.config.st_lawrence_csv_name,
+            subdir=self.config.st_lawrence_subdir,
             sflux_rad_file=sflux_rad,
             prev_rerun_dir=prev_rerun,
             archive_prefix=archive_prefix,

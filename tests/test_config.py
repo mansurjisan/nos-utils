@@ -252,3 +252,51 @@ class TestPrepExtras:
             factory.dynamic_adjust_enabled,
             factory.obc_min_timesteps,
         )
+
+
+class TestNCOBridgePaths:
+    """config_from_env() maps NCO env vars into the paths dict.
+
+    Regression guard for the STOFS-3D-ATL bug where COMINlaw / COMINadt
+    were never threaded into paths, so the orchestrator silently skipped
+    St. Lawrence forcing and reported ADT missing.
+    """
+
+    def _base_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PDY", "20260401")
+        monkeypatch.setenv("cyc", "12")
+        monkeypatch.setenv("RUN", "stofs_3d_atl")
+        monkeypatch.delenv("OFS_CONFIG", raising=False)
+        # Required for hotstart/output resolution; harmless here.
+        monkeypatch.setenv("DATA", str(tmp_path / "data"))
+
+    def test_cominlaw_maps_to_law_path(self, monkeypatch, tmp_path):
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        law_dir = tmp_path / "dcom_law"
+        monkeypatch.setenv("COMINlaw", str(law_dir))
+
+        _, paths = config_from_env()
+        assert paths.get("law") == str(law_dir)
+
+    def test_cominadt_maps_to_adt_path(self, monkeypatch, tmp_path):
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        adt_dir = tmp_path / "dcom_adt"
+        monkeypatch.setenv("COMINadt", str(adt_dir))
+
+        _, paths = config_from_env()
+        assert paths.get("adt") == str(adt_dir)
+
+    def test_law_adt_absent_when_unset(self, monkeypatch, tmp_path):
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        monkeypatch.delenv("COMINlaw", raising=False)
+        monkeypatch.delenv("COMINadt", raising=False)
+
+        _, paths = config_from_env()
+        assert "law" not in paths
+        assert "adt" not in paths

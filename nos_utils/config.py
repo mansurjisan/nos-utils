@@ -185,6 +185,10 @@ class ForcingConfig:
     # then to the previous cycle's archived .riv.obs.* files.
     st_lawrence_enabled: bool = False
     st_lawrence_csv_name: str = "02OA016_hydrometric.csv"
+    # Subdirectory under $COMINlaw/<pdy>/ holding the hydrometric CSV.
+    # Legacy default "can_streamgauge"; operational WCOSS2 uses
+    # "canadian_water" (with a "QC_..._hourly_hydrometric.csv" filename).
+    st_lawrence_subdir: str = "can_streamgauge"
 
     # Dynamic SSH adjustment (STOFS-3D-ATL NOAA tide-gauge bias correction).
     # When True, the orchestrator runs DynamicAdjustProcessor after RTOFS
@@ -341,7 +345,11 @@ class ForcingConfig:
             nwm_n_list_target=121,
             nwm_n_list_min=97,
             # St. Lawrence climatology — always on for STOFS-3D-ATL.
+            # Operational WCOSS2 layout: $COMINlaw/<pdy>/canadian_water/
+            # QC_02OA016_hourly_hydrometric.csv
             st_lawrence_enabled=True,
+            st_lawrence_subdir="canadian_water",
+            st_lawrence_csv_name="QC_02OA016_hourly_hydrometric.csv",
             # Dynamic SSH adjust — operational default for STOFS-3D-ATL.
             dynamic_adjust_enabled=True,
             # OBC dim QC threshold (operational N_dim_cr_max).
@@ -377,7 +385,11 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
+            # Operational WCOSS2 layout: $COMINlaw/<pdy>/canadian_water/
+            # QC_02OA016_hourly_hydrometric.csv
             st_lawrence_enabled=True,
+            st_lawrence_subdir="canadian_water",
+            st_lawrence_csv_name="QC_02OA016_hourly_hydrometric.csv",
             dynamic_adjust_enabled=True,
             obc_min_timesteps=21,
             # DATM forcing grid (ATLANTIC preset, slightly narrower than model)
@@ -584,6 +596,9 @@ class ForcingConfig:
                 csv_name = stl.get("csv_name")
                 if csv_name:
                     kwargs["st_lawrence_csv_name"] = str(csv_name)
+                subdir = stl.get("subdir")
+                if subdir:
+                    kwargs["st_lawrence_subdir"] = str(subdir)
 
         # STOFS-like YAMLs are identified by the presence of OBC ROI indices
         # (index-based RTOFS subsetting is STOFS-only).

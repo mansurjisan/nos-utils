@@ -88,6 +88,8 @@ def config_from_env(
         "hrrr": "COMINhrrr",
         "nwm": "COMINnwm",
         "rtofs": "COMINrtofs",
+        "law": "COMINlaw",
+        "adt": "COMINadt",
         "fix": "FIXofs",
         "output": "DATA",
         "comout": "COMOUT",

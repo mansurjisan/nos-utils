@@ -196,3 +196,107 @@ class TestArchiveFallback:
         # flux.th should exist in out_dir and contain shifted values.
         assert (out_dir / "flux.th").exists()
         assert (out_dir / "TEM_1.th").exists()
+
+
+class TestStLawrenceCustomSubdir:
+    """StLawrenceProcessor honors a custom CSV subdirectory.
+
+    Operational WCOSS2 uses $COMINlaw/<pdy>/canadian_water/ with a
+    QC_..._hourly_hydrometric.csv filename, not the legacy
+    can_streamgauge/02OA016_hydrometric.csv layout.
+    """
+
+    def test_custom_subdir_and_csv_name(self, tmp_path):
+        pdy = "20260401"
+        input_dir = tmp_path / "comin"
+        csv_name = "QC_02OA016_hourly_hydrometric.csv"
+        csv = input_dir / pdy / "canadian_water" / csv_name
+        _write_hydrometric_csv(csv, start_date="2026-03-31", n_days=8,
+                               flow_cms=8000.0)
+
+        out_dir = tmp_path / "out"
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy=pdy, cyc=12)
+        proc = StLawrenceProcessor(
+            cfg, input_dir, out_dir,
+            csv_name=csv_name,
+            subdir="canadian_water",
+        )
+
+        result = proc.process()
+        assert result.success, result.errors
+        assert (out_dir / "flux.th").exists()
+        assert proc._csv_path_for(datetime(2026, 4, 1)).name == csv_name
+        assert "canadian_water" in str(proc._csv_path_for(datetime(2026, 4, 1)))
+
+    def test_legacy_subdir_still_default(self, tmp_path):
+        # Without an explicit subdir the processor keeps the legacy layout
+        # so existing callers (and direct construction) are unaffected.
+        pdy = "20260401"
+        input_dir = tmp_path / "comin"
+        csv = input_dir / pdy / "can_streamgauge" / DEFAULT_CSV_NAME
+        _write_hydrometric_csv(csv, start_date="2026-03-31", n_days=8)
+
+        out_dir = tmp_path / "out"
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy=pdy, cyc=12)
+        proc = StLawrenceProcessor(cfg, input_dir, out_dir)
+
+        result = proc.process()
+        assert result.success, result.errors
+
+
+class TestADTDcomrootFallback:
+    """adt.py falls back to $DCOMROOT when COMINadt is unset.
+
+    Operational WCOSS2 J-jobs don't always export COMINadt; the CMEMS
+    ADT files live under $DCOMROOT, so _find_adt_data() must resolve
+    them there. Regression guard for the STOFS-3D-ATL "ADT missing" bug.
+    """
+
+    def _write_adt(self, root: Path, date_str: str) -> Path:
+        adt = (root / date_str / "validation_data" / "marine" /
+               "cmems" / "ssh" /
+               f"nrt_global_allsat_phy_l4_{date_str}_{date_str}.nc")
+        adt.parent.mkdir(parents=True, exist_ok=True)
+        adt.write_bytes(b"")  # presence is all _find_adt_data checks
+        return adt
+
+    def test_falls_back_to_dcomroot(self, tmp_path, monkeypatch):
+        from nos_utils.forcing.adt import ADTBlender
+
+        dcom = tmp_path / "dcom"
+        expected = self._write_adt(dcom, "20260401")
+
+        monkeypatch.delenv("COMINadt", raising=False)
+        monkeypatch.setenv("DCOMROOT", str(dcom))
+
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+        blender = ADTBlender(cfg, tmp_path / "rtofs")
+        found = blender._find_adt_data()
+        assert found == expected
+
+    def test_cominadt_takes_precedence(self, tmp_path, monkeypatch):
+        from nos_utils.forcing.adt import ADTBlender
+
+        adt_root = tmp_path / "adt"
+        dcom = tmp_path / "dcom"
+        expected = self._write_adt(adt_root, "20260401")
+        # A different (wrong) file under DCOMROOT must be ignored.
+        self._write_adt(dcom, "20260401")
+
+        monkeypatch.setenv("COMINadt", str(adt_root))
+        monkeypatch.setenv("DCOMROOT", str(dcom))
+
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+        blender = ADTBlender(cfg, tmp_path / "rtofs")
+        found = blender._find_adt_data()
+        assert found == expected
+
+    def test_missing_everywhere_returns_none(self, tmp_path, monkeypatch):
+        from nos_utils.forcing.adt import ADTBlender
+
+        monkeypatch.delenv("COMINadt", raising=False)
+        monkeypatch.delenv("DCOMROOT", raising=False)
+
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+        blender = ADTBlender(cfg, tmp_path / "rtofs")
+        assert blender._find_adt_data() is None
