@@ -140,7 +140,7 @@ class TestStLawrenceTempFromSflux:
         # model_t0 = cycle - 24h = 2026-03-31 12:00; CSV must cover that.
         _write_hydrometric_csv(csv, start_date="2026-03-31", n_days=8)
 
-        sflux_file = tmp_path / "sflux" / "sflux_rad_1.1.nc"
+        sflux_file = tmp_path / "sflux" / "sflux_rad_1.0001.nc"
         # sflux must also extend back to model_t0 = 2026-03-31 12:00.
         _write_fake_sflux_rad(
             sflux_file, datetime(2026, 3, 31, 12, 0, 0), n_times=192,

@@ -4,18 +4,20 @@ SCHISM sflux NetCDF writer.
 Creates sflux_air, sflux_rad, sflux_prc files in SCHISM-compatible format.
 Shared by GFS, HRRR, and GEFS processors — eliminates duplicate output code.
 
-File naming convention: sflux_{type}_{source_index}.{file_num}.nc
+File naming convention: sflux_{type}_{source_index}.{file_num:04d}.nc
   - type: air, rad, prc
   - source_index: 1 = primary (GFS/GEFS), 2 = secondary (HRRR)
-  - file_num: always 1 in single_file mode (COMF default);
-              1, 2, 3, ... per day in multi-file mode
+  - file_num: 4-digit zero-padded; always 0001 in single_file mode (COMF
+              default); 0001, 0002, 0003, ... per day in multi-file mode.
+              4-digit zero-pad matches SCHISM sflux_9c.F90 (i4.4) — pschism
+              (nws=2) ABORTs without it.
 
 Dimensions: (ntime, ny_grid, nx_grid)
 Time: days since base_date, must be monotonically increasing.
 
 COMF convention (single_file=True, the default):
 
-  All timesteps go into one file per type: ``sflux_air_1.1.nc``.
+  All timesteps go into one file per type: ``sflux_air_1.0001.nc``.
   ``sflux_inputs.txt`` is minimal (``&sflux_inputs`` / ``/``).
 
 Multi-file mode (single_file=False):
@@ -75,8 +77,8 @@ class SfluxWriter:
             output_dir: Directory to write sflux files into
             source_index: 1 for primary (GFS/GEFS), 2 for secondary (HRRR)
             single_file: If True (default), write all timesteps into a single
-                .1.nc file per type, matching COMF convention. If False, split
-                by calendar day (legacy STOFS behavior).
+                .0001.nc file per type, matching COMF convention. If False,
+                split by calendar day (legacy STOFS behavior).
         """
         if not HAS_NETCDF4:
             raise ImportError("netCDF4 required for sflux output. Install with: pip install netCDF4")
@@ -97,9 +99,9 @@ class SfluxWriter:
         Write all sflux files.
 
         In single_file mode (default, COMF convention): writes all timesteps
-        into sflux_{type}_{source}.1.nc — one file per type.
+        into sflux_{type}_{source}.0001.nc — one file per type.
 
-        In multi-file mode: splits by calendar day into .1.nc, .2.nc, etc.
+        In multi-file mode: splits by calendar day into .0001.nc, .0002.nc, etc.
 
         Args:
             data: Dict mapping variable names to lists of 2D arrays (one per time step)
@@ -124,7 +126,7 @@ class SfluxWriter:
                 )
 
         if self.single_file:
-            # COMF convention: all timesteps in one file per type (always .1.nc)
+            # COMF convention: all timesteps in one file per type (always .0001.nc)
             files = self.write_day(data, times, lons, lats, base_date, day_num=1)
             log.info(f"Wrote {len(files)} sflux files (single-file mode, "
                      f"{len(times)} timesteps)")
@@ -242,9 +244,9 @@ class SfluxWriter:
         if not available:
             return None
 
-        # File naming: sflux_{type}_{source_index}.{day_num}.nc
-        # Using .{N}.nc format (NOT .{NNNN}.nc) per lesson #11
-        filename = f"sflux_{file_type}_{self.source_index}.{day_num}.nc"
+        # File naming: sflux_{type}_{source_index}.{day_num:04d}.nc
+        # SCHISM sflux_9c.F90 uses i4.4 zero-pad; pschism (nws=2) requires it.
+        filename = f"sflux_{file_type}_{self.source_index}.{day_num:04d}.nc"
         output_path = self.output_dir / filename
 
         try:

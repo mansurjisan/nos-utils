@@ -24,8 +24,8 @@ class TestSfluxWriter:
         assert len(files) == 3  # air, rad, prc
         assert all(f.exists() for f in files)
 
-    def test_file_naming_uses_single_digit(self, synthetic_data, synthetic_grid, tmp_output_dir):
-        """Verify .{N}.nc naming, NOT .{NNNN}.nc (lesson #11)."""
+    def test_file_naming_uses_4digit_zeropad(self, synthetic_data, synthetic_grid, tmp_output_dir):
+        """Verify .{NNNN}.nc naming to match SCHISM sflux_9c.F90 i4.4 format."""
         lons, lats = synthetic_grid
         data, times = synthetic_data
         base_date = datetime(2026, 3, 31, 6, 0, 0)
@@ -34,13 +34,9 @@ class TestSfluxWriter:
         files = writer.write_day(data, times, lons, lats, base_date, day_num=1)
 
         filenames = [f.name for f in files]
-        assert "sflux_air_1.1.nc" in filenames
-        assert "sflux_rad_1.1.nc" in filenames
-        assert "sflux_prc_1.1.nc" in filenames
-
-        # Ensure NNNN format is NOT used
-        for name in filenames:
-            assert ".0001." not in name
+        assert "sflux_air_1.0001.nc" in filenames
+        assert "sflux_rad_1.0001.nc" in filenames
+        assert "sflux_prc_1.0001.nc" in filenames
 
     def test_source_index_2(self, synthetic_data, synthetic_grid, tmp_output_dir):
         """HRRR files use source_index=2."""
@@ -52,10 +48,10 @@ class TestSfluxWriter:
         files = writer.write_day(data, times, lons, lats, base_date, day_num=1)
 
         filenames = [f.name for f in files]
-        assert "sflux_air_2.1.nc" in filenames
+        assert "sflux_air_2.0001.nc" in filenames
 
     def test_write_all_single_file(self, synthetic_grid, tmp_output_dir):
-        """Verify single_file mode writes all timesteps into .1.nc (COMF convention)."""
+        """Verify single_file mode writes all timesteps into .0001.nc (COMF convention)."""
         lons, lats = synthetic_grid
         ny, nx = len(lats), len(lons)
 
@@ -70,8 +66,8 @@ class TestSfluxWriter:
 
         # Should have exactly 1 file per type (air only — only uwind/vwind provided)
         assert len(files) == 1
-        # File should be .1.nc regardless of how many days the data spans
-        assert files[0].name == "sflux_air_1.1.nc"
+        # File should be .0001.nc regardless of how many days the data spans
+        assert files[0].name == "sflux_air_1.0001.nc"
 
         # Verify all 6 timesteps are in the single file
         ds = netCDF4.Dataset(str(files[0]))

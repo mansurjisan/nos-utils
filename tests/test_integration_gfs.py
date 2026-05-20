@@ -92,10 +92,11 @@ def main():
     print(f"  sflux_rad files: {len(rad_files)}")
     print(f"  sflux_prc files: {len(prc_files)}")
 
-    # Check naming convention (.{N}.nc not .{NNNN}.nc)
+    # Check naming convention (.{NNNN}.nc — matches SCHISM sflux_9c.F90 i4.4)
     for f in result.output_files:
         if "sflux_" in f.name:
-            assert ".0001." not in f.name, f"Wrong naming: {f.name} (should be .N.nc not .NNNN.nc)"
+            assert f.name.split(".")[-2].isdigit() and len(f.name.split(".")[-2]) == 4, \
+                f"Wrong naming: {f.name} (should be .NNNN.nc, 4-digit zero-pad)"
 
     # Inspect first air file
     if air_files:

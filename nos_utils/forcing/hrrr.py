@@ -16,7 +16,7 @@ Key differences from GFS:
   - Writes to source_index=2 (secondary) for SCHISM sflux blending
 
 Output:
-  sflux mode: sflux_air_2.N.nc, sflux_rad_2.N.nc, sflux_prc_2.N.nc
+  sflux mode: sflux_air_2.NNNN.nc, sflux_rad_2.NNNN.nc, sflux_prc_2.NNNN.nc
 """
 
 import logging
