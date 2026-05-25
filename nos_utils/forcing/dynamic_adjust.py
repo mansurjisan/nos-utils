@@ -670,6 +670,19 @@ class DynamicAdjustProcessor(ForcingProcessor):
 
         self.create_output_dir()
 
+        # External inputs: NOAA tide-gauge obs XML + the previous cycle's
+        # staout_1 timeseries. (elev2D.th.nc is prep-internal and excluded.)
+        from ._log import log_input_files
+        adj_inputs = list(self.find_input_files())
+        if self.prev_staout_1 is not None and self.prev_staout_1.exists():
+            adj_inputs.append(self.prev_staout_1)
+        log_input_files(
+            self.SOURCE_NAME, adj_inputs,
+            source="DYNAMIC_ADJUST", category="ocean",
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} "
+                 f"stations={len(self.stations)}",
+        )
+
         if not self.elev2d_th_nc.exists():
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,

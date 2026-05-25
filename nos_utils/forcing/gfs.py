@@ -297,6 +297,7 @@ class GFSProcessor(ForcingProcessor):
         from ._log import log_input_files
         log_input_files(
             "GFS", gfs_files or [],
+            source="GFS", category="atmospheric",
             note=f"pdy={self.config.pdy} cyc={self.config.cyc} phase={self.phase}",
         )
         if not gfs_files:

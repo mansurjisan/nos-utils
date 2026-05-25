@@ -268,6 +268,7 @@ class RTOFSProcessor(ForcingProcessor):
         from ._log import log_input_files
         log_input_files(
             "RTOFS", (files_2d or []) + (files_3d or []),
+            source="RTOFS", category="ocean",
             note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} mode=SECOFS "
                  f"n_2d={len(files_2d or [])} n_3d={len(files_3d or [])}",
         )
@@ -319,6 +320,7 @@ class RTOFSProcessor(ForcingProcessor):
         from ._log import log_input_files
         log_input_files(
             "RTOFS", (files_2d or []) + (files_3d or []),
+            source="RTOFS", category="ocean",
             note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} mode=STOFS "
                  f"n_2d={len(files_2d or [])} n_3d={len(files_3d or [])}",
         )

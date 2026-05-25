@@ -569,6 +569,7 @@ class NWMProcessor(ForcingProcessor):
         n_reaches = len(self.river_config.feature_ids) if self.river_config else 0
         log_input_files(
             "NWM", nwm_files,
+            source="NWM", category="river",
             note=f"pdy={self.config.pdy} cyc={self.config.cyc} "
                  f"stofs_mode={self.is_stofs_mode} reaches={n_reaches} "
                  f"target_hours={n_target}",

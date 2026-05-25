@@ -169,6 +169,17 @@ class NudgingProcessor(ForcingProcessor):
                  f"mode={'STOFS' if self.is_stofs_mode else 'SECOFS'}")
         self.create_output_dir()
 
+        # Log under source=NUDGING so the delegated RTOFS files (consumed
+        # via rtofs_input_path / pre-extracted T/S) land in the nudging
+        # manifest group rather than double-counting under RTOFS.
+        from ._log import log_input_files
+        log_input_files(
+            self.SOURCE_NAME, self.find_input_files(),
+            source="NUDGING", category="nudging",
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d} "
+                 f"stofs_mode={self.is_stofs_mode}",
+        )
+
         # STOFS mode: try Fortran gen_nudge_from_hycom
         if self.is_stofs_mode:
             return self._process_stofs()
