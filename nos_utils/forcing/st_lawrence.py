@@ -128,6 +128,13 @@ class StLawrenceProcessor(ForcingProcessor):
 
         self.create_output_dir()
 
+        from ._log import log_input_files
+        log_input_files(
+            self.SOURCE_NAME, self.find_input_files(),
+            source="ST_LAWRENCE", category="river",
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d}",
+        )
+
         # ``start`` anchors the in-file time axis at SCHISM's ``model_t0``
         # (= ``cycle - nowcast_hours``). CSV/sflux discovery uses the cycle's
         # PDY directory, not model_t0, to match the operational layout.

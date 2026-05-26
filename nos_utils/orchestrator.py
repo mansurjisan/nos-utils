@@ -153,6 +153,11 @@ class PrepOrchestrator:
         """
         t0 = time.time()
         results = []
+        # Arm input capture so every log_input_files call during this run
+        # is recorded for the per-stage input manifest written to $COMOUT
+        # at the end of archive_to_comout.
+        from .forcing._log import start_input_capture
+        start_input_capture()
         log.info(f"PrepOrchestrator: {self.run_name} {phase} "
                  f"pdy={self.config.pdy} cyc={self.config.cyc:02d}z "
                  f"mode={'STOFS' if self.is_stofs else 'SECOFS'}")
@@ -1325,5 +1330,62 @@ class PrepOrchestrator:
                 shutil.copy2(src, dst)
                 archived.append(dst)
 
+        # Input manifest: list (filenames only) the input files prep
+        # consumed this run, grouped by category/source. Written last so it
+        # reflects every processor that ran.
+        if comout is not None:
+            manifest_path = self._write_inputs_manifest(result, comout)
+            if manifest_path is not None:
+                archived.append(manifest_path)
+
         log.info(f"Archived {len(archived)} files to {comout}")
         return archived
+
+    def _write_inputs_manifest(
+        self, result: PrepResult, comout: Path
+    ) -> Optional[Path]:
+        """Write the per-stage input-file manifest to $COMOUT.
+
+        Drains the input-capture collector (armed at the top of
+        :meth:`run`) and emits ``{prefix}.t{cyc}z.{pdy}.inputs.prep.json``
+        listing the input files prep consumed, grouped by category/source.
+        Filenames only — no checksums, sizes, or mtimes.
+
+        Returns the manifest path, or ``None`` if the manifest could not
+        be written (logged as a warning — prep must not fail on this).
+        """
+        import json
+        from datetime import timezone
+
+        from .forcing._log import drain_input_capture
+
+        inputs = drain_input_capture()
+
+        comout = Path(comout)
+        prefix = self.run_name
+        cycle = f"t{self.config.cyc:02d}z"
+        pdy = self.config.pdy
+
+        manifest = {
+            "ofs": prefix,
+            "pdy": pdy,
+            "cyc": f"{self.config.cyc:02d}",
+            "stage": "prep",
+            "phase": result.phase,
+            "schema_version": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "inputs": inputs,
+        }
+
+        manifest_path = comout / f"{prefix}.{cycle}.{pdy}.inputs.prep.json"
+        try:
+            with open(manifest_path, "w") as fh:
+                json.dump(manifest, fh, indent=2)
+            log.info(
+                f"  Wrote input manifest -> {manifest_path.name} "
+                f"({len(inputs)} group(s))"
+            )
+            return manifest_path
+        except OSError as e:
+            log.warning(f"  Failed to write input manifest: {e}")
+            return None

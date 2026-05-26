@@ -118,6 +118,7 @@ class HRRRProcessor(ForcingProcessor):
             from ._log import log_input_files
             log_input_files(
                 "HRRR", hrrr_files or [],
+                source="HRRR", category="atmospheric",
                 note=f"pdy={self.config.pdy} cyc={self.config.cyc} phase={self.phase}",
             )
             if not hrrr_files:

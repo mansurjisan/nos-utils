@@ -297,6 +297,7 @@ class TestArchiveManifest:
             "secofs_ufs.source_sink.in",
             "secofs_ufs.t12z.20260401.river.vsource.th",
             "secofs_ufs.t12z.20260401.river.msource.th",
+            "secofs_ufs.t12z.20260401.inputs.prep.json",
         }
         assert files == expected
         # Negative: no St. Lawrence / OBC-QC artifacts under OFF.
@@ -367,6 +368,7 @@ class TestArchiveManifest:
             "stofs_3d_atl.source_sink.in",
             "stofs_3d_atl.t12z.20260401.river.vsource.th",
             "stofs_3d_atl.t12z.20260401.river.msource.th",
+            "stofs_3d_atl.t12z.20260401.inputs.prep.json",
         }
         st_lawrence = {
             "stofs_3d_atl.t12z.riv.obs.flux.th",

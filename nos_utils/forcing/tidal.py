@@ -92,6 +92,13 @@ class TidalProcessor(ForcingProcessor):
         log.info(f"Tidal processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z")
         self.create_output_dir()
 
+        from ._log import log_input_files
+        log_input_files(
+            self.SOURCE_NAME, self.find_input_files(),
+            source="TIDAL", category="tidal",
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d}",
+        )
+
         output_file = self.output_path / "bctides.in"
 
         # Find template (needed for both Fortran and template modes)
