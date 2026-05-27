@@ -113,6 +113,13 @@ class ForcingConfig:
     nudging_timescale_seconds: float = 86400.0
     # Number of vertical levels
     n_levels: int = 51
+    # SCHISM model timestep (seconds) used to write the elev2D.th.nc
+    # ``time_step`` attribute. SCHISM aborts (misc_subs.F90:563
+    # ``MISC: elev2D.th dt wrong``) if this is smaller than the run's
+    # ``dt`` in param.nml. Must mirror the per-OFS ``model.physics.dt``:
+    # SECOFS uses 120.0, STOFS-3D-ATL uses 150.0. Distinct from
+    # ``schism_dt`` above, which sizes the river ``schism_*.th`` grids.
+    model_dt: float = 120.0
 
     # --- River settings ---
     # River config file mapping NWM reach IDs to SCHISM source elements
@@ -328,6 +335,9 @@ class ForcingConfig:
             nowcast_hours=24, forecast_hours=108,
             gfs_resolution="0p25",
             met_num=2, n_levels=51,
+            # STOFS-3D-ATL runs at dt=150 (param.nml dt=150.); elev2D.th.nc
+            # time_step must match so SCHISM's misc_subs.F90:563 check passes.
+            model_dt=150.0,
             # HRRR domain (different from GFS/model domain)
             hrrr_lon_min=-98.5, hrrr_lon_max=-49.5,
             hrrr_lat_min=5.5, hrrr_lat_max=50.0,
@@ -373,6 +383,9 @@ class ForcingConfig:
             nowcast_hours=24, forecast_hours=108,
             gfs_resolution="0p25",
             met_num=2, nws=4, n_levels=51,
+            # STOFS-3D-ATL runs at dt=150 (param.nml dt=150.); elev2D.th.nc
+            # time_step must match so SCHISM's misc_subs.F90:563 check passes.
+            model_dt=150.0,
             hrrr_lon_min=-98.5, hrrr_lon_max=-49.5,
             hrrr_lat_min=5.5, hrrr_lat_max=50.0,
             obc_roi_2d={"x1": 2805, "x2": 2923, "y1": 1598, "y2": 2325},
@@ -494,6 +507,19 @@ class ForcingConfig:
         if data.get("execution", {}).get("mode", "ufs") == "standalone":
             nws = 2
 
+        # SCHISM model timestep drives elev2D.th.nc time_step. Read from
+        # model.physics.dt defensively (defaults to 120.0 if absent). The
+        # prep also exports DELT_MODEL from this same value, so honor it as
+        # a fallback when the YAML omits model.physics.dt.
+        import os
+        model_dt = physics.get("dt")
+        if model_dt is None:
+            model_dt = os.environ.get("DELT_MODEL")
+        try:
+            model_dt = float(model_dt) if model_dt is not None else 120.0
+        except (TypeError, ValueError):
+            model_dt = 120.0
+
         # River config file
         river_files = river.get("files", {}) if isinstance(river, dict) else {}
         river_config_file = river_files.get("ctl_file") or river_files.get("nwm_reach")
@@ -546,6 +572,7 @@ class ForcingConfig:
             met_num=met_num,
             gfs_resolution=gfs_resolution,
             nws=nws,
+            model_dt=model_dt,
             scale_hflux=float(atm.get("scale_hflux", 1.0)),
             n_levels=n_levels,
             nudging_enabled=nudge.get("enabled", False) if isinstance(nudge, dict) else False,

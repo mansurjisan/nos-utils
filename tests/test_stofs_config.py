@@ -80,6 +80,17 @@ class TestSTOFSConfigFactory:
         assert cfg.adt_enabled is True
         assert cfg.obc_roi_2d is not None
 
+    def test_model_dt_is_150(self):
+        """STOFS-3D-ATL runs at dt=150 (param.nml dt=150.). The elev2D.th.nc
+        time_step must match or SCHISM aborts (misc_subs.F90:563
+        'MISC: elev2D.th dt wrong')."""
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+        assert cfg.model_dt == 150.0
+
+    def test_ufs_model_dt_is_150(self):
+        cfg = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260401", cyc=12)
+        assert cfg.model_dt == 150.0
+
 
 class TestSTOFSConfigSecofsBwdCompat:
     """Verify SECOFS defaults are unchanged by STOFS additions."""
@@ -101,6 +112,25 @@ class TestSTOFSConfigSecofsBwdCompat:
     def test_secofs_no_hrrr_domain(self):
         cfg = ForcingConfig.for_secofs(pdy="20260401", cyc=12)
         assert cfg.hrrr_lon_min is None
+
+    def test_secofs_model_dt_is_120(self):
+        """SECOFS runs at dt=120, so the elev2D writer keeps time_step=120
+        (byte-identical to prior output)."""
+        cfg = ForcingConfig.for_secofs(pdy="20260401", cyc=12)
+        assert cfg.model_dt == 120.0
+
+    def test_secofs_ufs_model_dt_is_120(self):
+        cfg = ForcingConfig.for_secofs_ufs(pdy="20260401", cyc=12)
+        assert cfg.model_dt == 120.0
+
+    def test_default_model_dt_is_120(self):
+        """Bare ForcingConfig (no factory) defaults to 120.0."""
+        cfg = ForcingConfig(
+            lon_min=-80.0, lon_max=-70.0,
+            lat_min=25.0, lat_max=35.0,
+            pdy="20260401", cyc=12,
+        )
+        assert cfg.model_dt == 120.0
 
 
 class TestSTOFSFromYAML:
@@ -164,6 +194,66 @@ class TestSTOFSFromYAML:
         assert cfg.obc_ssh_offset == 0.04
         assert cfg.nudging_enabled is True
         assert cfg.nwm_n_list_target == 121
+
+
+class TestModelDtFromYAML:
+    """from_yaml() parses model.physics.dt into ForcingConfig.model_dt."""
+
+    def _yaml(self, tmp_path, physics_block):
+        content = {
+            "grid": {
+                "domain": {
+                    "lon_min": -98.5035, "lon_max": -52.4867,
+                    "lat_min": 7.347, "lat_max": 52.5904,
+                },
+                "n_levels": 51,
+            },
+            "model": {
+                "physics": physics_block,
+                "run": {"nowcast_hours": 24, "forecast_hours": 108},
+            },
+        }
+        import yaml
+        f = tmp_path / "stofs_3d_atl.yaml"
+        f.write_text(yaml.dump(content))
+        return f
+
+    def test_dt_150_parsed(self, tmp_path):
+        f = self._yaml(tmp_path, {"nws": 2, "dt": 150.0})
+        cfg = ForcingConfig.from_yaml(f, pdy="20260401", cyc=12)
+        assert cfg.model_dt == 150.0
+
+    def test_dt_120_parsed(self, tmp_path):
+        f = self._yaml(tmp_path, {"nws": 4, "dt": 120.0})
+        cfg = ForcingConfig.from_yaml(f, pdy="20260401", cyc=12)
+        assert cfg.model_dt == 120.0
+
+    def test_dt_defaults_when_absent(self, tmp_path):
+        """No model.physics.dt and no DELT_MODEL env -> defaults to 120.0."""
+        import os
+        f = self._yaml(tmp_path, {"nws": 2})
+        old = os.environ.pop("DELT_MODEL", None)
+        try:
+            cfg = ForcingConfig.from_yaml(f, pdy="20260401", cyc=12)
+            assert cfg.model_dt == 120.0
+        finally:
+            if old is not None:
+                os.environ["DELT_MODEL"] = old
+
+    def test_delt_model_env_fallback(self, tmp_path):
+        """When model.physics.dt is absent, honor the prep's DELT_MODEL export."""
+        import os
+        f = self._yaml(tmp_path, {"nws": 2})
+        old = os.environ.get("DELT_MODEL")
+        try:
+            os.environ["DELT_MODEL"] = "150.0"
+            cfg = ForcingConfig.from_yaml(f, pdy="20260401", cyc=12)
+            assert cfg.model_dt == 150.0
+        finally:
+            if old is not None:
+                os.environ["DELT_MODEL"] = old
+            else:
+                os.environ.pop("DELT_MODEL", None)
 
 
 class TestStLawrenceSubdirFromYAML:
