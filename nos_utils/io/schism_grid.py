@@ -181,6 +181,54 @@ class SchismGrid:
 
         return all_lons, all_lats, all_depths, all_ids
 
+    def open_boundary_nodes_subset(
+        self, seg_indices: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
+        """
+        Get open boundary node coordinates for ONLY the listed segments.
+
+        SCHISM's ``*.th.nc`` boundary-forcing files (elev2D, TEM_3D, SAL_3D,
+        uv3D) must carry only the nodes on the segments that are actually
+        forced by that file type. For elevation files that is the union of
+        the iettype 4/5 (elevation-forced) segments; a flow-only segment
+        (e.g. iettype 0, a river boundary) must be excluded or SCHISM aborts
+        at ``misc_subs.F90:641`` (``# of open nodes(N)`` mismatch).
+
+        The segments are concatenated in the order they appear in
+        ``seg_indices`` so the caller controls node ordering. This mirrors
+        the operational Fortran's explicit ``iob(1:nob)`` segment list.
+
+        Args:
+            seg_indices: 0-based open-boundary segment indices to include.
+
+        Returns:
+            (lons, lats, depths, node_ids) — nodes for the listed segments only.
+        """
+        if not self.open_boundaries:
+            return np.array([]), np.array([]), np.array([]), []
+
+        n_seg = len(self.open_boundaries)
+        selected = []
+        for idx in seg_indices:
+            if idx < 0 or idx >= n_seg:
+                raise IndexError(
+                    f"open boundary segment index {idx} out of range "
+                    f"(grid has {n_seg} segments)"
+                )
+            selected.append(self.open_boundaries[idx])
+
+        if not selected:
+            return np.array([]), np.array([]), np.array([]), []
+
+        sub_lons = np.concatenate([b.lons for b in selected])
+        sub_lats = np.concatenate([b.lats for b in selected])
+        sub_depths = np.concatenate([b.depths for b in selected])
+        sub_ids = []
+        for b in selected:
+            sub_ids.extend(b.node_ids)
+
+        return sub_lons, sub_lats, sub_depths, sub_ids
+
     def obc_nodes_from_ctl(self, ctl_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
         """
         Read boundary node IDs from obc.ctl file (exact match with Fortran).

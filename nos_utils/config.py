@@ -106,6 +106,18 @@ class ForcingConfig:
     # Geoid-to-MSL datum offset (meters). OFS-specific — verify from Fortran source.
     # SECOFS: 1.25 (confirmed). STOFS-3D-ATL: 0.04. Other OFS: 0.0 until verified.
     obc_ssh_offset: float = 0.0
+    # Open-boundary segment indices (0-based) that are ELEVATION-forced
+    # (SCHISM iettype 4/5). When set AND no obc.ctl is supplied, the RTOFS
+    # processor restricts the boundary node set used for elev2D / TEM_3D /
+    # SAL_3D / uv3D ``*.th.nc`` to just these segments. This excludes any
+    # flow-only segment (iettype 0, e.g. STOFS-3D-ATL's St-Lawrence River
+    # boundary) — including it over-stamps the files and aborts the nowcast
+    # at ``misc_subs.F90:641`` (``# of open nodes(N)`` mismatch). The list
+    # mirrors the operational Fortran's explicit ``iob(1:nob)`` segment
+    # list and is order-independent. SECOFS uses an obc.ctl instead, so it
+    # leaves this None (no-op). STOFS-3D-ATL v2.1 mesh: [0, 1] (B0=756,
+    # B1=22 are iettype 5; B2=3 is the iettype-0 St-Lawrence flow boundary).
+    obc_elev_segments: Optional[List[int]] = None
     # ADT satellite SSH blending (STOFS-3D-ATL uses CMEMS ADT to correct boundary SSH)
     adt_enabled: bool = False
     # Nudging enabled and timescale
@@ -336,6 +348,10 @@ class ForcingConfig:
             obc_roi_3d={"x1": 482, "x2": 600, "y1": 94, "y2": 821},
             nudge_roi_3d={"x1": 422, "x2": 600, "y1": 94, "y2": 835},
             obc_ssh_offset=0.04,
+            # Elevation-forced open-boundary segments (iettype 4/5). B2 (the
+            # St-Lawrence River, iettype 0) is excluded so the *.th.nc files
+            # carry only the 778 elevation nodes SCHISM expects.
+            obc_elev_segments=[0, 1],
             adt_enabled=True,
             # Nudging
             nudging_enabled=True,
@@ -379,6 +395,10 @@ class ForcingConfig:
             obc_roi_3d={"x1": 482, "x2": 600, "y1": 94, "y2": 821},
             nudge_roi_3d={"x1": 422, "x2": 600, "y1": 94, "y2": 835},
             obc_ssh_offset=0.04,
+            # Elevation-forced open-boundary segments (iettype 4/5). B2 (the
+            # St-Lawrence River, iettype 0) is excluded so the *.th.nc files
+            # carry only the 778 elevation nodes SCHISM expects.
+            obc_elev_segments=[0, 1],
             adt_enabled=True,
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
@@ -511,6 +531,14 @@ class ForcingConfig:
         obc = ocean.get("obc", {}) if isinstance(ocean, dict) else {}
         obc_ssh_offset = float(obc.get("ssh_offset", 0.0))
 
+        # Elevation-forced open-boundary segment indices (0-based). When set
+        # AND no obc.ctl is used, restricts the *.th.nc boundary node set to
+        # these segments (excludes flow-only iettype-0 segments). See the
+        # ``obc_elev_segments`` field docstring on ForcingConfig.
+        obc_elev_segments = obc.get("elev_segments") if isinstance(obc, dict) else None
+        if obc_elev_segments is not None:
+            obc_elev_segments = [int(i) for i in obc_elev_segments]
+
         # ROI indices for RTOFS subsetting (STOFS-style index-based)
         roi_2ds = obc.get("roi_2ds", {})
         roi_3dz = obc.get("roi_3dz", {})
@@ -553,6 +581,7 @@ class ForcingConfig:
                 nudge.get("timescale_seconds", nudge.get("timescale_days", 1.0) * 86400)
             ) if isinstance(nudge, dict) else 86400.0,
             obc_ssh_offset=obc_ssh_offset,
+            obc_elev_segments=obc_elev_segments,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
             nwm_product=nwm_product,
         )

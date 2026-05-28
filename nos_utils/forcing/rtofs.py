@@ -217,6 +217,22 @@ class RTOFSProcessor(ForcingProcessor):
         if self.obc_ctl_file and Path(self.obc_ctl_file).exists():
             self._bnd_lons, self._bnd_lats, self._bnd_depths, self._bnd_ids = \
                 self._grid.obc_nodes_from_ctl(self.obc_ctl_file)
+        elif getattr(self.config, "obc_elev_segments", None):
+            # No obc.ctl (e.g. STOFS-3D-ATL). Restrict the boundary node set
+            # to the elevation-forced (iettype 4/5) segments so the four
+            # ``*.th.nc`` files carry exactly the nodes SCHISM expects on the
+            # elevation boundary. Including a flow-only segment (iettype 0,
+            # e.g. the St-Lawrence River boundary) over-stamps the files and
+            # aborts the nowcast at ``misc_subs.F90:641``.
+            elev_segs = list(self.config.obc_elev_segments)
+            self._bnd_lons, self._bnd_lats, self._bnd_depths, self._bnd_ids = \
+                self._grid.open_boundary_nodes_subset(elev_segs)
+            n_all = self._grid.n_open_boundary_nodes
+            n_sub = len(self._bnd_lons)
+            log.info(
+                f"elev2D OBC: {len(elev_segs)} elevation segments -> "
+                f"{n_sub} nodes (excluded {n_all - n_sub} flow-only)"
+            )
         else:
             self._bnd_lons, self._bnd_lats, self._bnd_depths, self._bnd_ids = \
                 self._grid.open_boundary_nodes()
