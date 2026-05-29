@@ -279,6 +279,11 @@ class UFSConfigProcessor(ForcingProcessor):
             datm_tasks=int(self.config.ufs_datm_tasks),
             total_tasks=int(self.config.ufs_total_tasks),
         )
+        # Coupling interval must equal the SCHISM dt or ModelAdvance stalls
+        # at it=1 (template ships SECOFS @120; STOFS dt=150 needs @150).
+        patched = self._patch_runseq_interval(
+            patched, getattr(self.config, "model_dt", 120.0),
+        )
         uc_dst.write_text(patched)
         output_files.append(uc_dst)
 
@@ -526,3 +531,32 @@ class UFSConfigProcessor(ForcingProcessor):
             content = re.sub(pattern, repl, content, flags=re.MULTILINE)
 
         return content
+
+    @staticmethod
+    def _patch_runseq_interval(content: str, model_dt: float) -> str:
+        """Patch the NUOPC ``runSeq::`` coupling interval to ``@<model_dt>``.
+
+        The driver hands SCHISM a coupling window equal to the runSeq
+        interval; SCHISM must be able to land exactly on it, so the interval
+        has to equal the SCHISM timestep (``dt``). The template ships a
+        SECOFS value (``@120``), which is wrong for STOFS-3D-ATL (dt=150):
+        the driver gives SCHISM a 120s window it can't step (150 > 120) and
+        ``ModelAdvance`` is stuck at ``it=1`` -- the nowcast inits clean but
+        never timesteps (no hotstart, empty output, false ``rc=0`` PASS).
+
+        Only the numeric interval line inside the runSeq block is replaced
+        (``^@\\d+$``). The trailing bare ``@`` line (no digits) that closes
+        the block is left untouched.
+        """
+        n = int(model_dt)
+        new_content, count = re.subn(
+            r"(?m)^@\d+\s*$", f"@{n}", content
+        )
+        if count:
+            log.info(f"  ufs.configure runSeq -> @{n} (model_dt)")
+        else:
+            log.warning(
+                "ufs.configure has no @<interval> runSeq line; "
+                "leaving coupling interval verbatim"
+            )
+        return new_content

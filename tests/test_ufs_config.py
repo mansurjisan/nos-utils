@@ -53,6 +53,16 @@ _UFS_CONFIGURE = (
     "OCN_model:                      schism\n"
     "OCN_petlist_bounds:             120 1199\n"
     "OCN_omp_num_threads:            1\n"
+    "\n"
+    "runSeq::\n"
+    "@120\n"
+    "  ATM -> MED :remapMethod=redist\n"
+    "  MED med_phases_prep_ocn_avg\n"
+    "  MED -> OCN :remapMethod=redist\n"
+    "  ATM\n"
+    "  OCN\n"
+    "@\n"
+    "::\n"
 )
 
 
@@ -161,6 +171,94 @@ def test_pet_patching(tmp_path):
     assert "OCN_petlist_bounds:             120 2913" in uc2
     # Old hardcoded value must be gone.
     assert "OCN_petlist_bounds:             120 1199" not in uc2
+
+
+class TestRunSeqInterval:
+    """ufs.configure runSeq coupling interval must equal the SCHISM dt.
+
+    The template ships a SECOFS value (``@120``). The NUOPC driver hands
+    SCHISM a coupling window equal to this interval; SCHISM cannot step a
+    150s dt inside a 120s window, so STOFS-3D-ATL (dt=150) stalls at
+    ``ModelAdvance it=1`` (clean init, no timestepping, empty output,
+    false rc=0). The interval must be config-driven from ``model_dt``.
+    """
+
+    def test_stofs_runseq_becomes_150(self, tmp_path):
+        """STOFS-like (model_dt=150) -> runSeq interval @150, not @120.
+
+        The trailing bare ``@`` that closes the runSeq block must survive.
+        """
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260510", cyc=12)
+        assert cfg.model_dt == 150.0
+
+        proc = UFSConfigProcessor(cfg, fix, out)
+        result = proc.process()
+        assert result.success, result.errors
+
+        uc = (out / "ufs.configure").read_text()
+        assert "runSeq::" in uc
+        assert "@150" in uc, "runSeq interval not driven to @150"
+        # SECOFS template value must be gone.
+        assert "@120" not in uc
+        # The bare closing @ (no digits) must be preserved verbatim.
+        assert "\n@\n::\n" in uc
+
+    def test_secofs_runseq_stays_120(self, tmp_path):
+        """SECOFS-like (model_dt=120) -> no-op; ufs.configure byte-identical.
+
+        model_dt already equals the template's @120, so the written
+        ufs.configure must be byte-for-byte identical to the source
+        template (apart from the PET bounds, which are unchanged for the
+        default SECOFS layout used here)."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_secofs_ufs(
+            pdy="20260510", cyc=12,
+            ufs_datm_tasks=120, ufs_schism_tasks=1080, ufs_total_tasks=1200,
+        )
+        assert cfg.model_dt == 120.0
+
+        proc = UFSConfigProcessor(cfg, fix, out)
+        result = proc.process()
+        assert result.success, result.errors
+
+        uc = (out / "ufs.configure").read_text()
+        assert "@120" in uc
+        assert "@150" not in uc
+        # No-op: written file equals the source template byte-for-byte
+        # (PET bounds already match the SECOFS layout, runSeq already @120).
+        assert uc == (fix / "ufs.configure").read_text()
+
+    def test_missing_model_dt_leaves_template_default(self, tmp_path):
+        """Configs without model_dt are unaffected (guard keeps template @120).
+
+        The getattr default mirrors the template's SECOFS interval so a
+        config that never set model_dt behaves exactly as before this fix.
+        """
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_secofs_ufs(
+            pdy="20260510", cyc=12,
+            ufs_datm_tasks=120, ufs_schism_tasks=1080, ufs_total_tasks=1200,
+        )
+        # Simulate a config predating the model_dt field.
+        delattr(cfg, "model_dt")
+
+        proc = UFSConfigProcessor(cfg, fix, out)
+        result = proc.process()
+        assert result.success, result.errors
+
+        uc = (out / "ufs.configure").read_text()
+        assert "@120" in uc
+        assert "@150" not in uc
 
 
 def test_missing_template_fails(ufs_config, tmp_path):

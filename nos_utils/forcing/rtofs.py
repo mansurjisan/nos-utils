@@ -1072,7 +1072,7 @@ class RTOFSProcessor(ForcingProcessor):
         """Extract SSH from RTOFS 2D files, interpolate to boundary nodes."""
         output_file = self.output_path / "elev2D.th.nc"
         n_bnd = len(self._bnd_lons)
-        model_dt = 120.0  # SCHISM model timestep (seconds)
+        model_dt = float(getattr(self.config, "model_dt", 120.0))  # SCHISM model timestep (seconds)
 
         # Check for precomputed REMESH weights
         ssh_weights = self._find_ssh_weights()
@@ -1118,7 +1118,8 @@ class RTOFSProcessor(ForcingProcessor):
                     ssh_array[:, ni] = ssh_array[:, nearest_valid]
                 log.info(f"Filled {n_nan} NaN boundary nodes from nearest valid nodes")
 
-            # Temporally interpolate to model dt (120s)
+            # Temporally interpolate to the model dt (config.model_dt;
+            # 120s SECOFS, 150s STOFS-3D-ATL).
             # Anchor t=0 to model_t0, cover the phase window
             n_rtofs = ssh_array.shape[0]
 
@@ -1224,7 +1225,7 @@ class RTOFSProcessor(ForcingProcessor):
             # parity with v3.9 production output.
             time_var = nc.createVariable("time", "f4", ("time",))
             if dt_out == model_dt and nt > n_rtofs:
-                # Temporally interpolated: uniform 120s steps anchored at
+                # Temporally interpolated: uniform model_dt steps anchored at
                 # t=0 = model_t0 (cycle - nowcast_hours).
                 time_var[:] = [i * dt_out for i in range(nt)]
             else:
