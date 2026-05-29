@@ -3,14 +3,15 @@ St. Lawrence River forcing processor (STOFS-3D-ATL).
 
 Generates the two climatology-free river files for the St. Lawrence:
 
-  - ``flux.th``  — daily discharge (m^3/s, negative = inflow) from Canadian
-    hydrometric observations (``02OA016_hydrometric.csv`` under
-    ``$COMINlaw/<yyyymmdd>/can_streamgauge/``).
+  - ``flux.th``  — daily discharge (m^3/s, negative = inflow) read from the
+    discharge column of the wide ECCC hydrometric CSV
+    (``QC_02OA016_hourly_hydrometric.csv`` under
+    ``$DCOMROOT/<yyyymmdd>/canadian_water/``).
   - ``TEM_1.th`` — daily water temperature derived from GFS air temperature
     at the river mouth via a linear regression ``T_water = 0.83 * T_air + 2.817``
-    (negative values clamped to 0). When a GFS sflux radiation file is not
-    available (e.g., legacy CSV-only runs), temperature observations from
-    the same CSV are used.
+    (negative values clamped to 0). The hydrometric CSV carries discharge
+    only, so when a GFS sflux radiation file is not available a -9999
+    sentinel is written for temperature, matching the operational default.
 
 The operational ex-script sources
 ``gen_fluxth_st_lawrence_riv.py`` and ``gen_temp_1_st_lawrence_riv.py`` with a
@@ -45,11 +46,6 @@ try:
 except ImportError:
     HAS_NETCDF4 = False
 
-
-# Environment and Climate Change Canada hydrometric CSV parameter codes.
-# See https://wateroffice.ec.gc.ca for the full dictionary.
-PARAM_TEMPERATURE = 5
-PARAM_DISCHARGE = 47
 
 # Water-temperature linear regression at the St. Lawrence mouth; derived
 # operationally from multi-year GFS-rad-to-observed river-temperature fits.
@@ -87,9 +83,10 @@ class StLawrenceProcessor(ForcingProcessor):
     ``<run>.<cycle>.riv.obs.flux.th`` and ``...tem_1.th``.
 
     The GFS sflux radiation file (``stofs_3d_atl.tHHz.gfs.rad.nc``) is read
-    for temperature if available. When it is not, temperature observations
-    from the CSV (parameter code 5) are used; otherwise a constant -9999
-    sentinel is written, matching the operational default.
+    for temperature if available (the air-temp regression). The wide ECCC
+    hydrometric export carries discharge only — no temperature column — so
+    when no rad file is present a constant -9999 sentinel is written for
+    temperature, matching the operational default.
     """
 
     SOURCE_NAME = "ST_LAWRENCE"
@@ -235,38 +232,78 @@ class StLawrenceProcessor(ForcingProcessor):
     ) -> _StLawrenceSeries:
         """Return a _StLawrenceSeries with daily flow & temperature.
 
-        Mirrors ``gen_fluxth_st_lawrence_riv.py``:
-          * parameter 5  -> water temperature (°C)
-          * parameter 47 -> discharge (m^3/s)
-        For each day in the hindcast window we look up the exact timestamp
-        in the CSV. If missing:
-          * day 0: raise (flow) or default to -9999 (temp)
-          * day >0: carry forward the previous day's value.
-        Days in the forecast window are padded with the last available value.
+        Mirrors the operational ``gen_fluxth_st_lawrence_riv.py`` reader
+        (``get_river_discharge``): the NCO dcom Canadian gauge file
+        (``QC_02OA016_hourly_hydrometric.csv`` under
+        ``$DCOMROOT/<PDY>/canadian_water/``) is a **wide** ECCC hydrometric
+        export, *not* a parameter-coded ("long") table. Its columns are::
+
+            0: ID
+            1: Date (local, e.g. "...-05:00")
+            2: Water Level / Niveau d'eau (m)
+            3-5: water-level grade / symbol / approval
+            6: Discharge / Débit (m^3/s)
+            7-9: discharge grade / symbol / approval
+
+        The operational script does ``df.drop(df.columns[[0,2,3,4,5,7,8,9]])``,
+        keeping column 1 (Date) and column 6 (Discharge), converts the
+        timezone-aware local timestamps with ``.dt.tz_convert('UTC')``, and
+        reads discharge straight from the flow column — there is **no**
+        ``parameter == 47`` row filtering. We read positionally (``.iloc``)
+        so the parser is robust to the bilingual header text in the real
+        file.
+
+        Discharge windowing (also from the operational script):
+          * day 0 miss -> raise (caller falls back to the previous-day CSV
+            or the previous-cycle archive);
+          * day >0 miss -> carry forward the previous day's value;
+          * forecast days are padded with the last available value.
+
+        The wide export carries **no** river-temperature column, so the
+        temperature series defaults to the -9999 sentinel here; ``process()``
+        overwrites it with the GFS-sflux air-temp regression
+        (``_temp_from_sflux``) when a radiation file is available, matching
+        operational ``gen_temp_1_st_lawrence_riv.py`` (which never reads the
+        CSV for temperature).
         """
         df = pd.read_csv(csv_path, sep=",", na_values="")
-        # CSV columns: STATION, date_local, parameter, value, and several
-        # QA columns we don't care about. Drop what we don't need, rename
-        # the surviving columns to match the operational script.
-        drop_cols = [df.columns[i] for i in (0, 4, 5, 6, 7, 8) if i < len(df.columns)]
-        df = df.drop(columns=drop_cols)
-        df = df.rename(
-            columns={
-                df.columns[0]: "date_local",
-                df.columns[1]: "parameter",
-                df.columns[2]: "value",
+        # Wide ECCC layout: keep column 1 (local date) and column 6
+        # (discharge), discarding ID + water-level + the grade/symbol/approval
+        # qualifier columns — exactly the operational
+        # ``df.drop(df.columns[[0,2,3,4,5,7,8,9]])``. Read positionally so the
+        # bilingual header strings don't matter.
+        DATE_COL = 1
+        FLOW_COL = 6
+        if df.shape[1] <= FLOW_COL:
+            raise ValueError(
+                f"St. Lawrence CSV {csv_path} has only {df.shape[1]} columns; "
+                f"expected the wide ECCC hydrometric layout with discharge at "
+                f"column {FLOW_COL} (>= {FLOW_COL + 1} columns). This looks "
+                "like a water-level-only or unexpected export."
+            )
+        df_flow = pd.DataFrame(
+            {
+                "date_local": df.iloc[:, DATE_COL].values,
+                "flow": pd.to_numeric(df.iloc[:, FLOW_COL], errors="coerce").values,
             }
         )
-        df["date_utc"] = pd.to_datetime(df["date_local"])
-
-        df_temp = df[df["parameter"] == PARAM_TEMPERATURE].copy().set_index("date_utc")
-        df_flow = df[df["parameter"] == PARAM_DISCHARGE].copy().set_index("date_utc")
+        # Local timestamps carry a UTC offset (e.g. "-05:00"); convert to UTC
+        # so the index aligns with the tz-aware UTC lookup keys. Operational:
+        # ``pd.to_datetime(date_local).dt.tz_convert('UTC')``. Localize naive
+        # timestamps to UTC as a defensive fallback (real dcom is offset-aware).
+        ts = pd.to_datetime(df_flow["date_local"], errors="coerce")
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize("UTC")
+        else:
+            ts = ts.dt.tz_convert("UTC")
+        df_flow["date_utc"] = ts
+        df_flow = df_flow.dropna(subset=["date_utc"]).set_index("date_utc")
 
         data_flow: List[float] = []
         last_flow_idx = -1
         for i, dt in enumerate(datevectors_hindcast):
             try:
-                value = float(df_flow.loc[dt]["value"])
+                value = float(df_flow.loc[dt]["flow"])
                 data_flow.append(round(value, 3))
                 last_flow_idx = i
             except KeyError:
@@ -284,21 +321,16 @@ class StLawrenceProcessor(ForcingProcessor):
         for _ in datevectors_full[tail_start:]:
             data_flow.append(data_flow[-1])
 
-        data_temp: List[float] = []
-        for i, dt in enumerate(datevectors_hindcast):
-            try:
-                value = float(df_temp.loc[dt]["value"])
-                data_temp.append(round(value, 3))
-            except KeyError:
-                if i == 0:
-                    log.info(
-                        "No temperature observation for %s; "
-                        "using sentinel -9999 (caller will overwrite with "
-                        "sflux regression if available)", dt,
-                    )
-                    data_temp.append(-9999.0)
-                else:
-                    data_temp.append(data_temp[-1])
+        # The wide ECCC export has no river-temperature column (operational
+        # temperature comes from the GFS-sflux regression, never the CSV), so
+        # seed the hindcast window with the -9999 sentinel. ``process()``
+        # overwrites this with ``_temp_from_sflux`` when a rad file is present.
+        log.info(
+            "St. Lawrence CSV carries discharge only; seeding temperature "
+            "with -9999 sentinel (caller overwrites with sflux regression "
+            "if a radiation file is available)"
+        )
+        data_temp: List[float] = [-9999.0 for _ in datevectors_hindcast]
 
         tail_start = min(len(datevectors_hindcast), len(data_temp))
         for _ in datevectors_full[tail_start:]:
