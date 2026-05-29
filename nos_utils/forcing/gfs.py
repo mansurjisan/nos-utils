@@ -10,7 +10,7 @@ Input: GFS GRIB2 files from COMINgfs
               "sflux" (hourly, ~30MB — surface fields only, native ~0.25°)
 
 Output:
-  sflux mode (nws=2): sflux_air_1.N.nc, sflux_rad_1.N.nc, sflux_prc_1.N.nc
+  sflux mode (nws=2): sflux_air_1.NNNN.nc, sflux_rad_1.NNNN.nc, sflux_prc_1.NNNN.nc
   DATM mode (nws=4):  datm_forcing.nc
 """
 
