@@ -22,6 +22,17 @@ class TestHRRRFileDiscovery:
         # 6h nowcast = ~6 analysis files + up to 48 forecast files
         assert len(files) >= 6
 
+    def test_nowcast_covers_model_t0(self, mock_config, mock_hrrr_dir):
+        """Nowcast must include a HRRR field valid AT model_t0 (cyc - nowcast_hours).
+
+        f01 from cycle hour H is valid at H+1, so model_t0=06z (cyc 12 - 6h)
+        requires hrrr.t05z.wrfsfcf01. Without it the DATM blend's first grid
+        step falls back to coarse GFS.
+        """
+        proc = HRRRProcessor(mock_config, mock_hrrr_dir, Path("/tmp/out"))
+        names = [f.name for f in proc.find_input_files()]
+        assert "hrrr.t05z.wrfsfcf01.grib2" in names
+
     def test_max_forecast_48h(self, mock_config, mock_hrrr_dir):
         """HRRR max forecast is 48 hours regardless of config."""
         cfg = ForcingConfig(

@@ -196,7 +196,7 @@ class HRRRProcessor(ForcingProcessor):
         """
         Find HRRR GRIB2 files for nowcast + forecast window.
 
-        Nowcast: hourly analysis files (f01) from multiple cycles
+        Nowcast: hourly f01 from each cycle, reaching back to cover model_t0
         Forecast: hourly forecast files (f01-f48) from current cycle
         """
         hrrr_files = []
@@ -206,8 +206,12 @@ class HRRRProcessor(ForcingProcessor):
         prev_path = self._resolve_path(prev_date)
         today_path = self._resolve_path(base_date)
 
-        # Nowcast: hourly f01 from previous hours
-        nowcast_start_hour = self.config.cyc - self.config.nowcast_hours
+        # Nowcast: hourly f01 from previous cycles. f01 from cycle hour H is
+        # valid at H+1, so reach back one extra hour (cyc - nowcast_hours - 1)
+        # to include a HRRR field valid AT model_t0 (= cyc - nowcast_hours).
+        # Without it the DATM blend's first grid step (anchored at model_t0)
+        # has no exact HRRR match and falls back to coarse GFS.
+        nowcast_start_hour = self.config.cyc - self.config.nowcast_hours - 1
         if nowcast_start_hour < 0:
             # Spans previous day
             start_hour_prev = 24 + nowcast_start_hour
