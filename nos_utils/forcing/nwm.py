@@ -833,7 +833,11 @@ class NWMProcessor(ForcingProcessor):
         is ~thousands of paths across two days.
         """
         start = self._phase_start_time()
-        window_end = start + timedelta(hours=self._phase_total_hours() + 1)
+        # Match the output grid exactly: _normalize_to_simulation_grid keeps
+        # hours [0, total_hours], so a file valid past start + total_hours is
+        # dropped there anyway. Bounding selection at total_hours avoids opening
+        # a NetCDF only to discard it.
+        window_end = start + timedelta(hours=self._phase_total_hours())
         if analysis_files:
             # Forecast continues strictly past the latest observed analysis.
             frontier = max(_nwm_valid_time(f) for f in analysis_files)
@@ -861,6 +865,10 @@ class NWMProcessor(ForcingProcessor):
         scored.sort()  # (valid_time, product_rank, lead, path)
         chosen: Dict[int, Path] = {}
         for vt, _r, _lead, _s, f in scored:
+            # NWM valid times and ``start`` are both whole hours, so this is an
+            # exact integer. ``round`` (not floor) is deliberate: it matches the
+            # identical bucketing in _normalize_to_simulation_grid, and the two
+            # must agree on the hour index a file maps to.
             hour = int(round((vt - start).total_seconds() / 3600.0))
             if hour not in chosen:
                 chosen[hour] = f
