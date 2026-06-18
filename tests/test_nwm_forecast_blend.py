@@ -157,11 +157,19 @@ class TestForecastBlendSelection:
         assert datetime(2026, 5, 7, 10) in vts
 
     def test_forecast_excluded_past_window_end(self, tmp_path):
-        """Forecast files valid past the phase window end are dropped."""
+        """Forecast files valid past the phase window end are dropped, and the
+        window-end hour itself is the inclusive cap.
+
+        for_secofs phase=None: start = 05-06 18z, total_hours = 6+48+18 = 72,
+        so window_end = 05-09 18z (hour 72). A file valid exactly at 18z is
+        kept; one at 19z (hour 73) is dropped. f-leads are from the 05-07 00z
+        cycle, so valid = 05-07 00z + lead.
+        """
         _touch_analysis(tmp_path, "20260507", cyc=0)
-        # window_end ~ start(05-06 18z) + 72h + 1 = 05-09 19z.
-        _touch_medium(tmp_path, "20260507", cyc=0, fhr=50)   # valid 05-09 02z (kept)
-        _touch_medium(tmp_path, "20260507", cyc=0, fhr=120)  # valid 05-12 00z (drop)
+        _touch_medium(tmp_path, "20260507", cyc=0, fhr=50)   # 05-09 02z  (kept)
+        _touch_medium(tmp_path, "20260507", cyc=0, fhr=66)   # 05-09 18z  (kept, == window_end)
+        _touch_medium(tmp_path, "20260507", cyc=0, fhr=67)   # 05-09 19z  (drop, past end)
+        _touch_medium(tmp_path, "20260507", cyc=0, fhr=120)  # 05-12 00z  (drop)
 
         proc = _proc(tmp_path)
         fc = proc._select_forecast_files(
@@ -170,8 +178,10 @@ class TestForecastBlendSelection:
                 "analysis_assim", [datetime(2026, 5, 7), datetime(2026, 5, 6)]),
         )
         vts = [_nwm_valid_time(f) for f in fc]
-        assert datetime(2026, 5, 7, 0) < max(vts) <= datetime(2026, 5, 9, 19)
-        assert datetime(2026, 5, 12, 0) not in vts
+        assert datetime(2026, 5, 9, 18) in vts            # window-end hour kept
+        assert datetime(2026, 5, 9, 19) not in vts        # one hour past -> dropped
+        assert datetime(2026, 5, 12, 0) not in vts        # far tail dropped
+        assert max(vts) == datetime(2026, 5, 9, 18)       # window_end is the cap
 
     def test_explicit_short_range_product_single_glob(self, tmp_path):
         """nwm_product='short_range' is an explicit single-product override

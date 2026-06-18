@@ -769,10 +769,14 @@ class NWMProcessor(ForcingProcessor):
         search_dates = [base_date, base_date - timedelta(days=1)]
 
         # Explicit single-forecast-product override: glob just that product.
+        # ``medium_range_mem1`` is intentionally NOT handled here — find_input_files
+        # routes it to _find_stofs_nwm_files before this method is reached, so the
+        # only forecast shorthands that arrive are short_range and medium_range.
         configured = self.config.nwm_product
-        if configured in ("short_range", "medium_range", "medium_range_mem1"):
+        if configured in ("short_range", "medium_range"):
+            # "medium_range" is shorthand for the mem1 product directory.
             product = ("medium_range_mem1"
-                       if configured.startswith("medium_range") else configured)
+                       if configured == "medium_range" else configured)
             return self._glob_product_files(product, search_dates)
 
         # Default path (analysis_assim / unset): observed past + forecast future.
