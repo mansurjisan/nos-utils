@@ -443,6 +443,13 @@ class NWMProcessor(ForcingProcessor):
     # compatibility lever and is added on top of the buffer.
     DEFAULT_BUFFER_HOURS = 3
 
+    # A trailing forward-fill longer than this (hours past the last real NWM
+    # row, in ``_normalize_to_simulation_grid``) is treated as a red flag —
+    # NWM forecast data missing for the window tail → a flat vsource.th tail —
+    # and logged at WARNING. A few hours of tail fill past the last forecast
+    # file is normal.
+    PAD_WARN_HOURS = 6
+
     def __init__(
         self,
         config: ForcingConfig,
@@ -727,7 +734,7 @@ class NWMProcessor(ForcingProcessor):
         return sorted(files, key=lambda p: (_nwm_valid_time(p), str(p)))
 
     def _find_secofs_nwm_files(self) -> List[Path]:
-        """Find NWM files using SECOFS product search.
+        """Find NWM files for SECOFS by blending observed analysis with forecast.
 
         NWM v3.0 production layout (`/lfs/h1/ops/prod/com/nwm/v3.0/`):
             nwm.YYYYMMDD/<product>/nwm.tHHz.<product>.channel_rt.<lead>.conus.nc
@@ -736,51 +743,128 @@ class NWMProcessor(ForcingProcessor):
             - analysis_assim: ``tmHH`` (lookback hours; tm00 is on-the-hour)
             - short_range / medium_range: ``fHHH`` (forecast hours)
 
-        If `nwm_product` is set explicitly (e.g. "analysis_assim"), only
-        that product is searched. Otherwise the priority order is
-        ``analysis_assim → short_range → medium_range`` — first non-empty
-        product wins.
+        The earlier behavior searched a single product and stopped at the
+        first non-empty one — with the default ``nwm_product="analysis_assim"``
+        that staged ONLY past analysis snapshots (~the latest few hours).
+        ``_pad_to_target`` then repeated that last snapshot across the entire
+        forecast horizon, so ``vsource.th`` came out FLAT in time while the
+        operational COMF source/sink generator (which stages analysis +
+        short_range + medium_range_mem1, see
+        ``schism_cp_nwm_files_local.sh``) produced a time-varying series.
+        That is the SECOFS river NWM flat-vsource bug.
+
+        This restores the operational coverage: stage observed analysis for
+        the past (nowcast) window and NWM forecast for the future (forecast)
+        window, collapsed to one file per hour. The downstream
+        ``_normalize_to_simulation_grid`` keys every row off the file's actual
+        valid time, so the blend produces a dense, monotonic, time-varying
+        hourly grid.
+
+        An explicit ``nwm_product`` of ``short_range`` / ``medium_range`` is
+        still honored as a single-product override (no analysis blend).
+        ``medium_range_mem1`` never reaches here — it is routed to
+        :meth:`_find_stofs_nwm_files` by :meth:`find_input_files`.
         """
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
-        nwm_files: List[Path] = []
+        search_dates = [base_date, base_date - timedelta(days=1)]
 
-        # Honor explicit product config; otherwise fall back to priority list.
+        # Explicit single-forecast-product override: glob just that product.
         configured = self.config.nwm_product
-        if configured and configured in self.PRODUCTS:
-            search_products = [configured]
-        else:
-            search_products = list(self.PRODUCTS)
+        if configured in ("short_range", "medium_range", "medium_range_mem1"):
+            product = ("medium_range_mem1"
+                       if configured.startswith("medium_range") else configured)
+            return self._glob_product_files(product, search_dates)
 
-        for date in [base_date, base_date - timedelta(days=1)]:
-            date_str = date.strftime("%Y%m%d")
-            nwm_dir = self.input_path / f"nwm.{date_str}"
+        # Default path (analysis_assim / unset): observed past + forecast future.
+        analysis = self._glob_product_files("analysis_assim", search_dates)
+        forecast = self._select_forecast_files(search_dates, analysis)
+        return analysis + forecast
+
+    def _glob_product_files(self, product: str,
+                            search_dates: List[datetime]) -> List[Path]:
+        """Glob channel_rt files for one NWM product across ``search_dates``.
+
+        Production layout nests files under a per-product subdirectory
+        (``nwm.YYYYMMDD/<product>/``); older caches store them flat under
+        ``nwm.YYYYMMDD/``. Both are searched and de-duplicated by path.
+
+        The filename tokens differ by product: ``medium_range`` files live
+        under the ``medium_range_mem1`` subdir but are named
+        ``...medium_range.channel_rt_1.fNNN...`` (note ``channel_rt_1``), so
+        the glob is built per-product rather than from the subdir name.
+        """
+        if product == "analysis_assim":
+            name_token, rt_token, lead_glob = "analysis_assim", "channel_rt", "tm*"
+        elif product == "medium_range_mem1":
+            name_token, rt_token, lead_glob = "medium_range", "channel_rt_1", "f*"
+        else:  # short_range
+            name_token, rt_token, lead_glob = product, "channel_rt", "f*"
+        pattern = f"nwm.t*z.{name_token}.{rt_token}.{lead_glob}.conus.nc"
+
+        out: List[Path] = []
+        for date in search_dates:
+            nwm_dir = self.input_path / f"nwm.{date.strftime('%Y%m%d')}"
             if not nwm_dir.exists():
                 continue
+            found = (set((nwm_dir / product).glob(pattern))
+                     | set(nwm_dir.glob(pattern)))
+            out.extend(sorted(found))
+        return out
 
-            for product in search_products:
-                # analysis_assim uses tmHH lookback; forecast products use fHHH
-                lead_glob = "tm*" if product == "analysis_assim" else "f*"
-                pattern = (
-                    f"nwm.t*z.{product}.channel_rt.{lead_glob}.conus.nc"
-                )
-                # Production layout has a per-product subdirectory; older
-                # caches may have flat files. Try both, dedup by path.
-                found = sorted(
-                    set(
-                        list((nwm_dir / product).glob(pattern))
-                        + list(nwm_dir.glob(pattern))
-                    )
-                )
-                if found:
-                    nwm_files.extend(found)
-                    # Stop at first product that returns files so we don't
-                    # mix analysis with forecast on the same time grid.
-                    break
+    def _select_forecast_files(self, search_dates: List[datetime],
+                               analysis_files: List[Path]) -> List[Path]:
+        """Pick one NWM forecast file per future hour to cover the window tail.
 
-            if nwm_files:
-                break
+        Globs every ``short_range`` and ``medium_range_mem1`` channel_rt file
+        under ``search_dates``, keeps those valid AFTER the analysis frontier
+        and within the phase window, then collapses to a single file per
+        integer valid hour. Precedence per hour: ``short_range`` before
+        ``medium_range`` (a shorter lead = a more recent issuing cycle for the
+        same valid time), and within a product the smallest lead (freshest).
 
-        return nwm_files
+        This mirrors the operational ``schism_cp_nwm_files_local.sh`` staging
+        (analysis ``tm00`` over the nowcast, ``short_range`` ``f001..f045``,
+        ``medium_range_mem1`` to fill the 72h tail) without reimplementing its
+        cycle-walk/lead-offset arithmetic: the valid-time sort + per-hour dedup
+        selects the same files the shell stages.
+
+        Returning one file per hour (not the full glob) bounds how many
+        NetCDFs ``_extract_streamflow*`` opens — the medium_range tree alone
+        is ~thousands of paths across two days.
+        """
+        start = self._phase_start_time()
+        window_end = start + timedelta(hours=self._phase_total_hours() + 1)
+        if analysis_files:
+            # Forecast continues strictly past the latest observed analysis.
+            frontier = max(_nwm_valid_time(f) for f in analysis_files)
+        else:
+            # No analysis staged → forecast owns the whole window from start.
+            frontier = start - timedelta(hours=1)
+
+        product_rank = {"short_range": 0, "medium_range": 1}
+        candidates = (self._glob_product_files("short_range", search_dates)
+                      + self._glob_product_files("medium_range_mem1",
+                                                 search_dates))
+
+        scored: List[Tuple[datetime, int, int, str, Path]] = []
+        for f in candidates:
+            vt = _nwm_valid_time(f)
+            if vt == datetime.min or vt <= frontier or vt > window_end:
+                continue
+            m = _NWM_FNAME_RE.search(f.name)
+            if not m or m.group("lead_kind") != "f":
+                continue
+            prod = "medium_range" if "channel_rt_1" in f.name else "short_range"
+            scored.append((vt, product_rank[prod], int(m.group("lead")),
+                           str(f), f))
+
+        scored.sort()  # (valid_time, product_rank, lead, path)
+        chosen: Dict[int, Path] = {}
+        for vt, _r, _lead, _s, f in scored:
+            hour = int(round((vt - start).total_seconds() / 3600.0))
+            if hour not in chosen:
+                chosen[hour] = f
+        return [chosen[h] for h in sorted(chosen)]
 
     def _find_stofs_nwm_files(self) -> List[Path]:
         """Find NWM files using STOFS multi-cycle assembly (medium_range_mem1).
@@ -1003,10 +1087,26 @@ class NWMProcessor(ForcingProcessor):
 
                 all_flows.append(flows)
 
-                # Parse valid time from NetCDF attribute
+                # Resolve valid time -> hours from start_time, mirroring
+                # _extract_streamflow: prefer the NetCDF
+                # ``model_output_valid_time`` attribute (guarded), fall back to
+                # the filename (``_nwm_valid_time``), and only then to a
+                # sequential index. The filename fallback matters for the
+                # analysis+forecast blend — a file missing the attribute must
+                # still land on its true valid hour, otherwise the index
+                # fallback would mis-order the mixed-product series.
+                model_time: Optional[datetime] = None
                 if hasattr(ds, 'model_output_valid_time'):
-                    model_time = datetime.strptime(
-                        ds.model_output_valid_time, "%Y-%m-%d_%H:%M:%S")
+                    try:
+                        model_time = datetime.strptime(
+                            ds.model_output_valid_time, "%Y-%m-%d_%H:%M:%S")
+                    except (TypeError, ValueError):
+                        model_time = None
+                if model_time is None:
+                    fname_time = _nwm_valid_time(nwm_file)
+                    if fname_time != datetime.min:
+                        model_time = fname_time
+                if model_time is not None:
                     t_seconds = (model_time - start_time).total_seconds()
                 else:
                     t_seconds = len(all_times) * 3600.0  # hourly fallback
@@ -1227,6 +1327,23 @@ class NWMProcessor(ForcingProcessor):
                 f"no gaps, output starts at h=0"
             )
 
+        # Trailing forward-fill guard. Every hour past the last real NWM row
+        # repeats that row's flow, so a long trailing fill = a FLAT source
+        # series over the window tail (analysis-only discovery with no forecast
+        # files staged). The forecast blend in _find_secofs_nwm_files should
+        # keep this small; a loud warning surfaces the regression instead of
+        # letting SCHISM run on a constant-discharge tail.
+        last_real_hour = sorted_hours[-1]
+        trailing_fill = (n_target - 1) - last_real_hour
+        if trailing_fill > self.PAD_WARN_HOURS:
+            log.warning(
+                f"NWM source series FLAT for the final {trailing_fill}h: last "
+                f"real NWM row is at hour {last_real_hour} of {n_target - 1}; "
+                f"the tail is forward-filled (constant). NWM forecast "
+                f"(short_range/medium_range_mem1) appears missing for the "
+                f"window tail — check COMINnwm availability."
+            )
+
         return np.stack(out_flows, axis=0), out_times
 
     def _pad_to_target(self, flows: np.ndarray, times: List[float],
@@ -1247,6 +1364,9 @@ class NWMProcessor(ForcingProcessor):
         last_time = times[-1] if times else 0.0
         times.extend([last_time + (i + 1) for i in range(n_pad)])
 
+        # Note: the flat-tail guard lives in _normalize_to_simulation_grid,
+        # which forward-fills to n_target before this is reached. This path
+        # only runs if normalize returns fewer than n_target rows.
         log.info(f"Padded river forcing from {n_current} to {n_target} time steps")
         return flows, times
 
