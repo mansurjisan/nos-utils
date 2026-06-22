@@ -930,16 +930,6 @@ class PrepOrchestrator:
                 "condition": True,
                 "label": "OBC",
             },
-            # --- COMMON: OBC (combined, COMF convention) ---
-            {
-                "tar_name": f"{prefix}.{cycle}.{pdy}.obc.tar",
-                "payload_files": [
-                    "elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc",
-                    "uv3D.th.nc", "TEM_nu.nc", "SAL_nu.nc",
-                ],
-                "condition": True,
-                "label": "OBC (combined)",
-            },
             # --- COMMON: SECOFS-UFS boundary-flux river forcing ---
             {
                 "tar_name": f"{prefix}.{cycle}.{pdy}.river.th.tar",
@@ -1197,8 +1187,8 @@ class PrepOrchestrator:
             # Everything in this branch is the original implementation,
             # unchanged, executed verbatim when the manifest flag is OFF.
 
-            # Tar OBC files
-            # COMF convention: one combined obc.tar with all 6 files (boundary + nudging)
+            # Tar OBC files (phase-specific): obc.nowcast.tar / obc.forecast.tar,
+            # each with all 6 files (boundary + nudging).
             obc_files = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc",
                          "TEM_nu.nc", "SAL_nu.nc"]
             existing_obc = [work_dir / f for f in obc_files if (work_dir / f).exists()]
@@ -1216,20 +1206,6 @@ class PrepOrchestrator:
                     log.info(f"  Archived OBC -> {phase_tar_name}")
                 except (subprocess.CalledProcessError, FileNotFoundError) as e:
                     log.warning(f"  Failed to tar OBC (phase): {e}")
-
-                # Combined obc.tar (COMF convention): single tar with all 6 files
-                combined_tar_name = f"{prefix}.{cycle}.{pdy}.obc.tar"
-                combined_tar_path = comout / combined_tar_name
-                try:
-                    file_list = [f.name for f in existing_obc]
-                    subprocess.run(
-                        ["tar", "-cf", str(combined_tar_path), "-C", str(work_dir)] + file_list,
-                        check=True, capture_output=True,
-                    )
-                    archived.append(combined_tar_path)
-                    log.info(f"  Archived OBC (combined) -> {combined_tar_name}")
-                except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                    log.warning(f"  Failed to tar OBC (combined): {e}")
 
             # SECOFS-UFS boundary-flux river forcing — schism_flux/temp/salt.th
             # tarred together as ${prefix}.${cycle}.${pdy}.river.th.tar. Matches
@@ -1277,11 +1253,8 @@ class PrepOrchestrator:
         # downstream consumers (model_configure et al. in COMOUT) work
         # whether prep ran via legacy shell or Python.
         copy_map = {
-            "param.nml": f"{prefix}.{cycle}.{pdy}.{phase}.in",
             "bctides.in": f"{prefix}.{cycle}.{pdy}.bctides.in.{phase}",
             "source_sink.in": f"{prefix}.source_sink.in",
-            "vsource.th": f"{prefix}.{cycle}.{pdy}.river.vsource.th",
-            "msource.th": f"{prefix}.{cycle}.{pdy}.river.msource.th",
             "sflux_inputs.txt": "sflux_inputs.txt",
             "partition.prop": "partition.prop",
             # UFS-Coastal config files (nws=4). Names match what the
