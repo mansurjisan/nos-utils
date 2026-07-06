@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ..config import ForcingConfig
+from ..geo import domain_center_lon, unwrap_to_domain
 from ..io.grib_extract import GRIBExtractor, get_extractor
 from .base import ForcingProcessor, ForcingResult
 from .sflux_writer import SfluxWriter
@@ -506,6 +507,12 @@ class HRRRProcessor(ForcingProcessor):
         # Use forcing_domain so nws=4 extracts over the wide DATM grid.
         if native_lons is not None:
             lon_min, lon_max, lat_min, lat_max = self.config.forcing_domain
+            # Unwrap into the domain-centered frame so a dateline-crossing tile
+            # (HRRR-Alaska for Pacific) is contiguous and the written sflux/DATM
+            # lon matches the 0-360 hgrid; no-op for Atlantic. Winds were already
+            # rotated above on the -180..180 native grid (frame-invariant here).
+            center = domain_center_lon(lon_min, lon_max)
+            native_lons = unwrap_to_domain(native_lons, center).astype(np.float32)
             # Find bounding box in grid indices
             in_domain = (
                 (native_lons >= lon_min) & (native_lons <= lon_max) &
@@ -569,8 +576,10 @@ class HRRRProcessor(ForcingProcessor):
             return None
 
         lon_min, lon_max, lat_min, lat_max = domain
+        center = domain_center_lon(lon_min, lon_max)
         ny_target, nx_target = len(target_lats), len(target_lons)
         target_lon_2d, target_lat_2d = np.meshgrid(target_lons, target_lats)
+        target_lon_2d = unwrap_to_domain(target_lon_2d, center)
 
         file_data = {}
 
@@ -611,9 +620,6 @@ class HRRRProcessor(ForcingProcessor):
                             lo = float(parts[0])
                             la = float(parts[1])
                             va = float(parts[2])
-                            # Convert 0-360 to -180-180 if needed
-                            if lo > 180:
-                                lo -= 360.0
                             lons_lcc.append(lo)
                             lats_lcc.append(la)
                             vals.append(va)
@@ -626,7 +632,10 @@ class HRRRProcessor(ForcingProcessor):
             if not vals:
                 continue
 
-            lons_lcc = np.array(lons_lcc, dtype=np.float32)
+            # Unwrap parsed source lons into the same domain-centered frame as
+            # the target grid (dateline-safe; no-op for Atlantic).
+            lons_lcc = unwrap_to_domain(
+                np.array(lons_lcc, dtype=np.float32), center).astype(np.float32)
             lats_lcc = np.array(lats_lcc, dtype=np.float32)
             vals = np.array(vals, dtype=np.float32)
 

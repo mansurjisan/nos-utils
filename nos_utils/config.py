@@ -10,6 +10,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from .geo import crosses_dateline as _crosses_dateline
+from .geo import domain_center_lon as _domain_center_lon
+
 log = logging.getLogger(__name__)
 
 
@@ -248,6 +251,24 @@ class ForcingConfig:
     def domain(self):
         """Return domain bounds as tuple (lon_min, lon_max, lat_min, lat_max)."""
         return (self.lon_min, self.lon_max, self.lat_min, self.lat_max)
+
+    @property
+    def domain_center_lon(self) -> float:
+        """Frame center 0.5*(lon_min+lon_max) of the MODEL domain (authored frame).
+
+        Interpolation modules that mask against a WIDER extent (atmospheric
+        forcing over ``forcing_domain``/``datm_domain``) must instead derive
+        their unwrap center from that same tuple, not this one.
+        """
+        return _domain_center_lon(self.lon_min, self.lon_max)
+
+    @property
+    def crosses_dateline(self) -> bool:
+        """True when any authored bound exceeds 180E (a 0-360 domain, e.g. Pacific).
+
+        Hint only; ``nos_utils.geo.unwrap_to_domain`` handles both cases uniformly.
+        """
+        return _crosses_dateline(self.lon_min, self.lon_max)
 
     @property
     def hrrr_domain(self):

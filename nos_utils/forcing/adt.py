@@ -30,6 +30,7 @@ from typing import Optional
 import numpy as np
 
 from ..config import ForcingConfig
+from ..geo import domain_center_lon, unwrap_to_domain
 
 log = logging.getLogger(__name__)
 
@@ -39,11 +40,16 @@ try:
 except ImportError:
     HAS_NETCDF4 = False
 
-# ADT subset domain (eastern boundary region)
+# ADT subset domain for western-hemisphere STOFS-3D-ATL: the operational
+# eastern-boundary strip (ncks -d longitude,-62.5,-51.5 -d latitude,7.0,54.0).
+# Kept exactly so Atlantic ADT output stays byte-identical.
 ADT_LON_MIN = -62.5
 ADT_LON_MAX = -51.5
 ADT_LAT_MIN = 7.0
 ADT_LAT_MAX = 54.0
+# Padding (deg) around a DATELINE domain's config bounds, where ADT is derived
+# from the model domain instead (the fixed Atlantic strip cannot cover it).
+ADT_BBOX_PAD_DEG = 1.0
 
 
 class ADTBlender:
@@ -142,7 +148,7 @@ class ADTBlender:
         return None
 
     def _read_adt(self, adt_path: Path) -> Optional[np.ndarray]:
-        """Read and subset ADT data to the eastern boundary domain."""
+        """Read and subset ADT data to the model domain (dateline-safe)."""
         try:
             ds = Dataset(str(adt_path))
 
@@ -153,33 +159,54 @@ class ADTBlender:
             lons = np.array(ds.variables[lon_name][:])
             lats = np.array(ds.variables[lat_name][:])
 
-            # Subset to ADT domain
-            lon_mask = (lons >= ADT_LON_MIN) & (lons <= ADT_LON_MAX)
-            lat_mask = (lats >= ADT_LAT_MIN) & (lats <= ADT_LAT_MAX)
+            if self.config.crosses_dateline:
+                # Dateline-spanning domain (Pacific): unwrap the global CMEMS ADT
+                # longitudes into the domain-centered window so the west half
+                # (92.5..180) and east half (CMEMS -180..-70 -> 180..290) are
+                # contiguous, then subset with ONE domain-derived bbox (replaces
+                # the operational dual-region + shift).
+                center_lon = domain_center_lon(self.config.lon_min, self.config.lon_max)
+                lons_u = unwrap_to_domain(lons, center_lon)
+                pad = ADT_BBOX_PAD_DEG
+                lon_lo, lon_hi = self.config.lon_min - pad, self.config.lon_max + pad
+                lat_lo, lat_hi = self.config.lat_min - pad, self.config.lat_max + pad
+            else:
+                # Western-hemisphere domain (STOFS-3D-ATL): keep the exact
+                # operational eastern-boundary strip -> byte-identical output.
+                lons_u = lons
+                lon_lo, lon_hi = ADT_LON_MIN, ADT_LON_MAX
+                lat_lo, lat_hi = ADT_LAT_MIN, ADT_LAT_MAX
+
+            lon_mask = (lons_u >= lon_lo) & (lons_u <= lon_hi)
+            lat_mask = (lats >= lat_lo) & (lats <= lat_hi)
 
             lon_idx = np.where(lon_mask)[0]
             lat_idx = np.where(lat_mask)[0]
 
-            if len(lon_idx) == 0 or len(lat_idx) == 0:
+            if lon_idx.size == 0 or lat_idx.size == 0:
                 ds.close()
                 log.warning("ADT data doesn't cover target domain")
                 return None
+
+            # After unwrapping, the selected columns can wrap the dateline as two
+            # non-contiguous index groups, so a lon_idx[0]:lon_idx[-1]+1 slice
+            # would span the globe. Order the columns by unwrapped lon and
+            # fancy-index them so the subset grid stays monotonic (Atlantic:
+            # already contiguous -> order-preserving).
+            lon_idx = lon_idx[np.argsort(lons_u[lon_idx])]
+            lat_sl = slice(int(lat_idx[0]), int(lat_idx[-1]) + 1)
 
             # Read ADT variable
             adt_var = "adt" if "adt" in ds.variables else "surf_el"
             adt_data = ds.variables[adt_var]
             if adt_data.ndim == 3:
-                # (time, lat, lon) — take mean across time if multiple
-                subset = np.ma.filled(
-                    adt_data[:, lat_idx[0]:lat_idx[-1]+1, lon_idx[0]:lon_idx[-1]+1],
-                    fill_value=np.nan,
-                )
+                # (time, lat, lon): load the lat band, fancy-select lon columns
+                subset = np.ma.filled(adt_data[:, lat_sl, :], fill_value=np.nan)
+                subset = subset[:, :, lon_idx]
                 adt_mean = np.nanmean(subset, axis=0)
             else:
-                adt_mean = np.ma.filled(
-                    adt_data[lat_idx[0]:lat_idx[-1]+1, lon_idx[0]:lon_idx[-1]+1],
-                    fill_value=np.nan,
-                )
+                subset = np.ma.filled(adt_data[lat_sl, :], fill_value=np.nan)
+                adt_mean = subset[:, lon_idx]
 
             ds.close()
             log.info(f"Read ADT: shape={adt_mean.shape}, "

@@ -18,6 +18,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ..geo import unwrap_to_domain
+
 log = logging.getLogger(__name__)
 
 try:
@@ -36,17 +38,24 @@ class StructuredGridInterpolator:
     """
 
     def __init__(self, lon_2d: np.ndarray, lat_2d: np.ndarray,
-                 mask: Optional[np.ndarray] = None):
+                 mask: Optional[np.ndarray] = None,
+                 center_lon: Optional[float] = None):
         """
         Build interpolator from a structured grid.
 
         Args:
-            lon_2d: Longitude array, shape (ny, nx). Will be converted to -180/180.
+            lon_2d: Longitude array, shape (ny, nx).
             lat_2d: Latitude array, shape (ny, nx).
             mask: Boolean ocean mask, shape (ny, nx). True = ocean. If None, all ocean.
+            center_lon: Domain center for dateline-safe lon unwrap (0-360 domains).
+                ``None`` keeps the legacy -180/180 fold. When set, the caller
+                MUST pass ``interpolate`` target lons unwrapped to the SAME center.
         """
         self.ny, self.nx = lon_2d.shape
-        self.lon = np.where(lon_2d > 180, lon_2d - 360, lon_2d).astype(np.float64)
+        if center_lon is None:
+            self.lon = np.where(lon_2d > 180, lon_2d - 360, lon_2d).astype(np.float64)
+        else:
+            self.lon = unwrap_to_domain(lon_2d, center_lon).astype(np.float64)
         self.lat = lat_2d.astype(np.float64)
         self.mask = mask if mask is not None else np.ones((self.ny, self.nx), dtype=bool)
 

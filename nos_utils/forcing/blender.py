@@ -37,6 +37,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from ..config import ForcingConfig
+from ..geo import domain_center_lon, unwrap_to_domain
 from .base import ForcingProcessor, ForcingResult
 
 log = logging.getLogger(__name__)
@@ -178,17 +179,34 @@ class BlenderProcessor(ForcingProcessor):
         gfs_lon_full = np.asarray(gfs.variables["longitude"][:], dtype=np.float32)
         gfs_time = np.asarray(gfs.variables["time"][:], dtype=np.float64)
 
-        # GFS lon may be 0..360; convert to -180..180
-        gfs_lon_180 = np.where(gfs_lon_full > 180, gfs_lon_full - 360, gfs_lon_full)
+        # Unwrap GFS lon into the domain-centered frame so a dateline-spanning
+        # domain (STOFS-3D-Pacific) stays contiguous; no-op for Atlantic. The
+        # target grid already lies in this frame (a valid domain is within its
+        # own center window), so source and target match.
+        center = domain_center_lon(lon_min, lon_max)
+        gfs_lon_uw = unwrap_to_domain(gfs_lon_full, center)
 
         # Subset GFS to target box (1° buffer)
         BUFFER = 1.0
         lat_mask = (gfs_lat_full >= lat_min - BUFFER) & (gfs_lat_full <= lat_max + BUFFER)
-        lon_mask = (gfs_lon_180 >= lon_min - BUFFER) & (gfs_lon_180 <= lon_max + BUFFER)
+        lon_mask = (gfs_lon_uw >= lon_min - BUFFER) & (gfs_lon_uw <= lon_max + BUFFER)
         gfs_lat_idx = np.where(lat_mask)[0]
         gfs_lon_idx = np.where(lon_mask)[0]
         gfs_lat = gfs_lat_full[lat_mask]
-        gfs_lon = gfs_lon_180[lon_mask]
+        gfs_lon = gfs_lon_uw[lon_mask]
+
+        # RegularGridInterpolator (below) needs strictly-increasing lon, and the
+        # gfs_data column slice (gfs_lon_idx[0]:gfs_lon_idx[-1]+1) must align with
+        # the boolean-masked gfs_lon. Both hold when the masked indices are
+        # contiguous -- true for a 0-360 or pre-cropped GFS on any domain. A
+        # GLOBAL GFS stored in -180..180 on a dateline-spanning domain splits
+        # across the array seam (non-contiguous) -> fail clearly, not deep in scipy.
+        if gfs_lon.size > 1 and not np.all(np.diff(gfs_lon) > 0):
+            raise ValueError(
+                "GFS longitude non-monotonic after dateline unwrap; a global "
+                "-180..180 GFS on a dateline-spanning domain is unsupported -- "
+                "provide 0-360 or pre-cropped GFS forcing."
+            )
         log.info(f"GFS subset: {len(gfs_lat)} x {len(gfs_lon)}, {len(gfs_time)} timesteps")
 
         if gfs_lat[0] > gfs_lat[-1]:
@@ -215,6 +233,9 @@ class BlenderProcessor(ForcingProcessor):
             hrrr_time_raw = np.asarray(hrrr.variables["time"][:], dtype=np.float64)
             hrrr_lon2d_full = np.asarray(hrrr.variables["longitude"][:], dtype=np.float32)
             hrrr_lat2d_full = np.asarray(hrrr.variables["latitude"][:], dtype=np.float32)
+            # Unwrap HRRR lon into the same domain-centered frame as GFS + target
+            # (dateline-safe; no-op for Atlantic).
+            hrrr_lon2d_full = unwrap_to_domain(hrrr_lon2d_full, center).astype(np.float32)
 
             # Subset HRRR to target box (1° buffer)
             hrrr_mask = (

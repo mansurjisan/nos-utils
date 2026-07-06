@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ..config import ForcingConfig
+from ..geo import domain_center_lon, unwrap_to_domain
 from ..io.schism_grid import SchismGrid
 from .base import ForcingProcessor, ForcingResult
 
@@ -868,9 +869,14 @@ class RTOFSProcessor(ForcingProcessor):
         """
         n_bnd = len(self._bnd_lons)
 
-        # Delaunay interpolation with corner points (matching Fortran INTERP_REMESH)
-        # Use -180/180 convention (matching Fortran: if lon>180, lon=lon-360)
-        target_pts = np.column_stack([self._bnd_lons, self._bnd_lats])
+        # Delaunay interpolation with corner points (matching Fortran INTERP_REMESH).
+        # Unwrap BOTH target and source lon into the domain-centered 360-deg window
+        # so dateline-spanning domains (STOFS-3D-Pacific, lon 92.5->290) are
+        # contiguous. No-op for western-hemisphere domains (STOFS-3D-ATL). LOCAL
+        # copy only -- self._bnd_lons stays in its authored frame.
+        center_lon = domain_center_lon(self.config.lon_min, self.config.lon_max)
+        bnd_lon_u = unwrap_to_domain(self._bnd_lons, center_lon)
+        target_pts = np.column_stack([bnd_lon_u, self._bnd_lats])
 
         # Flatten RTOFS grid
         if rtofs_lon.ndim == 2:
@@ -883,13 +889,13 @@ class RTOFSProcessor(ForcingProcessor):
 
         data_flat = rtofs_data.ravel()
 
-        # Convert RTOFS lons to -180/180 (matching Fortran convention)
-        lon_flat = np.where(lon_flat > 180, lon_flat - 360, lon_flat)
+        # Unwrap RTOFS lons into the same domain-centered frame as the target
+        lon_flat = unwrap_to_domain(lon_flat, center_lon)
 
         # Subset to domain bounding box (matching Fortran minlon/maxlon from CTL)
         buf = 1.0  # 1-degree buffer (Fortran uses CTL bounds + 1 grid cell)
-        lon_min = self._bnd_lons.min() - buf
-        lon_max = self._bnd_lons.max() + buf
+        lon_min = bnd_lon_u.min() - buf
+        lon_max = bnd_lon_u.max() + buf
         lat_min = self._bnd_lats.min() - buf
         lat_max = self._bnd_lats.max() + buf
         domain_mask = ((lon_flat >= lon_min) & (lon_flat <= lon_max) &
@@ -995,7 +1001,7 @@ class RTOFSProcessor(ForcingProcessor):
         except ImportError:
             result = np.zeros(n_bnd, dtype=np.float32)
             for k in range(n_bnd):
-                dist = (ocean_pts[:, 0] - self._bnd_lons[k])**2 + \
+                dist = (ocean_pts[:, 0] - bnd_lon_u[k])**2 + \
                        (ocean_pts[:, 1] - self._bnd_lats[k])**2
                 result[k] = ocean_val[np.argmin(dist)]
 
@@ -1292,12 +1298,14 @@ class RTOFSProcessor(ForcingProcessor):
             log.info("3D ROI: skipping — lon/lat are not 2D curvilinear arrays")
             return None
 
-        # Convert to -180/180 to match boundary node convention
-        full_lon = np.where(full_lon > 180, full_lon - 360, full_lon)
+        # Unwrap grid + target into the domain-centered 360-deg window (dateline-safe)
+        center_lon = domain_center_lon(self.config.lon_min, self.config.lon_max)
+        full_lon = unwrap_to_domain(full_lon, center_lon)
+        bnd_lon_u = unwrap_to_domain(self._bnd_lons, center_lon)
 
         buf = 1.0  # 1-degree buffer around boundary domain
-        lon_min = float(self._bnd_lons.min()) - buf
-        lon_max = float(self._bnd_lons.max()) + buf
+        lon_min = float(bnd_lon_u.min()) - buf
+        lon_max = float(bnd_lon_u.max()) + buf
         lat_min = float(self._bnd_lats.min()) - buf
         lat_max = float(self._bnd_lats.max()) + buf
 

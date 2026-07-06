@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ..config import ForcingConfig
+from ..geo import domain_center_lon, unwrap_to_domain
 from .base import ForcingProcessor, ForcingResult
 
 log = logging.getLogger(__name__)
@@ -857,6 +858,12 @@ class NudgingProcessor(ForcingProcessor):
         except ImportError:
             return None
 
+        # Unwrap target + source lon into the domain-centered 360-deg window so
+        # dateline-spanning domains (STOFS-3D-Pacific) are contiguous; no-op for
+        # Atlantic. Local copy -- the caller's nudge_lons array is untouched.
+        center_lon = domain_center_lon(self.config.lon_min, self.config.lon_max)
+        target_lons = unwrap_to_domain(target_lons, center_lon)
+
         target_pts = np.column_stack([target_lons, target_lats])
 
         # Flatten RTOFS grid (same logic as _interpolate_2d_to_boundary)
@@ -874,7 +881,7 @@ class NudgingProcessor(ForcingProcessor):
             lat_flat = lat_2d.ravel()
 
         data_flat = surface_arr.ravel()
-        lon_flat = np.where(lon_flat > 180, lon_flat - 360, lon_flat)
+        lon_flat = unwrap_to_domain(lon_flat, center_lon)
 
         # Domain bounding-box subset
         buf = 1.0

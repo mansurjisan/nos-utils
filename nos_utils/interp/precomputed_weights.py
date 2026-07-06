@@ -30,6 +30,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ..geo import unwrap_to_domain
+
 log = logging.getLogger(__name__)
 
 try:
@@ -96,6 +98,7 @@ def build_npz(
     rtofs_lat_2d: np.ndarray,
     out_npz: Path,
     tol: float = 0.01,
+    center_lon: Optional[float] = None,
 ) -> None:
     """
     One-time conversion: export text → production .npz with grid indices.
@@ -106,15 +109,22 @@ def build_npz(
         rtofs_lat_2d: RTOFS 2D latitude array (ny, nx)
         out_npz: Output NPZ path
         tol: Max allowed distance (degrees) for source-to-grid matching
+        center_lon: Domain center for dateline-safe lon unwrap (0-360 domains,
+            e.g. STOFS-3D-Pacific). ``None`` keeps the legacy -180..180 fold so
+            existing Atlantic NPZ hashes stay byte-identical.
     """
     exp = load_remesh_export(export_txt)
 
-    lon = np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d)
+    if center_lon is None:
+        lon = np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d)
+        src_lon = exp["source_lon"]
+    else:
+        lon = unwrap_to_domain(rtofs_lon_2d, center_lon)
+        src_lon = unwrap_to_domain(exp["source_lon"], center_lon)
     lat = rtofs_lat_2d
     flat_lon = lon.ravel()
     flat_lat = lat.ravel()
 
-    src_lon = exp["source_lon"]
     src_lat = exp["source_lat"]
     is_corner = exp["source_is_corner"]
 
@@ -171,6 +181,7 @@ def build_npz(
         corner_mean_export=np.float64(float(exp["metadata"].get("corner_mean", "0"))),
         n_target=np.int32(len(exp["mode"])),
         n_source_data=np.int32(int(exp["metadata"].get("n_source_data", "0"))),
+        center_lon=np.float64(np.nan if center_lon is None else center_lon),
     )
 
     log.info(f"Built SSH weight NPZ: {len(exp['mode'])} targets, "
@@ -185,9 +196,14 @@ def validate_grid(npz: dict, rtofs_lon_2d: np.ndarray, rtofs_lat_2d: np.ndarray)
             f"Grid shape mismatch: weights for {tuple(npz['grid_shape'])}, "
             f"data is {rtofs_lon_2d.shape}")
 
-    lon = np.ascontiguousarray(
-        np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d),
-        dtype=np.float64)
+    _center = npz["center_lon"] if "center_lon" in npz else None
+    if _center is None or not np.isfinite(np.asarray(_center, dtype=float)):
+        lon = np.ascontiguousarray(
+            np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d),
+            dtype=np.float64)
+    else:
+        lon = np.ascontiguousarray(
+            unwrap_to_domain(rtofs_lon_2d, float(_center)), dtype=np.float64)
     lat = np.ascontiguousarray(rtofs_lat_2d, dtype=np.float64)
     current_hash = hashlib.md5(lon.tobytes() + lat.tobytes()).hexdigest()
     stored_hash = str(npz["grid_hash"][0])
@@ -256,6 +272,7 @@ def build_nudge_npz(
     rtofs_lat_2d: np.ndarray,
     out_npz: Path,
     tol: float = 0.01,
+    center_lon: Optional[float] = None,
 ) -> None:
     """
     One-time conversion: nudge export text -> production .npz with grid indices.
@@ -273,12 +290,16 @@ def build_nudge_npz(
     """
     exp = load_remesh_export(export_txt)
 
-    lon = np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d)
+    if center_lon is None:
+        lon = np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d)
+        src_lon = exp["source_lon"]
+    else:
+        lon = unwrap_to_domain(rtofs_lon_2d, center_lon)
+        src_lon = unwrap_to_domain(exp["source_lon"], center_lon)
     lat = rtofs_lat_2d
     flat_lon = lon.ravel()
     flat_lat = lat.ravel()
 
-    src_lon = exp["source_lon"]
     src_lat = exp["source_lat"]
     is_corner = exp["source_is_corner"]
 
@@ -332,6 +353,7 @@ def build_nudge_npz(
         corner_mean_export=np.float64(float(exp["metadata"].get("corner_mean", "0"))),
         n_target=np.int32(len(exp["mode"])),
         n_source_data=np.int32(int(exp["metadata"].get("n_source_data", "0"))),
+        center_lon=np.float64(np.nan if center_lon is None else center_lon),
     )
 
     log.info(f"Built NUDGE weight NPZ: {len(exp['mode'])} targets, "
@@ -345,6 +367,7 @@ def build_3d_npz(
     rtofs_lat_2d: np.ndarray,
     out_npz: Path,
     tol: float = 0.01,
+    center_lon: Optional[float] = None,
 ) -> None:
     """
     One-time conversion: 3D T/S export text -> production .npz with grid indices.
@@ -364,12 +387,16 @@ def build_3d_npz(
     """
     exp = load_remesh_export(export_txt)
 
-    lon = np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d)
+    if center_lon is None:
+        lon = np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d)
+        src_lon = exp["source_lon"]
+    else:
+        lon = unwrap_to_domain(rtofs_lon_2d, center_lon)
+        src_lon = unwrap_to_domain(exp["source_lon"], center_lon)
     lat = rtofs_lat_2d
     flat_lon = lon.ravel()
     flat_lat = lat.ravel()
 
-    src_lon = exp["source_lon"]
     src_lat = exp["source_lat"]
     is_corner = exp["source_is_corner"]
 
@@ -423,6 +450,7 @@ def build_3d_npz(
         corner_mean_export=np.float64(float(exp["metadata"].get("corner_mean", "0"))),
         n_target=np.int32(len(exp["mode"])),
         n_source_data=np.int32(int(exp["metadata"].get("n_source_data", "0"))),
+        center_lon=np.float64(np.nan if center_lon is None else center_lon),
     )
 
     log.info(f"Built 3D weight NPZ: {len(exp['mode'])} targets, "
