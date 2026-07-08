@@ -35,6 +35,11 @@ def cmd_prep(args):
             config = ForcingConfig.for_stofs_3d_atl_ufs(pdy=args.pdy, cyc=args.cyc)
         else:
             config = ForcingConfig.for_stofs_3d_atl(pdy=args.pdy, cyc=args.cyc)
+    elif args.ofs in ("stofs_3d_pac", "stofs_3d_pac_ufs"):
+        if args.ufs or args.ofs == "stofs_3d_pac_ufs":
+            config = ForcingConfig.for_stofs_3d_pac_ufs(pdy=args.pdy, cyc=args.cyc)
+        else:
+            config = ForcingConfig.for_stofs_3d_pac(pdy=args.pdy, cyc=args.cyc)
     else:
         print(f"Unknown OFS: {args.ofs}. Use --yaml for custom configs.")
         sys.exit(1)
@@ -70,6 +75,8 @@ def cmd_list(args):
     print("  secofs          — SE Coastal (6h nowcast, 48h forecast)")
     print("  secofs_ufs      — SE Coastal UFS-Coastal (nws=4)")
     print("  stofs_3d_atl    — Atlantic Storm Surge (24h nowcast, 108h forecast)")
+    print("  stofs_3d_pac    — Pacific Storm Surge (24h nowcast, 108h forecast)")
+    print("  stofs_3d_pac_ufs — Pacific Storm Surge UFS-Coastal (nws=4, 0-360 domain)")
     print("  ensemble        — Ensemble member forcing")
     print()
     print("Processors:")

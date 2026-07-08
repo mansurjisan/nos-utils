@@ -37,6 +37,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from ..config import ForcingConfig
+from ..coords import normalize_lon, lon_convention
 from .base import ForcingProcessor, ForcingResult
 
 log = logging.getLogger(__name__)
@@ -178,17 +179,18 @@ class BlenderProcessor(ForcingProcessor):
         gfs_lon_full = np.asarray(gfs.variables["longitude"][:], dtype=np.float32)
         gfs_time = np.asarray(gfs.variables["time"][:], dtype=np.float64)
 
-        # GFS lon may be 0..360; convert to -180..180
-        gfs_lon_180 = np.where(gfs_lon_full > 180, gfs_lon_full - 360, gfs_lon_full)
+        # GFS lon may be 0..360 or -180..180; convert to match target domain convention
+        _conv = lon_convention(self.config)
+        gfs_lon_norm = normalize_lon(gfs_lon_full, _conv)
 
         # Subset GFS to target box (1° buffer)
         BUFFER = 1.0
         lat_mask = (gfs_lat_full >= lat_min - BUFFER) & (gfs_lat_full <= lat_max + BUFFER)
-        lon_mask = (gfs_lon_180 >= lon_min - BUFFER) & (gfs_lon_180 <= lon_max + BUFFER)
+        lon_mask = (gfs_lon_norm >= lon_min - BUFFER) & (gfs_lon_norm <= lon_max + BUFFER)
         gfs_lat_idx = np.where(lat_mask)[0]
         gfs_lon_idx = np.where(lon_mask)[0]
         gfs_lat = gfs_lat_full[lat_mask]
-        gfs_lon = gfs_lon_180[lon_mask]
+        gfs_lon = gfs_lon_norm[lon_mask]
         log.info(f"GFS subset: {len(gfs_lat)} x {len(gfs_lon)}, {len(gfs_time)} timesteps")
 
         if gfs_lat[0] > gfs_lat[-1]:

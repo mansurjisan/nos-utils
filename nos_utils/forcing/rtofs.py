@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ..config import ForcingConfig
+from ..coords import normalize_lon, lon_convention
 from ..io.schism_grid import SchismGrid
 from .base import ForcingProcessor, ForcingResult
 
@@ -869,7 +870,7 @@ class RTOFSProcessor(ForcingProcessor):
         n_bnd = len(self._bnd_lons)
 
         # Delaunay interpolation with corner points (matching Fortran INTERP_REMESH)
-        # Use -180/180 convention (matching Fortran: if lon>180, lon=lon-360)
+        # target_pts uses the mesh boundary convention (same as self._bnd_lons)
         target_pts = np.column_stack([self._bnd_lons, self._bnd_lats])
 
         # Flatten RTOFS grid
@@ -883,8 +884,10 @@ class RTOFSProcessor(ForcingProcessor):
 
         data_flat = rtofs_data.ravel()
 
-        # Convert RTOFS lons to -180/180 (matching Fortran convention)
-        lon_flat = np.where(lon_flat > 180, lon_flat - 360, lon_flat)
+        # Convert RTOFS lons to match the mesh boundary convention
+        # (Atlantic: -180/+180; Pacific: 0/+360)
+        _conv = lon_convention(self.config)
+        lon_flat = normalize_lon(lon_flat, _conv)
 
         # Subset to domain bounding box (matching Fortran minlon/maxlon from CTL)
         buf = 1.0  # 1-degree buffer (Fortran uses CTL bounds + 1 grid cell)
@@ -1292,8 +1295,9 @@ class RTOFSProcessor(ForcingProcessor):
             log.info("3D ROI: skipping — lon/lat are not 2D curvilinear arrays")
             return None
 
-        # Convert to -180/180 to match boundary node convention
-        full_lon = np.where(full_lon > 180, full_lon - 360, full_lon)
+        # Convert to match boundary node convention
+        # (Atlantic: -180/+180; Pacific: 0/+360)
+        full_lon = normalize_lon(full_lon, lon_convention(self.config))
 
         buf = 1.0  # 1-degree buffer around boundary domain
         lon_min = float(self._bnd_lons.min()) - buf

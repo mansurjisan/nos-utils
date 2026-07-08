@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ..config import ForcingConfig
+from ..coords import normalize_lon, lon_convention
 from .base import ForcingProcessor, ForcingResult
 
 log = logging.getLogger(__name__)
@@ -874,7 +875,9 @@ class NudgingProcessor(ForcingProcessor):
             lat_flat = lat_2d.ravel()
 
         data_flat = surface_arr.ravel()
-        lon_flat = np.where(lon_flat > 180, lon_flat - 360, lon_flat)
+        # Convert RTOFS lons to match the nudge-node convention
+        # (Atlantic: -180/+180; Pacific: 0/+360)
+        lon_flat = normalize_lon(lon_flat, lon_convention(self.config))
 
         # Domain bounding-box subset
         buf = 1.0

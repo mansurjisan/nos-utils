@@ -440,6 +440,78 @@ class ForcingConfig:
         return cls(**defaults)
 
     @classmethod
+    def for_stofs_3d_pac(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
+        """Factory with STOFS-3D-PAC defaults (Pacific Storm Surge, standalone SCHISM).
+
+        Domain in native 0-360 (mesh spans Indian Ocean across antimeridian).
+        Verified from hgrid.ll: 2,961,412 node rows, lon 93.1098-289.6750.
+        """
+        defaults = dict(
+            # Native 0-360 mesh bounds (verified from hgrid.ll node scan)
+            lon_min=93.1098, lon_max=289.6750,
+            lat_min=-33.0388, lat_max=66.3254,
+            pdy=pdy, cyc=cyc,
+            nowcast_hours=24, forecast_hours=108,
+            gfs_resolution="0p25",
+            met_num=2, n_levels=84,
+            model_dt=90.0,
+            # No St-Lawrence River, no CO-OPS dynamic SSH bias adjust
+            st_lawrence_enabled=False,
+            dynamic_adjust_enabled=False,
+            # Elev-forced OBC segments (0-based): Indian Ocean=0, Pacific=1, Arctic=9
+            # Segments 2-8 are flow-only river OBCs (excluded from *.th.nc).
+            obc_elev_segments=[0, 1, 9],
+            obc_ssh_offset=0.0,
+            adt_enabled=False,
+            nudging_enabled=True,
+            nudging_timescale_seconds=86400.0,
+            nwm_product="medium_range_mem1",
+            obc_min_timesteps=21,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
+    def for_stofs_3d_pac_ufs(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
+        """Factory with STOFS-3D-PAC UFS-Coastal defaults (nws=4, DATM coupling).
+
+        DATM forcing grid uses the STOFS3D_PAC preset (92.5-290.0, -33.5-67.0)
+        at 0.025 deg -> nx_global=7901, ny_global=4021.
+        Verified from weight_gfs.nc SCRIP source grid (xc_a/yc_a bounds).
+        """
+        defaults = dict(
+            lon_min=93.1098, lon_max=289.6750,
+            lat_min=-33.0388, lat_max=66.3254,
+            pdy=pdy, cyc=cyc,
+            nowcast_hours=24, forecast_hours=108,
+            gfs_resolution="0p25",
+            met_num=2, nws=4, n_levels=84,
+            model_dt=90.0,
+            st_lawrence_enabled=False,
+            dynamic_adjust_enabled=False,
+            obc_elev_segments=[0, 1, 9],
+            obc_ssh_offset=0.0,
+            adt_enabled=False,
+            nudging_enabled=True,
+            nudging_timescale_seconds=86400.0,
+            nwm_product="medium_range_mem1",
+            obc_min_timesteps=21,
+            # DATM grid — STOFS3D_PAC preset, verified from weight_gfs.nc
+            # nx = round((290.0-92.5)/0.025)+1 = 7901; ny = round((67.0-(-33.5))/0.025)+1 = 4021
+            datm_lon_min=92.5, datm_lon_max=290.0,
+            datm_lat_min=-33.5, datm_lat_max=67.0,
+            datm_dx=0.025,
+            # UFS resource layout — 3952 operational partition.prop ranks + 120 DATM
+            ufs_datm_tasks=120,
+            ufs_schism_tasks=3952,
+            ufs_total_tasks=4072,
+            ufs_nhours_fcst=108,
+            ufs_dt_atmos=720,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
     def for_ensemble(
         cls, pdy: str, cyc: int,
         member: int = 0, n_members: int = 6,
@@ -741,6 +813,11 @@ class ForcingConfig:
                     "ATLANTIC":    (-98.0, -55.0, 10.0, 53.0),
                     "SECOFS":      (-90.0, -61.0, 15.0, 42.0),
                     "STOFS3D_ATL": (-99.0, -52.0,  7.0, 53.0),
+                    # Pacific domain in native 0-360.
+                    # Verified from weight_gfs.nc SCRIP src grid (xc_a/yc_a):
+                    # lon 92.5-290.0, lat -33.5-67.0 (791x403 at 0.25 deg).
+                    # DATM blend at 0.025 deg -> nx_global=7901, ny_global=4021.
+                    "STOFS3D_PAC": (92.5, 290.0, -33.5, 67.0),
                 }
                 preset = str(ufs_coastal["datm_domain"]).upper()
                 if preset in DATM_PRESETS:

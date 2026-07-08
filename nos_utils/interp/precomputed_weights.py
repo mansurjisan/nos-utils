@@ -30,6 +30,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ..coords import normalize_lon
+
 log = logging.getLogger(__name__)
 
 try:
@@ -96,6 +98,7 @@ def build_npz(
     rtofs_lat_2d: np.ndarray,
     out_npz: Path,
     tol: float = 0.01,
+    convention: str = "pm180",
 ) -> None:
     """
     One-time conversion: export text → production .npz with grid indices.
@@ -106,10 +109,14 @@ def build_npz(
         rtofs_lat_2d: RTOFS 2D latitude array (ny, nx)
         out_npz: Output NPZ path
         tol: Max allowed distance (degrees) for source-to-grid matching
+        convention: Longitude convention to use when normalizing the RTOFS
+            grid and matching source coordinates — ``"pm180"`` (default,
+            Atlantic) or ``"0360"`` (Pacific). Must match the convention
+            of coordinates in *export_txt*.
     """
     exp = load_remesh_export(export_txt)
 
-    lon = np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d)
+    lon = normalize_lon(rtofs_lon_2d, convention)
     lat = rtofs_lat_2d
     flat_lon = lon.ravel()
     flat_lat = lat.ravel()
@@ -178,7 +185,8 @@ def build_npz(
              f"max dist={dist.max():.2e}, hash={grid_hash}")
 
 
-def validate_grid(npz: dict, rtofs_lon_2d: np.ndarray, rtofs_lat_2d: np.ndarray) -> None:
+def validate_grid(npz: dict, rtofs_lon_2d: np.ndarray, rtofs_lat_2d: np.ndarray,
+                  convention: str = "pm180") -> None:
     """Verify the RTOFS grid matches the stored weight mapping."""
     if tuple(rtofs_lon_2d.shape) != tuple(npz["grid_shape"]):
         raise ValueError(
@@ -186,7 +194,7 @@ def validate_grid(npz: dict, rtofs_lon_2d: np.ndarray, rtofs_lat_2d: np.ndarray)
             f"data is {rtofs_lon_2d.shape}")
 
     lon = np.ascontiguousarray(
-        np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d),
+        normalize_lon(rtofs_lon_2d, convention),
         dtype=np.float64)
     lat = np.ascontiguousarray(rtofs_lat_2d, dtype=np.float64)
     current_hash = hashlib.md5(lon.tobytes() + lat.tobytes()).hexdigest()
@@ -256,6 +264,7 @@ def build_nudge_npz(
     rtofs_lat_2d: np.ndarray,
     out_npz: Path,
     tol: float = 0.01,
+    convention: str = "pm180",
 ) -> None:
     """
     One-time conversion: nudge export text -> production .npz with grid indices.
@@ -270,10 +279,11 @@ def build_nudge_npz(
         rtofs_lat_2d: RTOFS 2D latitude array (ny, nx)
         out_npz: Output NPZ path
         tol: Max allowed distance (degrees) for source-to-grid matching
+        convention: Longitude convention (``"pm180"`` or ``"0360"``).
     """
     exp = load_remesh_export(export_txt)
 
-    lon = np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d)
+    lon = normalize_lon(rtofs_lon_2d, convention)
     lat = rtofs_lat_2d
     flat_lon = lon.ravel()
     flat_lat = lat.ravel()
@@ -345,6 +355,7 @@ def build_3d_npz(
     rtofs_lat_2d: np.ndarray,
     out_npz: Path,
     tol: float = 0.01,
+    convention: str = "pm180",
 ) -> None:
     """
     One-time conversion: 3D T/S export text -> production .npz with grid indices.
@@ -361,10 +372,11 @@ def build_3d_npz(
         rtofs_lat_2d: RTOFS 3D regional latitude array (ny, nx)
         out_npz: Output NPZ path
         tol: Max allowed distance (degrees) for source-to-grid matching
+        convention: Longitude convention (``"pm180"`` or ``"0360"``).
     """
     exp = load_remesh_export(export_txt)
 
-    lon = np.where(rtofs_lon_2d > 180, rtofs_lon_2d - 360, rtofs_lon_2d)
+    lon = normalize_lon(rtofs_lon_2d, convention)
     lat = rtofs_lat_2d
     flat_lon = lon.ravel()
     flat_lat = lat.ravel()
