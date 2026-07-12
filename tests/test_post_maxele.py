@@ -29,6 +29,10 @@ def test_maxele_reduces_over_stacks(tmp_path):
         assert ds["time"].base_date == "2026-07-10 00:00"
         assert ds["zeta_max"]._FillValue == np.float32(FILL_VALUE)
         assert ds["depth"].mesh == "adcirc_mesh"
+        assert ds["depth"].coordinates == "time y x"
+        gfill = ds.getncattr("_FillValue")
+        gfill = gfill.decode() if isinstance(gfill, bytes) else gfill
+        assert gfill == "-99999."
         assert np.allclose(ds["x"][:], [0.0, 1.0, 0.0, 1.0])
 
 

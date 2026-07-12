@@ -8,6 +8,12 @@ autoval/ADCIRC-style schema -- ``zeta_max(node)`` with ``x``/``y``/
 ``depth`` companions and a 2-point ``time`` coordinate spanning the
 product window. Raw max like ops: dry nodes carry their bed elevation;
 masking is a downstream consumer concern.
+
+Caller contract for ops parity: pass exactly the FORECAST stacks (ops
+reduces records 1-12 of stacks 3-10 only) and override
+``window_seconds=(90000, 432000)`` to reproduce the hardcoded ops time
+coordinate; the default derives the window from the stacks' own time
+axes (identical for the standard run).
 """
 from __future__ import annotations
 
@@ -41,6 +47,8 @@ def write_maxele(
 
     zeta_max: Optional[np.ndarray] = None
     x = y = depth = None
+    x_attrs: dict = {}
+    y_attrs: dict = {}
     t_first: Optional[float] = None
     t_last: Optional[float] = None
 
@@ -61,8 +69,13 @@ def write_maxele(
                 else np.maximum(zeta_max, stack_max)
             )
             if x is None and "SCHISM_hgrid_node_x" in ds.variables:
-                x = ds.variables["SCHISM_hgrid_node_x"][:]
-                y = ds.variables["SCHISM_hgrid_node_y"][:]
+                xv_src = ds.variables["SCHISM_hgrid_node_x"]
+                yv_src = ds.variables["SCHISM_hgrid_node_y"]
+                x = xv_src[:]
+                y = yv_src[:]
+                # ops renames the coord vars, which keeps their attrs
+                x_attrs = {a: xv_src.getncattr(a) for a in xv_src.ncattrs()}
+                y_attrs = {a: yv_src.getncattr(a) for a in yv_src.ncattrs()}
             if depth is None and "depth" in ds.variables:
                 depth = ds.variables["depth"][:]
 
@@ -89,6 +102,10 @@ def write_maxele(
         if x is not None:
             xv = ds.createVariable("x", "f8", ("node",))
             yv = ds.createVariable("y", "f8", ("node",))
+            for key, val in x_attrs.items():
+                xv.setncattr(key, val)
+            for key, val in y_attrs.items():
+                yv.setncattr(key, val)
             xv[:] = x
             yv[:] = y
         if depth is not None:
@@ -97,7 +114,11 @@ def write_maxele(
             dv.long_name = "distance below geoid"
             dv.standard_name = "depth below geoid"
             dv.mesh = "adcirc_mesh"
+            dv.coordinates = "time y x"
             dv[:] = depth
+
+        # ops: ncatted -a _FillValue,global,o,c,"-99999."
+        ds.setncattr("_FillValue", "-99999.")
 
     return Path(out_path)
 

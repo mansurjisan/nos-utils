@@ -14,6 +14,11 @@ fixed-depth values interpolate the ``zCoordinates`` column with
 surface/bottom clamping. Domain knobs (paths, depths, datum, element
 table, bottom indices, base date) are explicit arguments -- no CWD
 reads, no hardcoded mesh dims or cycle strings.
+
+Note: the ``element`` table uses the shared ``mesh.split_quads``
+diagonal ((a,b,c)+(a,c,d)); the ops adcirc/slab sources split quads as
+(a,b,d)+(b,c,d) -- an equivalent triangulation that differs byte-wise
+on quad meshes (node-based values are unaffected).
 """
 from __future__ import annotations
 
