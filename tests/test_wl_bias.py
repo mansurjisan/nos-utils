@@ -327,3 +327,26 @@ def parse_obc_ctl_from_text(text):
         fh.write(text)
         name = fh.name
     return parse_obc_ctl(name)
+
+
+def test_prediction_epoch_is_jan1_not_base_date(tmp_path):
+    """Nodal terms are frozen at Jan 1 of the year (ops equarg(IYRS,1,1) +
+    jbase_date convention), NOT re-evaluated at the cycle time.
+
+    Implementation-independent check: two calls whose (base_date, times_days)
+    pairs denote the SAME absolute instants must agree exactly.  That holds
+    only when f/V0+u are anchored to a fixed yearly epoch; anchoring them to
+    base_date makes the two disagree (~mm, measurable at this tolerance).
+    """
+    hc = tmp_path / "hc.nc"
+    _write_hc(hc, ["STA_C"])
+
+    a_base = datetime(2026, 7, 22, 6, 0)
+    b_base = datetime(2026, 7, 20, 6, 0)          # 2 days earlier
+    t_a = np.array([0.0, 0.25, 0.5, 1.0])
+    t_b = t_a + 2.0                                # same absolute instants
+
+    pred_a = predict_station_tide(hc, "STA_C", t_a, a_base)
+    pred_b = predict_station_tide(hc, "STA_C", t_b, b_base)
+
+    np.testing.assert_allclose(pred_a, pred_b, atol=1e-12)

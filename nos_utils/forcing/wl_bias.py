@@ -369,11 +369,27 @@ def predict_station_tide(
     """
     Predict the tidal water level at a gauge from its 37 harmonic constants.
 
-    APPROXIMATION BOUNDARY (see module docstring): the operational NOS_PRD is
-    reproduced with a standard Schureman construction using the ``tidal.py``
-    nodal-correction machinery.  Nodal factors ``f`` and equilibrium arguments
-    ``V0+u`` are evaluated once at ``base_date``; the phase then advances as
-    ``speed * (t - base_date)``.
+    Reproduces ``NOS_PRD`` (nos_ofs_tideprediction.f 196-500)::
+
+        pred(t) = sum_j  amp_j * f_j * cos( speed_j * (t - Jan1) + VPU_j - kappa_j )
+
+    with the ops epoch convention taken from the call site: ops calls
+    ``equarg(37, IYRS, 1, 1, 365, ...)`` (line ~377) and sets
+    ``jbase_date`` to January 1 of the start year (``yearb=IYRS; monthb=1``),
+    so ``f`` and ``V0+u`` are evaluated at **Jan 1 00:00 of the prediction
+    year** and the phase argument advances from that same origin
+    (``FIRST=(jday0-jbase_date)*24``, line ~417).  The commented-out
+    ``equarg(...,IMMS,IDDS,length,...)`` variant shows ops deliberately does
+    not use the actual start date.
+
+    APPROXIMATION BOUNDARY (see module docstring), now narrowed to two items:
+    (1) ``V0+u`` / ``f`` come from ``tidal.py``'s Schureman implementation
+    rather than ops' ``equarg.f`` (same theory, independent code); (2) ops
+    accumulates through a 1024-bin quarter-wave cosine lookup
+    (``XCOS``, ~0.09 deg bin, round-to-nearest) while this uses exact
+    ``cos`` -- strictly more accurate.  Measured effect of the epoch
+    convention alone before this was aligned: 6 mm peak, 3 mm RMS, and
+    0.2 mm on the window mean (the only quantity ``AVGERR`` consumes).
 
     Parameters
     ----------
@@ -388,15 +404,22 @@ def _predict_from_hc(
 ) -> np.ndarray:
     from .tidal import _dayjul, _gterms, _nfacs  # reuse Schureman nodal machinery
 
+    # Ops epoch: equarg(37,IYRS,1,1,365) + jbase_date = Jan 1 00:00 of the
+    # prediction year (nos_ofs_tideprediction.f ~300, ~377).  f and V0+u are
+    # frozen there and the phase advances from that same origin, so the
+    # nodal terms must NOT be re-evaluated at the cycle time.
     yr = float(base_date.year)
-    dayj = _dayjul(yr, float(base_date.month), float(base_date.day))
-    bhr = base_date.hour + base_date.minute / 60.0 + base_date.second / 3600.0
+    dayj0 = _dayjul(yr, 1.0, 1.0)
 
-    f37 = np.asarray(_nfacs(yr, dayj, bhr), dtype=float)          # nodal factors
-    vpu37 = np.asarray(_gterms(yr, dayj, bhr, dayj, bhr), dtype=float)  # V0+u (deg)
+    f37 = np.asarray(_nfacs(yr, dayj0, 0.0), dtype=float)          # nodal factors
+    vpu37 = np.asarray(_gterms(yr, dayj0, 0.0, dayj0, 0.0), dtype=float)  # V0+u (deg)
+
+    # FIRST=(jday0-jbase_date)*24 (line ~417): hours measured from Jan 1.
+    jan1 = datetime(base_date.year, 1, 1)
+    hours_base_from_jan1 = (base_date - jan1).total_seconds() / 3600.0
 
     t = np.asarray(times_days, dtype=float)
-    hours = t * 24.0
+    hours = hours_base_from_jan1 + t * 24.0
     pred = np.zeros_like(t)
     for k in range(NCON):
         if amp[k] == 0.0:
