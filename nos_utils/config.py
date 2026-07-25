@@ -217,6 +217,31 @@ class ForcingConfig:
     dynamic_adjust_enabled: bool = False
     dynamic_adjust_window_days: int = 2
 
+    # --- Operational water-level OBC bias correction (COMF nosofs 3.9) ---
+    # Port of the station-based correction inside
+    # ``nos_ofs_create_forcing_obc_schism.f`` (see
+    # ``nos_utils.forcing.wl_bias``). As in COMF, the OBC control file IS the
+    # station configuration: which gauges correct which boundary nodes, with
+    # what weights. Operational SECOFS ships NSTA=0 / all WL_STA=0, so the
+    # correction is a documented no-op there even when enabled.
+    # Off by default; when False the RTOFS processor skips the hook entirely.
+    wl_bias_enabled: bool = False
+    # OBC control file ({ofs}.obc.ctl). Normally resolved from $FIXofs by the
+    # orchestrator and handed to RTOFSProcessor(obc_ctl_file=...); set here
+    # only to override that. The same file must define the boundary-node list
+    # (NOBC must equal the elev2D node count) or the correction is skipped.
+    obc_ctl_file: Optional[Path] = None
+    # Harmonic constants for the correction stations (nosofs.HC_NWLON.nc).
+    # Falls back to $FIXofs / $FIXstofs3d lookup when unset.
+    wl_bias_hc_file: Optional[Path] = None
+    # Observation source: "none" (default, nothing is fetched), "file"
+    # (two-column ``days water_level`` text per station under
+    # ``wl_bias_obs_dir``), or "coops" (live NOAA CO-OPS API — network).
+    # Production WCOSS2 reads NCEP BUFR tanks; that ingest is wired separately.
+    wl_bias_obs_source: str = "none"
+    # Directory of per-station observation files for wl_bias_obs_source="file".
+    wl_bias_obs_dir: Optional[Path] = None
+
     # Minimum number of time records required in RTOFS-derived OBC files
     # (elev2D.th.nc, TEM_3D.th.nc, SAL_3D.th.nc, uv3D.th.nc). When any
     # file falls short, the orchestrator copies the previous cycle's

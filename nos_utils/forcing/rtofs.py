@@ -15,16 +15,21 @@ Fortran-matching node list) and interpolates RTOFS data to those nodes.
 
 IMPORTANT: SSH bias correction
 
-The Fortran gen_3Dth_from_hycom applies a station-based bias correction:
+The Fortran nos_ofs_create_forcing_obc_schism applies a station-based bias
+correction:
 
 1. Reads real-time tide gauge observations (NOSBUFR)
-2. Computes AVGERR = mean(obs - RTOFS) per station (~1.25m for SECOFS)
-3. Applies WLOBC += weight * (AVGERR + obs_subtidal) per boundary node
+2. Computes AVGERR = mean(obs_subtidal - RTOFS) per station
+3. Applies WLOBC += weight * (AVGERR + obs_residual) per boundary node
 
-This Python processor does NOT apply this correction — the ~1.25m SSH
-offset relative to Fortran output is expected. For production runs,
-use hybrid mode (Fortran OBC) until Python has access to real-time
-tide gauge data.
+``nos_utils.forcing.wl_bias`` is a line-anchored port of that algorithm and
+``_process_2d`` calls it on the interpolated SSH array. It is OFF by default
+(``config.wl_bias_enabled``) and is additionally a no-op whenever the OBC
+control file configures no correction stations — which is the case for
+operational SECOFS (NSTA=0, all WL_STA=0), so enabling it there changes
+nothing until a station list is configured. It never fails prep: any missing
+input degrades to an un-corrected SSH plus a warning, and the result metadata
+reports ``ssh_bias_corrected`` accordingly.
 
 Works with any SCHISM-based OFS (SECOFS, STOFS-3D-ATL, CREOFS, etc.)
 """
@@ -125,6 +130,7 @@ class RTOFSProcessor(ForcingProcessor):
         self._n_ocean_surface = {}  # Cached ocean point count per grid shape
         self._struct_interp = {}  # Cached StructuredGridInterpolator per grid shape
         self._3d_roi = None     # Cached ROI indices (j_start, j_end, i_start, i_end) for 3D subsetting
+        self._wl_bias_info = None   # Outcome of the WL bias correction (see _apply_wl_bias)
 
     def _get_time_window(self) -> Tuple[datetime, datetime]:
         """Compute the time window for RTOFS file filtering.
@@ -310,24 +316,38 @@ class RTOFSProcessor(ForcingProcessor):
             obc_files = self._process_3d(files_3d)
             output_files.extend(obc_files)
 
-        if not warnings:
+        # The WL bias correction (wl_bias, COMF nosofs 3.9) reports whether it
+        # actually modified the SSH array; the legacy warning stands only when
+        # it did not run.
+        wl_info = getattr(self, "_wl_bias_info", None) or {}
+        bias_applied = bool(wl_info.get("applied"))
+
+        if not warnings and not bias_applied:
             warnings.append(
                 "SSH not bias-corrected (no tide gauge data). "
                 "Use hybrid mode for production OBC."
             )
+
+        metadata = {
+            "n_boundary_nodes": len(self._bnd_lons),
+            "n_2d_files": len(files_2d),
+            "n_3d_files": len(files_3d),
+            "n_levels": self._vgrid.nvrt if self._vgrid else self.config.n_levels,
+            "ssh_bias_corrected": bias_applied,
+        }
+        if bias_applied:
+            metadata["wl_bias"] = {
+                "n_stations": wl_info.get("n_stations", 0),
+                "n_nodes_corrected": wl_info.get("n_nodes_corrected", 0),
+                "avgerr": wl_info.get("avgerr", {}),
+            }
 
         return ForcingResult(
             success=len(output_files) > 0,
             source=self.SOURCE_NAME,
             output_files=output_files,
             warnings=warnings,
-            metadata={
-                "n_boundary_nodes": len(self._bnd_lons),
-                "n_2d_files": len(files_2d),
-                "n_3d_files": len(files_3d),
-                "n_levels": self._vgrid.nvrt if self._vgrid else self.config.n_levels,
-                "ssh_bias_corrected": False,
-            },
+            metadata=metadata,
         )
 
     def _process_stofs(self) -> ForcingResult:
@@ -1068,8 +1088,114 @@ class RTOFSProcessor(ForcingProcessor):
         self._3d_weights_cache = None
         return None
 
+    def _find_fix_file(self, patterns: List[str]) -> Optional[Path]:
+        """First glob match for ``patterns`` under the FIX directories.
+
+        Same search order as :meth:`_find_ssh_weights`: ``$FIXofs``, then
+        ``$FIXstofs3d``, then ``input_path`` (used by tests).
+        """
+        dirs = [Path(os.environ[v]) for v in ("FIXofs", "FIXstofs3d")
+                if os.environ.get(v)]
+        dirs.append(self.input_path)
+        for d in dirs:
+            for pattern in patterns:
+                try:
+                    matches = sorted(d.glob(pattern))
+                except OSError:
+                    continue
+                if matches:
+                    return matches[0]
+        return None
+
+    def _resolve_wl_bias_ctl(self) -> Optional[Path]:
+        """OBC control file for the WL bias correction (the COMF station list).
+
+        Prefers the ctl that defined the boundary-node list, so the correction
+        and the elev2D node ordering can never come from different files.
+        """
+        for cand in (self.obc_ctl_file, getattr(self.config, "obc_ctl_file", None)):
+            if cand and Path(cand).exists():
+                return Path(cand)
+        return self._find_fix_file(["*.obc.ctl"])
+
+    def _resolve_wl_bias_hc(self) -> Optional[Path]:
+        """Harmonic constants (``nosofs.HC_NWLON.nc``) for the gauge stations."""
+        cand = getattr(self.config, "wl_bias_hc_file", None)
+        if cand and Path(cand).exists():
+            return Path(cand)
+        return self._find_fix_file(["nosofs.HC_NWLON.nc", "*HC_NWLON*.nc"])
+
+    def _build_wl_obs_provider(self):
+        """Observation provider selected by ``config.wl_bias_obs_source``.
+
+        ``"none"`` (default) returns None — nothing is read and nothing hits
+        the network. Production WCOSS2 reads NCEP BUFR tanks; that ingest is
+        wired separately.
+        """
+        source = str(getattr(self.config, "wl_bias_obs_source", "none") or "none").lower()
+        if source in ("", "none"):
+            return None
+        if source == "file":
+            obs_dir = getattr(self.config, "wl_bias_obs_dir", None)
+            if not obs_dir:
+                log.warning("wl_bias_obs_source='file' but wl_bias_obs_dir is unset")
+                return None
+            from .wl_bias import FileObsProvider
+            return FileObsProvider(obs_dir)
+        if source == "coops":
+            from .wl_bias import CoopsApiProvider
+            return CoopsApiProvider()
+        log.warning(f"Unknown wl_bias_obs_source '{source}' — WL bias correction skipped")
+        return None
+
+    def _apply_wl_bias(
+        self,
+        ssh_array: np.ndarray,
+        times_seconds: np.ndarray,
+        model_t0: datetime,
+    ) -> Tuple[np.ndarray, dict]:
+        """Run the operational WL bias correction on the boundary SSH array.
+
+        ``times_seconds`` is the elev2D time axis (seconds since ``model_t0``).
+        Returns ``(ssh_array, info)`` — the array is returned unchanged, with
+        ``info["applied"] is False``, for every skip / failure path.
+        """
+        if not bool(getattr(self.config, "wl_bias_enabled", False)):
+            return ssh_array, {"applied": False, "reason": "wl_bias_enabled=False"}
+        try:
+            from .wl_bias import apply_wl_bias_to_ssh
+            return apply_wl_bias_to_ssh(
+                ssh_array, times_seconds, model_t0,
+                self._resolve_wl_bias_ctl(),
+                self._resolve_wl_bias_hc(),
+                self._build_wl_obs_provider(),
+            )
+        except Exception as e:  # resolution/provider failure must not fail prep
+            log.warning(f"WL bias correction unavailable ({e}) — SSH left uncorrected")
+            return ssh_array, {"applied": False, "reason": f"error: {e}"}
+
     def _process_2d(self, files_2d: List[Path]) -> Optional[Path]:
-        """Extract SSH from RTOFS 2D files, interpolate to boundary nodes."""
+        """Extract SSH from RTOFS 2D files, interpolate to boundary nodes.
+
+        After temporal interpolation the operational water-level bias
+        correction (``wl_bias``, the COMF nosofs 3.9 algorithm) is applied to
+        the ``(nt, n_bnd)`` array — the Fortran's ``WLOBC(node, time)`` — on
+        the same time axis that is written to ``elev2D.th.nc``. The outcome is
+        recorded in ``self._wl_bias_info`` for the caller's ``ForcingResult``.
+
+        Config surface (all read defensively via ``getattr``):
+          * ``wl_bias_enabled`` (bool, default False) — master switch; when
+            False the hook returns immediately and nothing is read.
+          * ``obc_ctl_file`` (path) — station configuration, as in COMF.
+            Defaults to the ``obc.ctl`` already used for the boundary-node
+            list, else ``*.obc.ctl`` under ``$FIXofs`` / ``$FIXstofs3d``.
+          * ``wl_bias_hc_file`` (path) — ``nosofs.HC_NWLON.nc`` harmonic
+            constants; defaults to the same FIX lookup.
+          * ``wl_bias_obs_source`` (``"coops"`` | ``"file"`` | ``"none"``,
+            default ``"none"``) — nothing hits the network unless configured.
+          * ``wl_bias_obs_dir`` (path) — station files for the ``"file"``
+            provider.
+        """
         output_file = self.output_path / "elev2D.th.nc"
         n_bnd = len(self._bnd_lons)
         model_dt = float(getattr(self.config, "model_dt", 120.0))  # SCHISM model timestep (seconds)
@@ -1204,12 +1330,37 @@ class RTOFSProcessor(ForcingProcessor):
             else:
                 dt_out = (rtofs_times[1] - rtofs_times[0]) if n_rtofs > 1 else 3600.0
 
+            nt = ssh_array.shape[0]
+
+            # Output time axis (seconds relative to model_t0), computed once
+            # and shared by the WL bias correction and the netCDF writer so
+            # the correction lands on exactly the instants SCHISM reads.
+            #   * interpolated branch: uniform model_dt steps anchored at
+            #     t=0 = model_t0.
+            #   * no-interpolation fallback (scipy missing, or n_rtofs >=
+            #     n_model_steps; production never hits this for SECOFS —
+            #     ~60 files vs 1621 model steps): the RTOFS file times, with
+            #     the leading entry clamped to 0 so SCHISM's model clock
+            #     stays anchored at model_t0 even if the first RTOFS file is
+            #     slightly before/after.
+            if dt_out == model_dt and nt > n_rtofs:
+                time_axis = np.arange(nt, dtype=np.float64) * dt_out
+            else:
+                time_axis = np.asarray(rtofs_times[:nt], dtype=np.float64).copy()
+                if time_axis.size > 0:
+                    time_axis[0] = 0.0
+
+            # Operational water-level bias correction (COMF nosofs 3.9).
+            # No-op unless configured; never fatal. See _apply_wl_bias.
+            ssh_array, self._wl_bias_info = self._apply_wl_bias(
+                ssh_array, time_axis, model_t0,
+            )
+
             # Write SCHISM format. NETCDF4_CLASSIC (not NETCDF4): SCHISM's
             # NUOPC cap opens these via collective parallel-NetCDF at 2794-rank
             # scale; HDF5-flavored files segfault during MPI-IO collective open
             # *before* partition_hgrid runs. Production v3.9 writes classic.
             nc = Dataset(str(output_file), "w", format="NETCDF4_CLASSIC")
-            nt = ssh_array.shape[0]
 
             # Dimension declaration order matches v3.9 production header layout
             # (nComponents *before* nOpenBndNodes). Parallel pnetcdf readers can
@@ -1224,20 +1375,7 @@ class RTOFSProcessor(ForcingProcessor):
             # Production elev2D uses time as f4 (not f8). Match for byte-format
             # parity with v3.9 production output.
             time_var = nc.createVariable("time", "f4", ("time",))
-            if dt_out == model_dt and nt > n_rtofs:
-                # Temporally interpolated: uniform model_dt steps anchored at
-                # t=0 = model_t0 (cycle - nowcast_hours).
-                time_var[:] = [i * dt_out for i in range(nt)]
-            else:
-                # No-interpolation fallback (scipy missing, or n_rtofs >=
-                # n_model_steps). Production never hits this for SECOFS
-                # (~60 files vs 1621 model steps). Clamp the leading entry
-                # to 0 so SCHISM's model clock stays anchored at model_t0
-                # even if the first RTOFS file is slightly before/after.
-                axis = rtofs_times[:nt].copy()
-                if len(axis) > 0:
-                    axis[0] = 0.0
-                time_var[:] = axis
+            time_var[:] = time_axis
 
             # SCHISM-required scalar for `nc dt1` consistency check.
             # Without this variable, model init aborts with `MISC: nc dt1`.
