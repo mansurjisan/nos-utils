@@ -27,6 +27,7 @@ from nos_utils.forcing.wl_bias import (
     WlCorrections,
     _avgerr_ramp,
     _detide,
+    apply_wl_bias_to_ssh,
     apply_wl_corrections,
     compute_wl_corrections,
     parse_obc_ctl,
@@ -327,6 +328,282 @@ def parse_obc_ctl_from_text(text):
         fh.write(text)
         name = fh.name
     return parse_obc_ctl(name)
+
+
+# ---------------------------------------------------------------------------
+# 6. Wiring: apply_wl_bias_to_ssh (what rtofs.py::_process_2d calls)
+#
+# The elev2D array is (nt, n_bnd) on the model output time grid with the axis
+# in SECONDS since model_t0 — the same axis written to elev2D.th.nc.  Here
+# model_t0 = BASE_DATE and the axis is hourly over 0..2 days, so the internal
+# zeta_time reproduces the `_grid()` convention used by the tests above.
+# ---------------------------------------------------------------------------
+TIMES_SECONDS = np.arange(49) * 3600.0     # 0 .. 2 days, matches _grid()'s zt
+
+# NSTA=0 / every WL_STA=0 — the operational SECOFS configuration.
+CTL_TEXT_NSTA0 = """\
+0 2 0 120.0
+SECTION 1: WATER LEVEL INFORMATION
+SID NOS_ID NWS_ID AGENCY DATUM WL_FLAG TS_FLAG BACKUP GRIDID_STA AS
+
+SECTION 2: CONFIGURATION OF LATERAL OPEN BOUNDARY
+GRIDID IOBC WL_STA WL_SID_1 WL_S_1 WL_SID_2 WL_S_2 TS_STA TS_SID_1 TS_S_1 TS_SID_2 TS_S_2
+1 101 0 0 0.0 0 0.0 0 0 0.0 0 0.0
+2 102 0 0 0.0 0 0.0 0 0 0.0 0 0.0
+"""
+
+# Station 1 points at a non-existent boundary node; station 2 is valid.
+CTL_TEXT_BAD_GRIDID = """\
+2 2 0 3600.0
+
+h1
+h2
+1 STA_A NA NOS 0.0 0 0 0 99 1.0
+2 STA_C NC NOS 0.0 0 0 0 2 1.0
+
+h3
+h4
+1 101 1 1 1.0 0 0.0 0 0 0.0 0 0.0
+2 102 1 2 1.0 0 0.0 0 0 0.0 0 0.0
+"""
+
+
+def _constant_offset_obs(hc, offset=0.30, station="STA_C"):
+    """48 hourly obs whose subtidal is a constant ``offset`` (AVGERR recovery)."""
+    time_prd, _ = _grid()
+    idx = np.arange(48, 96)
+    wl_prd = predict_station_tide(hc, station, time_prd, BASE_DATE)
+    return time_prd[idx], wl_prd[idx] + offset
+
+
+def test_wiring_nsta0_ctl_is_a_true_noop(tmp_path):
+    """Operational config (NSTA=0): array untouched, no HC/obs even consulted."""
+    ctl = tmp_path / "secofs.obc.ctl"
+    ctl.write_text(CTL_TEXT_NSTA0)
+    ssh = np.arange(49 * 2, dtype=np.float32).reshape(49, 2)
+
+    out, info = apply_wl_bias_to_ssh(
+        ssh, TIMES_SECONDS, BASE_DATE, ctl, hc_file=None, obs=None,
+    )
+
+    assert out is ssh                       # same object — nothing copied
+    assert info["applied"] is False
+    assert "no correction stations" in info["reason"]
+    assert info["n_nodes_corrected"] == 0
+
+
+def test_wiring_applies_correction_from_station_node(tmp_path):
+    """Hand-computed: AVGERR = obs_subtidal - WLOBC(GRIDID_STA)."""
+    pytest.importorskip("netCDF4")
+    hc = tmp_path / "hc.nc"
+    _write_hc(hc, ["STA_C"])
+    ctl = tmp_path / "one.ctl"
+    ctl.write_text(_single_ctl("STA_C"))
+
+    t_obs, wl_obs = _constant_offset_obs(hc, offset=0.30)
+    ssh = np.full((49, 1), 0.10, dtype=np.float32)   # source series = 0.10 m
+
+    out, info = apply_wl_bias_to_ssh(
+        ssh, TIMES_SECONDS, BASE_DATE, ctl, hc,
+        obs={"STA_C": (t_obs, wl_obs)},
+    )
+
+    # AVGERR = 0.30 - 0.10 = 0.20  ->  corrected = 0.10 + 0.20 = 0.30
+    assert info["applied"] is True
+    assert np.isclose(info["avgerr"]["STA_C"], 0.20, atol=1e-6)
+    assert np.allclose(out, 0.30, atol=1e-6)
+    assert out.dtype == ssh.dtype
+    assert info["n_nodes_corrected"] == 1
+    assert np.allclose(ssh, 0.10)                    # input not mutated
+
+
+def test_wiring_weighted_nodes_on_the_toy_boundary(tmp_path):
+    """The 3-station / 4-node ctl: WL_STA 0/1/2 weighting through the wrapper."""
+    pytest.importorskip("netCDF4")
+    hc = tmp_path / "hc.nc"
+    _write_hc(hc, ["STA_A", "STA_B", "STA_C"])
+    ctl = tmp_path / "toy.ctl"
+    ctl.write_text(CTL_TEXT)
+
+    tc, wc = _constant_offset_obs(hc, offset=0.30)
+    time_prd, _ = _grid()
+    idx_ab = np.arange(48, 53)                        # 5 obs -> both back up to C
+    tab = time_prd[idx_ab]
+    wab = predict_station_tide(hc, "STA_C", time_prd, BASE_DATE)[idx_ab]
+
+    ssh = np.zeros((49, 4), dtype=np.float32)
+    out, info = apply_wl_bias_to_ssh(
+        ssh, TIMES_SECONDS, BASE_DATE, ctl, hc,
+        obs=ArrayObsProvider({"STA_A": (tab, wab), "STA_B": (tab, wab),
+                              "STA_C": (tc, wc)}),
+    )
+
+    assert info["applied"] is True
+    assert np.allclose(out[:, 0], 0.0)                # WL_STA=0 untouched
+    assert np.allclose(out[:, 1], 0.30, atol=1e-6)    # 1.0*AVGERR(C)
+    assert np.allclose(out[:, 2], 0.225, atol=1e-6)   # 0.5*0.30 + 0.5*0.15
+    assert np.allclose(out[:, 3], 0.15, atol=1e-6)    # 1.0*AVGERR(B via backup)
+    assert info["n_nodes_corrected"] == 3
+    assert info["n_stations"] == 3
+
+
+def test_wiring_missing_hc_file_is_a_warning_not_a_failure(tmp_path):
+    pytest.importorskip("netCDF4")
+    hc = tmp_path / "hc.nc"
+    _write_hc(hc, ["STA_C"])
+    ctl = tmp_path / "one.ctl"
+    ctl.write_text(_single_ctl("STA_C"))
+    t_obs, wl_obs = _constant_offset_obs(hc, offset=0.30)
+    ssh = np.zeros((49, 1), dtype=np.float32)
+
+    out, info = apply_wl_bias_to_ssh(
+        ssh, TIMES_SECONDS, BASE_DATE, ctl, tmp_path / "absent.nc",
+        obs={"STA_C": (t_obs, wl_obs)},
+    )
+    assert out is ssh
+    assert info["applied"] is False
+    assert "harmonic-constants file not found" in info["reason"]
+
+
+def test_wiring_provider_exception_is_swallowed(tmp_path):
+    pytest.importorskip("netCDF4")
+    hc = tmp_path / "hc.nc"
+    _write_hc(hc, ["STA_C"])
+    ctl = tmp_path / "one.ctl"
+    ctl.write_text(_single_ctl("STA_C"))
+    ssh = np.zeros((49, 1), dtype=np.float32)
+
+    class _Boom:
+        def get(self, station, base_date=None, day_start=None, day_end=None):
+            raise RuntimeError("gauge tank late")
+
+    out, info = apply_wl_bias_to_ssh(
+        ssh, TIMES_SECONDS, BASE_DATE, ctl, hc, obs=_Boom(),
+    )
+    assert out is ssh
+    assert info["applied"] is False
+    assert "gauge tank late" in info["reason"]
+
+
+def test_wiring_missing_ctl_and_node_count_mismatch(tmp_path):
+    pytest.importorskip("netCDF4")
+    hc = tmp_path / "hc.nc"
+    _write_hc(hc, ["STA_C"])
+    ssh = np.zeros((49, 1), dtype=np.float32)
+
+    out, info = apply_wl_bias_to_ssh(
+        ssh, TIMES_SECONDS, BASE_DATE, tmp_path / "nope.ctl", hc, obs={},
+    )
+    assert out is ssh and "OBC control file not found" in info["reason"]
+
+    ctl = tmp_path / "toy.ctl"
+    ctl.write_text(CTL_TEXT)                          # NOBC=4 vs 1 SSH column
+    out, info = apply_wl_bias_to_ssh(
+        ssh, TIMES_SECONDS, BASE_DATE, ctl, hc, obs={},
+    )
+    assert out is ssh and "NOBC=4" in info["reason"]
+
+
+def test_wiring_out_of_range_gridid_skips_only_that_station(tmp_path):
+    """STA_A's GRIDID_STA is out of range; STA_C is still applied.
+
+    The HC file deliberately holds ONLY STA_C: if the skipped station were
+    still processed the (wl_flag=0) HC lookup would raise and the whole
+    correction would be dropped.
+    """
+    pytest.importorskip("netCDF4")
+    hc = tmp_path / "hc.nc"
+    _write_hc(hc, ["STA_C"])
+    ctl = tmp_path / "bad_gridid.ctl"
+    ctl.write_text(CTL_TEXT_BAD_GRIDID)
+
+    tc, wc = _constant_offset_obs(hc, offset=0.30)
+    ssh = np.zeros((49, 2), dtype=np.float32)
+
+    out, info = apply_wl_bias_to_ssh(
+        ssh, TIMES_SECONDS, BASE_DATE, ctl, hc,
+        obs={"STA_A": (tc, wc), "STA_C": (tc, wc)},
+    )
+
+    assert info["applied"] is True
+    assert info["skipped_stations"] == ["STA_A"]
+    assert np.allclose(out[:, 0], 0.0)                 # node fed by STA_A: no-op
+    assert np.allclose(out[:, 1], 0.30, atol=1e-6)     # node fed by STA_C
+    assert info["n_nodes_corrected"] == 1
+    assert set(info["avgerr"]) == {"STA_C"}
+
+
+# ---------------------------------------------------------------------------
+# 7. Wiring: the RTOFSProcessor config surface + FIX lookup
+# ---------------------------------------------------------------------------
+def _rtofs_proc(tmp_path, **cfg_overrides):
+    from nos_utils.config import ForcingConfig
+    from nos_utils.forcing.rtofs import RTOFSProcessor
+
+    cfg = ForcingConfig(
+        lon_min=-80.0, lon_max=-70.0, lat_min=25.0, lat_max=35.0,
+        pdy="20260401", cyc=12, **cfg_overrides,
+    )
+    return RTOFSProcessor(cfg, tmp_path / "in", tmp_path / "out")
+
+
+def test_processor_wl_bias_disabled_by_default(tmp_path):
+    """Feature off => hook returns immediately, array untouched."""
+    proc = _rtofs_proc(tmp_path)
+    ssh = np.zeros((49, 1), dtype=np.float32)
+    out, info = proc._apply_wl_bias(ssh, TIMES_SECONDS, BASE_DATE)
+    assert out is ssh
+    assert info == {"applied": False, "reason": "wl_bias_enabled=False"}
+
+
+def test_processor_resolves_ctl_hc_and_file_obs_from_fix(tmp_path, monkeypatch):
+    """Enabled + FIX layout + file observations: end-to-end, no network."""
+    pytest.importorskip("netCDF4")
+    fix = tmp_path / "fix"
+    fix.mkdir()
+    _write_hc(fix / "nosofs.HC_NWLON.nc", ["STA_C"])
+    (fix / "secofs.obc.ctl").write_text(_single_ctl("STA_C"))
+
+    obs_dir = tmp_path / "obs"
+    obs_dir.mkdir()
+    t_obs, wl_obs = _constant_offset_obs(fix / "nosofs.HC_NWLON.nc", offset=0.30)
+    np.savetxt(obs_dir / "STA_C.obs", np.column_stack([t_obs, wl_obs]))
+
+    monkeypatch.setenv("FIXofs", str(fix))
+    proc = _rtofs_proc(
+        tmp_path,
+        wl_bias_enabled=True,
+        wl_bias_obs_source="file",
+        wl_bias_obs_dir=obs_dir,
+    )
+    assert proc._resolve_wl_bias_ctl() == fix / "secofs.obc.ctl"
+    assert proc._resolve_wl_bias_hc() == fix / "nosofs.HC_NWLON.nc"
+
+    ssh = np.full((49, 1), 0.10, dtype=np.float32)
+    out, info = proc._apply_wl_bias(ssh, TIMES_SECONDS, BASE_DATE)
+
+    assert info["applied"] is True
+    assert np.isclose(info["avgerr"]["STA_C"], 0.20, atol=1e-6)
+    assert np.allclose(out, 0.30, atol=1e-6)
+
+
+def test_processor_obs_source_none_never_reads_gauges(tmp_path, monkeypatch):
+    """Default obs source is "none": nothing is fetched, correction skipped."""
+    pytest.importorskip("netCDF4")
+    fix = tmp_path / "fix"
+    fix.mkdir()
+    _write_hc(fix / "nosofs.HC_NWLON.nc", ["STA_C"])
+    (fix / "secofs.obc.ctl").write_text(_single_ctl("STA_C"))
+    monkeypatch.setenv("FIXofs", str(fix))
+
+    proc = _rtofs_proc(tmp_path, wl_bias_enabled=True)
+    assert proc._build_wl_obs_provider() is None
+
+    ssh = np.zeros((49, 1), dtype=np.float32)
+    out, info = proc._apply_wl_bias(ssh, TIMES_SECONDS, BASE_DATE)
+    assert out is ssh
+    assert info["applied"] is False
+    assert "no observation provider" in info["reason"]
 
 
 def test_prediction_epoch_is_jan1_not_base_date(tmp_path):

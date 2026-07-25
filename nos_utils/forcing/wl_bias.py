@@ -92,13 +92,30 @@ robust: whichever axis matches the station count is treated as ``Station``.
 
 Approximation ledger
 --------------------
-Everything above is a line-exact port EXCEPT the tide-prediction internals.
-The operational ``NOS_PRD`` (``nos_ofs_tideprediction.f``) is not available
-locally, so :func:`predict_station_tide` implements the standard Schureman
-prediction ``amp * f * cos(speed*t + (V0+u) - phase)`` reusing the nodal-factor
-machinery (``_nfacs`` / ``_gterms``) from :mod:`nos_utils.forcing.tidal`.  Nodal
-corrections are evaluated once at ``base_date`` (the prediction reference
-epoch).  This is the ONE documented approximation boundary.
+Everything above is a line-exact port EXCEPT the tide-prediction internals,
+and that boundary has been narrowed after reading the operational
+``nos_ofs_tideprediction.f`` (v3.9.1) end to end.  ``NOS_PRD`` reduces to::
+
+    pred(t) = sum_j amp_j * f_j * cos( speed_j*(t - Jan1) + (V0+u)_j - kappa_j )
+
+with the nodal terms frozen at **January 1 00:00 of the prediction year**
+(``equarg(37,IYRS,1,1,365)`` ~line 377; ``jbase_date`` = Jan 1 via
+``yearb=IYRS; monthb=1``; ``FIRST=(jday0-jbase_date)*24`` ~line 417).  The
+actual-start-date ``equarg`` variant sits commented out beside it, so the
+Jan-1 epoch is deliberate.  :func:`predict_station_tide` reproduces this
+convention exactly.  What remains approximate is only:
+
+  1. ``V0+u`` and ``f`` come from :mod:`nos_utils.forcing.tidal`'s Schureman
+     implementation (``_nfacs`` / ``_gterms``) rather than ops' ``equarg.f`` --
+     same theory, independent code.
+  2. Ops accumulates through a 1024-bin quarter-wave cosine lookup (``XCOS``,
+     ~0.09 deg bins, round-to-nearest via ``NP=ANG+1.5``); this uses exact
+     ``cos``, which is strictly more accurate.
+
+For scale: mis-anchoring the epoch to ``base_date`` instead of Jan 1 (the
+pre-fix behaviour) moved a real 2-day Charleston prediction by 6.1 mm peak /
+3.2 mm RMS and **0.216 mm on the window mean** -- the mean being the only
+quantity ``AVGERR`` consumes.
 
 Second (minor) deviation: the backup substitution reads the *raw* detided
 subtidal of the backup station regardless of station ordering.  The Fortran
@@ -114,6 +131,15 @@ ingest is the WCOSS2 path and is wired separately.  This module accepts pluggabl
 providers: :class:`ArrayObsProvider` (in-memory, for tests / offline),
 :class:`FileObsProvider` (two-column ``days wl`` text files), and
 :class:`CoopsApiProvider` (live CO-OPS datagetter; network only when called).
+
+Caller
+------
+:func:`apply_wl_bias_to_ssh` is the wiring entry point used by the RTOFS
+processor (``rtofs.py::_process_2d``): it takes the ``elev2D`` SSH array on the
+model output time grid, resolves everything against a single ``base_date``
+origin, and returns a corrected copy plus an ``info`` dict.  It never raises --
+a missing ctl / HC file / observation makes it a no-op, mirroring the ops
+behaviour where absent gauge data zeroes ``AVGERR`` instead of aborting prep.
 """
 
 import logging
@@ -796,3 +822,195 @@ def apply_wl_corrections(
                            + sc2 * (avgerr[j2] + resid[j2]))
         # wl_sta == 0 -> untouched
     return out
+
+
+# ---------------------------------------------------------------------------
+# Caller glue: correct an elev2D SSH array in place of the ops Fortran
+# ---------------------------------------------------------------------------
+class _MaskedObs:
+    """Provider wrapper reporting "no observations" for masked stations.
+
+    Used to neutralize a station whose ``GRIDID_STA`` is out of range: with no
+    observations it takes the ``NTR <= 20`` branch of
+    :func:`compute_wl_corrections` and contributes nothing.
+    """
+
+    def __init__(self, inner, masked: Sequence[CorrectionStation]):
+        self._inner = inner
+        self._masked = list(masked)
+
+    def get(self, station, base_date=None, day_start=None, day_end=None):
+        if any(station is s for s in self._masked):
+            return np.array([], float), np.array([], float)
+        return self._inner.get(station, base_date, day_start, day_end)
+
+
+def apply_wl_bias_to_ssh(
+    ssh_array: np.ndarray,
+    times_seconds: Sequence[float],
+    model_t0: datetime,
+    ctl_file: Optional[Union[str, Path]],
+    hc_file: Optional[Union[str, Path]],
+    obs=None,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Apply the operational water-level bias correction to an ``elev2D`` SSH array.
+
+    Thin, side-effect-free wrapper around :func:`compute_wl_corrections` +
+    :func:`apply_wl_corrections` that owns the caller-facing concerns: the
+    control-file / harmonic-constants lookup, the station -> boundary-node
+    mapping, and the time-origin bookkeeping.
+
+    It NEVER raises.  Every failure mode (no ctl, no HC file, no observations,
+    provider exception, malformed station row) logs and returns the input array
+    unchanged -- mirroring the ops Fortran, where absent gauge data zeroes
+    ``AVGERR`` rather than aborting the run.  A control file with no correction
+    stations (``NSTA=0`` / every ``WL_STA=0``, which is what operational SECOFS
+    ships) is a true no-op logged at INFO, not a warning.
+
+    Parameters
+    ----------
+    ssh_array : (nt, n_bnd)
+        Boundary SSH on the model output time grid -- the Fortran's
+        ``WLOBC(node, time)`` transposed.  Not mutated.
+    times_seconds : (nt,)
+        Output time axis in SECONDS relative to ``model_t0``; exactly the axis
+        written to ``elev2D.th.nc``'s ``time`` variable, so the correction lands
+        on the instants SCHISM reads.
+    model_t0 : datetime
+        Absolute time of ``times_seconds == 0``.  Used as the ``base_date`` for
+        the whole correction, so ``zeta_time``, the tide-prediction epoch, the
+        obs time origin and ``day_start`` / ``day_end`` share ONE origin (an
+        inconsistent one silently yields ``AVGERR = 0``).
+    ctl_file : the OBC control file -- the station configuration, as in COMF.
+    hc_file : ``nosofs.HC_NWLON.nc`` harmonic constants.
+    obs : observation provider (see :class:`ArrayObsProvider`) or a plain
+        ``{nos_id: (times_days, wl)}`` dict.  ``None`` => correction skipped.
+
+    Returns
+    -------
+    (ssh, info)
+        ``ssh`` is the corrected array (same shape and dtype) when the
+        correction ran and changed values, else the input array unchanged.
+        ``info`` carries ``applied`` (bool), ``reason`` (str), ``n_stations``,
+        ``n_nodes_corrected``, ``avgerr`` (``{nos_id: metres}``) and
+        ``skipped_stations``.
+    """
+    info: Dict = {
+        "applied": False,
+        "reason": "",
+        "n_stations": 0,
+        "n_nodes_corrected": 0,
+        "avgerr": {},
+        "skipped_stations": [],
+    }
+
+    def _skip(reason: str, warn: bool = True):
+        info["reason"] = reason
+        (log.warning if warn else log.info)(f"WL bias correction skipped: {reason}")
+        return ssh_array, info
+
+    try:
+        if ctl_file is None or not Path(ctl_file).exists():
+            return _skip(f"OBC control file not found ({ctl_file})")
+        ctl = parse_obc_ctl(ctl_file)
+
+        # NSTA=0 / no WL_STA node => nothing configured.  Checked FIRST so the
+        # operational (correction-off) config never touches HC files or obs.
+        n_wl_sta = sum(1 for s in ctl.stations if s.wl_flag == 0)
+        n_wl_nodes = sum(1 for n in ctl.nodes if n.wl_sta > 0)
+        if ctl.nsta == 0 or n_wl_sta == 0 or n_wl_nodes == 0:
+            return _skip(
+                f"no correction stations in {Path(ctl_file).name} "
+                f"(NSTA={ctl.nsta}, WL_FLAG=0 stations={n_wl_sta}, "
+                f"nodes with WL_STA>0={n_wl_nodes})",
+                warn=False,
+            )
+
+        ssh = np.asarray(ssh_array)
+        if ssh.ndim != 2:
+            return _skip(f"ssh_array must be 2-D (nt, n_bnd), got {ssh.shape}")
+        nt, n_bnd = ssh.shape
+        t_sec = np.asarray(times_seconds, dtype=float)
+        if t_sec.size != nt:
+            return _skip(
+                f"time axis has {t_sec.size} entries but ssh_array has {nt}"
+            )
+        if len(ctl.nodes) != n_bnd:
+            return _skip(
+                f"{Path(ctl_file).name} has NOBC={len(ctl.nodes)} but the "
+                f"boundary array has {n_bnd} nodes"
+            )
+        if hc_file is None or not Path(hc_file).exists():
+            return _skip(f"harmonic-constants file not found ({hc_file})")
+        if obs is None:
+            return _skip("no observation provider configured")
+        if isinstance(obs, dict):
+            obs = ArrayObsProvider(obs)
+
+        # One origin for everything: days since model_t0 (= base_date).
+        zeta_time_days = t_sec / 86400.0
+        day_start = float(zeta_time_days[0])
+        day_end = float(zeta_time_days[-1])
+
+        # Source series per station = WLOBC at its (1-based) GRIDID_STA node.
+        source = np.zeros((ctl.nsta, nt), dtype=float)
+        skipped: List[int] = []
+        for i, sta in enumerate(ctl.stations):
+            gid = int(sta.gridid_sta)
+            if 1 <= gid <= n_bnd:
+                source[i] = ssh[:, gid - 1]
+            else:
+                skipped.append(i)
+                log.warning(
+                    f"WL bias: station {sta.nos_id} has GRIDID_STA={gid} "
+                    f"outside 1..{n_bnd} -- station skipped"
+                )
+        info["skipped_stations"] = [ctl.stations[i].nos_id for i in skipped]
+        if len(skipped) == ctl.nsta:
+            return _skip("every correction station has an out-of-range GRIDID_STA")
+        if skipped:
+            obs = _MaskedObs(obs, [ctl.stations[i] for i in skipped])
+
+        corr = compute_wl_corrections(
+            ctl, obs, source, zeta_time_days, model_t0, day_end,
+            hc_path=hc_file, day_start=day_start,
+        )
+        for i in skipped:  # belt-and-braces: never let a bad row reach a node
+            corr.avgerr[i] = 0.0
+            corr.resid[i] = 0.0
+
+        corrected = apply_wl_corrections(ssh.T, ctl, corr).T
+        n_changed = int(np.count_nonzero(np.any(corrected != ssh, axis=0)))
+
+        info["n_stations"] = int(ctl.nsta - len(skipped))
+        info["avgerr"] = {
+            sta.nos_id: float(corr.avgerr[i]) for i, sta in enumerate(ctl.stations)
+            if i not in skipped
+        }
+        info["n_nodes_corrected"] = n_changed
+        for i, sta in enumerate(ctl.stations):
+            if i in skipped:
+                continue
+            log.info(
+                f"WL bias station {sta.nos_id} (node {sta.gridid_sta}): "
+                f"AVGERR={corr.avgerr[i]:+.4f} m"
+            )
+
+        if n_changed == 0:
+            info["reason"] = "corrections evaluated to zero (no usable observations)"
+            log.warning(f"WL bias correction: {info['reason']}")
+            return ssh_array, info
+
+        info["applied"] = True
+        info["reason"] = f"applied to {n_changed} of {n_bnd} boundary nodes"
+        log.info(
+            f"WL bias correction applied: {n_changed}/{n_bnd} boundary nodes, "
+            f"{info['n_stations']} station(s)"
+        )
+        return corrected.astype(ssh.dtype, copy=False), info
+
+    except Exception as exc:  # never fatal: prep must survive a late gauge tank
+        info["reason"] = f"error: {exc}"
+        log.warning(f"WL bias correction failed ({exc}) -- SSH left uncorrected")
+        return ssh_array, info
