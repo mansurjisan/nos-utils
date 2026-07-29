@@ -30,6 +30,7 @@ from typing import Optional
 import numpy as np
 
 from ..config import ForcingConfig
+from ..coords import normalize_lon, lon_convention
 
 log = logging.getLogger(__name__)
 
@@ -39,9 +40,11 @@ try:
 except ImportError:
     HAS_NETCDF4 = False
 
-# ADT subset domain (eastern boundary region)
-ADT_LON_MIN = -62.5
-ADT_LON_MAX = -51.5
+# ADT subset domain — computed from config at runtime, not hardcoded here.
+# Atlantic defaults kept as module-level fallbacks for callers that do not
+# pass a config (e.g. legacy shell tests).
+ADT_LON_MIN_DEFAULT = -62.5
+ADT_LON_MAX_DEFAULT = -51.5
 ADT_LAT_MIN = 7.0
 ADT_LAT_MAX = 54.0
 
@@ -57,6 +60,24 @@ class ADTBlender:
         """
         self.config = config
         self.input_path = input_path
+
+        # ADT subset domain: derive from the config's lon/lat extent.
+        # Pacific (0-360) needs the domain bounds converted to the ADT
+        # product convention (-180/+180) for subsetting the CMEMS NetCDF.
+        self._adt_lon_min = ADT_LON_MIN_DEFAULT
+        self._adt_lon_max = ADT_LON_MAX_DEFAULT
+        if hasattr(config, "lon_min") and hasattr(config, "lon_max"):
+            _conv = lon_convention(config)
+            if _conv == "0360":
+                # Pacific: convert the domain lon_min/max from 0-360 to -180/180
+                # so we can subset the CMEMS global ADT file (which uses -180/180)
+                self._adt_lon_min = float(normalize_lon(
+                    np.array([config.lon_min]), "pm180")[0])
+                self._adt_lon_max = float(normalize_lon(
+                    np.array([config.lon_max]), "pm180")[0])
+            else:
+                self._adt_lon_min = float(config.lon_min)
+                self._adt_lon_max = float(config.lon_max)
 
     def blend_ssh(self, ssh_path: Path, work_dir: Path) -> Optional[Path]:
         """Blend ADT into RTOFS SSH_1.nc.
@@ -153,8 +174,9 @@ class ADTBlender:
             lons = np.array(ds.variables[lon_name][:])
             lats = np.array(ds.variables[lat_name][:])
 
-            # Subset to ADT domain
-            lon_mask = (lons >= ADT_LON_MIN) & (lons <= ADT_LON_MAX)
+            # Subset to ADT domain using per-instance bounds (config-derived)
+            # self._adt_lon_min/max are always in -180/+180 to match CMEMS files
+            lon_mask = (lons >= self._adt_lon_min) & (lons <= self._adt_lon_max)
             lat_mask = (lats >= ADT_LAT_MIN) & (lats <= ADT_LAT_MAX)
 
             lon_idx = np.where(lon_mask)[0]

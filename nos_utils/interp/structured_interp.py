@@ -18,6 +18,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ..coords import normalize_lon
+
 log = logging.getLogger(__name__)
 
 try:
@@ -36,17 +38,22 @@ class StructuredGridInterpolator:
     """
 
     def __init__(self, lon_2d: np.ndarray, lat_2d: np.ndarray,
-                 mask: Optional[np.ndarray] = None):
+                 mask: Optional[np.ndarray] = None,
+                 convention: str = "pm180"):
         """
         Build interpolator from a structured grid.
 
         Args:
-            lon_2d: Longitude array, shape (ny, nx). Will be converted to -180/180.
+            lon_2d: Longitude array, shape (ny, nx). Converted to *convention*.
             lat_2d: Latitude array, shape (ny, nx).
             mask: Boolean ocean mask, shape (ny, nx). True = ocean. If None, all ocean.
+            convention: Longitude convention to use internally — ``"pm180"``
+                (default, -180..+180) or ``"0360"`` (0..+360 for Pacific).
+                Must match the convention of target points passed to
+                :meth:`interpolate`.
         """
         self.ny, self.nx = lon_2d.shape
-        self.lon = np.where(lon_2d > 180, lon_2d - 360, lon_2d).astype(np.float64)
+        self.lon = normalize_lon(lon_2d, convention).astype(np.float64)
         self.lat = lat_2d.astype(np.float64)
         self.mask = mask if mask is not None else np.ones((self.ny, self.nx), dtype=bool)
 
@@ -86,7 +93,8 @@ class StructuredGridInterpolator:
         Interpolate data field to target points using bilinear interpolation.
 
         Args:
-            target_lon: Target longitudes (-180/180), shape (n_targets,)
+            target_lon: Target longitudes (must use the same convention as
+                was passed to ``__init__``), shape (n_targets,)
             target_lat: Target latitudes, shape (n_targets,)
             data: Field values on the grid, shape (ny, nx). NaN/fill for land.
 

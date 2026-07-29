@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ..config import ForcingConfig
+from ..coords import normalize_lon, lon_convention
 from ..io.grib_extract import GRIBExtractor, get_extractor
 from .base import ForcingProcessor, ForcingResult
 from .sflux_writer import SfluxWriter
@@ -460,8 +461,9 @@ class HRRRProcessor(ForcingProcessor):
                             r2 = subprocess.run(cmd_lat2, capture_output=True, text=True, timeout=60)
                             if r2.returncode == 0 and lat_file.exists():
                                 lats = np.fromfile(lat_file, dtype=np.float32).reshape((ny, nx))
-                                # Convert lon from 0-360 to -180..180
-                                lons = np.where(lons > 180, lons - 360, lons)
+                                # Convert lon to match domain convention
+                                # (Atlantic: -180/+180; Pacific: 0/+360)
+                                lons = normalize_lon(lons, lon_convention(self.config))
                                 native_lons = lons
                                 native_lats = lats
                                 log.info(f"Native HRRR grid: {ny}x{nx}, "
@@ -611,9 +613,9 @@ class HRRRProcessor(ForcingProcessor):
                             lo = float(parts[0])
                             la = float(parts[1])
                             va = float(parts[2])
-                            # Convert 0-360 to -180-180 if needed
-                            if lo > 180:
-                                lo -= 360.0
+                            # Convert lon to match domain convention if needed
+                            if lo > 180 or lo < 0:
+                                lo = float(normalize_lon(np.array([lo]), lon_convention(self.config))[0])
                             lons_lcc.append(lo)
                             lats_lcc.append(la)
                             vals.append(va)
