@@ -12,6 +12,31 @@ from typing import List, Optional
 
 log = logging.getLogger(__name__)
 
+_DEFAULT_NUDGING_TIMESCALE_S = 86400.0
+
+
+def _nudging_timescale_seconds(nudge) -> float:
+    """Nudging timescale in seconds from a `forcing.ocean.nudging` block.
+
+    Systems whose relaxation strength is a spatial field in the *_nudge.gr3
+    files (Pacific, Alaska) author an explicit `timescale_days: null` to say
+    "no scalar applies". That key is present-but-None, so a `.get(key,
+    default)` still returns None and the old inline arithmetic raised
+    TypeError on None * 86400 -- taking the whole config load down.
+    """
+    if not isinstance(nudge, dict):
+        return _DEFAULT_NUDGING_TIMESCALE_S
+
+    seconds = nudge.get("timescale_seconds")
+    if seconds is not None:
+        return float(seconds)
+
+    days = nudge.get("timescale_days")
+    if days is not None:
+        return float(days) * 86400.0
+
+    return _DEFAULT_NUDGING_TIMESCALE_S
+
 
 @dataclass
 class ForcingConfig:
@@ -578,9 +603,12 @@ class ForcingConfig:
         grid_files = grid.get("files", {})
         grid_file = grid_files.get("horizontal_ll") or grid_files.get("horizontal")
 
-        # OBC settings
+        # OBC settings. An explicit `ssh_offset: null` -- which Pacific and
+        # Alaska both author, the offset being N/A for those domains -- is
+        # present-but-None, a case a .get() default does not cover.
         obc = ocean.get("obc", {}) if isinstance(ocean, dict) else {}
-        obc_ssh_offset = float(obc.get("ssh_offset", 0.0))
+        _ssh_offset = obc.get("ssh_offset")
+        obc_ssh_offset = 0.0 if _ssh_offset is None else float(_ssh_offset)
 
         # Elevation-forced open-boundary segment indices (0-based). When set
         # AND no obc.ctl is used, restricts the *.th.nc boundary node set to
@@ -629,9 +657,7 @@ class ForcingConfig:
             scale_hflux=float(atm.get("scale_hflux", 1.0)),
             n_levels=n_levels,
             nudging_enabled=nudge.get("enabled", False) if isinstance(nudge, dict) else False,
-            nudging_timescale_seconds=float(
-                nudge.get("timescale_seconds", nudge.get("timescale_days", 1.0) * 86400)
-            ) if isinstance(nudge, dict) else 86400.0,
+            nudging_timescale_seconds=_nudging_timescale_seconds(nudge),
             obc_ssh_offset=obc_ssh_offset,
             obc_elev_segments=obc_elev_segments,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
@@ -779,20 +805,25 @@ class ForcingConfig:
                         f"Unknown ufs_coastal.datm_domain preset '{preset}'. "
                         f"Known: {sorted(DATM_PRESETS)}. Falling back to model domain."
                     )
-            if "blend_resolution" in ufs_coastal:
+            if ufs_coastal.get("blend_resolution") is not None:
                 kwargs["datm_dx"] = float(ufs_coastal["blend_resolution"])
             # UFS resource layout (used by UFSConfigProcessor to patch
             # ufs.configure PET bounds and model_configure NHOURS/DT_ATMOS).
-            if "datm_tasks" in ufs_coastal:
-                kwargs["ufs_datm_tasks"] = int(ufs_coastal["datm_tasks"])
-            if "schism_tasks" in ufs_coastal:
-                kwargs["ufs_schism_tasks"] = int(ufs_coastal["schism_tasks"])
-            if "total_tasks" in ufs_coastal:
-                kwargs["ufs_total_tasks"] = int(ufs_coastal["total_tasks"])
-            if "nhours_fcst" in ufs_coastal:
-                kwargs["ufs_nhours_fcst"] = int(ufs_coastal["nhours_fcst"])
-            if "dt_atmos" in ufs_coastal:
-                kwargs["ufs_dt_atmos"] = int(ufs_coastal["dt_atmos"])
+            #
+            # Tested with `.get(...) is not None`, not `in`: a system that has
+            # no UFS rank layout yet authors the key explicitly as null (see
+            # stofs_3d_pac_ufs, whose validated engine is standalone), and an
+            # `in` test passes for a present-but-null key, so int(None) raised
+            # and took the whole config load down.
+            for yaml_key, attr in (
+                ("datm_tasks", "ufs_datm_tasks"),
+                ("schism_tasks", "ufs_schism_tasks"),
+                ("total_tasks", "ufs_total_tasks"),
+                ("nhours_fcst", "ufs_nhours_fcst"),
+                ("dt_atmos", "ufs_dt_atmos"),
+            ):
+                if ufs_coastal.get(yaml_key) is not None:
+                    kwargs[attr] = int(ufs_coastal[yaml_key])
 
         # Optional Path fields — only set if value is non-empty
         # River config: try sources_json first (STOFS), then ctl_file (SECOFS)
