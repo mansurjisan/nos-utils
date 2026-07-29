@@ -150,7 +150,8 @@ class ESMFMeshProcessor(ForcingProcessor):
         edges[-1] = centers[-1] + 0.5 * (centers[-1] - centers[-2])
         return edges
 
-    def _create_mesh(self, lons: np.ndarray, lats: np.ndarray, output_path: Path) -> None:
+    @staticmethod
+    def _create_mesh(lons: np.ndarray, lats: np.ndarray, output_path: Path) -> None:
         """Write an ESMF unstructured mesh whose ELEMENTS are the data points.
 
         CDEPS reads every stream field at ``ESMF_MESHLOC_ELEMENT``
@@ -184,8 +185,8 @@ class ESMFMeshProcessor(ForcingProcessor):
         nx = len(lons)
         ny = len(lats)
         n_elements = nx * ny
-        lon_edges = self._cell_edges(lons)
-        lat_edges = self._cell_edges(lats)
+        lon_edges = ESMFMeshProcessor._cell_edges(lons)
+        lat_edges = ESMFMeshProcessor._cell_edges(lats)
         nxe, nye = nx + 1, ny + 1
         n_nodes = nxe * nye
 
@@ -198,8 +199,12 @@ class ESMFMeshProcessor(ForcingProcessor):
         # Corner nodes, x-fastest.
         node_coords = nc.createVariable("nodeCoords", "f8", ("nodeCount", "coordDim"))
         node_coords.units = "degrees"
-        elon, elat = np.meshgrid(lon_edges, lat_edges)
-        node_coords[:] = np.column_stack([elon.ravel(), elat.ravel()])
+        # tile/repeat rather than meshgrid+ravel: it says x-fastest in the
+        # call itself, and ordering is exactly what was wrong here. (Peak
+        # memory is the same either way -- measured.)
+        node_coords[:] = np.column_stack(
+            [np.tile(lon_edges, nye), np.repeat(lat_edges, nxe)]
+        )
 
         # Connectivity into the (ny+1) x (nx+1) node grid, 1-based CCW.
         elem_conn = nc.createVariable(
@@ -227,8 +232,9 @@ class ESMFMeshProcessor(ForcingProcessor):
             "centerCoords", "f8", ("elementCount", "coordDim")
         )
         center_coords.units = "degrees"
-        clon, clat = np.meshgrid(lons, lats)
-        center_coords[:] = np.column_stack([clon.ravel(), clat.ravel()])
+        center_coords[:] = np.column_stack(
+            [np.tile(lons, ny), np.repeat(lats, nx)]
+        )
 
         nc.gridType = "unstructured"
         nc.title = "ESMF mesh for DATM atmospheric forcing"

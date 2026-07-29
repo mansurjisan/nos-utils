@@ -101,7 +101,7 @@ class TestCDEPSElementMapping:
     def _mesh(self, tmp_path, lons, lats):
         from nos_utils.forcing.esmf_mesh import ESMFMeshProcessor
         out = tmp_path / "m.nc"
-        ESMFMeshProcessor._create_mesh(ESMFMeshProcessor, lons, lats, out)
+        ESMFMeshProcessor._create_mesh(lons, lats, out)
         return netCDF4.Dataset(str(out))
 
     def test_element_k_is_the_data_point_at_flat_index_k(self, tmp_path):
