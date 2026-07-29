@@ -52,7 +52,20 @@ def config_from_env(
         (ForcingConfig, paths_dict)
     """
     pdy = os.environ.get("PDY", "")
-    cyc = int(os.environ.get("cyc", "12"))
+    # Accept either case: PBS cards export lowercase `cyc`, while launcher and
+    # Slurm paths pass uppercase `CYC`. Reading only the lowercase form and
+    # defaulting silently prepped the 12z cycle for a run of any other hour.
+    cyc_raw = os.environ.get("cyc") or os.environ.get("CYC") or ""
+    if not cyc_raw.strip():
+        raise EnvironmentError(
+            "Neither 'cyc' nor 'CYC' is set -- refusing to guess the cycle"
+        )
+    try:
+        cyc = int(cyc_raw)
+    except ValueError:
+        raise EnvironmentError(f"cycle is not an integer: {cyc_raw!r}") from None
+    if not 0 <= cyc <= 23:
+        raise EnvironmentError(f"cycle out of range: {cyc}")
     ofs = ofs_override or os.environ.get("RUN", "secofs")
 
     if not pdy:
