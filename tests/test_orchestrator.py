@@ -284,19 +284,18 @@ class TestArchiveManifest:
         files = self._archive(self._secofs_cfg(), "secofs_ufs",
                               tmp_path, monkeypatch, manifest=None)
         # COMMON tars + met tars + copied files. No St. Lawrence /
-        # OBC-QC artifacts (SECOFS config disables both).
+        # OBC-QC artifacts (SECOFS config disables both). The bare obc.tar,
+        # {phase}.in and loose river.{v,m}source.th are intentionally absent:
+        # unconsumed duplicates (phase tars / NWM tars / param.nml cover
+        # their data), pruned from archive_to_comout.
         expected = {
             "secofs_ufs.t12z.20260401.met.nowcast.nc.tar",
             "secofs_ufs.t12z.20260401.met.nowcast.nc.2.tar",
             "secofs_ufs.t12z.20260401.obc.nowcast.tar",
-            "secofs_ufs.t12z.20260401.obc.tar",
             "secofs_ufs.t12z.20260401.river.th.tar",
             "secofs_ufs.t12z.20260401.nwm.source.sink.now.tar",
-            "secofs_ufs.t12z.20260401.nowcast.in",
             "secofs_ufs.t12z.20260401.bctides.in.nowcast",
             "secofs_ufs.source_sink.in",
-            "secofs_ufs.t12z.20260401.river.vsource.th",
-            "secofs_ufs.t12z.20260401.river.msource.th",
             "secofs_ufs.t12z.20260401.inputs.prep.json",
         }
         assert files == expected
@@ -360,14 +359,10 @@ class TestArchiveManifest:
             "stofs_3d_atl.t12z.20260401.met.nowcast.nc.tar",
             "stofs_3d_atl.t12z.20260401.met.nowcast.nc.2.tar",
             "stofs_3d_atl.t12z.20260401.obc.nowcast.tar",
-            "stofs_3d_atl.t12z.20260401.obc.tar",
             "stofs_3d_atl.t12z.20260401.river.th.tar",
             "stofs_3d_atl.t12z.20260401.nwm.source.sink.now.tar",
-            "stofs_3d_atl.t12z.20260401.nowcast.in",
             "stofs_3d_atl.t12z.20260401.bctides.in.nowcast",
             "stofs_3d_atl.source_sink.in",
-            "stofs_3d_atl.t12z.20260401.river.vsource.th",
-            "stofs_3d_atl.t12z.20260401.river.msource.th",
             "stofs_3d_atl.t12z.20260401.inputs.prep.json",
         }
         st_lawrence = {
