@@ -39,7 +39,8 @@ class TestESMFMeshProcessor:
         n_nodes = ds.dimensions["nodeCount"].size
         n_elements = ds.dimensions["elementCount"].size
 
-        # For a 41x41 grid (10° lon × 10° lat at 0.25°): nodes=41*41=1681, elements=40*40=1600
+        # For a 41x41 forcing grid: elements=41*41 (one per data value),
+        # nodes=42*42 (the surrounding corners).
         assert n_nodes > 0
         assert n_elements > 0
         assert n_elements == result.metadata["n_elements"]
@@ -74,4 +75,87 @@ class TestESMFMeshProcessor:
         assert result.success
         assert result.metadata["nx"] == 5
         assert result.metadata["ny"] == 4
-        assert result.metadata["n_elements"] == 4 * 3  # (5-1)*(4-1)
+        # One element per forcing value: CDEPS reads stream fields at
+        # ESMF_MESHLOC_ELEMENT, so elementCount must equal nx*ny. This
+        # asserted (5-1)*(4-1) until 2026-07-28, which is what let the
+        # cell-cornered mesh ship.
+        assert result.metadata["n_elements"] == 5 * 4
+        assert result.metadata["n_nodes"] == 6 * 5
+
+
+class TestCDEPSElementMapping:
+    """The mesh must survive CDEPS's flat element read without shearing.
+
+    CDEPS creates every stream field at ESMF_MESHLOC_ELEMENT and does not
+    validate elementCount against the forcing file's dimensions. With a
+    cell-cornered mesh, (nx-1)*(ny-1) < nx*ny, so PIO silently read the
+    first (nx-1)*(ny-1) values in flat order: element (r,c) received file
+    value r*(nx-1)+c instead of r*nx+c, slipping one cell west per row.
+
+    On the real 1721x1721 SECOFS grid that displaced forcing by a median
+    1431 km -- the Chesapeake Bay mouth was driven by open-Atlantic wind
+    from 1427 km east. Reproduced from station output at r = 1.000 across
+    all 430 stations before the fix.
+    """
+
+    def _mesh(self, tmp_path, lons, lats):
+        from nos_utils.forcing.esmf_mesh import ESMFMeshProcessor
+        out = tmp_path / "m.nc"
+        ESMFMeshProcessor._create_mesh(ESMFMeshProcessor, lons, lats, out)
+        return netCDF4.Dataset(str(out))
+
+    def test_element_k_is_the_data_point_at_flat_index_k(self, tmp_path):
+        """The invariant that makes the flat read correct."""
+        nx, ny = 7, 5
+        lons = -98.0 + 0.025 * np.arange(nx)
+        lats = 10.0 + 0.025 * np.arange(ny)
+        ds = self._mesh(tmp_path, lons, lats)
+
+        assert ds.dimensions["elementCount"].size == nx * ny
+        assert ds.dimensions["nodeCount"].size == (nx + 1) * (ny + 1)
+
+        centers = np.asarray(ds.variables["centerCoords"][:])
+        k = np.arange(nx * ny)
+        expected = np.column_stack([lons[k % nx], lats[k // nx]])
+        assert np.allclose(centers, expected), (
+            "element k must carry the forcing value at flat index k; any "
+            "offset here IS the shear"
+        )
+        ds.close()
+
+    def test_nodes_are_half_cell_corners_not_the_data_points(self, tmp_path):
+        """Centres on the data points, corners staggered around them."""
+        nx, ny = 7, 5
+        dx = 0.025
+        lons = -98.0 + dx * np.arange(nx)
+        lats = 10.0 + dx * np.arange(ny)
+        ds = self._mesh(tmp_path, lons, lats)
+        nodes = np.asarray(ds.variables["nodeCoords"][:])
+        assert np.allclose(nodes[0], [lons[0] - dx / 2, lats[0] - dx / 2])
+        assert np.allclose(nodes[-1], [lons[-1] + dx / 2, lats[-1] + dx / 2])
+        ds.close()
+
+    def test_connectivity_indexes_the_corner_grid(self, tmp_path):
+        nx, ny = 7, 5
+        ds = self._mesh(tmp_path, -98.0 + 0.025 * np.arange(nx),
+                        10.0 + 0.025 * np.arange(ny))
+        conn = np.asarray(ds.variables["elementConn"][:])
+        n_nodes = ds.dimensions["nodeCount"].size
+        assert conn.shape == (nx * ny, 4)
+        assert conn.min() >= 1 and conn.max() <= n_nodes
+        # First element: SW, SE, NE, NW on a (nx+1)-wide node grid.
+        assert conn[0].tolist() == [1, 2, nx + 3, nx + 2]
+        assert np.all(np.asarray(ds.variables["elementMask"][:]) == 1)
+        ds.close()
+
+    def test_non_uniform_spacing_uses_midpoint_edges(self, tmp_path):
+        lons = np.array([-80.0, -79.5, -78.0, -77.9])
+        lats = np.array([25.0, 26.0, 28.5])
+        ds = self._mesh(tmp_path, lons, lats)
+        assert ds.dimensions["elementCount"].size == lons.size * lats.size
+        centers = np.asarray(ds.variables["centerCoords"][:])
+        assert np.allclose(centers[: lons.size, 0], lons)
+        nodes = np.asarray(ds.variables["nodeCoords"][:])
+        # Interior edge sits at the midpoint of neighbouring centres.
+        assert np.isclose(nodes[1, 0], (lons[0] + lons[1]) / 2)
+        ds.close()
