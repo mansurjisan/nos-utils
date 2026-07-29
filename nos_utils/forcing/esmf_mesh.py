@@ -83,15 +83,17 @@ class ESMFMeshProcessor(ForcingProcessor):
 
         nx, ny = len(lons), len(lats)
         log.info(f"Created datm_esmf_mesh.nc: nx={nx}, ny={ny}, "
-                 f"elements={(nx-1)*(ny-1)}, nodes={nx*ny}")
+                 f"elements={nx*ny}, nodes={(nx+1)*(ny+1)}")
 
         return ForcingResult(
             success=True, source=self.SOURCE_NAME,
             output_files=[output_file],
             metadata={
                 "nx": nx, "ny": ny,
-                "n_elements": (nx - 1) * (ny - 1),
-                "n_nodes": nx * ny,
+                # One element per forcing value (CDEPS reads at
+                # ESMF_MESHLOC_ELEMENT); nodes are the surrounding corners.
+                "n_elements": nx * ny,
+                "n_nodes": (nx + 1) * (ny + 1),
             },
         )
 
@@ -132,79 +134,108 @@ class ESMFMeshProcessor(ForcingProcessor):
         lats = np.arange(lat_min, lat_max + dx, dx)
         return lons, lats
 
-    def _create_mesh(self, lons: np.ndarray, lats: np.ndarray, output_path: Path) -> None:
-        """
-        Create ESMF unstructured mesh file from regular lat/lon grid.
+    @staticmethod
+    def _cell_edges(centers: np.ndarray) -> np.ndarray:
+        """Cell boundaries for ``centers``: midpoints, extrapolated at the ends.
 
-        ESMF mesh format:
-          - nodeCoords: [n_nodes, 2] (lon, lat pairs)
-          - elementConn: [n_elements, 4] (quad connectivity, 1-based)
-          - elementMask: [n_elements] — MUST be 1 (active), NOT 0 (lesson #18)
-          - numElementConn: [n_elements] — always 4 for quads
-          - centerCoords: [n_elements, 2] (element center lon/lat)
+        Works for non-uniform spacing, so a stretched or subset grid is
+        handled the same way as the regular 0.025 deg DATM grid.
+        """
+        centers = np.asarray(centers, dtype=float)
+        if centers.size < 2:
+            raise ValueError("need at least 2 grid points to build cell edges")
+        edges = np.empty(centers.size + 1, dtype=float)
+        edges[1:-1] = 0.5 * (centers[:-1] + centers[1:])
+        edges[0] = centers[0] - 0.5 * (centers[1] - centers[0])
+        edges[-1] = centers[-1] + 0.5 * (centers[-1] - centers[-2])
+        return edges
+
+    @staticmethod
+    def _create_mesh(lons: np.ndarray, lats: np.ndarray, output_path: Path) -> None:
+        """Write an ESMF unstructured mesh whose ELEMENTS are the data points.
+
+        CDEPS reads every stream field at ``ESMF_MESHLOC_ELEMENT``
+        (``dshr_strdata_mod.F90`` creates all stream fields that way; there
+        is no node-based read path), so a forcing file with ``nx*ny`` values
+        needs a mesh with exactly ``nx*ny`` elements, centred ON the data
+        points.
+
+        This previously treated the forcing coordinates as cell CORNERS --
+        ``n_elements = (nx-1)*(ny-1)`` with centres half a cell to the
+        north-east of each data point. CDEPS does not check element count
+        against the file's dimensions, and because (nx-1)*(ny-1) < nx*ny,
+        PIO silently read the first (nx-1)*(ny-1) values in flat order. The
+        data is row-major with nx per row while elements run nx-1 per row,
+        so the mapping slipped one cell west per row and sheared with
+        latitude: on the 1721x1721 SECOFS grid, stations were forced with
+        wind from a median 1431 km away (Chesapeake Bay mouth was reading
+        the open Atlantic, 1427 km east). Confirmed by reproducing station
+        output exactly (r = 1.000 at 430/430 stations) from the predicted
+        sheared indices.
+
+        Layout, with k = j*nx + i so element order matches the forcing
+        file's flattened ``(y, x)``:
+
+          - elementCount = nx*ny, centerCoords[k] = (lons[i], lats[j])
+          - nodeCount = (nx+1)*(ny+1) corner nodes on the staggered grid
+          - elementConn = the 4 surrounding corners, counter-clockwise
+          - elementMask = 1 everywhere; CMEPS uses srcMaskValues=(/0/), so
+            0 would mask the cell OUT
         """
         nx = len(lons)
         ny = len(lats)
-        n_nodes = nx * ny
-        n_elements = (nx - 1) * (ny - 1)
+        n_elements = nx * ny
+        lon_edges = ESMFMeshProcessor._cell_edges(lons)
+        lat_edges = ESMFMeshProcessor._cell_edges(lats)
+        nxe, nye = nx + 1, ny + 1
+        n_nodes = nxe * nye
 
         nc = Dataset(str(output_path), "w", format="NETCDF4")
-
-        # Dimensions
         nc.createDimension("nodeCount", n_nodes)
         nc.createDimension("elementCount", n_elements)
-        nc.createDimension("maxNodePElement", 4)  # quadrilateral
+        nc.createDimension("maxNodePElement", 4)
         nc.createDimension("coordDim", 2)
 
-        # Node coordinates (lon, lat pairs)
+        # Corner nodes, x-fastest.
         node_coords = nc.createVariable("nodeCoords", "f8", ("nodeCount", "coordDim"))
         node_coords.units = "degrees"
+        # tile/repeat rather than meshgrid+ravel: it says x-fastest in the
+        # call itself, and ordering is exactly what was wrong here. (Peak
+        # memory is the same either way -- measured.)
+        node_coords[:] = np.column_stack(
+            [np.tile(lon_edges, nye), np.repeat(lat_edges, nxe)]
+        )
 
-        lon_2d, lat_2d = np.meshgrid(lons, lats)
-        coords = np.column_stack([lon_2d.ravel(), lat_2d.ravel()])
-        node_coords[:] = coords
-
-        # Element connectivity (1-based, counter-clockwise quad vertices)
-        elem_conn = nc.createVariable("elementConn", "i4", ("elementCount", "maxNodePElement"))
+        # Connectivity into the (ny+1) x (nx+1) node grid, 1-based CCW.
+        elem_conn = nc.createVariable(
+            "elementConn", "i4", ("elementCount", "maxNodePElement")
+        )
         elem_conn.long_name = "Node indices that define the element connectivity"
-        elem_conn.start_index = 1  # 1-based indexing
+        elem_conn.start_index = 1
+        jj, ii = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
+        sw = (jj * nxe + ii + 1).ravel()
+        conn = np.empty((n_elements, 4), dtype=np.int32)
+        conn[:, 0] = sw                 # SW
+        conn[:, 1] = sw + 1             # SE
+        conn[:, 2] = sw + nxe + 1       # NE
+        conn[:, 3] = sw + nxe           # NW
+        elem_conn[:] = conn
 
-        connectivity = np.zeros((n_elements, 4), dtype=np.int32)
-        idx = 0
-        for j in range(ny - 1):
-            for i in range(nx - 1):
-                # Counter-clockwise: SW, SE, NE, NW (1-based)
-                n0 = j * nx + i + 1
-                n1 = j * nx + (i + 1) + 1
-                n2 = (j + 1) * nx + (i + 1) + 1
-                n3 = (j + 1) * nx + i + 1
-                connectivity[idx] = [n0, n1, n2, n3]
-                idx += 1
-        elem_conn[:] = connectivity
-
-        # Number of nodes per element (always 4 for quads)
         num_conn = nc.createVariable("numElementConn", "i4", ("elementCount",))
         num_conn[:] = 4
 
-        # Element mask — CRITICAL: must be 1 (active), NOT 0 (lesson #18)
-        # CMEPS uses srcMaskValues=(/0/), so elementMask=0 means MASKED OUT
         elem_mask = nc.createVariable("elementMask", "i4", ("elementCount",))
-        elem_mask[:] = np.ones(n_elements, dtype=np.int32)  # ALL ACTIVE
+        elem_mask[:] = np.ones(n_elements, dtype=np.int32)
 
-        # Element center coordinates
-        center_coords = nc.createVariable("centerCoords", "f8", ("elementCount", "coordDim"))
+        # Element centres ARE the data points -- this is the whole fix.
+        center_coords = nc.createVariable(
+            "centerCoords", "f8", ("elementCount", "coordDim")
+        )
         center_coords.units = "degrees"
+        center_coords[:] = np.column_stack(
+            [np.tile(lons, ny), np.repeat(lats, nx)]
+        )
 
-        centers = np.zeros((n_elements, 2))
-        idx = 0
-        for j in range(ny - 1):
-            for i in range(nx - 1):
-                centers[idx, 0] = (lons[i] + lons[i + 1]) / 2.0
-                centers[idx, 1] = (lats[j] + lats[j + 1]) / 2.0
-                idx += 1
-        center_coords[:] = centers
-
-        # Global attributes
         nc.gridType = "unstructured"
         nc.title = "ESMF mesh for DATM atmospheric forcing"
         nc.close()
