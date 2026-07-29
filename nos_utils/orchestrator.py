@@ -298,18 +298,56 @@ class PrepOrchestrator:
 
         elapsed = time.time() - t0
 
-        # Determine overall success (all critical steps must succeed)
-        critical_sources = {"GFS", "PARAM_NML", "TIDAL"}
-        if self.is_stofs:
-            # STOFS: NWM and RTOFS are also critical
-            critical_sources.update({"NWM", "RTOFS"})
+        # Determine overall success (all critical steps must succeed).
+        # `prep.critical_sources` in the system YAML is authoritative when
+        # present; otherwise fall back to the run-name heuristic, under which a
+        # non-STOFS system reports success even with no RTOFS and no NWM.
+        declared = getattr(self.config, "critical_sources", None)
+        observed = {r.source for r in results}
+        failed = {r.source for r in results if not r.success}
 
-        success = all(
-            r.success for r in results
-            if r.source in critical_sources
-        )
-        if not any(r.source in critical_sources for r in results):
-            success = any(r.success for r in results)
+        if declared is not None:
+            critical_sources = set(declared)
+            log.info(f"Critical prep sources (declared): {sorted(critical_sources)}")
+
+            # A stage is only created when its input path is present
+            # (`if "rtofs" in self.paths` etc.), so a critical source whose
+            # COMIN* is unset produces NO result at all. Checking only the
+            # results that exist therefore passes a prep that never ran the
+            # source -- which is precisely the state a new platform starts in.
+            missing = sorted(critical_sources - observed)
+            failed_critical = sorted(critical_sources & failed)
+
+            if missing:
+                log.error(
+                    "Critical prep sources NEVER RAN: %s -- no stage was "
+                    "created for them, which normally means their COMIN* "
+                    "input path is unset or does not exist",
+                    missing,
+                )
+            if failed_critical:
+                log.error(f"Critical prep sources FAILED: {failed_critical}")
+
+            success = not missing and not failed_critical
+        else:
+            # Legacy heuristic for configs that have not opted in. Preserved
+            # verbatim, including the never-ran blind spot, so declaring
+            # `prep.critical_sources` is the single switch that tightens it.
+            critical_sources = {"GFS", "PARAM_NML", "TIDAL"}
+            if self.is_stofs:
+                critical_sources.update({"NWM", "RTOFS"})
+            log.info(f"Critical prep sources (heuristic): {sorted(critical_sources)}")
+
+            failed_critical = sorted(critical_sources & failed)
+            if failed_critical:
+                log.error(f"Critical prep sources FAILED: {failed_critical}")
+
+            success = all(
+                r.success for r in results
+                if r.source in critical_sources
+            )
+            if not any(r.source in critical_sources for r in results):
+                success = any(r.success for r in results)
 
         prep_result = PrepResult(
             success=success, phase=phase,

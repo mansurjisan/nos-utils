@@ -216,6 +216,11 @@ class ForcingConfig:
     # this default the fallback would write zeros (V18 SECOFS-UFS bug).
     # 1.0 m^3/s keeps the model moving without dominating the dynamics.
     river_default_flow: float = 1.0
+    # Forcing sources whose failure must fail the whole prep, declared per
+    # system as `prep.critical_sources`. None => fall back to the historical
+    # run-name heuristic in PrepOrchestrator. Declaring this explicitly is what
+    # stops a SECOFS cycle with no RTOFS and no NWM from reporting success.
+    critical_sources: Optional[List[str]] = None
     # NWM product type (STOFS uses medium_range_mem1, SECOFS uses analysis_assim)
     nwm_product: str = "analysis_assim"
     # Target and minimum NWM file counts for STOFS-style assembly
@@ -762,6 +767,11 @@ class ForcingConfig:
                 obc_dyn = bool(prep_extras["obc_dynamic_adjust"])
                 kwargs["dynamic_adjust_enabled"] = obc_dyn
                 kwargs["obc_min_timesteps"] = 21 if obc_dyn else 0
+
+        if isinstance(prep, dict) and prep.get("critical_sources") is not None:
+            kwargs["critical_sources"] = [
+                str(s).upper() for s in prep["critical_sources"]
+            ]
 
         # UFS-Coastal DATM grid configuration. The DATM grid covers a halo
         # around the SCHISM mesh extent so atmospheric forcing reaches all
