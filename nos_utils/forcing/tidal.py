@@ -297,10 +297,25 @@ class TidalProcessor(ForcingProcessor):
             # Compute nodal corrections for this start time
             nodal = compute_nodal_corrections(start_time, self.config.tidal_constituents)
 
-            # Update nodal factors in the tidal potential section
-            # Format: after each constituent name line, the next line has:
-            #   n_doodson amplitude omega nodal_factor equilibrium_arg
-            # We update nodal_factor and equilibrium_arg
+            # Update the nodal factor f and equilibrium argument V0+u wherever a
+            # constituent name is followed by a parameter line. A bctides.in
+            # names each constituent once per section, and the column count is
+            # what distinguishes them:
+            #
+            #   tidal potential    5 cols  species amp freq f V0+u  -> [3], [4]
+            #   boundary forcing   3 cols  freq f V0+u              -> [1], [2]
+            #   per-node elevation 2 cols  amp pha                  -> leave alone
+            #   per-node velocity  4 cols  u_amp u_pha v_amp v_pha  -> leave alone
+            #
+            # The 2- and 4-column shapes are per-node harmonic data: a property
+            # of the mesh, never of the cycle. 4 columns in particular used to
+            # be treated as "a shorter potential line without the frequency
+            # column" and rewritten, which silently replaced the v-component
+            # amplitude and phase of the first node of every constituent on
+            # every ifltype 4/5 boundary with a nodal factor.
+            _NODAL_COLS = {5: (3, 4), 3: (1, 2)}
+
+            updated = 0
             i = 2  # Start after line 0 (date) and line 1 (ntip tip_dp)
             while i < len(lines) - 1:
                 line = lines[i].strip()
@@ -309,25 +324,31 @@ class TidalProcessor(ForcingProcessor):
                     # Next line has the nodal parameters
                     i += 1
                     parts = lines[i].split()
-                    if len(parts) >= 5:
-                        # parts: species amplitude frequency nodefactor equil_arg
-                        f_val = nodal[line]["f"]
-                        v0_plus_u = nodal[line]["v0_plus_u"]
-                        parts[3] = f"{f_val:.5f}"
-                        parts[4] = f"{v0_plus_u:.5f}"
-                    elif len(parts) >= 4:
-                        # Shorter format without frequency column
-                        f_val = nodal[line]["f"]
-                        v0_plus_u = nodal[line]["v0_plus_u"]
-                        parts[2] = f"{f_val:.5f}"
-                        parts[3] = f"{v0_plus_u:.5f}"
-                        lines[i] = " ".join(parts)
+                    slots = _NODAL_COLS.get(len(parts))
+                    if slots:
+                        f_slot, arg_slot = slots
+                        parts[f_slot] = f"{nodal[line]['f']:.5f}"
+                        parts[arg_slot] = f"{nodal[line]['v0_plus_u']:.5f}"
+                        indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+                        lines[i] = indent + " ".join(parts)
+                        updated += 1
                 i += 1
 
             # Write updated file
             output_path.write_text("\n".join(lines) + "\n")
+            if not updated:
+                # Every constituent line was skipped, so the output carries the
+                # template's own nodal factors under a rewritten date -- the
+                # exact silent-staleness this function exists to prevent.
+                log.warning(
+                    "bctides template: no nodal parameter line matched any of "
+                    "%s -- output keeps the template's factors. Check the "
+                    "template's constituent names and column layout.",
+                    sorted(nodal),
+                )
             log.info(f"Updated template: phase={self.phase}, start={start_time}, "
-                     f"nodal corrections applied for {len(nodal)} constituents")
+                     f"nodal corrections applied to {updated} lines "
+                     f"for {len(nodal)} constituents")
             return True
 
         except Exception as e:
