@@ -321,6 +321,7 @@ class TidalProcessor(ForcingProcessor):
             # a commented 2-column elevation node reads as 3 and would be
             # rewritten as if it were a forcing line.
             matched = set()
+            updated = 0
             i = 2  # Start after line 0 (date) and line 1 (ntip tip_dp)
             while i < len(lines) - 1:
                 line = lines[i].split("!")[0].strip()
@@ -341,6 +342,7 @@ class TidalProcessor(ForcingProcessor):
                         if sep:
                             lines[i] += " " + sep + comment
                         matched.add(line)
+                        updated += 1
                 i += 1
 
             # Write updated file
@@ -353,13 +355,21 @@ class TidalProcessor(ForcingProcessor):
             if missing:
                 log.warning(
                     "bctides template: no nodal parameter line was updated for "
-                    "%s -- those constituents keep the template's factors. "
-                    "Check the template's constituent names and column layout.",
+                    "%s -- either the template does not carry them, or their "
+                    "line shape was not recognised, in which case they keep "
+                    "the template's factors.",
                     missing,
                 )
+            # Both counts, deliberately. A constituent is counted as matched
+            # once it is rewritten ANYWHERE, so a template that names it in
+            # the potential section but not the boundary-forcing section
+            # (upper case in one, lower case in the other, say) reports every
+            # constituent matched while the forcing block stays stale. The
+            # line count is what exposes that: expect one line per
+            # constituent per section the template carries.
             log.info(f"Updated template: phase={self.phase}, start={start_time}, "
-                     f"nodal corrections applied for {len(matched)} of "
-                     f"{len(nodal)} constituents")
+                     f"nodal corrections applied to {updated} lines for "
+                     f"{len(matched)} of {len(nodal)} constituents")
             return True
 
         except Exception as e:

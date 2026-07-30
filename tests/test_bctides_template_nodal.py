@@ -180,8 +180,13 @@ class TestTrailingCommentsAreHandled:
         This is reachable in practice because STOFS-3D-AK templates use the
         same upper-case constituent names for per-node block headers as for
         the potential section, unlike SECOFS/ATL/PAC which use lower case.
+
+        The comment must be a SINGLE token: "!node1" makes the raw split 3,
+        which is the shape the boundary-forcing branch claims. A two-token
+        "!node 1" splits to 4 and is skipped for an unrelated reason, so it
+        would pass even without the comment stripping and guard nothing.
         """
         text = ("!d\n0 50.0\n0 !nbfr\n1 !nope\n1 5 0 0 0 !bnd\nM2\n"
-                " 0.307520  168.103381 !node 1\n")
+                " 0.307520  168.103381 !node1\n")
         before, after = _run(tmp_path, mock_config, text=text)
         assert after[6] == before[6], "per-node elevation data was rewritten"
