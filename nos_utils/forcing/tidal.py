@@ -315,40 +315,51 @@ class TidalProcessor(ForcingProcessor):
             # every ifltype 4/5 boundary with a nodal factor.
             _NODAL_COLS = {5: (3, 4), 3: (1, 2)}
 
-            updated = 0
+            # Trailing "!" comments are stripped before counting, and restored
+            # after. They are rare but they break the count both ways: a
+            # commented potential line reads as 8 columns and is skipped, and
+            # a commented 2-column elevation node reads as 3 and would be
+            # rewritten as if it were a forcing line.
+            matched = set()
             i = 2  # Start after line 0 (date) and line 1 (ntip tip_dp)
             while i < len(lines) - 1:
-                line = lines[i].strip()
+                line = lines[i].split("!")[0].strip()
                 # Check if this line is a constituent name
                 if line in nodal:
                     # Next line has the nodal parameters
                     i += 1
-                    parts = lines[i].split()
+                    raw = lines[i]
+                    body, sep, comment = raw.partition("!")
+                    parts = body.split()
                     slots = _NODAL_COLS.get(len(parts))
                     if slots:
                         f_slot, arg_slot = slots
                         parts[f_slot] = f"{nodal[line]['f']:.5f}"
                         parts[arg_slot] = f"{nodal[line]['v0_plus_u']:.5f}"
-                        indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+                        indent = raw[: len(raw) - len(raw.lstrip())]
                         lines[i] = indent + " ".join(parts)
-                        updated += 1
+                        if sep:
+                            lines[i] += " " + sep + comment
+                        matched.add(line)
                 i += 1
 
             # Write updated file
             output_path.write_text("\n".join(lines) + "\n")
-            if not updated:
-                # Every constituent line was skipped, so the output carries the
-                # template's own nodal factors under a rewritten date -- the
-                # exact silent-staleness this function exists to prevent.
+            # Any configured constituent that was never rewritten keeps the
+            # template's own factors under a rewritten date. Report per
+            # constituent rather than only when nothing matched at all: a
+            # partial update is the harder case to notice and just as stale.
+            missing = sorted(set(nodal) - matched)
+            if missing:
                 log.warning(
-                    "bctides template: no nodal parameter line matched any of "
-                    "%s -- output keeps the template's factors. Check the "
-                    "template's constituent names and column layout.",
-                    sorted(nodal),
+                    "bctides template: no nodal parameter line was updated for "
+                    "%s -- those constituents keep the template's factors. "
+                    "Check the template's constituent names and column layout.",
+                    missing,
                 )
             log.info(f"Updated template: phase={self.phase}, start={start_time}, "
-                     f"nodal corrections applied to {updated} lines "
-                     f"for {len(nodal)} constituents")
+                     f"nodal corrections applied for {len(matched)} of "
+                     f"{len(nodal)} constituents")
             return True
 
         except Exception as e:

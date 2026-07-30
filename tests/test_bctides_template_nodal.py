@@ -125,11 +125,63 @@ class TestPerNodeDataIsNeverTouched:
             assert len(b.split()) == len(a.split()), f"column count changed on line {i}"
 
 
-class TestUnmatchedTemplateIsReported:
+class TestStaleConstituentsAreReported:
     def test_warns_when_nothing_matched(self, tmp_path, mock_config, caplog):
         """A template whose constituents never match must not pass silently
         with the template's own (stale) factors."""
         text = "!2019-07-01 12:00:00 UTC\n0 50.0\n0 !nbfr\n0 !nope\n"
         with caplog.at_level("WARNING"):
             _run(tmp_path, mock_config, text=text)
-        assert any("no nodal parameter line matched" in r.message for r in caplog.records)
+        assert any("no nodal parameter line was updated" in r.message
+                   for r in caplog.records)
+
+    def test_warns_per_constituent_on_a_partial_update(self, tmp_path, mock_config, caplog):
+        """A PARTIAL update is the harder case to notice, and just as stale.
+
+        The template below carries only M2, so the other seven configured
+        constituents keep the template's factors -- reporting only the
+        all-or-nothing case would let that pass in silence.
+        """
+        text = ("!2019-07-01 12:00:00 UTC\n1 50.0\nM2\n"
+                " 2 0.242334 0.000140519 1.00958 21.5386\n")
+        with caplog.at_level("WARNING"):
+            _run(tmp_path, mock_config, text=text)
+        warned = [r.getMessage() for r in caplog.records
+                  if "no nodal parameter line was updated" in r.getMessage()]
+        assert warned, "a partial update must still warn"
+        assert "M2" not in warned[0], "M2 was updated and must not be listed"
+        for c in ("S2", "K1", "O1"):
+            assert c in warned[0]
+
+
+class TestTrailingCommentsAreHandled:
+    # Rare, but they shift the column count in both directions.
+
+    def test_commented_potential_line_is_still_updated(self, tmp_path, mock_config):
+        """5 values + a comment splits to 8 tokens and used to be skipped,
+        leaving that one constituent stale while the rest updated."""
+        text = ("!d\n1 50.0\nM2\n"
+                " 2 0.242334 0.000140519 1.00958 21.5386  !species constants\n")
+        before, after = _run(tmp_path, mock_config, text=text)
+        assert _field(after, 3, 3) != _field(before, 3, 3)
+        assert "!species constants" in after[3], "the comment must survive"
+
+    def test_commented_forcing_line_is_still_updated(self, tmp_path, mock_config):
+        text = ("!d\n0 50.0\n1 !nbfr\nM2\n"
+                " 0.000140519 1.00958 21.5386 !freq, nodal factor, argument\n")
+        before, after = _run(tmp_path, mock_config, text=text)
+        assert _field(after, 4, 1) != _field(before, 4, 1)
+        assert "!freq" in after[4]
+
+    def test_commented_elevation_node_is_not_rewritten(self, tmp_path, mock_config):
+        """The mirror hazard: 2 values + a comment reads as 3 raw tokens, and
+        would be rewritten as though it were a boundary-forcing line.
+
+        This is reachable in practice because STOFS-3D-AK templates use the
+        same upper-case constituent names for per-node block headers as for
+        the potential section, unlike SECOFS/ATL/PAC which use lower case.
+        """
+        text = ("!d\n0 50.0\n0 !nbfr\n1 !nope\n1 5 0 0 0 !bnd\nM2\n"
+                " 0.307520  168.103381 !node 1\n")
+        before, after = _run(tmp_path, mock_config, text=text)
+        assert after[6] == before[6], "per-node elevation data was rewritten"
