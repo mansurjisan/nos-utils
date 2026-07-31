@@ -304,6 +304,13 @@ class TidalProcessor(ForcingProcessor):
                 self.config.tidal_constituents,
                 run_days=self._phase_run_days(),
             )
+            # Constituent names are case-insensitive in SCHISM's Fortran
+            # reader. Templates also use mixed conventions in practice: the
+            # cycle-dependent blocks are commonly upper case while per-node
+            # blocks may be lower case. Normalize the lookup, then rely on the
+            # strict 3/5-column guard below to distinguish nodal rows from the
+            # 2/4-column per-node harmonics that must remain untouched.
+            nodal_by_name = {name.upper(): values for name, values in nodal.items()}
 
             # Update the nodal factor f and equilibrium argument V0+u wherever a
             # constituent name is followed by a parameter line. A bctides.in
@@ -334,7 +341,8 @@ class TidalProcessor(ForcingProcessor):
             while i < len(lines) - 1:
                 line = lines[i].split("!")[0].strip()
                 # Check if this line is a constituent name
-                if line in nodal:
+                constituent = line.upper()
+                if constituent in nodal_by_name:
                     # Next line has the nodal parameters
                     i += 1
                     raw = lines[i]
@@ -343,13 +351,14 @@ class TidalProcessor(ForcingProcessor):
                     slots = _NODAL_COLS.get(len(parts))
                     if slots:
                         f_slot, arg_slot = slots
-                        parts[f_slot] = f"{nodal[line]['f']:.5f}"
-                        parts[arg_slot] = f"{nodal[line]['v0_plus_u']:.5f}"
+                        correction = nodal_by_name[constituent]
+                        parts[f_slot] = f"{correction['f']:.5f}"
+                        parts[arg_slot] = f"{correction['v0_plus_u']:.5f}"
                         indent = raw[: len(raw) - len(raw.lstrip())]
                         lines[i] = indent + " ".join(parts)
                         if sep:
                             lines[i] += " " + sep + comment
-                        matched.add(line)
+                        matched.add(constituent)
                         updated += 1
                 i += 1
 
@@ -359,7 +368,7 @@ class TidalProcessor(ForcingProcessor):
             # template's own factors under a rewritten date. Report per
             # constituent rather than only when nothing matched at all: a
             # partial update is the harder case to notice and just as stale.
-            missing = sorted(set(nodal) - matched)
+            missing = sorted(set(nodal_by_name) - matched)
             if missing:
                 log.warning(
                     "bctides template: no nodal parameter line was updated for "
