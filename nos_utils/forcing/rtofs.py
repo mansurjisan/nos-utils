@@ -860,18 +860,33 @@ class RTOFSProcessor(ForcingProcessor):
         return result
 
     def find_input_files_by_type(self) -> Tuple[List[Path], List[Path]]:
-        """Find RTOFS 2D and 3D files, sorted by valid time and deduplicated."""
+        """Find RTOFS 2D and 3D files, sorted by valid time and deduplicated.
+
+        2D and 3D always come from the SAME cycle date -- never mixed across
+        dates. _process_2d/_process_3d/nudging.py all compute each file's
+        valid time as ``self._rtofs_cycle_date + hours_from_filename``, one
+        shared date for both variables, so picking 2D from one date and 3D
+        from another would silently misdate whichever type didn't match
+        that date -- a corrupted time axis, not a missing-file error.
+        """
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
-        files_2d = []
-        files_3d = []
-        rtofs_cycle_date = None
+        # Ops stages "alaska", "US_east" and "US_west" 3dz tiles side by
+        # side for every valid time, with no region distinction in the old
+        # unfiltered glob. Restricting it to this (when set) is what makes
+        # the valid-time dedup below a genuine nowcast/forecast dedup
+        # instead of an accidental cross-region tile pick -- see the field
+        # docstring on ForcingConfig.rtofs_3d_region for the failure this
+        # closes when unset.
+        region = self.config.rtofs_3d_region
 
         # Search newest RTOFS cycle first to match Fortran shell behavior.
         # The Fortran prep (nos_ofs_create_forcing_obc.sh) uses the latest
         # available cycle. PDY itself rarely has RTOFS ready at 00Z, so
         # PDY-1 is the typical production hit.
+        candidates = []  # [(date, day_2d, day_3d), ...] for every date with ANY hit
         for date in [base_date - timedelta(days=1), base_date - timedelta(days=2), base_date]:
             date_str = date.strftime("%Y%m%d")
+            day_2d, day_3d = [], []
 
             for rtofs_dir in [
                 self.input_path / f"rtofs.{date_str}",
@@ -882,15 +897,6 @@ class RTOFSProcessor(ForcingProcessor):
                     continue
 
                 found_2d = sorted(rtofs_dir.glob("rtofs_glo_2ds_*_diag.nc"))
-                # Ops stages "alaska", "US_east" and "US_west" 3dz tiles side
-                # by side for every valid time, with no region distinction
-                # in this glob. Restricting it to config.rtofs_3d_region
-                # (when set) is what makes _sort_and_dedup's valid-time dedup
-                # a genuine nowcast/forecast dedup instead of an accidental
-                # cross-region tile pick -- see the field docstring on
-                # ForcingConfig.rtofs_3d_region for how that picks the wrong
-                # tile silently when unset.
-                region = getattr(self.config, "rtofs_3d_region", None)
                 if region:
                     glob_3d = f"rtofs_glo_3dz_*_6hrly_hvr_{region}.nc"
                     glob_3d4 = f"rtofs_glo_3dz_*_6hrly_hvr_{region}.nc4"
@@ -900,24 +906,43 @@ class RTOFSProcessor(ForcingProcessor):
                 found_3d = sorted(rtofs_dir.glob(glob_3d))
                 found_3d.extend(sorted(rtofs_dir.glob(glob_3d4)))
 
-                for f in found_2d:
-                    if self.validate_file_size(f, self.MIN_FILE_SIZE_2D):
-                        files_2d.append(f)
-                for f in found_3d:
-                    if self.validate_file_size(f, self.MIN_FILE_SIZE_3D):
-                        files_3d.append(f)
+                day_2d = [f for f in found_2d if self.validate_file_size(f, self.MIN_FILE_SIZE_2D)]
+                day_3d = [f for f in found_3d if self.validate_file_size(f, self.MIN_FILE_SIZE_3D)]
 
-                if files_2d or files_3d:
-                    rtofs_cycle_date = date
-                    log.info(f"Found RTOFS files in {rtofs_dir}: {len(files_2d)} 2D, {len(files_3d)} 3D")
-                    break
+                if day_2d or day_3d:
+                    log.info(f"Found RTOFS files in {rtofs_dir}: {len(day_2d)} 2D, {len(day_3d)} 3D")
+                    break  # first populated directory layout wins for this date
 
-            if files_2d or files_3d:
-                break
+            if not (day_2d or day_3d):
+                continue
+            candidates.append((date, day_2d, day_3d))
 
-        # Sort by valid time and deduplicate n/f overlap
-        if rtofs_cycle_date is None:
-            rtofs_cycle_date = base_date
+            if not region:
+                break  # unchanged: first date with any hit is final
+            if day_2d and day_3d:
+                break  # best possible outcome for a pinned region: stop here
+            # Otherwise this date is a partial hit (commonly 2D-only, since
+            # the region-specific 3D tile is what tends to lag) -- keep
+            # searching older dates rather than accepting it immediately,
+            # so a one-day staging lag on just the requested tile doesn't
+            # turn into "no 3D data at all" for the whole cycle.
+
+        if not candidates:
+            files_2d, files_3d, rtofs_cycle_date = [], [], base_date
+        elif not region:
+            rtofs_cycle_date, files_2d, files_3d = candidates[0]
+        else:
+            # Prefer a date with both types; else the earliest date that at
+            # least has the requested 3D tile; else fall back to the very
+            # first hit (matches the no-region rule, now reached only after
+            # genuinely checking every candidate date for the region).
+            pick = (
+                next((c for c in candidates if c[1] and c[2]), None)
+                or next((c for c in candidates if c[2]), None)
+                or candidates[0]
+            )
+            rtofs_cycle_date, files_2d, files_3d = pick
+
         self._rtofs_cycle_date = rtofs_cycle_date
         if files_2d:
             files_2d = self._sort_and_dedup(files_2d, rtofs_cycle_date)

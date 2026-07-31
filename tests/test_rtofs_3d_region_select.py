@@ -280,3 +280,108 @@ class TestYamlWiring:
         )
         cfg = ForcingConfig.from_yaml(yml)
         assert cfg.rtofs_3d_region is None
+
+
+class TestDateFallbackWithRegion:
+    """The pre-existing date-fallback loop accumulates files_2d/files_3d
+    across dates and stops at the first date where EITHER is non-empty.
+    Filtering 3D by region makes that reachable in a new, damaging way: a
+    region-specific tile can legitimately lag the others by a day even
+    when 2D (global, unfiltered) is already staged for the newer cycle --
+    the loop must not give up on 3D after that first date.
+
+    But 2D and 3D always come from the SAME cycle date once found:
+    _process_2d/_process_3d/nudging.py all compute each file's valid time
+    as ``_rtofs_cycle_date + hours_from_filename``, one shared date for
+    both variables, so returning 2D from one date and 3D from another
+    would silently misdate whichever type didn't match -- a corrupted
+    time axis, not a missing-file error. Every test here checks
+    _rtofs_cycle_date alongside the file lists to confirm that never
+    happens.
+    """
+
+    def _stage(self, root, date_str, two_d=False, three_d_region=None):
+        d = root / f"rtofs.{date_str}"
+        d.mkdir()
+        if two_d:
+            (d / "rtofs_glo_2ds_f006_diag.nc").touch()
+        if three_d_region:
+            (d / f"rtofs_glo_3dz_f006_6hrly_hvr_{three_d_region}.nc").touch()
+        return d
+
+    def test_region_tile_lagging_a_day_is_still_found(self, tmp_path, monkeypatch):
+        """pdy-1: 2D only. pdy-2: 2D AND the requested 3D tile. Old code
+        stopped at pdy-1 and returned files_3d=[] permanently -- the exact
+        shape of the AK prep's original failure, just one day further back
+        than the alphabetical-tile bug. New code must keep searching and
+        settle on pdy-2, where BOTH types are available together."""
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_2D", 0)
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_3D", 0)
+        self._stage(tmp_path, "20260729", two_d=True)
+        self._stage(tmp_path, "20260728", two_d=True, three_d_region="alaska")
+
+        cfg = ForcingConfig(lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
+                            pdy="20260730", cyc=0, rtofs_3d_region="alaska")
+        proc = RTOFSProcessor(cfg, tmp_path, tmp_path)
+        files_2d, files_3d = proc.find_input_files_by_type()
+
+        assert len(files_2d) == 1
+        assert len(files_3d) == 1
+        assert proc._rtofs_cycle_date.strftime("%Y%m%d") == "20260728", (
+            "2D and 3D must come from the SAME date -- pdy-2, where 3D was "
+            "actually found -- not pdy-1, which only satisfied 2D"
+        )
+
+    def test_region_never_found_falls_back_to_first_hit_like_before(self, tmp_path, monkeypatch):
+        """If the requested tile genuinely never shows up across all three
+        candidate dates, the outcome is the same empty files_3d as before
+        -- this only changes HOW THOROUGHLY it searches, not the worst case."""
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_2D", 0)
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_3D", 0)
+        self._stage(tmp_path, "20260729", two_d=True)
+
+        cfg = ForcingConfig(lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
+                            pdy="20260730", cyc=0, rtofs_3d_region="alaska")
+        proc = RTOFSProcessor(cfg, tmp_path, tmp_path)
+        files_2d, files_3d = proc.find_input_files_by_type()
+        assert len(files_2d) == 1
+        assert files_3d == []
+        assert proc._rtofs_cycle_date.strftime("%Y%m%d") == "20260729"
+
+    def test_no_region_keeps_the_original_first_hit_behaviour_exactly(self, tmp_path, monkeypatch):
+        """Systems that never set rtofs_3d_region (today: everything in
+        production) must see byte-identical search behaviour: stop at the
+        FIRST date with any hit, even if a later date could offer more.
+        This is deliberately not "improved" as an uncontrolled side effect
+        of the region feature -- SECOFS/ATL only get the new behaviour if
+        they explicitly opt in."""
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_2D", 0)
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_3D", 0)
+        self._stage(tmp_path, "20260729", two_d=True)                      # 2D only
+        self._stage(tmp_path, "20260728", two_d=True, three_d_region="US_east")  # both
+
+        cfg = ForcingConfig(lon_min=-88.0, lon_max=-63.0, lat_min=17.0, lat_max=40.0,
+                            pdy="20260730", cyc=0)
+        assert cfg.rtofs_3d_region is None
+        proc = RTOFSProcessor(cfg, tmp_path, tmp_path)
+        files_2d, files_3d = proc.find_input_files_by_type()
+        assert len(files_2d) == 1
+        assert files_3d == [], "unset region must stop at the first hit, same as main"
+        assert proc._rtofs_cycle_date.strftime("%Y%m%d") == "20260729"
+
+    def test_both_types_on_the_first_date_stops_immediately(self, tmp_path, monkeypatch):
+        """The common case shouldn't pay for the fallback machinery: when
+        the first date already has both types, no further dates are
+        touched at all."""
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_2D", 0)
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_3D", 0)
+        self._stage(tmp_path, "20260729", two_d=True, three_d_region="alaska")
+        # A second, older date exists too -- it must never be consulted.
+        older = self._stage(tmp_path, "20260728", two_d=True, three_d_region="alaska")
+
+        cfg = ForcingConfig(lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
+                            pdy="20260730", cyc=0, rtofs_3d_region="alaska")
+        proc = RTOFSProcessor(cfg, tmp_path, tmp_path)
+        files_2d, files_3d = proc.find_input_files_by_type()
+        assert proc._rtofs_cycle_date.strftime("%Y%m%d") == "20260729"
+        assert not any(str(older) in str(f) for f in files_2d + files_3d)
