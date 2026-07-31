@@ -533,8 +533,10 @@ class RTOFSProcessor(ForcingProcessor):
                 # not "was anything copied" -- the Fortran exe (like
                 # _process_3d below) can write TEM_3D.th.nc without
                 # SAL_3D.th.nc or vice versa, and _call_fortran_gen_3dth's
-                # own success check (`len(found) >= 3`) already tolerates
-                # that, treating uv3D as the only truly optional file.
+                # own success check requires both by name and only treats
+                # uv3D as optional -- but that check only gates whether we
+                # reach this branch at all, not what ends up in `produced`,
+                # so this still has to verify independently.
                 produced = {p.name for p in output_files}
                 elev2d_ok = "elev2D.th.nc" in produced
                 obc3d_ok = set(self.REQUIRED_3D_OBC_FILES).issubset(produced)
