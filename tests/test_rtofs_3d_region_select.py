@@ -485,6 +485,160 @@ class TestPartialProcessingSuccessBlocked:
         assert result.output_files == []
 
 
+class TestIncomplete3DArtifactBlocked:
+    """A fifth review round found a narrower version of the same class of
+    bug: TestPartialProcessingSuccessBlocked above checks "both types
+    present at all", but _process_3d (SECOFS Python path, and the STOFS
+    Python fallback that reuses it) writes TEM_3D.th.nc and SAL_3D.th.nc on
+    two INDEPENDENT conditions (`if all_temp:` / `if all_salt:`) -- one
+    RTOFS 3dz file missing the "salinity" variable produces temperature
+    with no salinity, and the old `obc3d_ok = bool(obc_files)` treated that
+    nonempty-but-incomplete list as a complete 3D boundary. Alaska declares
+    isatype=4, so a missing SAL_3D.th.nc is not a valid boundary set.
+
+    The Fortran wrapper had the same shape of bug one level up: its own
+    completeness check was `len(found) >= 3` -- any three of the four
+    expected files, which is satisfied by elev2D+TEM_3D+uv3D just as
+    happily as by the intended "uv3D missing" case.
+    """
+
+    def test_secofs_temperature_without_salinity_still_fails(self, tmp_path, monkeypatch):
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        (rtofs_dir / "rtofs_glo_2ds_f006_diag.nc").touch()
+        (rtofs_dir / "rtofs_glo_3dz_f006_6hrly_hvr_alaska.nc").touch()
+
+        cfg = ForcingConfig(lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
+                            pdy="20260730", cyc=0, rtofs_3d_region="alaska")
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
+
+        fake_2d = tmp_path / "elev2D.th.nc"
+        monkeypatch.setattr(RTOFSProcessor, "_process_2d", lambda self, files: fake_2d)
+        # Simulates a source RTOFS file with a temperature variable but no
+        # salinity variable: _process_3d would return [TEM_3D.th.nc] only.
+        monkeypatch.setattr(RTOFSProcessor, "_process_3d",
+                            lambda self, files: [tmp_path / "TEM_3D.th.nc"])
+
+        result = proc.process()
+        assert result.success is False, (
+            "TEM_3D.th.nc alone is not a complete 3D boundary -- "
+            "SAL_3D.th.nc is missing"
+        )
+        assert result.output_files == []
+        assert any("SAL_3D.th.nc" in e for e in result.errors)
+
+    def test_stofs_python_fallback_temperature_without_salinity_still_fails(self, tmp_path, monkeypatch):
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        (rtofs_dir / "rtofs_glo_2ds_f006_diag.nc").touch()
+        (rtofs_dir / "rtofs_glo_3dz_f006_6hrly_hvr_US_east.nc").touch()
+
+        cfg = ForcingConfig(lon_min=-98.5035, lon_max=-52.4867, lat_min=7.347, lat_max=52.5904,
+                            pdy="20260730", cyc=0,
+                            obc_roi_2d={"x1": 0, "x2": 1, "y1": 0, "y2": 1},
+                            rtofs_3d_region="US_east")
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
+
+        monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_ssh",
+                            lambda self, files, work_dir: work_dir / "SSH_1.nc")
+        monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_tsuv",
+                            lambda self, files, work_dir: work_dir / "TSUV_1.nc")
+        monkeypatch.setattr(RTOFSProcessor, "_call_fortran_gen_3dth",
+                            lambda self, work_dir, ssh_path, tsuv_path: False)
+        monkeypatch.setattr(RTOFSProcessor, "_process_2d",
+                            lambda self, files: tmp_path / "elev2D.th.nc")
+        monkeypatch.setattr(RTOFSProcessor, "_process_3d",
+                            lambda self, files: [tmp_path / "TEM_3D.th.nc"])
+
+        result = proc.process()
+        assert result.success is False, (
+            "STOFS-mode Python fallback: TEM_3D.th.nc alone is not a "
+            "complete 3D boundary -- SAL_3D.th.nc is missing"
+        )
+        assert result.output_files == []
+        assert any("SAL_3D.th.nc" in e for e in result.errors)
+
+    def test_stofs_fortran_temperature_without_salinity_still_fails(self, tmp_path, monkeypatch):
+        """Reproduces the reviewer's exact STOFS case: elev2D.th.nc,
+        TEM_3D.th.nc and uv3D.th.nc all exist in work_dir, SAL_3D.th.nc
+        does not -- three of the four expected files, the case the old
+        `len(found) >= 3` inside _call_fortran_gen_3dth would have called
+        complete."""
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        (rtofs_dir / "rtofs_glo_2ds_f006_diag.nc").touch()
+        (rtofs_dir / "rtofs_glo_3dz_f006_6hrly_hvr_US_east.nc").touch()
+
+        cfg = ForcingConfig(lon_min=-98.5035, lon_max=-52.4867, lat_min=7.347, lat_max=52.5904,
+                            pdy="20260730", cyc=0,
+                            obc_roi_2d={"x1": 0, "x2": 1, "y1": 0, "y2": 1},
+                            rtofs_3d_region="US_east")
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
+
+        monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_ssh",
+                            lambda self, files, work_dir: work_dir / "SSH_1.nc")
+        monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_tsuv",
+                            lambda self, files, work_dir: work_dir / "TSUV_1.nc")
+
+        def _fake_fortran(self, work_dir, ssh_path, tsuv_path):
+            (work_dir / "elev2D.th.nc").touch()
+            (work_dir / "TEM_3D.th.nc").touch()
+            (work_dir / "uv3D.th.nc").touch()
+            # SAL_3D.th.nc deliberately not written
+            return True
+
+        monkeypatch.setattr(RTOFSProcessor, "_call_fortran_gen_3dth", _fake_fortran)
+
+        result = proc.process()
+        assert result.success is False, (
+            "elev2D+TEM_3D+uv3D (3 of 4 expected files) must not count as "
+            "complete when the missing one is SAL_3D.th.nc"
+        )
+        assert result.output_files == []
+        assert any("SAL_3D.th.nc" in e for e in result.errors)
+
+    def test_fortran_helper_rejects_missing_salinity_even_with_three_files(self, tmp_path, monkeypatch):
+        """Direct unit coverage of _call_fortran_gen_3dth's own output
+        verification (not mocked away, unlike the process()-level tests
+        above): a real subprocess run that writes exactly 3 of the 4
+        expected files, omitting SAL_3D.th.nc, must be rejected."""
+        exec_dir = tmp_path / "exec"
+        exec_dir.mkdir()
+        script = exec_dir / "stofs_3d_atl_gen_3Dth_from_hycom"
+        script.write_text("#!/bin/sh\ntouch elev2D.th.nc TEM_3D.th.nc uv3D.th.nc\n")
+        script.chmod(0o755)
+        monkeypatch.setenv("EXECstofs3d", str(exec_dir))
+
+        cfg = ForcingConfig(lon_min=-98.5035, lon_max=-52.4867, lat_min=7.347, lat_max=52.5904,
+                            pdy="20260730", cyc=0,
+                            obc_roi_2d={"x1": 0, "x2": 1, "y1": 0, "y2": 1})
+        proc = RTOFSProcessor(cfg, tmp_path, tmp_path)
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        assert proc._call_fortran_gen_3dth(work_dir, None, None) is False
+
+    def test_fortran_helper_still_allows_missing_uv3d(self, tmp_path, monkeypatch):
+        """The complement of the test above: uv3D.th.nc remains the one
+        genuinely optional file -- elev2D + TEM_3D + SAL_3D must still be
+        accepted as complete."""
+        exec_dir = tmp_path / "exec"
+        exec_dir.mkdir()
+        script = exec_dir / "stofs_3d_atl_gen_3Dth_from_hycom"
+        script.write_text("#!/bin/sh\ntouch elev2D.th.nc TEM_3D.th.nc SAL_3D.th.nc\n")
+        script.chmod(0o755)
+        monkeypatch.setenv("EXECstofs3d", str(exec_dir))
+
+        cfg = ForcingConfig(lon_min=-98.5035, lon_max=-52.4867, lat_min=7.347, lat_max=52.5904,
+                            pdy="20260730", cyc=0,
+                            obc_roi_2d={"x1": 0, "x2": 1, "y1": 0, "y2": 1})
+        proc = RTOFSProcessor(cfg, tmp_path, tmp_path)
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        assert proc._call_fortran_gen_3dth(work_dir, None, None) is True
+
+
 class TestFactoryDefaults:
     """The production factories no longer rely on alphabetical luck."""
 

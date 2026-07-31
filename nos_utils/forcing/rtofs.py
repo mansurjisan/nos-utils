@@ -79,6 +79,17 @@ class RTOFSProcessor(ForcingProcessor):
     # at ``sim_end``.
     DEFAULT_BUFFER_HOURS = 3
 
+    # The 3D T/S/UV boundary is written as up to three separate files
+    # (_process_3d gates TEM_3D.th.nc on all_temp and SAL_3D.th.nc on
+    # all_salt independently -- one variable missing from the source RTOFS
+    # file does not stop the other from being written). TEM_3D and SAL_3D
+    # are both mandatory: SCHISM boundaries with isatype/itetype set (e.g.
+    # STOFS-3D-AK's isatype=4) abort without both. uv3D.th.nc is written as
+    # all-zeros whenever TEM_3D is (COMF uses SSH-derived boundary
+    # velocities, not RTOFS ones) and the Fortran wrapper's own output
+    # check already treats it as optional -- so it is not required here.
+    REQUIRED_3D_OBC_FILES = ("TEM_3D.th.nc", "SAL_3D.th.nc")
+
     def __init__(
         self,
         config: ForcingConfig,
@@ -346,11 +357,16 @@ class RTOFSProcessor(ForcingProcessor):
             log.info(f"Processing {len(files_3d)} RTOFS 3D files")
             obc_files = self._process_3d(files_3d)
             output_files.extend(obc_files)
-            obc3d_ok = bool(obc_files)
+            # _process_3d gates TEM_3D.th.nc on all_temp and SAL_3D.th.nc on
+            # all_salt independently, so obc_files can be non-empty while
+            # still missing one of the two -- bool(obc_files) alone cannot
+            # tell "both variables produced" from "one variable produced".
+            produced_3d = {p.name for p in obc_files}
+            obc3d_ok = set(self.REQUIRED_3D_OBC_FILES).issubset(produced_3d)
 
         # The check above only knows what discovery FOUND, not what
-        # processing actually PRODUCED -- two ways that can still diverge
-        # even when both file lists were non-empty going in:
+        # processing actually PRODUCED -- ways that can still diverge even
+        # when both file lists were non-empty going in:
         #   - _sort_and_dedup's phase-window filter (called separately per
         #     type, after the discovery-level pick) can legitimately wipe
         #     out one type's files while leaving the other's, if their
@@ -358,19 +374,25 @@ class RTOFSProcessor(ForcingProcessor):
         #   - _process_2d or _process_3d can each fail independently on
         #     genuinely bad file content, regardless of how many files
         #     were found.
+        #   - _process_3d itself can produce temperature without salinity
+        #     (or vice versa) when the source RTOFS file is missing one
+        #     variable -- see REQUIRED_3D_OBC_FILES above.
         # Either way, `if files_3d: ... if files_2d: ...` run independently
-        # of each other, so len(output_files) > 0 alone cannot tell "both
-        # halves produced" from "exactly one half produced" -- and a
-        # region-pinned domain with elevation-forced boundaries needs both.
+        # of each other, so len(output_files) > 0 alone cannot tell "the
+        # full required set produced" from "some subset of it produced" --
+        # and a region-pinned domain with elevation-forced boundaries needs
+        # the full set.
         if region and not (elev2d_ok and obc3d_ok):
+            produced_names = {p.name for p in output_files}
+            required = ("elev2D.th.nc",) + self.REQUIRED_3D_OBC_FILES
+            missing = [n for n in required if n not in produced_names]
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
                 errors=[
                     f"rtofs_3d_region={region!r}: the 2D elevation boundary "
-                    f"and the 3D T/S/U/V boundary are both required, and "
-                    f"only one was produced (elev2D.th.nc={elev2d_ok}, "
-                    f"3D boundary files={obc3d_ok}) -- refusing to report "
-                    f"success from either half alone"
+                    f"and the full 3D T/S boundary (TEM_3D.th.nc, "
+                    f"SAL_3D.th.nc) are all required; missing {missing} -- "
+                    f"refusing to report success from a partial set"
                 ],
                 warnings=warnings,
             )
@@ -507,10 +529,15 @@ class RTOFSProcessor(ForcingProcessor):
                         dst = self.output_path / fname
                         shutil.copy2(src, dst)
                         output_files.append(dst)
-                        if fname == "elev2D.th.nc":
-                            elev2d_ok = True
-                        else:
-                            obc3d_ok = True
+                # Track elev2d_ok/obc3d_ok from the names actually copied,
+                # not "was anything copied" -- the Fortran exe (like
+                # _process_3d below) can write TEM_3D.th.nc without
+                # SAL_3D.th.nc or vice versa, and _call_fortran_gen_3dth's
+                # own success check (`len(found) >= 3`) already tolerates
+                # that, treating uv3D as the only truly optional file.
+                produced = {p.name for p in output_files}
+                elev2d_ok = "elev2D.th.nc" in produced
+                obc3d_ok = set(self.REQUIRED_3D_OBC_FILES).issubset(produced)
             else:
                 warnings.append("Fortran gen_3Dth not available, using Python interpolation")
                 # Fall back to Python Delaunay — load grid and use existing _process_2d/_process_3d
@@ -524,27 +551,35 @@ class RTOFSProcessor(ForcingProcessor):
                     if files_3d:
                         obc_files = self._process_3d(files_3d)
                         output_files.extend(obc_files)
-                        obc3d_ok = bool(obc_files)
+                        # See the matching comment in _process_secofs: T/S
+                        # are written on independent conditions, so
+                        # bool(obc_files) alone cannot tell "both produced"
+                        # from "one produced".
+                        produced_3d = {p.name for p in obc_files}
+                        obc3d_ok = set(self.REQUIRED_3D_OBC_FILES).issubset(produced_3d)
 
             # Same reasoning as the matching check in _process_secofs: what
             # was actually PRODUCED can diverge from what discovery FOUND,
-            # via the phase-window filter in _sort_and_dedup or an
-            # independent failure in either path above (Fortran writing
-            # only one of the two output groups, or the Python fallback's
-            # _process_2d/_process_3d each failing on their own). Neither
-            # branch here ties the two halves together, so len(output_files)
-            # > 0 alone cannot distinguish "both halves produced" from
-            # "exactly one half produced".
+            # via the phase-window filter in _sort_and_dedup, an
+            # independent failure in either path above (Fortran or the
+            # Python fallback's _process_2d/_process_3d each failing on
+            # their own), or Fortran/_process_3d writing temperature
+            # without salinity (or vice versa). Neither branch here ties
+            # the required outputs together, so len(output_files) > 0
+            # alone cannot distinguish "the full required set produced"
+            # from "some subset of it produced".
             if region and not (elev2d_ok and obc3d_ok):
+                produced_names = {p.name for p in output_files}
+                required = ("elev2D.th.nc",) + self.REQUIRED_3D_OBC_FILES
+                missing = [n for n in required if n not in produced_names]
                 return ForcingResult(
                     success=False, source=self.SOURCE_NAME,
                     errors=[
                         f"rtofs_3d_region={region!r}: the 2D elevation "
-                        f"boundary and the 3D T/S/U/V boundary are both "
-                        f"required, and only one was produced "
-                        f"(elev2D.th.nc={elev2d_ok}, 3D boundary "
-                        f"files={obc3d_ok}) -- refusing to report success "
-                        f"from either half alone"
+                        f"boundary and the full 3D T/S boundary "
+                        f"(TEM_3D.th.nc, SAL_3D.th.nc) are all required; "
+                        f"missing {missing} -- refusing to report success "
+                        f"from a partial set"
                     ],
                     warnings=warnings,
                 )
@@ -853,11 +888,20 @@ class RTOFSProcessor(ForcingProcessor):
             # already applies the offset internally (WL += 1.25 at line ~3133).
             # Applying it again would double the offset to +2.5m.
 
-            # Verify outputs exist
+            # Verify outputs exist. A bare count (`len(found) >= 3`) treated
+            # any three of the four files as good enough, which accepts
+            # elev2D+TEM_3D+uv3D with SAL_3D silently missing just as
+            # readily as the intended "uv3D is optional" case -- check by
+            # name instead so only uv3D can be absent.
             expected = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]
             found = [f for f in expected if (work_dir / f).exists()]
             log.info(f"Fortran gen_3Dth produced {len(found)}/{len(expected)} files")
-            return len(found) >= 3  # Allow uv3D to be optional
+            required = {"elev2D.th.nc", *self.REQUIRED_3D_OBC_FILES}
+            missing_required = required - set(found)
+            if missing_required:
+                log.warning(f"Fortran gen_3Dth missing required outputs: {sorted(missing_required)}")
+                return False
+            return True
 
         except subprocess.TimeoutExpired:
             log.warning("Fortran gen_3Dth timed out (600s)")
