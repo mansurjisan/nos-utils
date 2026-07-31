@@ -26,18 +26,28 @@ _REGIONS = ("alaska", "US_east", "US_west")
 _FHRS = ("f006", "f012", "f018", "f024", "n006", "n012")
 
 
+@pytest.fixture(autouse=True)
+def _no_size_floor(monkeypatch):
+    """Every test in this file only exercises file DISCOVERY (globbing,
+    dedup, region filtering) -- never the netCDF content. Writing a real
+    250 MB / 200 MB file per fixture instance just to clear
+    validate_file_size's threshold check costs ~5.7 GB per test and ~34 GB
+    across the file for no behavioural difference: threshold <= 0 makes
+    validate_file_size (forcing/base.py) return True unconditionally, so a
+    0-byte file clears it exactly the same as a 250 MB one.
+    """
+    monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_2D", 0)
+    monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_3D", 0)
+
+
 def _stage_three_region_rtofs(tmp_path, pdy="20260729"):
     """The real WCOSS2 layout: three 3dz tiles per valid time, one 2ds set."""
     rtofs_dir = tmp_path / f"rtofs.{pdy}"
     rtofs_dir.mkdir()
     for fhr in _FHRS:
         for region in _REGIONS:
-            (rtofs_dir / f"rtofs_glo_3dz_{fhr}_6hrly_hvr_{region}.nc").write_bytes(
-                b"0" * 250_000_000  # over MIN_FILE_SIZE_3D
-            )
-        (rtofs_dir / f"rtofs_glo_2ds_{fhr}_diag.nc").write_bytes(
-            b"0" * 200_000_000  # over MIN_FILE_SIZE_2D
-        )
+            (rtofs_dir / f"rtofs_glo_3dz_{fhr}_6hrly_hvr_{region}.nc").touch()
+        (rtofs_dir / f"rtofs_glo_2ds_{fhr}_diag.nc").touch()
     return tmp_path
 
 
@@ -114,9 +124,9 @@ class TestRegionSelection:
 
     def test_wrong_region_name_finds_nothing_rather_than_falling_back(self, tmp_path):
         """A typo'd or unstaged region must not silently degrade to the
-        unfiltered (US_east-by-accident) behaviour -- it should surface as
-        zero files found, which the caller's critical_sources check turns
-        into a loud prep failure instead of quietly wrong data."""
+        unfiltered (US_east-by-accident) behaviour -- discovery must return
+        zero files. See TestPartialFailurePropagates below for whether that
+        actually stops process() from reporting success."""
         root = _stage_three_region_rtofs(tmp_path)
         cfg = ForcingConfig(
             lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
@@ -141,6 +151,94 @@ class TestRegionSelection:
         assert RTOFSProcessor(cfg, root, root).is_stofs_mode
         _, files_3d = RTOFSProcessor(cfg, root, root).find_input_files_by_type()
         assert _tiles_selected(files_3d) == ["US_east"]
+
+
+def _with_fake_grid(proc):
+    """Bypass hgrid.gr3 parsing: _load_grid only needs to populate boundary
+    node arrays, and every test here is about RTOFS file selection, not
+    grid I/O. Real coordinates so a real interpolation attempt (if reached)
+    would not itself explode.
+    """
+    import numpy as np
+    proc._bnd_lons = np.array([160.0, 165.0])
+    proc._bnd_lats = np.array([55.0, 56.0])
+    proc._bnd_depths = np.array([50.0, 50.0])
+    proc._bnd_ids = np.array([1, 2])
+    return proc
+
+
+class TestPartialFailurePropagates:
+    """discovery-level correctness (above) is necessary but not sufficient:
+    process() has its own success rule -- `len(output_files) > 0` -- that a
+    missing 3D tile does not trip on its own, because a 2D-only result
+    (elev2D.th.nc, no TEM_3D/SAL_3D/uv3D) already satisfies it. Confirmed by
+    reading rtofs.py directly: `if files_3d:` guards the ONLY place 3D
+    output is added to output_files, and nothing downstream checks
+    metadata["n_3d_files"]. These test process() itself, not discovery, so
+    they only pass if the explicit region + empty files_3d + non-empty
+    files_2d combination hard-fails before reaching that success
+    computation. Uses touch()-only files: this path returns before
+    attempting to open any of them.
+    """
+
+    def test_secofs_mode_fails_when_region_set_and_3d_missing(self, tmp_path):
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        (rtofs_dir / "rtofs_glo_2ds_f006_diag.nc").touch()
+        # a real 3D file exists, but not for the requested region -- this is
+        # the exact shape of a typo'd or not-yet-staged tile name
+        (rtofs_dir / "rtofs_glo_3dz_f006_6hrly_hvr_alaska.nc").touch()
+
+        cfg = ForcingConfig(
+            lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
+            pdy="20260730", cyc=0, rtofs_3d_region="not_a_real_tile",
+        )
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
+        result = proc.process()
+        assert result.success is False
+        assert result.output_files == []
+        assert any("not_a_real_tile" in e for e in result.errors)
+
+    def test_secofs_mode_still_succeeds_2d_only_when_region_unset(self, tmp_path):
+        """The pre-existing, unrelated leniency this fix must NOT remove:
+        a system that never declared rtofs_3d_region keeps today's
+        behaviour exactly, including a legitimate 2D-only cycle."""
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        (rtofs_dir / "rtofs_glo_2ds_f006_diag.nc").touch()
+
+        cfg = ForcingConfig(
+            lon_min=-88.0, lon_max=-63.0, lat_min=17.0, lat_max=40.0,
+            pdy="20260730", cyc=0,
+        )
+        assert cfg.rtofs_3d_region is None
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
+        result = proc.process()
+        # _process_2d will fail on the empty touch()'d file (not real
+        # netCDF) -- that is a SEPARATE, pre-existing failure mode. The
+        # point here is only that the function reaches that attempt at all,
+        # i.e. is not short-circuited by the new region guard.
+        assert "Cannot load boundary nodes" not in " ".join(result.errors)
+        assert not any("rtofs_3d_region" in e for e in result.errors)
+
+    def test_stofs_mode_fails_when_region_set_and_3d_missing(self, tmp_path):
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        (rtofs_dir / "rtofs_glo_2ds_f006_diag.nc").touch()
+        (rtofs_dir / "rtofs_glo_3dz_f006_6hrly_hvr_alaska.nc").touch()
+
+        cfg = ForcingConfig(
+            lon_min=-98.5035, lon_max=-52.4867, lat_min=7.347, lat_max=52.5904,
+            pdy="20260730", cyc=0,
+            obc_roi_2d={"x1": 0, "x2": 1, "y1": 0, "y2": 1},
+            rtofs_3d_region="not_a_real_tile",
+        )
+        proc = RTOFSProcessor(cfg, tmp_path, tmp_path)
+        assert proc.is_stofs_mode
+        result = proc.process()
+        assert result.success is False
+        assert result.output_files == []
+        assert any("not_a_real_tile" in e for e in result.errors)
 
 
 class TestFactoryDefaults:

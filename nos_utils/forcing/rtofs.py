@@ -301,6 +301,28 @@ class RTOFSProcessor(ForcingProcessor):
                 errors=["No RTOFS input files found"],
             )
 
+        # A 2D-only success is normal when nobody asked for a specific 3D
+        # tile (some cycles genuinely have SSH data before the 3D product
+        # lands). It stops being normal once rtofs_3d_region is explicitly
+        # set: an empty files_3d then means the requested tile was not
+        # found, not that no 3D data exists at all. Without this check the
+        # branch below silently skips 3D processing, len(output_files) > 0
+        # still holds because elev2D.th.nc exists, and the caller sees
+        # success=True with no TEM_3D.th.nc / SAL_3D.th.nc ever written --
+        # exactly the silent-wrong-data failure mode this region filter was
+        # added to close.
+        region = getattr(self.config, "rtofs_3d_region", None)
+        if region and not files_3d:
+            return ForcingResult(
+                success=False, source=self.SOURCE_NAME,
+                errors=[
+                    f"rtofs_3d_region={region!r} matched no 3dz files -- "
+                    f"check the tile is staged for this cycle and the name "
+                    f"matches the filename convention (e.g. 'alaska', "
+                    f"'US_east')."
+                ],
+            )
+
         output_files = []
         warnings = []
 
@@ -365,6 +387,24 @@ class RTOFSProcessor(ForcingProcessor):
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
                 errors=["No RTOFS input files found"],
+            )
+
+        # See the matching check in _process_secofs: once rtofs_3d_region is
+        # explicitly set, an empty files_3d means the requested tile was not
+        # found, not that no 3D data exists this cycle. Left unchecked here,
+        # Step 1 (SSH only) still produces an output and the STOFS branch
+        # below reports success on SSH alone -- the same silent-wrong-data
+        # gap this region filter exists to close.
+        region = getattr(self.config, "rtofs_3d_region", None)
+        if region and not files_3d:
+            return ForcingResult(
+                success=False, source=self.SOURCE_NAME,
+                errors=[
+                    f"rtofs_3d_region={region!r} matched no 3dz files -- "
+                    f"check the tile is staged for this cycle and the name "
+                    f"matches the filename convention (e.g. 'alaska', "
+                    f"'US_east')."
+                ],
             )
 
         import tempfile
