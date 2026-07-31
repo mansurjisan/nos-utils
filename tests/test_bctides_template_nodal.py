@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import nos_utils.forcing.tidal as tidal_module
 from nos_utils.forcing.tidal import TidalProcessor
 
 
@@ -95,6 +96,49 @@ class TestNodalRewrite:
         _before, after = _run(tmp_path, mock_config)
         assert _field(after, 3, 3) == _field(after, 8, 1)
         assert _field(after, 3, 4) == _field(after, 8, 2)
+
+
+class TestPhaseDuration:
+    @pytest.mark.parametrize(
+        ("phase", "nowcast_hours", "forecast_hours", "expected_run_days"),
+        [
+            ("nowcast", 9, 48, 0.375),
+            ("forecast", 6, 48, 2.0),
+        ],
+    )
+    def test_template_uses_phase_duration_for_nodal_midpoint(
+        self,
+        tmp_path,
+        mock_config,
+        monkeypatch,
+        phase,
+        nowcast_hours,
+        forecast_hours,
+        expected_run_days,
+    ):
+        """Python fallback must match tide_fac's per-phase midpoint."""
+        mock_config.nowcast_hours = nowcast_hours
+        mock_config.forecast_hours = forecast_hours
+        original = tidal_module.compute_nodal_corrections
+        observed_run_days = []
+
+        def capture_run_days(start_time, constituents, run_days=0.25):
+            observed_run_days.append(run_days)
+            return original(start_time, constituents, run_days=run_days)
+
+        monkeypatch.setattr(
+            tidal_module, "compute_nodal_corrections", capture_run_days
+        )
+        template = tmp_path / "x.bctides.in_template"
+        template.write_text(_TEMPLATE)
+        processor = TidalProcessor(
+            mock_config, tmp_path, tmp_path, phase=phase
+        )
+
+        assert processor._process_template(
+            template, tmp_path / "bctides.in"
+        ) is True
+        assert observed_run_days == [expected_run_days]
 
 
 class TestPerNodeDataIsNeverTouched:

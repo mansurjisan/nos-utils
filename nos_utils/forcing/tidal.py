@@ -191,6 +191,14 @@ class TidalProcessor(ForcingProcessor):
                 return self.time_hotstart
             return cycle_dt - timedelta(hours=self.config.nowcast_hours)
 
+    def _phase_run_days(self) -> float:
+        """Return this phase's duration in days for midpoint corrections."""
+        if self.phase == "forecast":
+            phase_hours = self.config.forecast_hours
+        else:
+            phase_hours = self.config.nowcast_hours
+        return phase_hours / 24.0
+
     def _call_fortran_tide_fac(self, template_path: Path, output_path: Path) -> bool:
         """
         Call Fortran tide_fac executable for accurate nodal corrections.
@@ -228,11 +236,7 @@ class TidalProcessor(ForcingProcessor):
         # Previous implementation used int((nowcast+forecast)/24), which produced
         # nodal factors evaluated at a midpoint ~1 day off from production and
         # broke byte-parity with the static FIX bctides used in V16 success runs.
-        if self.phase == "forecast":
-            phase_hours = self.config.forecast_hours
-        else:
-            phase_hours = self.config.nowcast_hours
-        run_days = phase_hours / 24.0
+        run_days = self._phase_run_days()
 
         try:
             work_template = output_path.parent / "bctides.in_template"
@@ -295,7 +299,11 @@ class TidalProcessor(ForcingProcessor):
             lines[0] = start_time.strftime("%m/%d/%Y %H:%M:%S") + " UTC"
 
             # Compute nodal corrections for this start time
-            nodal = compute_nodal_corrections(start_time, self.config.tidal_constituents)
+            nodal = compute_nodal_corrections(
+                start_time,
+                self.config.tidal_constituents,
+                run_days=self._phase_run_days(),
+            )
 
             # Update the nodal factor f and equilibrium argument V0+u wherever a
             # constituent name is followed by a parameter line. A bctides.in
@@ -383,7 +391,11 @@ class TidalProcessor(ForcingProcessor):
         start_time = self._compute_start_time()
 
         constituents = self.config.tidal_constituents
-        nodal = compute_nodal_corrections(start_time, constituents)
+        nodal = compute_nodal_corrections(
+            start_time,
+            constituents,
+            run_days=self._phase_run_days(),
+        )
 
         with open(output_path, "w") as f:
             # Line 1: start time in MM/DD/YYYY format
