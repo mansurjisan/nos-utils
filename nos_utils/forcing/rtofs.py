@@ -842,8 +842,23 @@ class RTOFSProcessor(ForcingProcessor):
                     continue
 
                 found_2d = sorted(rtofs_dir.glob("rtofs_glo_2ds_*_diag.nc"))
-                found_3d = sorted(rtofs_dir.glob("rtofs_glo_3dz_*_6hrly_hvr_*.nc"))
-                found_3d.extend(sorted(rtofs_dir.glob("rtofs_glo_3dz_*_6hrly_hvr_*.nc4")))
+                # Ops stages "alaska", "US_east" and "US_west" 3dz tiles side
+                # by side for every valid time, with no region distinction
+                # in this glob. Restricting it to config.rtofs_3d_region
+                # (when set) is what makes _sort_and_dedup's valid-time dedup
+                # a genuine nowcast/forecast dedup instead of an accidental
+                # cross-region tile pick -- see the field docstring on
+                # ForcingConfig.rtofs_3d_region for how that picks the wrong
+                # tile silently when unset.
+                region = getattr(self.config, "rtofs_3d_region", None)
+                if region:
+                    glob_3d = f"rtofs_glo_3dz_*_6hrly_hvr_{region}.nc"
+                    glob_3d4 = f"rtofs_glo_3dz_*_6hrly_hvr_{region}.nc4"
+                else:
+                    glob_3d = "rtofs_glo_3dz_*_6hrly_hvr_*.nc"
+                    glob_3d4 = "rtofs_glo_3dz_*_6hrly_hvr_*.nc4"
+                found_3d = sorted(rtofs_dir.glob(glob_3d))
+                found_3d.extend(sorted(rtofs_dir.glob(glob_3d4)))
 
                 for f in found_2d:
                     if self.validate_file_size(f, self.MIN_FILE_SIZE_2D):
