@@ -241,6 +241,77 @@ class TestPartialFailurePropagates:
         assert any("not_a_real_tile" in e for e in result.errors)
 
 
+class TestSplitDatePartialSuccess:
+    """The scenario a second review round caught in the first version of
+    the M1 fix: PDY-1 has ONLY 2-D data, PDY-2 has ONLY the requested 3-D
+    tile. The date-fallback loop's job is to keep searching for a region
+    match -- it must NOT reward that search by pairing the 3-D it finds on
+    PDY-2 with nothing, while discarding the perfectly good 2-D data that
+    was sitting on PDY-1.
+
+    That pairing is fatal for a domain like STOFS-3D-AK: both open
+    boundaries are elevation-forced (parm/systems/stofs_3d_ak_ufs.yaml),
+    so elev2D.th.nc is mandatory, and `if files_3d:` runs independently of
+    `files_2d` in _process_secofs/_process_stofs -- a 3-D-only pick would
+    have produced TEM_3D.th.nc/SAL_3D.th.nc/uv3D.th.nc, no elev2D.th.nc,
+    and success=True.
+    """
+
+    def test_discovery_keeps_2d_and_drops_the_mismatched_3d(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_2D", 0)
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_3D", 0)
+        d1 = tmp_path / "rtofs.20260729"
+        d1.mkdir()
+        (d1 / "rtofs_glo_2ds_f006_diag.nc").touch()
+        d2 = tmp_path / "rtofs.20260728"
+        d2.mkdir()
+        (d2 / "rtofs_glo_3dz_f006_6hrly_hvr_alaska.nc").touch()
+
+        cfg = ForcingConfig(lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
+                            pdy="20260730", cyc=0, rtofs_3d_region="alaska")
+        proc = RTOFSProcessor(cfg, tmp_path, tmp_path)
+        files_2d, files_3d = proc.find_input_files_by_type()
+
+        assert len(files_2d) == 1, "PDY-1's 2D data must survive"
+        assert files_3d == [], (
+            "PDY-2's 3D must NOT be paired with PDY-1's 2D across dates -- "
+            "discard it rather than mixing cycle dates"
+        )
+        assert proc._rtofs_cycle_date.strftime("%Y%m%d") == "20260729"
+
+    def test_process_does_not_report_success_from_3d_alone(self, tmp_path, monkeypatch):
+        """End to end: even when 3D processing would itself SUCCEED (not
+        just when discovery finds nothing), the step overall must not,
+        because no elev2D.th.nc was ever produced. _process_3d is
+        monkeypatched to return a fake path -- simulating a real, valid
+        RTOFS 3dz file -- so this proves the fix acts at discovery, not by
+        coincidentally failing on the dummy files' unparsable content."""
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_2D", 0)
+        monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_3D", 0)
+        d1 = tmp_path / "rtofs.20260729"
+        d1.mkdir()
+        (d1 / "rtofs_glo_2ds_f006_diag.nc").touch()
+        d2 = tmp_path / "rtofs.20260728"
+        d2.mkdir()
+        (d2 / "rtofs_glo_3dz_f006_6hrly_hvr_alaska.nc").touch()
+
+        cfg = ForcingConfig(lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
+                            pdy="20260730", cyc=0, rtofs_3d_region="alaska")
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
+        fake_3d_outputs = [tmp_path / "TEM_3D.th.nc", tmp_path / "SAL_3D.th.nc",
+                          tmp_path / "uv3D.th.nc"]
+        monkeypatch.setattr(RTOFSProcessor, "_process_3d",
+                            lambda self, files: fake_3d_outputs)
+
+        result = proc.process()
+        assert result.success is False, (
+            "must not report success from 3D output alone when the "
+            "matching 2D (elev2D.th.nc) was never produced"
+        )
+        assert result.output_files == []
+        assert not any("TEM_3D" in str(f) for f in result.output_files)
+
+
 class TestFactoryDefaults:
     """The production factories no longer rely on alphabetical luck."""
 

@@ -932,16 +932,29 @@ class RTOFSProcessor(ForcingProcessor):
         elif not region:
             rtofs_cycle_date, files_2d, files_3d = candidates[0]
         else:
-            # Prefer a date with both types; else the earliest date that at
-            # least has the requested 3D tile; else fall back to the very
-            # first hit (matches the no-region rule, now reached only after
-            # genuinely checking every candidate date for the region).
-            pick = (
-                next((c for c in candidates if c[1] and c[2]), None)
-                or next((c for c in candidates if c[2]), None)
-                or candidates[0]
-            )
-            rtofs_cycle_date, files_2d, files_3d = pick
+            # A pinned region must not accept a 3D-only candidate on its
+            # own: 3D output requires nothing else to succeed (the
+            # `if files_3d:` branch below runs independently of files_2d),
+            # so a 3D-only pick would silently produce TEM_3D.th.nc /
+            # SAL_3D.th.nc / uv3D.th.nc with success=True and NO
+            # elev2D.th.nc -- fatal for a domain like STOFS-3D-AK, whose
+            # boundaries are entirely elevation-forced. The prior version
+            # of this pick treated any-3D as almost as good as both-types;
+            # it is not.
+            both = next((c for c in candidates if c[1] and c[2]), None)
+            if both:
+                rtofs_cycle_date, files_2d, files_3d = both
+            else:
+                # No date offered both together. Keep the earliest
+                # candidate's 2D (still legitimate data on its own) and
+                # deliberately drop any 3D found elsewhere -- pairing it
+                # with 2D from a different date is exactly the mismatch
+                # this whole method exists to prevent. files_3d now empty
+                # is what the region-set guard in _process_secofs /
+                # _process_stofs below checks for, so this reaches the
+                # same loud failure as a tile that was never found at all.
+                rtofs_cycle_date, files_2d, _ = candidates[0]
+                files_3d = []
 
         self._rtofs_cycle_date = rtofs_cycle_date
         if files_2d:
