@@ -127,6 +127,21 @@ class ForcingConfig:
     obc_roi_3d: Optional[dict] = None  # {x1, x2, y1, y2}
     # RTOFS ROI indices for nudging (slightly larger domain than OBC)
     nudge_roi_3d: Optional[dict] = None  # {x1, x2, y1, y2}
+    # Which regional RTOFS 3dz tile to read for 3D T/S/U/V (OBC and nudging
+    # share this discovery step). Ops stages "alaska", "US_east" and
+    # "US_west" tiles side by side for every valid time with no region in
+    # the filename pattern the discovery glob used
+    # (rtofs_glo_3dz_*_6hrly_hvr_*.nc matches all three), so an unset region
+    # here means the file-selection tie-break at dedup time is a plain
+    # alphabetical sort with no region awareness at all -- it keeps
+    # whichever tile's filename sorts first for a given valid time, not
+    # whichever tile actually covers the domain. That happens to be
+    # "US_east" (ASCII 'U' = 85 < 'a' = 97), which is geographically correct
+    # for SECOFS/STOFS-3D-ATL by coincidence and geographically wrong for
+    # STOFS-3D-AK, whose domain has zero overlap with it. Set explicitly
+    # for every system, not just Alaska, so correctness stops depending on
+    # alphabetical luck.
+    rtofs_3d_region: Optional[str] = None
     # SSH offset applied to boundary elevation (meters)
     # Geoid-to-MSL datum offset (meters). OFS-specific — verify from Fortran source.
     # SECOFS: 1.25 (confirmed). STOFS-3D-ATL: 0.04. Other OFS: 0.0 until verified.
@@ -348,6 +363,7 @@ class ForcingConfig:
             met_num=2,
             obc_ssh_offset=1.25,  # Geoid-to-MSL datum offset for SECOFS
             nudging_enabled=True,  # COMF Fortran generates TEM_nu/SAL_nu
+            rtofs_3d_region="US_east",
             # Production ``nos_ofs_create_forcing_river.sh`` extends the
             # NWM hourly window to ``time_hotstart + 72h`` (= sim_duration
             # + 18h for nowcast=6, forecast=48). 73 hourly rows total.
@@ -372,6 +388,7 @@ class ForcingConfig:
             met_num=2, nws=4,
             gfs_resolution="0p25",
             obc_ssh_offset=1.25,
+            rtofs_3d_region="US_east",
             # DATM forcing grid (ATLANTIC preset)
             datm_lon_min=-98.0, datm_lon_max=-55.0,
             datm_lat_min=10.0, datm_lat_max=53.0,
@@ -413,6 +430,7 @@ class ForcingConfig:
             obc_roi_3d={"x1": 482, "x2": 600, "y1": 94, "y2": 821},
             nudge_roi_3d={"x1": 422, "x2": 600, "y1": 94, "y2": 835},
             obc_ssh_offset=0.04,
+            rtofs_3d_region="US_east",
             # Elevation-forced open-boundary segments (iettype 4/5). B2 (the
             # St-Lawrence River, iettype 0) is excluded so the *.th.nc files
             # carry only the 778 elevation nodes SCHISM expects.
@@ -463,6 +481,7 @@ class ForcingConfig:
             obc_roi_3d={"x1": 482, "x2": 600, "y1": 94, "y2": 821},
             nudge_roi_3d={"x1": 422, "x2": 600, "y1": 94, "y2": 835},
             obc_ssh_offset=0.04,
+            rtofs_3d_region="US_east",
             # Elevation-forced open-boundary segments (iettype 4/5). B2 (the
             # St-Lawrence River, iettype 0) is excluded so the *.th.nc files
             # carry only the 778 elevation nodes SCHISM expects.
@@ -700,6 +719,13 @@ class ForcingConfig:
         roi_3dz = obc.get("roi_3dz", {})
         nudge_roi = nudge.get("roi_3dz", {}) if isinstance(nudge, dict) else {}
 
+        # Which regional RTOFS 3dz tile (OBC 3D + nudging share this). See
+        # the ``rtofs_3d_region`` field docstring: unset means the file
+        # discovery's valid-time dedup falls back to an alphabetical
+        # tie-break with no region awareness, which is a live bug for any
+        # domain "US_east" does not cover.
+        rtofs_3d_region = ocean.get("rtofs_3d_region") if isinstance(ocean, dict) else None
+
         # HRRR blend domain (may differ from main domain)
         hrrr_blend = atm.get("hrrr_blend", {})
 
@@ -755,6 +781,8 @@ class ForcingConfig:
             kwargs["obc_roi_3d"] = {k: int(v) for k, v in roi_3dz.items()}
         if nudge_roi:
             kwargs["nudge_roi_3d"] = {k: int(v) for k, v in nudge_roi.items()}
+        if rtofs_3d_region:
+            kwargs["rtofs_3d_region"] = str(rtofs_3d_region)
 
         # NWM target counts
         if isinstance(river, dict):

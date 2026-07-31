@@ -79,6 +79,17 @@ class RTOFSProcessor(ForcingProcessor):
     # at ``sim_end``.
     DEFAULT_BUFFER_HOURS = 3
 
+    # The 3D T/S/UV boundary is written as up to three separate files
+    # (_process_3d gates TEM_3D.th.nc on all_temp and SAL_3D.th.nc on
+    # all_salt independently -- one variable missing from the source RTOFS
+    # file does not stop the other from being written). TEM_3D and SAL_3D
+    # are both mandatory: SCHISM boundaries with isatype/itetype set (e.g.
+    # STOFS-3D-AK's isatype=4) abort without both. uv3D.th.nc is written as
+    # all-zeros whenever TEM_3D is (COMF uses SSH-derived boundary
+    # velocities, not RTOFS ones) and the Fortran wrapper's own output
+    # check already treats it as optional -- so it is not required here.
+    REQUIRED_3D_OBC_FILES = ("TEM_3D.th.nc", "SAL_3D.th.nc")
+
     def __init__(
         self,
         config: ForcingConfig,
@@ -301,14 +312,44 @@ class RTOFSProcessor(ForcingProcessor):
                 errors=["No RTOFS input files found"],
             )
 
+        # A 2D-only success is normal when nobody asked for a specific 3D
+        # tile (some cycles genuinely have SSH data before the 3D product
+        # lands). It stops being normal once rtofs_3d_region is explicitly
+        # set: an empty files_3d then means the requested tile was not
+        # found, not that no 3D data exists at all. Without this check the
+        # branch below silently skips 3D processing, len(output_files) > 0
+        # still holds because elev2D.th.nc exists, and the caller sees
+        # success=True with no TEM_3D.th.nc / SAL_3D.th.nc ever written --
+        # exactly the silent-wrong-data failure mode this region filter was
+        # added to close.
+        region = self.config.rtofs_3d_region
+        if region and not files_3d:
+            # Fast path with the most specific message: the tile was never
+            # found in discovery at all. The general check below (after
+            # processing is actually attempted) catches every other way
+            # this pairing can fail -- see its comment for why that one
+            # cannot be skipped even with this check kept.
+            return ForcingResult(
+                success=False, source=self.SOURCE_NAME,
+                errors=[
+                    f"rtofs_3d_region={region!r} matched no 3dz files -- "
+                    f"check the tile is staged for this cycle and the name "
+                    f"matches the filename convention (e.g. 'alaska', "
+                    f"'US_east')."
+                ],
+            )
+
         output_files = []
         warnings = []
+        elev2d_ok = False
+        obc3d_ok = False
 
         if files_2d:
             log.info(f"Processing {len(files_2d)} RTOFS 2D files")
             f = self._process_2d(files_2d)
             if f:
                 output_files.append(f)
+                elev2d_ok = True
             else:
                 warnings.append("Failed to create elev2D.th.nc")
 
@@ -316,6 +357,45 @@ class RTOFSProcessor(ForcingProcessor):
             log.info(f"Processing {len(files_3d)} RTOFS 3D files")
             obc_files = self._process_3d(files_3d)
             output_files.extend(obc_files)
+            # _process_3d gates TEM_3D.th.nc on all_temp and SAL_3D.th.nc on
+            # all_salt independently, so obc_files can be non-empty while
+            # still missing one of the two -- bool(obc_files) alone cannot
+            # tell "both variables produced" from "one variable produced".
+            produced_3d = {p.name for p in obc_files}
+            obc3d_ok = set(self.REQUIRED_3D_OBC_FILES).issubset(produced_3d)
+
+        # The check above only knows what discovery FOUND, not what
+        # processing actually PRODUCED -- ways that can still diverge even
+        # when both file lists were non-empty going in:
+        #   - _sort_and_dedup's phase-window filter (called separately per
+        #     type, after the discovery-level pick) can legitimately wipe
+        #     out one type's files while leaving the other's, if their
+        #     valid-time spreads differ.
+        #   - _process_2d or _process_3d can each fail independently on
+        #     genuinely bad file content, regardless of how many files
+        #     were found.
+        #   - _process_3d itself can produce temperature without salinity
+        #     (or vice versa) when the source RTOFS file is missing one
+        #     variable -- see REQUIRED_3D_OBC_FILES above.
+        # Either way, `if files_3d: ... if files_2d: ...` run independently
+        # of each other, so len(output_files) > 0 alone cannot tell "the
+        # full required set produced" from "some subset of it produced" --
+        # and a region-pinned domain with elevation-forced boundaries needs
+        # the full set.
+        if region and not (elev2d_ok and obc3d_ok):
+            produced_names = {p.name for p in output_files}
+            required = ("elev2D.th.nc",) + self.REQUIRED_3D_OBC_FILES
+            missing = [n for n in required if n not in produced_names]
+            return ForcingResult(
+                success=False, source=self.SOURCE_NAME,
+                errors=[
+                    f"rtofs_3d_region={region!r}: the 2D elevation boundary "
+                    f"and the full 3D T/S boundary (TEM_3D.th.nc, "
+                    f"SAL_3D.th.nc) are all required; missing {missing} -- "
+                    f"refusing to report success from a partial set"
+                ],
+                warnings=warnings,
+            )
 
         # The WL bias correction (wl_bias, COMF nosofs 3.9) reports whether it
         # actually modified the SSH array; the legacy warning stands only when
@@ -367,6 +447,29 @@ class RTOFSProcessor(ForcingProcessor):
                 errors=["No RTOFS input files found"],
             )
 
+        # See the matching check in _process_secofs: once rtofs_3d_region is
+        # explicitly set, an empty files_3d means the requested tile was not
+        # found, not that no 3D data exists this cycle. Left unchecked here,
+        # Step 1 (SSH only) still produces an output and the STOFS branch
+        # below reports success on SSH alone -- the same silent-wrong-data
+        # gap this region filter exists to close.
+        region = self.config.rtofs_3d_region
+        if region and not files_3d:
+            # Fast path with the most specific message: the tile was never
+            # found in discovery at all. The general check below (after
+            # processing is actually attempted) catches every other way
+            # this pairing can fail -- see its comment for why that one
+            # cannot be skipped even with this check kept.
+            return ForcingResult(
+                success=False, source=self.SOURCE_NAME,
+                errors=[
+                    f"rtofs_3d_region={region!r} matched no 3dz files -- "
+                    f"check the tile is staged for this cycle and the name "
+                    f"matches the filename convention (e.g. 'alaska', "
+                    f"'US_east')."
+                ],
+            )
+
         import tempfile
         work_dir = Path(tempfile.mkdtemp(prefix="rtofs_stofs_"))
 
@@ -408,6 +511,9 @@ class RTOFSProcessor(ForcingProcessor):
             # Step 4: Try Fortran gen_3Dth_from_hycom
             fortran_ok = self._call_fortran_gen_3dth(work_dir, ssh_path, tsuv_path)
 
+            elev2d_ok = False
+            obc3d_ok = False
+
             if fortran_ok:
                 # Copy Fortran outputs to final output directory.
                 # NOTE: do NOT apply obc_ssh_offset here — the Fortran exe
@@ -423,6 +529,17 @@ class RTOFSProcessor(ForcingProcessor):
                         dst = self.output_path / fname
                         shutil.copy2(src, dst)
                         output_files.append(dst)
+                # Track elev2d_ok/obc3d_ok from the names actually copied,
+                # not "was anything copied" -- the Fortran exe (like
+                # _process_3d below) can write TEM_3D.th.nc without
+                # SAL_3D.th.nc or vice versa, and _call_fortran_gen_3dth's
+                # own success check requires both by name and only treats
+                # uv3D as optional -- but that check only gates whether we
+                # reach this branch at all, not what ends up in `produced`,
+                # so this still has to verify independently.
+                produced = {p.name for p in output_files}
+                elev2d_ok = "elev2D.th.nc" in produced
+                obc3d_ok = set(self.REQUIRED_3D_OBC_FILES).issubset(produced)
             else:
                 warnings.append("Fortran gen_3Dth not available, using Python interpolation")
                 # Fall back to Python Delaunay — load grid and use existing _process_2d/_process_3d
@@ -432,9 +549,42 @@ class RTOFSProcessor(ForcingProcessor):
                         f = self._process_2d(files_2d)
                         if f:
                             output_files.append(f)
+                            elev2d_ok = True
                     if files_3d:
                         obc_files = self._process_3d(files_3d)
                         output_files.extend(obc_files)
+                        # See the matching comment in _process_secofs: T/S
+                        # are written on independent conditions, so
+                        # bool(obc_files) alone cannot tell "both produced"
+                        # from "one produced".
+                        produced_3d = {p.name for p in obc_files}
+                        obc3d_ok = set(self.REQUIRED_3D_OBC_FILES).issubset(produced_3d)
+
+            # Same reasoning as the matching check in _process_secofs: what
+            # was actually PRODUCED can diverge from what discovery FOUND,
+            # via the phase-window filter in _sort_and_dedup, an
+            # independent failure in either path above (Fortran or the
+            # Python fallback's _process_2d/_process_3d each failing on
+            # their own), or Fortran/_process_3d writing temperature
+            # without salinity (or vice versa). Neither branch here ties
+            # the required outputs together, so len(output_files) > 0
+            # alone cannot distinguish "the full required set produced"
+            # from "some subset of it produced".
+            if region and not (elev2d_ok and obc3d_ok):
+                produced_names = {p.name for p in output_files}
+                required = ("elev2D.th.nc",) + self.REQUIRED_3D_OBC_FILES
+                missing = [n for n in required if n not in produced_names]
+                return ForcingResult(
+                    success=False, source=self.SOURCE_NAME,
+                    errors=[
+                        f"rtofs_3d_region={region!r}: the 2D elevation "
+                        f"boundary and the full 3D T/S boundary "
+                        f"(TEM_3D.th.nc, SAL_3D.th.nc) are all required; "
+                        f"missing {missing} -- refusing to report success "
+                        f"from a partial set"
+                    ],
+                    warnings=warnings,
+                )
 
             return ForcingResult(
                 success=len(output_files) > 0,
@@ -740,11 +890,20 @@ class RTOFSProcessor(ForcingProcessor):
             # already applies the offset internally (WL += 1.25 at line ~3133).
             # Applying it again would double the offset to +2.5m.
 
-            # Verify outputs exist
+            # Verify outputs exist. A bare count (`len(found) >= 3`) treated
+            # any three of the four files as good enough, which accepts
+            # elev2D+TEM_3D+uv3D with SAL_3D silently missing just as
+            # readily as the intended "uv3D is optional" case -- check by
+            # name instead so only uv3D can be absent.
             expected = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]
             found = [f for f in expected if (work_dir / f).exists()]
             log.info(f"Fortran gen_3Dth produced {len(found)}/{len(expected)} files")
-            return len(found) >= 3  # Allow uv3D to be optional
+            required = {"elev2D.th.nc", *self.REQUIRED_3D_OBC_FILES}
+            missing_required = required - set(found)
+            if missing_required:
+                log.warning(f"Fortran gen_3Dth missing required outputs: {sorted(missing_required)}")
+                return False
+            return True
 
         except subprocess.TimeoutExpired:
             log.warning("Fortran gen_3Dth timed out (600s)")
@@ -820,18 +979,33 @@ class RTOFSProcessor(ForcingProcessor):
         return result
 
     def find_input_files_by_type(self) -> Tuple[List[Path], List[Path]]:
-        """Find RTOFS 2D and 3D files, sorted by valid time and deduplicated."""
+        """Find RTOFS 2D and 3D files, sorted by valid time and deduplicated.
+
+        2D and 3D always come from the SAME cycle date -- never mixed across
+        dates. _process_2d/_process_3d/nudging.py all compute each file's
+        valid time as ``self._rtofs_cycle_date + hours_from_filename``, one
+        shared date for both variables, so picking 2D from one date and 3D
+        from another would silently misdate whichever type didn't match
+        that date -- a corrupted time axis, not a missing-file error.
+        """
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
-        files_2d = []
-        files_3d = []
-        rtofs_cycle_date = None
+        # Ops stages "alaska", "US_east" and "US_west" 3dz tiles side by
+        # side for every valid time, with no region distinction in the old
+        # unfiltered glob. Restricting it to this (when set) is what makes
+        # the valid-time dedup below a genuine nowcast/forecast dedup
+        # instead of an accidental cross-region tile pick -- see the field
+        # docstring on ForcingConfig.rtofs_3d_region for the failure this
+        # closes when unset.
+        region = self.config.rtofs_3d_region
 
         # Search newest RTOFS cycle first to match Fortran shell behavior.
         # The Fortran prep (nos_ofs_create_forcing_obc.sh) uses the latest
         # available cycle. PDY itself rarely has RTOFS ready at 00Z, so
         # PDY-1 is the typical production hit.
+        candidates = []  # [(date, day_2d, day_3d), ...] for every date with ANY hit
         for date in [base_date - timedelta(days=1), base_date - timedelta(days=2), base_date]:
             date_str = date.strftime("%Y%m%d")
+            day_2d, day_3d = [], []
 
             for rtofs_dir in [
                 self.input_path / f"rtofs.{date_str}",
@@ -842,27 +1016,65 @@ class RTOFSProcessor(ForcingProcessor):
                     continue
 
                 found_2d = sorted(rtofs_dir.glob("rtofs_glo_2ds_*_diag.nc"))
-                found_3d = sorted(rtofs_dir.glob("rtofs_glo_3dz_*_6hrly_hvr_*.nc"))
-                found_3d.extend(sorted(rtofs_dir.glob("rtofs_glo_3dz_*_6hrly_hvr_*.nc4")))
+                if region:
+                    glob_3d = f"rtofs_glo_3dz_*_6hrly_hvr_{region}.nc"
+                    glob_3d4 = f"rtofs_glo_3dz_*_6hrly_hvr_{region}.nc4"
+                else:
+                    glob_3d = "rtofs_glo_3dz_*_6hrly_hvr_*.nc"
+                    glob_3d4 = "rtofs_glo_3dz_*_6hrly_hvr_*.nc4"
+                found_3d = sorted(rtofs_dir.glob(glob_3d))
+                found_3d.extend(sorted(rtofs_dir.glob(glob_3d4)))
 
-                for f in found_2d:
-                    if self.validate_file_size(f, self.MIN_FILE_SIZE_2D):
-                        files_2d.append(f)
-                for f in found_3d:
-                    if self.validate_file_size(f, self.MIN_FILE_SIZE_3D):
-                        files_3d.append(f)
+                day_2d = [f for f in found_2d if self.validate_file_size(f, self.MIN_FILE_SIZE_2D)]
+                day_3d = [f for f in found_3d if self.validate_file_size(f, self.MIN_FILE_SIZE_3D)]
 
-                if files_2d or files_3d:
-                    rtofs_cycle_date = date
-                    log.info(f"Found RTOFS files in {rtofs_dir}: {len(files_2d)} 2D, {len(files_3d)} 3D")
-                    break
+                if day_2d or day_3d:
+                    log.info(f"Found RTOFS files in {rtofs_dir}: {len(day_2d)} 2D, {len(day_3d)} 3D")
+                    break  # first populated directory layout wins for this date
 
-            if files_2d or files_3d:
-                break
+            if not (day_2d or day_3d):
+                continue
+            candidates.append((date, day_2d, day_3d))
 
-        # Sort by valid time and deduplicate n/f overlap
-        if rtofs_cycle_date is None:
-            rtofs_cycle_date = base_date
+            if not region:
+                break  # unchanged: first date with any hit is final
+            if day_2d and day_3d:
+                break  # best possible outcome for a pinned region: stop here
+            # Otherwise this date is a partial hit (commonly 2D-only, since
+            # the region-specific 3D tile is what tends to lag) -- keep
+            # searching older dates rather than accepting it immediately,
+            # so a one-day staging lag on just the requested tile doesn't
+            # turn into "no 3D data at all" for the whole cycle.
+
+        if not candidates:
+            files_2d, files_3d, rtofs_cycle_date = [], [], base_date
+        elif not region:
+            rtofs_cycle_date, files_2d, files_3d = candidates[0]
+        else:
+            # A pinned region must not accept a 3D-only candidate on its
+            # own: 3D output requires nothing else to succeed (the
+            # `if files_3d:` branch below runs independently of files_2d),
+            # so a 3D-only pick would silently produce TEM_3D.th.nc /
+            # SAL_3D.th.nc / uv3D.th.nc with success=True and NO
+            # elev2D.th.nc -- fatal for a domain like STOFS-3D-AK, whose
+            # boundaries are entirely elevation-forced. The prior version
+            # of this pick treated any-3D as almost as good as both-types;
+            # it is not.
+            both = next((c for c in candidates if c[1] and c[2]), None)
+            if both:
+                rtofs_cycle_date, files_2d, files_3d = both
+            else:
+                # No date offered both together. Keep the earliest
+                # candidate's 2D (still legitimate data on its own) and
+                # deliberately drop any 3D found elsewhere -- pairing it
+                # with 2D from a different date is exactly the mismatch
+                # this whole method exists to prevent. files_3d now empty
+                # is what the region-set guard in _process_secofs /
+                # _process_stofs below checks for, so this reaches the
+                # same loud failure as a tile that was never found at all.
+                rtofs_cycle_date, files_2d, _ = candidates[0]
+                files_3d = []
+
         self._rtofs_cycle_date = rtofs_cycle_date
         if files_2d:
             files_2d = self._sort_and_dedup(files_2d, rtofs_cycle_date)
