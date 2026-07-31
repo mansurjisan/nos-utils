@@ -1,0 +1,305 @@
+"""Nodal-factor rewriting in a bctides.in template.
+
+A bctides.in names each constituent once per section, and only the column
+count distinguishes what follows it:
+
+    tidal potential    5 cols  species amp freq f V0+u
+    boundary forcing   3 cols  freq f V0+u
+    per-node elevation 2 cols  amp pha
+    per-node velocity  4 cols  u_amp u_pha v_amp v_pha
+
+Only the first two carry cycle-dependent nodal parameters. The per-node
+blocks are harmonic constants of the mesh and must survive untouched.
+"""
+from pathlib import Path
+
+import pytest
+
+import nos_utils.forcing.tidal as tidal_module
+from nos_utils.forcing.tidal import TidalProcessor
+
+
+# One elevation-forced boundary with 2 nodes, iettype/ifltype 5, so the
+# template exercises all four line shapes for a single constituent.
+_TEMPLATE = """\
+!2019-07-01 12:00:00 UTC
+2 50.0 !ntip, cutoff depth
+M2
+ 2 0.242334 0.000140519 1.00958 21.5386
+S2
+ 2 0.112841 0.000145444 1.0 0.0
+2 !nbfr
+M2
+ 0.000140519 1.00958 21.5386
+S2
+ 0.000145444 1.0 0.0
+1 !nope
+2 5 5 4 4 !test boundary
+M2
+ 0.307520  168.103381
+ 0.302088  166.298557
+S2
+ 0.100000  100.000000
+ 0.110000  110.000000
+M2
+ 0.385391  306.426197  0.455913  151.518474
+ 0.380000  300.000000  0.450000  150.000000
+S2
+ 0.108138  339.219848  0.146274  189.256472
+ 0.100000  330.000000  0.140000  180.000000
+"""
+
+
+def _run(tmp_path, mock_config, text=_TEMPLATE):
+    tpl = tmp_path / "x.bctides.in_template"
+    tpl.write_text(text)
+    out = tmp_path / "bctides.in"
+    proc = TidalProcessor(mock_config, tmp_path, tmp_path)
+    assert proc._process_template(tpl, out) is True
+    return text.splitlines(), out.read_text().splitlines()
+
+
+def _field(lines, idx, col):
+    return float(lines[idx].split()[col])
+
+
+class TestNodalRewrite:
+    def test_line_count_is_preserved(self, tmp_path, mock_config):
+        before, after = _run(tmp_path, mock_config)
+        assert len(before) == len(after)
+
+    def test_potential_section_is_rewritten(self, tmp_path, mock_config):
+        """5-column line: f and V0+u are columns 3 and 4.
+
+        These used to be computed and then dropped -- the assignment back
+        into the line was missing, so the output kept the template's own
+        factors under a rewritten date.
+        """
+        before, after = _run(tmp_path, mock_config)
+        assert after[3].split()[:3] == before[3].split()[:3]   # species/amp/freq intact
+        assert _field(after, 3, 3) != _field(before, 3, 3)     # f updated
+        assert _field(after, 3, 4) != _field(before, 3, 4)     # V0+u updated
+
+    def test_boundary_forcing_section_is_rewritten(self, tmp_path, mock_config):
+        """3-column line: f and V0+u are columns 1 and 2.
+
+        This section drives the elevation boundary and was not handled at
+        all -- neither the 5- nor the 4-column branch matched it.
+        """
+        before, after = _run(tmp_path, mock_config)
+        assert _field(after, 8, 0) == _field(before, 8, 0)     # frequency intact
+        assert _field(after, 8, 1) != _field(before, 8, 1)
+        assert _field(after, 8, 2) != _field(before, 8, 2)
+
+    def test_potential_and_boundary_agree_for_a_constituent(self, tmp_path, mock_config):
+        """Same constituent, same f and V0+u, wherever it appears."""
+        _before, after = _run(tmp_path, mock_config)
+        assert _field(after, 3, 3) == _field(after, 8, 1)
+        assert _field(after, 3, 4) == _field(after, 8, 2)
+
+
+class TestPhaseDuration:
+    @pytest.mark.parametrize(
+        ("phase", "nowcast_hours", "forecast_hours", "expected_run_days"),
+        [
+            ("nowcast", 9, 48, 0.375),
+            ("forecast", 6, 48, 2.0),
+        ],
+    )
+    def test_template_uses_phase_duration_for_nodal_midpoint(
+        self,
+        tmp_path,
+        mock_config,
+        monkeypatch,
+        phase,
+        nowcast_hours,
+        forecast_hours,
+        expected_run_days,
+    ):
+        """Python fallback must match tide_fac's per-phase midpoint."""
+        mock_config.nowcast_hours = nowcast_hours
+        mock_config.forecast_hours = forecast_hours
+        original = tidal_module.compute_nodal_corrections
+        observed_run_days = []
+
+        def capture_run_days(start_time, constituents, run_days=0.25):
+            observed_run_days.append(run_days)
+            return original(start_time, constituents, run_days=run_days)
+
+        monkeypatch.setattr(
+            tidal_module, "compute_nodal_corrections", capture_run_days
+        )
+        template = tmp_path / "x.bctides.in_template"
+        template.write_text(_TEMPLATE)
+        processor = TidalProcessor(
+            mock_config, tmp_path, tmp_path, phase=phase
+        )
+
+        assert processor._process_template(
+            template, tmp_path / "bctides.in"
+        ) is True
+        assert observed_run_days == [expected_run_days]
+
+    def test_fortran_mode_receives_forecast_duration(
+        self, tmp_path, mock_config, monkeypatch
+    ):
+        """The tide_fac subprocess must receive the same phase duration."""
+        executable = tmp_path / "nos_ofs_create_tide_fac_schism"
+        executable.touch()
+        template = tmp_path / "source.bctides.in_template"
+        template.write_text(_TEMPLATE)
+        output = tmp_path / "bctides.in"
+        observed_input = []
+
+        def fake_run(command, input, cwd, **kwargs):
+            observed_input.append(input)
+            output.write_text("generated by fake tide_fac\n")
+
+            class Result:
+                returncode = 0
+                stderr = ""
+
+            return Result()
+
+        monkeypatch.setenv("EXECnos", str(tmp_path))
+        monkeypatch.setattr(tidal_module.subprocess, "run", fake_run)
+        processor = TidalProcessor(
+            mock_config, tmp_path, tmp_path, phase="forecast"
+        )
+
+        assert processor._call_fortran_tide_fac(template, output) is True
+        assert observed_input == ["2.0000\n12,01,04,2026\ny\n"]
+
+    def test_python_native_receives_forecast_duration(
+        self, tmp_path, mock_config, monkeypatch
+    ):
+        """Python-native generation must use the forecast midpoint too."""
+        original = tidal_module.compute_nodal_corrections
+        observed_run_days = []
+
+        def capture_run_days(start_time, constituents, run_days=0.25):
+            observed_run_days.append(run_days)
+            return original(start_time, constituents, run_days=run_days)
+
+        monkeypatch.setattr(
+            tidal_module, "compute_nodal_corrections", capture_run_days
+        )
+        processor = TidalProcessor(
+            mock_config, tmp_path, tmp_path, phase="forecast"
+        )
+
+        processor._generate_python(tmp_path / "bctides.in")
+        assert observed_run_days == [2.0]
+
+
+class TestConstituentCase:
+    def test_lowercase_headers_update_without_touching_per_node_data(
+        self, tmp_path, mock_config
+    ):
+        """SCHISM constituent names are case-insensitive in every section."""
+        lowercase_template = _TEMPLATE.replace("M2", "m2").replace("S2", "s2")
+        before, after = _run(tmp_path, mock_config, text=lowercase_template)
+
+        # Potential and boundary-forcing nodal rows are updated.
+        for idx in (3, 5, 8, 10):
+            assert after[idx] != before[idx]
+
+        # Lower-case per-node headers now match the normalized lookup, but the
+        # 2/4-column shape guard must still preserve every harmonic row.
+        for idx in (14, 15, 17, 18, 20, 21, 23, 24):
+            assert after[idx] == before[idx]
+
+
+class TestPerNodeDataIsNeverTouched:
+    # The regression that matters: per-node harmonics belong to the mesh,
+    # not the cycle.
+
+    def test_two_column_elevation_nodes_untouched(self, tmp_path, mock_config):
+        before, after = _run(tmp_path, mock_config)
+        for idx in (14, 15, 17, 18):
+            assert after[idx] == before[idx], f"elevation node line {idx} rewritten"
+
+    def test_four_column_velocity_nodes_untouched(self, tmp_path, mock_config):
+        """4 columns is u_amp u_pha v_amp v_pha, not a short potential line.
+
+        Treating it as the latter overwrote the v-component amplitude and
+        phase of the first node of every constituent on every ifltype 4/5
+        boundary with a nodal factor.
+        """
+        before, after = _run(tmp_path, mock_config)
+        for idx in (20, 21, 23, 24):
+            assert after[idx] == before[idx], f"velocity node line {idx} rewritten"
+
+    def test_no_line_gains_or_loses_columns(self, tmp_path, mock_config):
+        before, after = _run(tmp_path, mock_config)
+        for i, (b, a) in enumerate(zip(before, after)):
+            if i == 0:
+                continue  # the date line is reformatted by design
+            assert len(b.split()) == len(a.split()), f"column count changed on line {i}"
+
+
+class TestStaleConstituentsAreReported:
+    def test_warns_when_nothing_matched(self, tmp_path, mock_config, caplog):
+        """A template whose constituents never match must not pass silently
+        with the template's own (stale) factors."""
+        text = "!2019-07-01 12:00:00 UTC\n0 50.0\n0 !nbfr\n0 !nope\n"
+        with caplog.at_level("WARNING"):
+            _run(tmp_path, mock_config, text=text)
+        assert any("no nodal parameter line was updated" in r.message
+                   for r in caplog.records)
+
+    def test_warns_per_constituent_on_a_partial_update(self, tmp_path, mock_config, caplog):
+        """A PARTIAL update is the harder case to notice, and just as stale.
+
+        The template below carries only M2, so the other seven configured
+        constituents keep the template's factors -- reporting only the
+        all-or-nothing case would let that pass in silence.
+        """
+        text = ("!2019-07-01 12:00:00 UTC\n1 50.0\nM2\n"
+                " 2 0.242334 0.000140519 1.00958 21.5386\n")
+        with caplog.at_level("WARNING"):
+            _run(tmp_path, mock_config, text=text)
+        warned = [r.getMessage() for r in caplog.records
+                  if "no nodal parameter line was updated" in r.getMessage()]
+        assert warned, "a partial update must still warn"
+        assert "M2" not in warned[0], "M2 was updated and must not be listed"
+        for c in ("S2", "K1", "O1"):
+            assert c in warned[0]
+
+
+class TestTrailingCommentsAreHandled:
+    # Rare, but they shift the column count in both directions.
+
+    def test_commented_potential_line_is_still_updated(self, tmp_path, mock_config):
+        """5 values + a comment splits to 8 tokens and used to be skipped,
+        leaving that one constituent stale while the rest updated."""
+        text = ("!d\n1 50.0\nM2\n"
+                " 2 0.242334 0.000140519 1.00958 21.5386  !species constants\n")
+        before, after = _run(tmp_path, mock_config, text=text)
+        assert _field(after, 3, 3) != _field(before, 3, 3)
+        assert "!species constants" in after[3], "the comment must survive"
+
+    def test_commented_forcing_line_is_still_updated(self, tmp_path, mock_config):
+        text = ("!d\n0 50.0\n1 !nbfr\nM2\n"
+                " 0.000140519 1.00958 21.5386 !freq, nodal factor, argument\n")
+        before, after = _run(tmp_path, mock_config, text=text)
+        assert _field(after, 4, 1) != _field(before, 4, 1)
+        assert "!freq" in after[4]
+
+    def test_commented_elevation_node_is_not_rewritten(self, tmp_path, mock_config):
+        """The mirror hazard: 2 values + a comment reads as 3 raw tokens, and
+        would be rewritten as though it were a boundary-forcing line.
+
+        This is reachable in practice because STOFS-3D-AK templates use the
+        same upper-case constituent names for per-node block headers as for
+        the potential section, unlike SECOFS/ATL/PAC which use lower case.
+
+        The comment must be a SINGLE token: "!node1" makes the raw split 3,
+        which is the shape the boundary-forcing branch claims. A two-token
+        "!node 1" splits to 4 and is skipped for an unrelated reason, so it
+        would pass even without the comment stripping and guard nothing.
+        """
+        text = ("!d\n0 50.0\n0 !nbfr\n1 !nope\n1 5 0 0 0 !bnd\nM2\n"
+                " 0.307520  168.103381 !node1\n")
+        before, after = _run(tmp_path, mock_config, text=text)
+        assert after[6] == before[6], "per-node elevation data was rewritten"

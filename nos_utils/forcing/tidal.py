@@ -191,6 +191,14 @@ class TidalProcessor(ForcingProcessor):
                 return self.time_hotstart
             return cycle_dt - timedelta(hours=self.config.nowcast_hours)
 
+    def _phase_run_days(self) -> float:
+        """Return this phase's duration in days for midpoint corrections."""
+        if self.phase == "forecast":
+            phase_hours = self.config.forecast_hours
+        else:
+            phase_hours = self.config.nowcast_hours
+        return phase_hours / 24.0
+
     def _call_fortran_tide_fac(self, template_path: Path, output_path: Path) -> bool:
         """
         Call Fortran tide_fac executable for accurate nodal corrections.
@@ -228,11 +236,7 @@ class TidalProcessor(ForcingProcessor):
         # Previous implementation used int((nowcast+forecast)/24), which produced
         # nodal factors evaluated at a midpoint ~1 day off from production and
         # broke byte-parity with the static FIX bctides used in V16 success runs.
-        if self.phase == "forecast":
-            phase_hours = self.config.forecast_hours
-        else:
-            phase_hours = self.config.nowcast_hours
-        run_days = phase_hours / 24.0
+        run_days = self._phase_run_days()
 
         try:
             work_template = output_path.parent / "bctides.in_template"
@@ -295,39 +299,94 @@ class TidalProcessor(ForcingProcessor):
             lines[0] = start_time.strftime("%m/%d/%Y %H:%M:%S") + " UTC"
 
             # Compute nodal corrections for this start time
-            nodal = compute_nodal_corrections(start_time, self.config.tidal_constituents)
+            nodal = compute_nodal_corrections(
+                start_time,
+                self.config.tidal_constituents,
+                run_days=self._phase_run_days(),
+            )
+            # Constituent names are case-insensitive in SCHISM's Fortran
+            # reader. Templates also use mixed conventions in practice: the
+            # cycle-dependent blocks are commonly upper case while per-node
+            # blocks may be lower case. Normalize the lookup, then rely on the
+            # strict 3/5-column guard below to distinguish nodal rows from the
+            # 2/4-column per-node harmonics that must remain untouched.
+            nodal_by_name = {name.upper(): values for name, values in nodal.items()}
 
-            # Update nodal factors in the tidal potential section
-            # Format: after each constituent name line, the next line has:
-            #   n_doodson amplitude omega nodal_factor equilibrium_arg
-            # We update nodal_factor and equilibrium_arg
+            # Update the nodal factor f and equilibrium argument V0+u wherever a
+            # constituent name is followed by a parameter line. A bctides.in
+            # names each constituent once per section, and the column count is
+            # what distinguishes them:
+            #
+            #   tidal potential    5 cols  species amp freq f V0+u  -> [3], [4]
+            #   boundary forcing   3 cols  freq f V0+u              -> [1], [2]
+            #   per-node elevation 2 cols  amp pha                  -> leave alone
+            #   per-node velocity  4 cols  u_amp u_pha v_amp v_pha  -> leave alone
+            #
+            # The 2- and 4-column shapes are per-node harmonic data: a property
+            # of the mesh, never of the cycle. 4 columns in particular used to
+            # be treated as "a shorter potential line without the frequency
+            # column" and rewritten, which silently replaced the v-component
+            # amplitude and phase of the first node of every constituent on
+            # every ifltype 4/5 boundary with a nodal factor.
+            _NODAL_COLS = {5: (3, 4), 3: (1, 2)}
+
+            # Trailing "!" comments are stripped before counting, and restored
+            # after. They are rare but they break the count both ways: a
+            # commented potential line reads as 8 columns and is skipped, and
+            # a commented 2-column elevation node reads as 3 and would be
+            # rewritten as if it were a forcing line.
+            matched = set()
+            updated = 0
             i = 2  # Start after line 0 (date) and line 1 (ntip tip_dp)
             while i < len(lines) - 1:
-                line = lines[i].strip()
+                line = lines[i].split("!")[0].strip()
                 # Check if this line is a constituent name
-                if line in nodal:
+                constituent = line.upper()
+                if constituent in nodal_by_name:
                     # Next line has the nodal parameters
                     i += 1
-                    parts = lines[i].split()
-                    if len(parts) >= 5:
-                        # parts: species amplitude frequency nodefactor equil_arg
-                        f_val = nodal[line]["f"]
-                        v0_plus_u = nodal[line]["v0_plus_u"]
-                        parts[3] = f"{f_val:.5f}"
-                        parts[4] = f"{v0_plus_u:.5f}"
-                    elif len(parts) >= 4:
-                        # Shorter format without frequency column
-                        f_val = nodal[line]["f"]
-                        v0_plus_u = nodal[line]["v0_plus_u"]
-                        parts[2] = f"{f_val:.5f}"
-                        parts[3] = f"{v0_plus_u:.5f}"
-                        lines[i] = " ".join(parts)
+                    raw = lines[i]
+                    body, sep, comment = raw.partition("!")
+                    parts = body.split()
+                    slots = _NODAL_COLS.get(len(parts))
+                    if slots:
+                        f_slot, arg_slot = slots
+                        correction = nodal_by_name[constituent]
+                        parts[f_slot] = f"{correction['f']:.5f}"
+                        parts[arg_slot] = f"{correction['v0_plus_u']:.5f}"
+                        indent = raw[: len(raw) - len(raw.lstrip())]
+                        lines[i] = indent + " ".join(parts)
+                        if sep:
+                            lines[i] += " " + sep + comment
+                        matched.add(constituent)
+                        updated += 1
                 i += 1
 
             # Write updated file
             output_path.write_text("\n".join(lines) + "\n")
+            # Any configured constituent that was never rewritten keeps the
+            # template's own factors under a rewritten date. Report per
+            # constituent rather than only when nothing matched at all: a
+            # partial update is the harder case to notice and just as stale.
+            missing = sorted(set(nodal_by_name) - matched)
+            if missing:
+                log.warning(
+                    "bctides template: no nodal parameter line was updated for "
+                    "%s -- either the template does not carry them, or their "
+                    "line shape was not recognised, in which case they keep "
+                    "the template's factors.",
+                    missing,
+                )
+            # Both counts, deliberately. A constituent is counted as matched
+            # once it is rewritten ANYWHERE, so a template that names it in
+            # the potential section but not the boundary-forcing section
+            # (upper case in one, lower case in the other, say) reports every
+            # constituent matched while the forcing block stays stale. The
+            # line count is what exposes that: expect one line per
+            # constituent per section the template carries.
             log.info(f"Updated template: phase={self.phase}, start={start_time}, "
-                     f"nodal corrections applied for {len(nodal)} constituents")
+                     f"nodal corrections applied to {updated} lines for "
+                     f"{len(matched)} of {len(nodal)} constituents")
             return True
 
         except Exception as e:
@@ -341,7 +400,11 @@ class TidalProcessor(ForcingProcessor):
         start_time = self._compute_start_time()
 
         constituents = self.config.tidal_constituents
-        nodal = compute_nodal_corrections(start_time, constituents)
+        nodal = compute_nodal_corrections(
+            start_time,
+            constituents,
+            run_days=self._phase_run_days(),
+        )
 
         with open(output_path, "w") as f:
             # Line 1: start time in MM/DD/YYYY format
