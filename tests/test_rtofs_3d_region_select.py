@@ -312,6 +312,179 @@ class TestSplitDatePartialSuccess:
         assert not any("TEM_3D" in str(f) for f in result.output_files)
 
 
+class TestPartialProcessingSuccessBlocked:
+    """A fourth review round found the deeper version of the bug
+    TestSplitDatePartialSuccess covers above: even when BOTH 2-D and 3-D
+    files survive discovery paired to the same cycle date, they are still
+    processed independently -- `if files_2d: ...` and `if files_3d: ...`
+    run one after another with no shared outcome, so
+    `len(output_files) > 0` alone cannot tell "both halves produced" from
+    "exactly one half produced, the other silently empty or failed".
+
+    Two distinct ways that split happens even after date-pairing fixed the
+    discovery-level version:
+      1. _sort_and_dedup applies the phase time-window filter separately
+         per type (rtofs.py, in _sort_and_dedup), AFTER the "both present"
+         check at discovery. A file set that had both types when picked
+         can still end up with one emptied by the window.
+      2. _process_2d/_process_3d (or the STOFS Fortran exe) can each fail
+         independently on bad content, regardless of how many files were
+         found.
+
+    These monkeypatch the processing methods themselves (not the file
+    content) to isolate the success-condition bug from the unrelated,
+    pre-existing question of whether bogus touch()'d files parse -- the
+    same pattern TestSplitDatePartialSuccess uses above.
+    """
+
+    def test_phase_window_leaves_3d_only_still_fails(self, tmp_path, monkeypatch):
+        """Reproduces the reviewer's Case 1: a single date has both types
+        at discovery, but the phase window (self.phase is not None) keeps
+        only the 3-D file because the 2-D file's valid time falls before
+        the window starts."""
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        # n006 -> valid 2026-07-29 06:00, before t_start=2026-07-29 12:00
+        (rtofs_dir / "rtofs_glo_2ds_n006_diag.nc").touch()
+        # f024 -> valid 2026-07-30 00:00, inside the window
+        (rtofs_dir / "rtofs_glo_3dz_f024_6hrly_hvr_alaska.nc").touch()
+
+        cfg = ForcingConfig(lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
+                            pdy="20260730", cyc=0, rtofs_3d_region="alaska",
+                            nowcast_hours=6, forecast_hours=48)
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path, phase="nowcast"))
+
+        files_2d, files_3d = proc.find_input_files_by_type()
+        assert files_2d == [], "the 2D file must be filtered out by the phase window"
+        assert len(files_3d) == 1, "the 3D file's valid time is inside the window"
+
+        fake_3d = [tmp_path / "TEM_3D.th.nc", tmp_path / "SAL_3D.th.nc", tmp_path / "uv3D.th.nc"]
+        monkeypatch.setattr(RTOFSProcessor, "_process_3d", lambda self, files: fake_3d)
+
+        result = proc.process()
+        assert result.success is False, (
+            "phase-window filtering emptied the 2D side after discovery "
+            "found both -- must not report success from 3D alone"
+        )
+        assert result.output_files == []
+
+    def test_2d_processing_failure_with_3d_success_still_fails(self, tmp_path, monkeypatch):
+        """_process_2d returning None (a real processing failure, e.g. no
+        ocean points in the interpolation domain) must not be papered over
+        by a successful _process_3d."""
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        (rtofs_dir / "rtofs_glo_2ds_f006_diag.nc").touch()
+        (rtofs_dir / "rtofs_glo_3dz_f006_6hrly_hvr_alaska.nc").touch()
+
+        cfg = ForcingConfig(lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
+                            pdy="20260730", cyc=0, rtofs_3d_region="alaska")
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
+
+        monkeypatch.setattr(RTOFSProcessor, "_process_2d", lambda self, files: None)
+        fake_3d = [tmp_path / "TEM_3D.th.nc"]
+        monkeypatch.setattr(RTOFSProcessor, "_process_3d", lambda self, files: fake_3d)
+
+        result = proc.process()
+        assert result.success is False, (
+            "2D processing failed outright -- must not report success "
+            "because 3D alone produced output"
+        )
+        assert result.output_files == []
+
+    def test_3d_processing_failure_with_2d_success_still_fails(self, tmp_path, monkeypatch):
+        """_process_3d returning [] (a real processing failure) must not
+        be papered over by a successful _process_2d."""
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        (rtofs_dir / "rtofs_glo_2ds_f006_diag.nc").touch()
+        (rtofs_dir / "rtofs_glo_3dz_f006_6hrly_hvr_alaska.nc").touch()
+
+        cfg = ForcingConfig(lon_min=156.0, lon_max=204.0, lat_min=48.5, lat_max=67.0,
+                            pdy="20260730", cyc=0, rtofs_3d_region="alaska")
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
+
+        fake_2d = tmp_path / "elev2D.th.nc"
+        monkeypatch.setattr(RTOFSProcessor, "_process_2d", lambda self, files: fake_2d)
+        monkeypatch.setattr(RTOFSProcessor, "_process_3d", lambda self, files: [])
+
+        result = proc.process()
+        assert result.success is False, (
+            "3D processing failed outright -- must not report success "
+            "because 2D alone produced output"
+        )
+        assert result.output_files == []
+
+    def test_stofs_mode_python_fallback_requires_both(self, tmp_path, monkeypatch):
+        """The STOFS branch's Python fallback (_call_fortran_gen_3dth
+        unavailable) mirrors _process_secofs's own if-files_2d/if-files_3d
+        structure -- confirm it is held to the same both-required rule."""
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        (rtofs_dir / "rtofs_glo_2ds_f006_diag.nc").touch()
+        (rtofs_dir / "rtofs_glo_3dz_f006_6hrly_hvr_US_east.nc").touch()
+
+        cfg = ForcingConfig(lon_min=-98.5035, lon_max=-52.4867, lat_min=7.347, lat_max=52.5904,
+                            pdy="20260730", cyc=0,
+                            obc_roi_2d={"x1": 0, "x2": 1, "y1": 0, "y2": 1},
+                            rtofs_3d_region="US_east")
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
+        assert proc.is_stofs_mode
+
+        monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_ssh",
+                            lambda self, files, work_dir: work_dir / "SSH_1.nc")
+        monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_tsuv",
+                            lambda self, files, work_dir: work_dir / "TSUV_1.nc")
+        monkeypatch.setattr(RTOFSProcessor, "_call_fortran_gen_3dth",
+                            lambda self, work_dir, ssh_path, tsuv_path: False)
+        monkeypatch.setattr(RTOFSProcessor, "_process_2d",
+                            lambda self, files: tmp_path / "elev2D.th.nc")
+        monkeypatch.setattr(RTOFSProcessor, "_process_3d", lambda self, files: [])
+
+        result = proc.process()
+        assert result.success is False, (
+            "STOFS-mode Python fallback: 3D failed outright -- must not "
+            "report success because 2D alone produced output"
+        )
+        assert result.output_files == []
+
+    def test_stofs_mode_fortran_partial_output_still_fails(self, tmp_path, monkeypatch):
+        """The Fortran path copies whichever of the four filenames exist in
+        work_dir independently of each other (see the `for fname in [...]:
+        if src.exists()` loop in _process_stofs) -- confirm a Fortran run
+        that only wrote elev2D.th.nc (e.g. it crashed partway through the
+        3D interpolation but had already written the SSH-only output) is
+        still held to the both-required rule."""
+        rtofs_dir = tmp_path / "rtofs.20260729"
+        rtofs_dir.mkdir()
+        (rtofs_dir / "rtofs_glo_2ds_f006_diag.nc").touch()
+        (rtofs_dir / "rtofs_glo_3dz_f006_6hrly_hvr_US_east.nc").touch()
+
+        cfg = ForcingConfig(lon_min=-98.5035, lon_max=-52.4867, lat_min=7.347, lat_max=52.5904,
+                            pdy="20260730", cyc=0,
+                            obc_roi_2d={"x1": 0, "x2": 1, "y1": 0, "y2": 1},
+                            rtofs_3d_region="US_east")
+        proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
+
+        monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_ssh",
+                            lambda self, files, work_dir: work_dir / "SSH_1.nc")
+        monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_tsuv",
+                            lambda self, files, work_dir: work_dir / "TSUV_1.nc")
+
+        def _fake_fortran(self, work_dir, ssh_path, tsuv_path):
+            (work_dir / "elev2D.th.nc").touch()
+            return True
+
+        monkeypatch.setattr(RTOFSProcessor, "_call_fortran_gen_3dth", _fake_fortran)
+
+        result = proc.process()
+        assert result.success is False, (
+            "Fortran wrote only elev2D.th.nc -- must not report success "
+            "without the 3D boundary files"
+        )
+        assert result.output_files == []
+
+
 class TestFactoryDefaults:
     """The production factories no longer rely on alphabetical luck."""
 

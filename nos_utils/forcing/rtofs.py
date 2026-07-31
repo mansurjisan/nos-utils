@@ -311,8 +311,13 @@ class RTOFSProcessor(ForcingProcessor):
         # success=True with no TEM_3D.th.nc / SAL_3D.th.nc ever written --
         # exactly the silent-wrong-data failure mode this region filter was
         # added to close.
-        region = getattr(self.config, "rtofs_3d_region", None)
+        region = self.config.rtofs_3d_region
         if region and not files_3d:
+            # Fast path with the most specific message: the tile was never
+            # found in discovery at all. The general check below (after
+            # processing is actually attempted) catches every other way
+            # this pairing can fail -- see its comment for why that one
+            # cannot be skipped even with this check kept.
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
                 errors=[
@@ -325,12 +330,15 @@ class RTOFSProcessor(ForcingProcessor):
 
         output_files = []
         warnings = []
+        elev2d_ok = False
+        obc3d_ok = False
 
         if files_2d:
             log.info(f"Processing {len(files_2d)} RTOFS 2D files")
             f = self._process_2d(files_2d)
             if f:
                 output_files.append(f)
+                elev2d_ok = True
             else:
                 warnings.append("Failed to create elev2D.th.nc")
 
@@ -338,6 +346,34 @@ class RTOFSProcessor(ForcingProcessor):
             log.info(f"Processing {len(files_3d)} RTOFS 3D files")
             obc_files = self._process_3d(files_3d)
             output_files.extend(obc_files)
+            obc3d_ok = bool(obc_files)
+
+        # The check above only knows what discovery FOUND, not what
+        # processing actually PRODUCED -- two ways that can still diverge
+        # even when both file lists were non-empty going in:
+        #   - _sort_and_dedup's phase-window filter (called separately per
+        #     type, after the discovery-level pick) can legitimately wipe
+        #     out one type's files while leaving the other's, if their
+        #     valid-time spreads differ.
+        #   - _process_2d or _process_3d can each fail independently on
+        #     genuinely bad file content, regardless of how many files
+        #     were found.
+        # Either way, `if files_3d: ... if files_2d: ...` run independently
+        # of each other, so len(output_files) > 0 alone cannot tell "both
+        # halves produced" from "exactly one half produced" -- and a
+        # region-pinned domain with elevation-forced boundaries needs both.
+        if region and not (elev2d_ok and obc3d_ok):
+            return ForcingResult(
+                success=False, source=self.SOURCE_NAME,
+                errors=[
+                    f"rtofs_3d_region={region!r}: the 2D elevation boundary "
+                    f"and the 3D T/S/U/V boundary are both required, and "
+                    f"only one was produced (elev2D.th.nc={elev2d_ok}, "
+                    f"3D boundary files={obc3d_ok}) -- refusing to report "
+                    f"success from either half alone"
+                ],
+                warnings=warnings,
+            )
 
         # The WL bias correction (wl_bias, COMF nosofs 3.9) reports whether it
         # actually modified the SSH array; the legacy warning stands only when
@@ -395,8 +431,13 @@ class RTOFSProcessor(ForcingProcessor):
         # Step 1 (SSH only) still produces an output and the STOFS branch
         # below reports success on SSH alone -- the same silent-wrong-data
         # gap this region filter exists to close.
-        region = getattr(self.config, "rtofs_3d_region", None)
+        region = self.config.rtofs_3d_region
         if region and not files_3d:
+            # Fast path with the most specific message: the tile was never
+            # found in discovery at all. The general check below (after
+            # processing is actually attempted) catches every other way
+            # this pairing can fail -- see its comment for why that one
+            # cannot be skipped even with this check kept.
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
                 errors=[
@@ -448,6 +489,9 @@ class RTOFSProcessor(ForcingProcessor):
             # Step 4: Try Fortran gen_3Dth_from_hycom
             fortran_ok = self._call_fortran_gen_3dth(work_dir, ssh_path, tsuv_path)
 
+            elev2d_ok = False
+            obc3d_ok = False
+
             if fortran_ok:
                 # Copy Fortran outputs to final output directory.
                 # NOTE: do NOT apply obc_ssh_offset here — the Fortran exe
@@ -463,6 +507,10 @@ class RTOFSProcessor(ForcingProcessor):
                         dst = self.output_path / fname
                         shutil.copy2(src, dst)
                         output_files.append(dst)
+                        if fname == "elev2D.th.nc":
+                            elev2d_ok = True
+                        else:
+                            obc3d_ok = True
             else:
                 warnings.append("Fortran gen_3Dth not available, using Python interpolation")
                 # Fall back to Python Delaunay — load grid and use existing _process_2d/_process_3d
@@ -472,9 +520,34 @@ class RTOFSProcessor(ForcingProcessor):
                         f = self._process_2d(files_2d)
                         if f:
                             output_files.append(f)
+                            elev2d_ok = True
                     if files_3d:
                         obc_files = self._process_3d(files_3d)
                         output_files.extend(obc_files)
+                        obc3d_ok = bool(obc_files)
+
+            # Same reasoning as the matching check in _process_secofs: what
+            # was actually PRODUCED can diverge from what discovery FOUND,
+            # via the phase-window filter in _sort_and_dedup or an
+            # independent failure in either path above (Fortran writing
+            # only one of the two output groups, or the Python fallback's
+            # _process_2d/_process_3d each failing on their own). Neither
+            # branch here ties the two halves together, so len(output_files)
+            # > 0 alone cannot distinguish "both halves produced" from
+            # "exactly one half produced".
+            if region and not (elev2d_ok and obc3d_ok):
+                return ForcingResult(
+                    success=False, source=self.SOURCE_NAME,
+                    errors=[
+                        f"rtofs_3d_region={region!r}: the 2D elevation "
+                        f"boundary and the 3D T/S/U/V boundary are both "
+                        f"required, and only one was produced "
+                        f"(elev2D.th.nc={elev2d_ok}, 3D boundary "
+                        f"files={obc3d_ok}) -- refusing to report success "
+                        f"from either half alone"
+                    ],
+                    warnings=warnings,
+                )
 
             return ForcingResult(
                 success=len(output_files) > 0,
