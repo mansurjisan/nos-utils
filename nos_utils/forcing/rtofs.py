@@ -68,6 +68,13 @@ class RTOFSProcessor(ForcingProcessor):
     SOURCE_NAME = "RTOFS"
     MIN_FILE_SIZE_2D = 150_000_000
     MIN_FILE_SIZE_3D = 200_000_000
+    # Regional RTOFS 3dz products have different native grid sizes. WCOSS2
+    # v2.5 Alaska files observed across 2026-07-28--30 were
+    # 138,350,284--138,601,157 bytes, so the generic 200 MB floor rejects
+    # every complete Alaska file. Keep the established default for all other
+    # regions and give Alaska a floor with roughly 13% headroom below the
+    # observed minimum while still rejecting materially truncated inputs.
+    MIN_FILE_SIZE_3D_BY_REGION = {"alaska": 120_000_000}
 
     # Default buffer (hours) appended past the phase-window end so SCHISM's
     # time-series reader has interpolation headroom on its pre-load look-ahead.
@@ -143,6 +150,139 @@ class RTOFSProcessor(ForcingProcessor):
         self._struct_interp = {}  # Cached StructuredGridInterpolator per grid shape
         self._3d_roi = None     # Cached ROI indices (j_start, j_end, i_start, i_end) for 3D subsetting
         self._wl_bias_info = None   # Outcome of the WL bias correction (see _apply_wl_bias)
+        # Discovery diagnostics, reset by find_input_files_by_type(). Values
+        # are exact glob matches before size/pairing/window filtering.
+        self._matched_3d_sizes = {}
+        self._accepted_3d_paths = set()
+        self._invalid_3d_files = {}
+
+    def _minimum_3d_file_size(self) -> int:
+        """Return the regional 3dz size floor, preserving the 200 MB default."""
+        region = self.config.rtofs_3d_region
+        if region:
+            regional = self.MIN_FILE_SIZE_3D_BY_REGION.get(region.casefold())
+            if regional is not None:
+                return regional
+        return self.MIN_FILE_SIZE_3D
+
+    def _missing_region_3d_error(self, region: str) -> str:
+        """Explain why region-pinned discovery returned no usable 3dz files."""
+        matched = self._matched_3d_sizes
+        accepted = self._accepted_3d_paths
+        minimum = self._minimum_3d_file_size()
+
+        if self._invalid_3d_files:
+            details = "; ".join(
+                f"{path.name}: {reason}"
+                for path, reason in sorted(
+                    self._invalid_3d_files.items(), key=lambda item: item[0].name,
+                )
+            )
+            return (
+                f"rtofs_3d_region={region!r} matched size-valid 3dz files, "
+                f"but structural NetCDF validation failed ({details}); "
+                f"refusing incomplete input"
+            )
+
+        if matched and not accepted:
+            known_sizes = [size for size in matched.values() if size >= 0]
+            if known_sizes:
+                observed = (
+                    f"observed {min(known_sizes):,}--{max(known_sizes):,} bytes"
+                )
+            else:
+                observed = "sizes could not be read"
+            return (
+                f"rtofs_3d_region={region!r} matched {len(matched)} 3dz "
+                f"files, but none passed the {minimum:,}-byte regional "
+                f"minimum ({observed}); refusing undersized or unreadable input"
+            )
+
+        if not matched:
+            return (
+                f"rtofs_3d_region={region!r} matched no 3dz files -- check "
+                f"the tile is staged for this cycle and the name matches "
+                f"the filename convention (e.g. 'alaska', 'US_east')."
+            )
+
+        return (
+            f"rtofs_3d_region={region!r} matched {len(matched)} 3dz files "
+            f"and {len(accepted)} passed size validation, but no same-cycle "
+            f"2D/3D pair survived discovery and phase-window filtering"
+        )
+
+    @staticmethod
+    def _validate_3d_file_structure(path: Path) -> Tuple[bool, str]:
+        """Validate the RTOFS variables/shapes and sample both file edges.
+
+        The size floor catches gross truncation but cannot tell a complete
+        regional product from a same-sized file missing one tracer or data
+        chunk. Reading the first and last scalar from every required variable
+        also makes HDF5 surface common partially-published/truncated-file
+        failures before a cycle date is selected.
+        """
+        if not HAS_NETCDF4:
+            return False, "netCDF4 is unavailable"
+
+        try:
+            with Dataset(str(path)) as ds:
+                aliases = {
+                    "longitude": ("Longitude", "lon"),
+                    "latitude": ("Latitude", "lat"),
+                    "depth": ("Depth", "lev"),
+                    "temperature": ("temperature",),
+                    "salinity": ("salinity",),
+                }
+                variables = {}
+                for label, names in aliases.items():
+                    variable = next(
+                        (ds.variables[name] for name in names if name in ds.variables),
+                        None,
+                    )
+                    if variable is None:
+                        return False, f"missing required variable {label}"
+                    if not variable.shape or any(n <= 0 for n in variable.shape):
+                        return False, f"{label} has empty shape {variable.shape}"
+                    variables[label] = variable
+
+                lon = variables["longitude"]
+                lat = variables["latitude"]
+                depth = variables["depth"]
+                temp = variables["temperature"]
+                salt = variables["salinity"]
+
+                if lon.ndim != 2 or lat.ndim != 2 or lon.shape != lat.shape:
+                    return False, (
+                        f"longitude/latitude shapes are incompatible: "
+                        f"{lon.shape} vs {lat.shape}"
+                    )
+                if depth.ndim != 1:
+                    return False, f"depth must be 1-D, got {depth.shape}"
+                if temp.ndim not in (3, 4) or salt.shape != temp.shape:
+                    return False, (
+                        f"temperature/salinity shapes are incompatible: "
+                        f"{temp.shape} vs {salt.shape}"
+                    )
+                if temp.shape[-2:] != lon.shape:
+                    return False, (
+                        f"tracer grid {temp.shape[-2:]} does not match "
+                        f"coordinate grid {lon.shape}"
+                    )
+                if temp.shape[-3] != depth.shape[0]:
+                    return False, (
+                        f"tracer depth count {temp.shape[-3]} does not match "
+                        f"Depth count {depth.shape[0]}"
+                    )
+
+                for label, variable in variables.items():
+                    first = tuple(0 for _ in variable.shape)
+                    last = tuple(-1 for _ in variable.shape)
+                    variable[first]
+                    variable[last]
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+        return True, ""
 
     def _get_time_window(self) -> Tuple[datetime, datetime]:
         """Compute the time window for RTOFS file filtering.
@@ -324,19 +464,13 @@ class RTOFSProcessor(ForcingProcessor):
         # added to close.
         region = self.config.rtofs_3d_region
         if region and not files_3d:
-            # Fast path with the most specific message: the tile was never
-            # found in discovery at all. The general check below (after
-            # processing is actually attempted) catches every other way
-            # this pairing can fail -- see its comment for why that one
-            # cannot be skipped even with this check kept.
+            # Fast path with the most specific discovery message: distinguish
+            # a missing tile from exact matches rejected by regional size QC,
+            # or a same-date/time-window pairing failure. The general check
+            # below still catches failures after processing is attempted.
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
-                errors=[
-                    f"rtofs_3d_region={region!r} matched no 3dz files -- "
-                    f"check the tile is staged for this cycle and the name "
-                    f"matches the filename convention (e.g. 'alaska', "
-                    f"'US_east')."
-                ],
+                errors=[self._missing_region_3d_error(region)],
             )
 
         output_files = []
@@ -455,19 +589,12 @@ class RTOFSProcessor(ForcingProcessor):
         # gap this region filter exists to close.
         region = self.config.rtofs_3d_region
         if region and not files_3d:
-            # Fast path with the most specific message: the tile was never
-            # found in discovery at all. The general check below (after
-            # processing is actually attempted) catches every other way
-            # this pairing can fail -- see its comment for why that one
-            # cannot be skipped even with this check kept.
+            # Keep this in lockstep with _process_secofs: discovery knows
+            # whether the tile was absent, undersized, or later discarded by
+            # same-date/time-window rules; processing has not started yet.
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
-                errors=[
-                    f"rtofs_3d_region={region!r} matched no 3dz files -- "
-                    f"check the tile is staged for this cycle and the name "
-                    f"matches the filename convention (e.g. 'alaska', "
-                    f"'US_east')."
-                ],
+                errors=[self._missing_region_3d_error(region)],
             )
 
         import tempfile
@@ -997,6 +1124,11 @@ class RTOFSProcessor(ForcingProcessor):
         # docstring on ForcingConfig.rtofs_3d_region for the failure this
         # closes when unset.
         region = self.config.rtofs_3d_region
+        minimum_3d_size = self._minimum_3d_file_size()
+        self._matched_3d_sizes = {}
+        self._accepted_3d_paths = set()
+        self._invalid_3d_files = {}
+        diagnostics_by_date = {}
 
         # Search newest RTOFS cycle first to match Fortran shell behavior.
         # The Fortran prep (nos_ofs_create_forcing_obc.sh) uses the latest
@@ -1006,6 +1138,9 @@ class RTOFSProcessor(ForcingProcessor):
         for date in [base_date - timedelta(days=1), base_date - timedelta(days=2), base_date]:
             date_str = date.strftime("%Y%m%d")
             day_2d, day_3d = [], []
+            date_matched_3d_sizes = {}
+            date_accepted_3d_paths = set()
+            date_invalid_3d_files = {}
 
             for rtofs_dir in [
                 self.input_path / f"rtofs.{date_str}",
@@ -1026,11 +1161,73 @@ class RTOFSProcessor(ForcingProcessor):
                 found_3d.extend(sorted(rtofs_dir.glob(glob_3d4)))
 
                 day_2d = [f for f in found_2d if self.validate_file_size(f, self.MIN_FILE_SIZE_2D)]
-                day_3d = [f for f in found_3d if self.validate_file_size(f, self.MIN_FILE_SIZE_3D)]
+                day_3d = []
+                rejected_3d = []
+                for f in found_3d:
+                    try:
+                        size = f.stat().st_size
+                    except OSError:
+                        size = -1
+                    date_matched_3d_sizes[f] = size
+                    if self.validate_file_size(f, minimum_3d_size):
+                        day_3d.append(f)
+                        date_accepted_3d_paths.add(f)
+                    else:
+                        rejected_3d.append((f, size))
+
+                if rejected_3d:
+                    known_sizes = [size for _, size in rejected_3d if size >= 0]
+                    if known_sizes:
+                        observed = (
+                            f"{min(known_sizes):,}--{max(known_sizes):,} bytes"
+                        )
+                    else:
+                        observed = "unreadable sizes"
+                    log.warning(
+                        "RTOFS 3D region %r: rejected %d/%d matches in %s "
+                        "against the %s-byte minimum (observed %s)",
+                        region, len(rejected_3d), len(found_3d), rtofs_dir,
+                        f"{minimum_3d_size:,}", observed,
+                    )
+
+                # A product using a grid-specific size policy can clear that
+                # floor while still being incomplete (for example, a
+                # partially published HDF5 file or one missing salinity).
+                # Validate only those regional exceptions, and only files
+                # surviving valid-time deduplication and phase filtering, so
+                # established regions and irrelevant duplicates/out-of-window
+                # files retain their prior behavior.
+                if (
+                    region
+                    and region.casefold() in self.MIN_FILE_SIZE_3D_BY_REGION
+                    and minimum_3d_size > 0
+                    and day_3d
+                ):
+                    applicable_3d = self._sort_and_dedup(day_3d, date)
+                    invalid_3d = {}
+                    for f in applicable_3d:
+                        valid, reason = self._validate_3d_file_structure(f)
+                        if not valid:
+                            invalid_3d[f] = reason
+                    if invalid_3d:
+                        date_invalid_3d_files.update(invalid_3d)
+                        for f, reason in invalid_3d.items():
+                            log.warning(
+                                "RTOFS 3D region %r: rejecting %s after "
+                                "structural NetCDF validation: %s",
+                                region, f, reason,
+                            )
+                        day_3d = []
 
                 if day_2d or day_3d:
                     log.info(f"Found RTOFS files in {rtofs_dir}: {len(day_2d)} 2D, {len(day_3d)} 3D")
                     break  # first populated directory layout wins for this date
+
+            diagnostics_by_date[date] = (
+                date_matched_3d_sizes,
+                date_accepted_3d_paths,
+                date_invalid_3d_files,
+            )
 
             if not (day_2d or day_3d):
                 continue
@@ -1074,6 +1271,18 @@ class RTOFSProcessor(ForcingProcessor):
                 # same loud failure as a tile that was never found at all.
                 rtofs_cycle_date, files_2d, _ = candidates[0]
                 files_3d = []
+
+        # Diagnostics must describe the date that discovery actually chose.
+        # Keeping failures from rejected fallback candidates would make a
+        # later phase-window/pairing failure blame the wrong file and date.
+        selected_diagnostics = diagnostics_by_date.get(
+            rtofs_cycle_date, ({}, set(), {}),
+        )
+        (
+            self._matched_3d_sizes,
+            self._accepted_3d_paths,
+            self._invalid_3d_files,
+        ) = selected_diagnostics
 
         self._rtofs_cycle_date = rtofs_cycle_date
         if files_2d:

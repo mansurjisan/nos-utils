@@ -38,6 +38,7 @@ def _no_size_floor(monkeypatch):
     """
     monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_2D", 0)
     monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_3D", 0)
+    monkeypatch.setattr(RTOFSProcessor, "MIN_FILE_SIZE_3D_BY_REGION", {})
 
 
 def _stage_three_region_rtofs(tmp_path, pdy="20260729"):
@@ -198,6 +199,7 @@ class TestPartialFailurePropagates:
         assert result.success is False
         assert result.output_files == []
         assert any("not_a_real_tile" in e for e in result.errors)
+        assert any("matched no 3dz files" in e for e in result.errors)
 
     def test_secofs_mode_still_succeeds_2d_only_when_region_unset(self, tmp_path):
         """The pre-existing, unrelated leniency this fix must NOT remove:

@@ -10,6 +10,45 @@ from nos_utils.config import ForcingConfig
 from nos_utils.forcing.rtofs import RTOFSProcessor
 
 
+def _create_sparse_file(path: Path, size: int) -> Path:
+    """Create a file with the requested stat size without allocating its body."""
+    with path.open("wb") as stream:
+        stream.truncate(size)
+    return path
+
+
+def _create_rtofs_3d_file(
+    path: Path, size: int, *, include_salinity: bool = True,
+) -> Path:
+    """Create a structurally valid tiny RTOFS file with a sparse tail."""
+    Dataset = pytest.importorskip("netCDF4").Dataset
+    with Dataset(str(path), "w") as ds:
+        ds.createDimension("MT", 1)
+        ds.createDimension("Depth", 2)
+        ds.createDimension("Y", 2)
+        ds.createDimension("X", 2)
+        lon = ds.createVariable("Longitude", "f4", ("Y", "X"))
+        lat = ds.createVariable("Latitude", "f4", ("Y", "X"))
+        depth = ds.createVariable("Depth", "f4", ("Depth",))
+        temp = ds.createVariable(
+            "temperature", "f4", ("MT", "Depth", "Y", "X"),
+        )
+        lon[:] = [[190.0, 191.0], [190.0, 191.0]]
+        lat[:] = [[55.0, 55.0], [56.0, 56.0]]
+        depth[:] = [0.0, 10.0]
+        temp[:] = 5.0
+        if include_salinity:
+            salt = ds.createVariable(
+                "salinity", "f4", ("MT", "Depth", "Y", "X"),
+            )
+            salt[:] = 32.0
+
+    assert path.stat().st_size < size
+    with path.open("r+b") as stream:
+        stream.truncate(size)
+    return path
+
+
 class TestRTOFSFileDiscovery:
     def test_find_no_files(self, mock_config, tmp_path):
         proc = RTOFSProcessor(mock_config, tmp_path / "empty", tmp_path / "out")
@@ -90,9 +129,194 @@ class TestRTOFSConstants:
     def test_min_file_sizes(self):
         assert RTOFSProcessor.MIN_FILE_SIZE_2D == 150_000_000
         assert RTOFSProcessor.MIN_FILE_SIZE_3D == 200_000_000
+        assert RTOFSProcessor.MIN_FILE_SIZE_3D_BY_REGION == {
+            "alaska": 120_000_000,
+        }
 
     def test_source_name(self):
         assert RTOFSProcessor.SOURCE_NAME == "RTOFS"
+
+
+class TestRTOFSRegionalFileSizes:
+    """Regional 3dz products retain meaningful, grid-specific size QC."""
+
+    @staticmethod
+    def _config(region: str, *, stofs_mode: bool = False) -> ForcingConfig:
+        kwargs = {}
+        if stofs_mode:
+            kwargs["obc_roi_2d"] = {"x1": 0, "x2": 1, "y1": 0, "y2": 1}
+        return ForcingConfig(
+            lon_min=156.0,
+            lon_max=204.0,
+            lat_min=48.5,
+            lat_max=67.0,
+            pdy="20260401",
+            cyc=12,
+            rtofs_3d_region=region,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _stage_pair(tmp_path: Path, region: str, size_3d: int) -> Path:
+        rtofs_dir = tmp_path / "rtofs.20260331"
+        rtofs_dir.mkdir()
+        _create_sparse_file(
+            rtofs_dir / "rtofs_glo_2ds_f006_diag.nc",
+            RTOFSProcessor.MIN_FILE_SIZE_2D,
+        )
+        return _create_rtofs_3d_file(
+            rtofs_dir / f"rtofs_glo_3dz_f006_6hrly_hvr_{region}.nc",
+            size_3d,
+        )
+
+    @pytest.mark.parametrize("size_3d", [120_000_000, 138_350_284])
+    def test_production_sized_alaska_tile_is_accepted(self, tmp_path, size_3d):
+        self._stage_pair(tmp_path, "alaska", size_3d)
+        proc = RTOFSProcessor(self._config("alaska"), tmp_path, tmp_path / "out")
+
+        files_2d, files_3d = proc.find_input_files_by_type()
+
+        assert len(files_2d) == 1
+        assert len(files_3d) == 1
+        assert files_3d[0].name.endswith("_hvr_alaska.nc")
+        assert proc._minimum_3d_file_size() == 120_000_000
+
+    def test_alaska_below_regional_floor_fails_with_size_details(self, tmp_path):
+        self._stage_pair(tmp_path, "alaska", 119_999_999)
+        proc = RTOFSProcessor(
+            self._config("alaska", stofs_mode=True),
+            tmp_path,
+            tmp_path / "out",
+        )
+
+        result = proc.process()
+
+        assert result.success is False
+        assert result.output_files == []
+        message = " ".join(result.errors)
+        assert "matched 1 3dz files" in message
+        assert "120,000,000-byte regional minimum" in message
+        assert "119,999,999--119,999,999 bytes" in message
+        assert "matched no 3dz files" not in message
+
+    def test_us_east_keeps_generic_200_mb_floor(self, tmp_path):
+        tile = self._stage_pair(tmp_path, "US_east", 199_999_999)
+        config = self._config("US_east")
+        proc = RTOFSProcessor(config, tmp_path, tmp_path / "out")
+
+        files_2d, files_3d = proc.find_input_files_by_type()
+
+        assert len(files_2d) == 1
+        assert files_3d == []
+        assert proc._minimum_3d_file_size() == 200_000_000
+
+        tile.unlink()
+        _create_sparse_file(tile, 200_000_000)
+        proc = RTOFSProcessor(config, tmp_path, tmp_path / "out")
+        _, files_3d = proc.find_input_files_by_type()
+        assert len(files_3d) == 1
+
+    def test_size_valid_alaska_tile_missing_salinity_is_rejected(self, tmp_path):
+        tile = self._stage_pair(tmp_path, "alaska", 130_000_000)
+        tile.unlink()
+        _create_rtofs_3d_file(tile, 130_000_000, include_salinity=False)
+        proc = RTOFSProcessor(
+            self._config("alaska", stofs_mode=True),
+            tmp_path,
+            tmp_path / "out",
+        )
+
+        result = proc.process()
+
+        assert result.success is False
+        assert result.output_files == []
+        message = " ".join(result.errors)
+        assert "structural NetCDF validation failed" in message
+        assert "missing required variable salinity" in message
+        assert "refusing incomplete input" in message
+
+    def test_size_valid_non_netcdf_alaska_tile_is_rejected(self, tmp_path):
+        tile = self._stage_pair(tmp_path, "alaska", 130_000_000)
+        tile.unlink()
+        _create_sparse_file(tile, 130_000_000)
+        proc = RTOFSProcessor(
+            self._config("alaska", stofs_mode=True),
+            tmp_path,
+            tmp_path / "out",
+        )
+
+        result = proc.process()
+
+        assert result.success is False
+        assert result.output_files == []
+        message = " ".join(result.errors)
+        assert "structural NetCDF validation failed" in message
+        assert "NetCDF" in message
+        assert "refusing incomplete input" in message
+
+    def test_structurally_invalid_newer_cycle_falls_back_to_older(self, tmp_path):
+        for date, include_salinity in [
+            ("20260331", False),
+            ("20260330", True),
+        ]:
+            rtofs_dir = tmp_path / f"rtofs.{date}"
+            rtofs_dir.mkdir()
+            _create_sparse_file(
+                rtofs_dir / "rtofs_glo_2ds_f006_diag.nc",
+                RTOFSProcessor.MIN_FILE_SIZE_2D,
+            )
+            _create_rtofs_3d_file(
+                rtofs_dir / "rtofs_glo_3dz_f006_6hrly_hvr_alaska.nc",
+                130_000_000,
+                include_salinity=include_salinity,
+            )
+        proc = RTOFSProcessor(
+            self._config("alaska"), tmp_path, tmp_path / "out",
+        )
+
+        files_2d, files_3d = proc.find_input_files_by_type()
+
+        assert len(files_2d) == 1
+        assert len(files_3d) == 1
+        assert "rtofs.20260330" in str(files_2d[0])
+        assert "rtofs.20260330" in str(files_3d[0])
+
+    def test_diagnostics_follow_selected_date_after_fallback(self, tmp_path):
+        newer = tmp_path / "rtofs.20260331"
+        newer.mkdir()
+        _create_sparse_file(
+            newer / "rtofs_glo_2ds_f030_diag.nc",
+            RTOFSProcessor.MIN_FILE_SIZE_2D,
+        )
+        _create_rtofs_3d_file(
+            newer / "rtofs_glo_3dz_f030_6hrly_hvr_alaska.nc",
+            130_000_000,
+            include_salinity=False,
+        )
+
+        older = tmp_path / "rtofs.20260330"
+        older.mkdir()
+        _create_sparse_file(
+            older / "rtofs_glo_2ds_f054_diag.nc",
+            RTOFSProcessor.MIN_FILE_SIZE_2D,
+        )
+        _create_rtofs_3d_file(
+            older / "rtofs_glo_3dz_f006_6hrly_hvr_alaska.nc",
+            130_000_000,
+        )
+        proc = RTOFSProcessor(
+            self._config("alaska", stofs_mode=True),
+            tmp_path,
+            tmp_path / "out",
+            phase="nowcast",
+        )
+
+        result = proc.process()
+
+        assert result.success is False
+        message = " ".join(result.errors)
+        assert "no same-cycle 2D/3D pair survived" in message
+        assert "missing required variable salinity" not in message
 
 
 class TestRTOFSParseHour:
