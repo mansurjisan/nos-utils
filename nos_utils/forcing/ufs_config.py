@@ -29,6 +29,12 @@ Token substitution mirrors the shell ``sed -e "s/@\\[TOKEN\\]/value/g"``:
     @[DATM_FORCING_FILE]               -> "datm_forcing.nc" (default)
     @[NX_GLOBAL], @[NY_GLOBAL]         -> from datm_forcing.nc dims, or from
                                           config.datm_* fallback
+    @[YYYY_FIRST], @[YYYY_LAST]        -> datm.streams only. YYYY_FIRST is
+                                          model_t0's year; YYYY_LAST is
+                                          max(YYYY_FIRST, year of cycle +
+                                          forecast_hours), so the one
+                                          rendered file spans both the
+                                          nowcast and forecast legs.
 
 ufs.configure additionally has its three petlist_bounds lines replaced based
 on ``config.ufs_datm_tasks`` and ``config.ufs_total_tasks`` so the v3.9
@@ -264,8 +270,8 @@ class UFSConfigProcessor(ForcingProcessor):
         # 3. datm.streams
         ds_path = self._render_template(
             "datm.streams.template", "datm.streams",
-            tokens=("YYYY", "DATM_INPUT_DIR", "DATM_MESH_FILE",
-                    "DATM_FORCING_FILE"),
+            tokens=("YYYY", "YYYY_FIRST", "YYYY_LAST", "DATM_INPUT_DIR",
+                    "DATM_MESH_FILE", "DATM_FORCING_FILE"),
             subs=subs,
         )
         output_files.append(ds_path)
@@ -389,8 +395,21 @@ class UFSConfigProcessor(ForcingProcessor):
 
         nx, ny = self._resolve_nx_ny()
 
+        # datm.streams is never re-patched at stage time (unlike
+        # model_configure/ufs.configure/param.nml/datm_in), so whichever
+        # phase renders it must cover the union of both legs: the nowcast
+        # leg starts at model_t0, the forecast leg ends at cycle +
+        # forecast_hours. A single-year window (the old @[YYYY] token)
+        # breaks the Jan-1 cycle, where the nowcast tail and the whole
+        # forecast fall in the new year.
+        window_end = cycle_dt + timedelta(hours=forecast_hours)
+        yyyy_first = model_t0.year
+        yyyy_last = max(yyyy_first, window_end.year)
+
         return {
             "YYYY": yyyy,
+            "YYYY_FIRST": f"{yyyy_first:04d}",
+            "YYYY_LAST": f"{yyyy_last:04d}",
             "MM": mm,
             "DD": dd,
             "HH": hh,

@@ -38,6 +38,15 @@ _DATM_STREAMS_TEMPLATE = (
     'stream_data_files01:       "@[DATM_INPUT_DIR]/@[DATM_FORCING_FILE]"\n'
 )
 
+_DATM_STREAMS_TEMPLATE_YEAR_WINDOW = (
+    "stream_info:               atm.01\n"
+    "yearFirst01:               @[YYYY_FIRST]\n"
+    "yearLast01:                @[YYYY_LAST]\n"
+    "yearAlign01:               @[YYYY_FIRST]\n"
+    'stream_mesh_file01:        "@[DATM_INPUT_DIR]/@[DATM_MESH_FILE]"\n'
+    'stream_data_files01:       "@[DATM_INPUT_DIR]/@[DATM_FORCING_FILE]"\n'
+)
+
 _UFS_CONFIGURE = (
     "# MED #\n"
     "MED_model:                      cmeps\n"
@@ -66,11 +75,14 @@ _UFS_CONFIGURE = (
 )
 
 
-def _write_full_fix(fix_dir: Path, *, include_optional: bool = True) -> None:
+def _write_full_fix(
+    fix_dir: Path, *, include_optional: bool = True,
+    datm_streams_template: str = _DATM_STREAMS_TEMPLATE,
+) -> None:
     fix_dir.mkdir(parents=True, exist_ok=True)
     (fix_dir / "model_configure.template").write_text(_MODEL_CONFIGURE_TEMPLATE)
     (fix_dir / "datm_in.template").write_text(_DATM_IN_TEMPLATE)
-    (fix_dir / "datm.streams.template").write_text(_DATM_STREAMS_TEMPLATE)
+    (fix_dir / "datm.streams.template").write_text(datm_streams_template)
     (fix_dir / "ufs.configure").write_text(_UFS_CONFIGURE)
     if include_optional:
         (fix_dir / "fd_ufs.yaml").write_text("# fake fd_ufs\n")
@@ -666,3 +678,91 @@ def test_nx_ny_from_datm(ufs_config, tmp_path):
     # Metadata should reflect the same.
     assert result.metadata["nx_global"] == 100
     assert result.metadata["ny_global"] == 80
+
+
+class TestDatmStreamsYearWindow:
+    """datm.streams is never re-patched at stage time, so the single
+    rendered file must cover both the nowcast leg (starts at model_t0)
+    and the forecast leg (ends at cycle + forecast_hours). A one-year
+    window breaks the Jan-1 cycle, where the nowcast tail and the whole
+    forecast fall in the new year.
+    """
+
+    def test_december_forecast_crosses_new_year(self, tmp_path):
+        """Dec 31 00z forecast leg: window must extend into the new year."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(
+            fix, datm_streams_template=_DATM_STREAMS_TEMPLATE_YEAR_WINDOW,
+        )
+
+        cfg = ForcingConfig.for_secofs_ufs(pdy="20261231", cyc=0)
+        proc = UFSConfigProcessor(cfg, fix, out, phase="forecast")
+        result = proc.process()
+        assert result.success, result.errors
+
+        ds = (out / "datm.streams").read_text()
+        assert "yearFirst01:               2026" in ds
+        assert "yearLast01:                2027" in ds
+        assert "yearAlign01:               2026" in ds
+        assert "@[" not in ds, "Unsubstituted token in datm.streams"
+
+    def test_jan1_nowcast_leg_spans_both_years(self, tmp_path):
+        """Jan 1 00z nowcast leg: time_hotstart pins model_t0 to Dec 31 18z.
+
+        The nowcast tail and the entire forecast fall in the new year, so
+        yearLast must be 2027 even though the nowcast leg itself never
+        leaves 2026.
+        """
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(
+            fix, datm_streams_template=_DATM_STREAMS_TEMPLATE_YEAR_WINDOW,
+        )
+
+        cfg = ForcingConfig.for_secofs_ufs(pdy="20270101", cyc=0)
+        pinned = datetime(2026, 12, 31, 18, 0)
+        proc = UFSConfigProcessor(
+            cfg, fix, out, phase="nowcast", time_hotstart=pinned,
+        )
+        result = proc.process()
+        assert result.success, result.errors
+
+        ds = (out / "datm.streams").read_text()
+        assert "yearFirst01:               2026" in ds
+        assert "yearLast01:                2027" in ds
+
+    def test_mid_year_cycle_all_years_equal(self, tmp_path):
+        """A cycle nowhere near a year boundary: first == last == align."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(
+            fix, datm_streams_template=_DATM_STREAMS_TEMPLATE_YEAR_WINDOW,
+        )
+
+        cfg = ForcingConfig.for_secofs_ufs(pdy="20260601", cyc=12)
+        proc = UFSConfigProcessor(cfg, fix, out)
+        result = proc.process()
+        assert result.success, result.errors
+
+        ds = (out / "datm.streams").read_text()
+        assert "yearFirst01:               2026" in ds
+        assert "yearLast01:                2026" in ds
+        assert "yearAlign01:               2026" in ds
+
+    def test_old_template_backward_compat(self, tmp_path):
+        """A template still using bare @[YYYY] renders exactly as before."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix, datm_streams_template=_DATM_STREAMS_TEMPLATE)
+
+        cfg = ForcingConfig.for_secofs_ufs(pdy="20261231", cyc=0)
+        proc = UFSConfigProcessor(cfg, fix, out, phase="forecast")
+        result = proc.process()
+        assert result.success, result.errors
+
+        ds = (out / "datm.streams").read_text()
+        assert "yearFirst01:               2026" in ds
+        assert "yearLast01:                2026" in ds
+        assert "yearAlign01:               2026" in ds
+        assert "@[" not in ds, "Unsubstituted token in datm.streams"
