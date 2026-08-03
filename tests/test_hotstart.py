@@ -425,6 +425,247 @@ class TestStageInitToComout:
             assert ds.test_marker == "rst-from-test"
 
 
+class TestStageInitPreservesSeededInit:
+    """Regression coverage for a WCOSS2 20260802/12z incident: an operator
+    hand-seeded a cold-start rest-state init at the documented target name
+    (``$COMOUT/stofs_3d_ak_ufs.t12z.20260802.init.nowcast.nc``), and
+    ``stage_init_to_comout``'s lookback found an unrelated, 60h-stale
+    restart from earlier bring-up testing and silently converted/copied it
+    ONTO the seeded file, destroying it. ``stage_init_to_comout`` must never
+    overwrite an existing target.
+    """
+
+    def test_seeded_init_is_not_overwritten_by_stale_restart(
+        self, tmp_path, caplog,
+    ):
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        target = target_dir / f"{run}.t12z.20260802.init.nowcast.nc"
+
+        # Operator hand-seeds the cold-start rest-state init. time_seconds
+        # is the distinguishing marker: the seed's content must survive.
+        _make_rst(target, time_seconds=0.0)
+        seeded_mtime = target.stat().st_mtime
+        seeded_size = target.stat().st_size
+
+        # A stale, unrelated restart from earlier bring-up testing sitting
+        # in the lookback path, 60h before the t12z anchor.
+        _make_rst(
+            comout_root / f"{run}.20260730" /
+            f"{run}.t00z.20260730.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=12)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+
+        with caplog.at_level("WARNING", logger="nos_utils.forcing.hotstart"):
+            staged = proc.stage_init_to_comout(
+                target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
+            )
+
+        assert staged == target
+
+        # Content unchanged: still the seeded file, not the stale restart.
+        with netCDF4.Dataset(str(target)) as ds:
+            assert float(ds.variables["time"][:].flat[0]) == 0.0
+        assert target.stat().st_mtime == seeded_mtime
+        assert target.stat().st_size == seeded_size
+
+        assert any(
+            "PRESERVED" in r.message and "t00z.20260730" in r.message
+            for r in caplog.records
+        ), "expected a prominent preserve warning naming the stale restart"
+
+    def test_seeded_init_preserved_warning_reaches_forcingresult_warnings(
+        self, tmp_path,
+    ):
+        """Same clobber scenario, exercised through the ``warnings=``
+        plumbing the orchestrator uses so the message lands in
+        ``ForcingResult.warnings`` rather than only the log."""
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        target = target_dir / f"{run}.t12z.20260802.init.nowcast.nc"
+        _make_rst(target, time_seconds=0.0)
+        _make_rst(
+            comout_root / f"{run}.20260730" /
+            f"{run}.t00z.20260730.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=12)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+
+        warnings: list = []
+        staged = proc.stage_init_to_comout(
+            target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
+            warnings=warnings,
+        )
+        assert staged == target
+        assert warnings, "preserve warning must be appended to the caller's list"
+        assert "PRESERVED" in warnings[0]
+
+    def test_no_pre_existing_init_still_stages_from_restart(self, tmp_path):
+        """Pin the pre-fix behavior: with no existing target, staging from
+        the found restart proceeds exactly as before the guard was added."""
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        _make_rst(
+            comout_root / f"{run}.20260801" /
+            f"{run}.t18z.20260801.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=0)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+
+        target = target_dir / f"{run}.t00z.20260802.init.nowcast.nc"
+        assert not target.exists()
+
+        staged = proc.stage_init_to_comout(
+            target_dir, f"{run}.t00z.20260802.init.nowcast.nc",
+        )
+        assert staged == target
+        assert target.exists()
+        with netCDF4.Dataset(str(target)) as ds:
+            assert float(ds.variables["time"][:].flat[0]) == 21600.0
+
+    def test_double_stage_same_cycle_is_silent(self, tmp_path, caplog):
+        """Prep runs two phases (nowcast, forecast) and BOTH call
+        stage_init_to_comout with the same target and the same source
+        restart: phase 1 creates the file, phase 2 finds it already there.
+        This is the ordinary path on EVERY warm cycle, so it must be
+        completely silent -- no PRESERVED warning, nothing appended to the
+        caller's warnings list -- only an informational "already staged"
+        log record. A naive "preserve on any pre-existing target" fix would
+        fire the operator-seed warning here forever; that's the flaw this
+        test guards against.
+        """
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        _make_rst(
+            comout_root / f"{run}.20260801" /
+            f"{run}.t18z.20260801.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=0)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+        init_filename = f"{run}.t00z.20260802.init.nowcast.nc"
+
+        warnings: list = []
+        first = proc.stage_init_to_comout(
+            target_dir, init_filename, warnings=warnings,
+        )
+        assert first is not None
+
+        caplog.clear()
+        with caplog.at_level("INFO", logger="nos_utils.forcing.hotstart"):
+            second = proc.stage_init_to_comout(
+                target_dir, init_filename, warnings=warnings,
+            )
+
+        assert second == first
+        assert warnings == [], (
+            "a same-state re-stage (normal phase-2-of-a-cycle case) must "
+            "not append anything to the caller's warnings list"
+        )
+        assert not any(
+            r.levelname == "WARNING" and "PRESERVED" in r.message
+            for r in caplog.records
+        ), "same-state re-stage must not fire the PRESERVED warning"
+        assert any(
+            r.levelname == "INFO" and "already staged" in r.message
+            for r in caplog.records
+        ), "expected an INFO 'already staged' record on the second call"
+
+    def test_unreadable_target_is_restaged(self, tmp_path, caplog):
+        """A corrupt/truncated leftover at the target path (e.g. from a
+        prep interrupted mid-write, before the crash-safe rename existed)
+        is not a valid seed. It must be self-healed by re-staging from the
+        found restart, not preserved forever, and the re-stage must be
+        logged."""
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        target = target_dir / f"{run}.t12z.20260802.init.nowcast.nc"
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"not a valid netcdf file -- truncated mid-write")
+
+        _make_rst(
+            comout_root / f"{run}.20260730" /
+            f"{run}.t00z.20260730.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=12)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+
+        with caplog.at_level("WARNING", logger="nos_utils.forcing.hotstart"):
+            staged = proc.stage_init_to_comout(
+                target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
+            )
+
+        assert staged == target
+        with netCDF4.Dataset(str(target)) as ds:
+            assert float(ds.variables["time"][:].flat[0]) == 21600.0
+            assert ds.file_format == "NETCDF4_CLASSIC"
+
+        assert any(
+            "could not be read" in r.message and "re-staged" in r.message
+            for r in caplog.records
+        ), "expected a warning about re-staging the unreadable target"
+
+    def test_preserved_seed_non_classic_format_errors(self, tmp_path, caplog):
+        """A preserved operator seed that is HDF5 (NETCDF4) rather than
+        NETCDF4_CLASSIC must ERROR loudly: SCHISM's parallel-IO staging
+        requires classic and segfaults at rank scale on HDF5
+        (ush/nos_run.sh archives rst.nowcast.nc as HDF5, so `cp rst ->
+        init` is a realistic operator mistake). The seed is still
+        preserved -- never destroyed -- but the ERROR must name the actual
+        format and also reach the caller's warnings list."""
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        target = target_dir / f"{run}.t12z.20260802.init.nowcast.nc"
+
+        _make_rst(target, fmt="NETCDF4", time_seconds=0.0)
+        _make_rst(
+            comout_root / f"{run}.20260730" /
+            f"{run}.t00z.20260730.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=12)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+
+        warnings: list = []
+        with caplog.at_level("WARNING", logger="nos_utils.forcing.hotstart"):
+            staged = proc.stage_init_to_comout(
+                target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
+                warnings=warnings,
+            )
+
+        assert staged == target
+        # Seed itself must be untouched -- still HDF5, not converted.
+        with netCDF4.Dataset(str(target)) as ds:
+            assert ds.file_format == "NETCDF4"
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert any(
+            "NETCDF4" in r.message and "NETCDF4_CLASSIC" in r.message
+            for r in error_records
+        ), "expected an ERROR record naming the seed's actual format"
+        assert any(
+            "NETCDF4_CLASSIC" in w for w in warnings
+        ), "the format ERROR message must also land in the warnings list"
+
+
 class TestSearchRootFromCycleLeaf:
     """Regression: cold-start despite a valid prior-day restart.
 

@@ -18,6 +18,7 @@ Key SCHISM hotstart.nc variables:
 """
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -166,6 +167,7 @@ class HotstartProcessor(ForcingProcessor):
         self,
         comout_dir: Path,
         init_filename: str,
+        warnings: Optional[List[str]] = None,
     ) -> Optional[Path]:
         """Stage the previous-cycle restart as today's COMOUT init file.
 
@@ -188,6 +190,8 @@ class HotstartProcessor(ForcingProcessor):
             comout_dir: Target ``$COMOUT`` directory (created if missing).
             init_filename: Operational init name, typically
                 ``f"{prefix}.t{cyc:02d}z.{pdy}.init.nowcast.nc"``.
+            warnings: Optional list to append surfaced warning messages to
+                (typically the caller's ``ForcingResult.warnings``).
 
         Returns:
             Path to the staged init file, or ``None`` if no valid restart
@@ -205,19 +209,79 @@ class HotstartProcessor(ForcingProcessor):
         comout_dir.mkdir(parents=True, exist_ok=True)
         target = comout_dir / init_filename
 
-        # Skip work if the target already exists and points at the same
-        # source — operators sometimes pre-stage manually.
+        # Never overwrite an existing target with a DIFFERENT state. On a
+        # normal cycle nothing else creates this file -- stage_init_to_comout
+        # is its only producer -- so a pre-existing target usually means
+        # either (a) a same-cycle prep re-run already staged it from this
+        # very restart (nowcast and forecast phases both call this, so this
+        # is the ordinary path on EVERY warm cycle -- must be silent, not a
+        # warning), or (b) an operator hand-seeded a cold-start/rest-state
+        # file at the documented name (the WCOSS2 20260802/12z incident: a
+        # 60h-stale unrelated restart from earlier bring-up testing silently
+        # overwrote a hand-seeded rest-state init because the old code only
+        # skipped when target and source resolved to the identical file).
+        # _same_state distinguishes the two by content instead of assuming
+        # existence alone means "operator seed".
         if target.exists():
-            try:
-                if target.resolve() == source.resolve():
-                    log.info(f"Init already staged at {target} (matches source)")
-                    return target
-            except OSError:
-                pass
+            same = self._same_state(target, source)
+            if same is None:
+                # Target exists but can't be read -- a corrupt/truncated
+                # leftover from an interrupted prep, not a valid seed.
+                # Self-heal by re-staging over it rather than protecting it
+                # forever.
+                msg = (
+                    f"Existing init file {target} could not be read (corrupt "
+                    f"or truncated, likely from an interrupted prep); it is "
+                    f"not a valid seed and is being re-staged from "
+                    f"{source.name}"
+                )
+                log.warning(msg)
+                if warnings is not None:
+                    warnings.append(msg)
+                # fall through to the normal copy/convert path below
+            elif same:
+                log.info(f"Init already staged at {target} from {source.name}")
+                return target
+            else:
+                msg = (
+                    f"Existing init file {target} is being PRESERVED, not "
+                    f"overwritten by restart {source.name}. stage_init_to_comout "
+                    f"is the only normal producer of this file, so its prior "
+                    f"existence with a different model state almost always "
+                    f"means it was hand-seeded by an operator (e.g. a "
+                    f"cold-start rest-state); if a refresh from {source.name} "
+                    f"was actually wanted, remove {target} manually and "
+                    f"re-run prep."
+                )
+                log.warning(msg)
+                if warnings is not None:
+                    warnings.append(msg)
+
+                seed_format = self._netcdf_format(target)
+                if seed_format != "NETCDF4_CLASSIC":
+                    fmt_msg = (
+                        f"Preserved seed {target} is "
+                        f"{seed_format or 'an unrecognized/unreadable'} "
+                        f"format, not NETCDF4_CLASSIC; SCHISM's parallel-IO "
+                        f"staging requires the classic model format and "
+                        f"this seed will fail or segfault at rank scale as-is "
+                        f"(ush/nos_run.sh archives rst.nowcast.nc as HDF5, so "
+                        f"`cp rst -> init` is a realistic way to end up here). "
+                        f"The seed was preserved -- never destroying an "
+                        f"operator file -- but it MUST be converted (e.g. "
+                        f"nccopy -k 'netCDF-4 classic model') before the next "
+                        f"run."
+                    )
+                    log.error(fmt_msg)
+                    if warnings is not None:
+                        warnings.append(fmt_msg)
+                return target
 
         src_format = self._netcdf_format(source)
         if src_format == "NETCDF4_CLASSIC":
-            shutil.copy2(source, target)
+            tmp_target = target.with_name(target.name + ".tmp")
+            shutil.copy2(source, tmp_target)
+            os.replace(tmp_target, target)
             log.info(f"Staged init.nowcast.nc (already classic): {source.name} → {target}")
             return target
 
@@ -230,6 +294,34 @@ class HotstartProcessor(ForcingProcessor):
             f"→ NETCDF4_CLASSIC): {source.name} → {target}"
         )
         return target
+
+    def _same_state(self, target: Path, source: Path) -> Optional[bool]:
+        """Compare scalar model state between an existing target and the
+        candidate source restart, via the existing ``_read_hotstart``.
+
+        Returns ``True`` when both are readable and their ``time``/``iths``
+        scalars match -- the ordinary case where a same-cycle prep re-run
+        (e.g. the forecast phase following the nowcast phase) already
+        staged ``target`` from this very ``source``. Returns ``False`` when
+        both are readable but the state differs -- ``target`` holds a
+        genuinely different state, almost always an operator-provided seed.
+        Returns ``None`` when ``target`` itself could not be read at all
+        (corrupt or truncated), which the caller must treat as an invalid
+        leftover rather than a seed worth protecting.
+        """
+        target_info = self._read_hotstart(target)
+        if target_info is None:
+            return None
+        source_info = self._read_hotstart(source)
+        if source_info is None:
+            # The source already passed _find_hotstart's size filter and is
+            # about to be staged either way; if it can't be read here there
+            # is no basis to call the states "same", so preserve target.
+            return False
+        return (
+            target_info.time_seconds == source_info.time_seconds
+            and target_info.iths == source_info.iths
+        )
 
     @staticmethod
     def _netcdf_format(path: Path) -> Optional[str]:
@@ -253,20 +345,29 @@ class HotstartProcessor(ForcingProcessor):
         Tries the operational ``nccopy -k 'netCDF-4 classic model'`` first;
         falls back to a pure netCDF4-Python rewrite when the binary isn't
         on PATH. Both produce a byte-identical SCHISM-readable file as far
-        as the model's pnetcdf reader is concerned.
+        as the model's pnetcdf reader is concerned. Both paths write to a
+        temp name in the same directory and ``os.replace`` onto ``dst``
+        only after a full successful write, so an interrupted prep (killed
+        job, OOM, node failure) never leaves a truncated file at the final
+        ``dst`` name for a later cycle to mistake for a valid seed.
         """
+        tmp_dst = dst.with_name(dst.name + ".tmp")
+
         if shutil.which("nccopy"):
             try:
                 subprocess.run(
-                    ["nccopy", "-k", "netCDF-4 classic model", str(src), str(dst)],
+                    ["nccopy", "-k", "netCDF-4 classic model", str(src), str(tmp_dst)],
                     check=True, capture_output=True,
                 )
+                os.replace(tmp_dst, dst)
                 return True
             except subprocess.CalledProcessError as e:
                 log.warning(
                     f"nccopy failed (rc={e.returncode}); falling back to "
                     f"Python conversion. stderr: {e.stderr.decode(errors='replace')[:200]}"
                 )
+                if tmp_dst.exists():
+                    tmp_dst.unlink()
 
         if not HAS_NETCDF4:
             log.error("Neither nccopy nor netCDF4-Python available for format conversion")
@@ -274,7 +375,7 @@ class HotstartProcessor(ForcingProcessor):
 
         try:
             with Dataset(str(src), "r") as src_ds, \
-                 Dataset(str(dst), "w", format="NETCDF4_CLASSIC") as dst_ds:
+                 Dataset(str(tmp_dst), "w", format="NETCDF4_CLASSIC") as dst_ds:
                 # Global attrs
                 dst_ds.setncatts({k: src_ds.getncattr(k) for k in src_ds.ncattrs()})
                 # Dims
@@ -287,9 +388,12 @@ class HotstartProcessor(ForcingProcessor):
                     )
                     new_var.setncatts({k: var.getncattr(k) for k in var.ncattrs()})
                     new_var[:] = var[:]
+            os.replace(tmp_dst, dst)
             return True
         except Exception as e:
             log.error(f"Python NetCDF format conversion failed: {e}")
+            if tmp_dst.exists():
+                tmp_dst.unlink()
             return False
 
     def _search_roots(self) -> List[Path]:

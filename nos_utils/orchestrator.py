@@ -383,7 +383,9 @@ class PrepOrchestrator:
                 f"{self.run_name}.t{self.config.cyc:02d}z."
                 f"{self.config.pdy}.init.nowcast.nc"
             )
-            staged = proc.stage_init_to_comout(Path(comout), init_filename)
+            staged = proc.stage_init_to_comout(
+                Path(comout), init_filename, warnings=result.warnings,
+            )
             if staged is not None:
                 # Surface the staged path on the result so downstream
                 # steps (and the J-job archive logic) can pick it up.
