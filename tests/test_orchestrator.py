@@ -133,6 +133,82 @@ class TestTimeHotstartAnchor:
         assert marker.read_text().strip() == "2026040106"
 
 
+class TestOrchestratorHotstartStagingFailure:
+    """Round-2 review, finding 2: a PRESERVED non-CLASSIC seed at the
+    staged-init target must make PREP FAIL, not just log an ERROR from
+    inside HotstartProcessor while the pipeline continues to report
+    success.
+
+    ``PrepOrchestrator.run()`` has no try/except around the hotstart step
+    (``hotstart_result = self._run_hotstart(output_dir)``), and
+    ``_run_hotstart`` itself has no try/except around its
+    ``stage_init_to_comout`` call -- both deliberately, per the comment
+    in ``_run_hotstart``. So ``HotstartStagingError`` raised deep inside
+    ``HotstartProcessor.stage_init_to_comout`` must propagate all the way
+    out of ``run()`` uncaught. That is also exactly what
+    ``nco_bridge.run_prep`` (``result = orch.run(phase=phase)``, no
+    try/except) and ``cli.cmd_prep`` (``result = orch.run(phase=args.phase)``,
+    no try/except) both call directly, so an uncaught exception here means
+    the operational entry points exit with a nonzero return code instead
+    of reporting a green prep.
+    """
+
+    @staticmethod
+    def _seed_non_classic_target(comout_root: Path, run: str, pdy: str, cyc: int) -> Path:
+        from tests.test_hotstart import _make_rst
+
+        target = comout_root / f"{run}.t{cyc:02d}z.{pdy}.init.nowcast.nc"
+        # HDF5 seed, no provenance sidecar -- an operator hand-seed or a
+        # `cp rst -> init` mistake (ush/nos_run.sh archives
+        # rst.nowcast.nc as HDF5).
+        _make_rst(target, fmt="NETCDF4", time_seconds=0.0)
+        return target
+
+    def _build_paths_with_differing_seed(self, orch_paths, tmp_path):
+        from tests.test_hotstart import _make_rst
+
+        comout_root = tmp_path / "comout"
+        self._seed_non_classic_target(comout_root, "secofs", "20260401", 12)
+        # A differing restart the lookback WILL find (within
+        # max_lookback_days=3 of pdy=20260401).
+        _make_rst(
+            comout_root / "secofs.20260331" /
+            "secofs.t00z.20260331.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+        paths = dict(orch_paths)
+        paths["comout"] = str(comout_root)
+        return paths
+
+    def test_run_hotstart_raises_on_non_classic_preserved_seed(
+        self, mock_config, orch_paths, tmp_path,
+    ):
+        from nos_utils.forcing.hotstart import HotstartStagingError
+
+        paths = self._build_paths_with_differing_seed(orch_paths, tmp_path)
+        orch = PrepOrchestrator(mock_config, paths, run_name="secofs")
+
+        with pytest.raises(HotstartStagingError):
+            orch._run_hotstart(Path(paths["output"]))
+
+    def test_full_prep_run_fails_hard_on_non_classic_preserved_seed(
+        self, mock_config, orch_paths, tmp_path,
+    ):
+        """Driven through the real, unmodified ``run()`` entry point --
+        the same one the operational J-job glue calls -- to prove the
+        exception reaches all the way out instead of being absorbed
+        anywhere in the pipeline (e.g. the Phase-1 ThreadPoolExecutor's
+        per-future ``except Exception`` does NOT apply here: the hotstart
+        step runs synchronously in Step 1, before the parallel pool)."""
+        from nos_utils.forcing.hotstart import HotstartStagingError
+
+        paths = self._build_paths_with_differing_seed(orch_paths, tmp_path)
+        orch = PrepOrchestrator(mock_config, paths, run_name="secofs")
+
+        with pytest.raises(HotstartStagingError):
+            orch.run(phase="nowcast")
+
+
 class TestRoutePhaseOrchestrator:
     """Verify phase is threaded through to the phase-aware processors.
 

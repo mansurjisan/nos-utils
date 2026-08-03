@@ -367,6 +367,12 @@ class PrepOrchestrator:
         further fallback when the 6h-prior cycle is missing. Removes the
         manual ``nccopy -k 'netCDF-4 classic model'`` operators have
         been running each cycle.
+
+        Deliberately does not catch ``HotstartStagingError`` from
+        ``stage_init_to_comout``: a PRESERVED seed that isn't
+        NETCDF4_CLASSIC must abort prep, not report success with a seed
+        that is guaranteed to fail SCHISM at launch. It propagates through
+        ``run()`` uncaught for the same reason.
         """
         from .forcing.hotstart import HotstartProcessor
 
@@ -383,7 +389,9 @@ class PrepOrchestrator:
                 f"{self.run_name}.t{self.config.cyc:02d}z."
                 f"{self.config.pdy}.init.nowcast.nc"
             )
-            staged = proc.stage_init_to_comout(Path(comout), init_filename)
+            staged = proc.stage_init_to_comout(
+                Path(comout), init_filename, warnings=result.warnings,
+            )
             if staged is not None:
                 # Surface the staged path on the result so downstream
                 # steps (and the J-job archive logic) can pick it up.
