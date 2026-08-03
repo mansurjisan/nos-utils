@@ -115,7 +115,8 @@ class HotstartProcessor(ForcingProcessor):
         self.create_output_dir()
 
         # Search for hotstart files
-        hotstart_file = self._find_hotstart()
+        warnings: List[str] = []
+        hotstart_file = self._find_hotstart(warnings)
         if hotstart_file is None:
             log.warning("No hotstart file found — cold start will be used (ihot=0)")
             return ForcingResult(
@@ -150,6 +151,7 @@ class HotstartProcessor(ForcingProcessor):
         return ForcingResult(
             success=True, source=self.SOURCE_NAME,
             output_files=[output_file],
+            warnings=warnings,
             metadata={
                 "ihot": 1,
                 "hotstart_info": info,
@@ -352,7 +354,7 @@ class HotstartProcessor(ForcingProcessor):
                 deduped.append(c)
         return deduped
 
-    def _find_hotstart(self) -> Optional[Path]:
+    def _find_hotstart(self, warnings: Optional[List[str]] = None) -> Optional[Path]:
         """
         Find the correct hotstart file for the current cycle.
 
@@ -400,6 +402,7 @@ class HotstartProcessor(ForcingProcessor):
             best = scored[0][1]
             log.info(f"Selected hotstart by cycle time: {best.name} "
                      f"(valid {scored[0][0]}, current cycle {cycle_dt})")
+            self._check_staleness(best, scored[0][0], cycle_dt, warnings)
             return best
 
         # Fallback: mtime sort over files whose filename did NOT parse to a
@@ -427,7 +430,60 @@ class HotstartProcessor(ForcingProcessor):
             f"Found {len(unparsable)} unparsable-filename hotstart "
             f"candidates, using newest by mtime: {unparsable[0].name}"
         )
+        self._check_staleness(unparsable[0], None, cycle_dt, warnings)
         return unparsable[0]
+
+    def _check_staleness(
+        self,
+        hotstart_file: Path,
+        file_dt: Optional[datetime],
+        cycle_dt: datetime,
+        warnings: Optional[List[str]],
+    ) -> None:
+        """Warn when the selected restart's valid time differs from the
+        orchestrator's time_hotstart anchor (cycle - nowcast_hours): ihot=1
+        relabels the restart's state to the anchor regardless, so any gap
+        between them is silently skipped or re-simulated unless flagged here.
+        """
+        expected = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+
+        if file_dt is None:
+            msg = (
+                f"Hotstart {hotstart_file.name} has no parseable valid time "
+                f"(selected by mtime fallback); expected anchor is "
+                f"{expected:%Y-%m-%d %H:%M} — cannot verify SCHISM state alignment"
+            )
+            log.warning(msg)
+            if warnings is not None:
+                warnings.append(msg)
+            return
+
+        if file_dt == expected:
+            return
+
+        gap_hours = abs((expected - file_dt).total_seconds()) / 3600.0
+        if file_dt < expected:
+            msg = (
+                f"Hotstart {hotstart_file.name} valid at {file_dt:%Y-%m-%d %H:%M} "
+                f"is {gap_hours:.0f}h before the time_hotstart anchor "
+                f"{expected:%Y-%m-%d %H:%M} (cycle {cycle_dt:%Y-%m-%d %H:%M} - "
+                f"nowcast_hours={self.config.nowcast_hours}h); SCHISM will relabel "
+                f"this state to {expected:%Y-%m-%d %H:%M}; {gap_hours:.0f}h of ocean "
+                f"evolution will be skipped — run intermediate cycles or increase "
+                f"nowcast_hours"
+            )
+        else:
+            msg = (
+                f"Hotstart {hotstart_file.name} valid at {file_dt:%Y-%m-%d %H:%M} "
+                f"is {gap_hours:.0f}h after the time_hotstart anchor "
+                f"{expected:%Y-%m-%d %H:%M} (cycle {cycle_dt:%Y-%m-%d %H:%M} - "
+                f"nowcast_hours={self.config.nowcast_hours}h); SCHISM will relabel "
+                f"this state to {expected:%Y-%m-%d %H:%M}; {gap_hours:.0f}h will be "
+                f"re-simulated"
+            )
+        log.warning(msg)
+        if warnings is not None:
+            warnings.append(msg)
 
     def _parse_file_datetime(self, filepath: Path) -> Optional[datetime]:
         """

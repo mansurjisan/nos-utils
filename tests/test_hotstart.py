@@ -173,6 +173,68 @@ class TestFindHotstartFallback:
         assert result == legacy
 
 
+class TestStalenessWarning:
+    """Regression coverage for the silent hotstart/anchor mismatch: SCHISM's
+    ihot=1 relabels whatever restart is selected to the time_hotstart anchor
+    (cycle - nowcast_hours) regardless of the restart's own valid time, so a
+    mismatch must be flagged loudly instead of silently skipping or
+    re-simulating ocean evolution.
+    """
+
+    @staticmethod
+    def _restart_at(root: Path, run: str, pdy: str, cyc: int) -> Path:
+        path = root / f"{run}.{pdy}" / f"{run}.t{cyc:02d}z.{pdy}.rst.nowcast.nc"
+        _make_rst(path)
+        return path
+
+    def test_daily_cadence_warns_evolution_skipped(self, tmp_path):
+        """Daily 00z cadence with nowcast_hours=6: only yesterday's 00z
+        restart is available, 18h short of the 18z anchor a 6h nowcast
+        window expects. This is the stofs_3d_ak_ufs bring-up scenario."""
+        run = "secofs"
+        root = tmp_path / "com" / "nos"
+        self._restart_at(root, run, "20260730", 0)
+
+        cfg = ForcingConfig.for_secofs(pdy="20260731", cyc=0)
+        proc = HotstartProcessor(cfg, root, tmp_path / "out", run_name=run)
+        result = proc.process()
+
+        assert result.success
+        assert result.warnings, "staleness warning must land in ForcingResult.warnings"
+        msg = " ".join(result.warnings)
+        assert "18h of ocean evolution will be skipped" in msg
+
+    def test_normal_6hourly_chain_is_silent(self, tmp_path):
+        """The routine warm chain (file_dt == anchor == previous cycle)
+        must not trip the staleness warning."""
+        run = "secofs"
+        root = tmp_path / "com" / "nos"
+        self._restart_at(root, run, "20260730", 18)
+
+        cfg = ForcingConfig.for_secofs(pdy="20260731", cyc=0)
+        proc = HotstartProcessor(cfg, root, tmp_path / "out", run_name=run)
+        result = proc.process()
+
+        assert result.success
+        assert result.warnings == []
+
+    def test_restart_newer_than_anchor_warns_re_simulated(self, tmp_path):
+        """A restart valid AFTER the anchor (but still before the cycle)
+        means SCHISM will re-simulate the gap, not skip it."""
+        run = "secofs"
+        root = tmp_path / "com" / "nos"
+        self._restart_at(root, run, "20260730", 21)
+
+        cfg = ForcingConfig.for_secofs(pdy="20260731", cyc=0)
+        proc = HotstartProcessor(cfg, root, tmp_path / "out", run_name=run)
+        result = proc.process()
+
+        assert result.success
+        assert result.warnings
+        msg = " ".join(result.warnings)
+        assert "3h will be re-simulated" in msg
+
+
 class TestHotstartInfo:
     def test_time_days(self):
         info = HotstartInfo(
