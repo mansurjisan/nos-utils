@@ -592,19 +592,24 @@ class TestStageInitPreservesSeededInit:
             for r in caplog.records
         ), "expected an INFO 'already staged' record on the second call"
 
-    def test_unreadable_target_is_restaged(self, tmp_path, caplog):
-        """A corrupt/truncated leftover at the target path (e.g. from a
-        prep interrupted mid-write, before the crash-safe rename existed)
-        is not a valid seed. It must be self-healed by re-staging from the
-        found restart, not preserved forever, and the re-stage must be
-        logged."""
+    def test_unreadable_unprovenanced_target_is_preserved_and_raises(self, tmp_path, caplog):
+        """Round-3 review, finding 2 (blocker): a corrupt/truncated leftover
+        at the target path has no provenance sidecar proving this method
+        wrote it, so it can no longer be distinguished here from a healthy
+        seed sitting behind a transient probe failure. The old self-heal-
+        by-restage behavior (silently overwriting it from a found restart)
+        is exactly the failure mode that can destroy a valid operator seed
+        on a flaky probe -- so this now PRESERVES the file and raises
+        HotstartStagingError instead of restaging over it. A human must
+        inspect and clear it manually."""
         run = "stofs_3d_ak_ufs"
         comout_root = tmp_path / "com" / "nos"
         target_dir = comout_root / f"{run}.20260802"
         target = target_dir / f"{run}.t12z.20260802.init.nowcast.nc"
 
         target_dir.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"not a valid netcdf file -- truncated mid-write")
+        junk = b"not a valid netcdf file -- truncated mid-write"
+        target.write_bytes(junk)
 
         _make_rst(
             comout_root / f"{run}.20260730" /
@@ -615,20 +620,27 @@ class TestStageInitPreservesSeededInit:
         cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=12)
         proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
 
+        warnings: list = []
         with caplog.at_level("WARNING", logger="nos_utils.forcing.hotstart"):
-            staged = proc.stage_init_to_comout(
-                target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
-            )
+            with pytest.raises(HotstartStagingError) as excinfo:
+                proc.stage_init_to_comout(
+                    target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
+                    warnings=warnings,
+                )
 
-        assert staged == target
-        with netCDF4.Dataset(str(target)) as ds:
-            assert float(ds.variables["time"][:].flat[0]) == 21600.0
-            assert ds.file_format == "NETCDF4_CLASSIC"
+        assert "could not be read" in str(excinfo.value)
 
+        # Junk content must be untouched -- NOT overwritten by the stale
+        # restart that was sitting in the lookback path.
+        assert target.read_bytes() == junk
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
         assert any(
-            "could not be read" in r.message and "re-staged" in r.message
-            for r in caplog.records
-        ), "expected a warning about re-staging the unreadable target"
+            "could not be read" in r.message for r in error_records
+        ), "expected an ERROR record about the unreadable target"
+        assert any(
+            "could not be read" in w for w in warnings
+        ), "the error message must also land in the warnings list"
 
     def test_preserved_seed_non_classic_format_raises(self, tmp_path, caplog):
         """A preserved operator seed that is HDF5 (NETCDF4) rather than
@@ -683,6 +695,191 @@ class TestStageInitPreservesSeededInit:
         assert any(
             "NETCDF4_CLASSIC" in w for w in warnings
         ), "the format ERROR message must also land in the warnings list"
+
+
+class TestStageInitValidatesTargetBeforeSourceDiscovery:
+    """Round-3 review, finding 1 (blocker): the target's format must be
+    validated BEFORE ``_find_hotstart()`` is ever called, not after.
+
+    The old code called ``source = self._find_hotstart()`` first and
+    returned ``None`` immediately when no source existed -- before the
+    existing target was inspected at all. On a first-cycle bring-up
+    (operator seed present, NO previous restart anywhere), a non-CLASSIC
+    seed sailed through unexamined: prep stayed green and the runner
+    handed SCHISM a format guaranteed to fail at rank scale. The fix moves
+    the format gate ahead of source discovery so it fires unconditionally.
+    """
+
+    def test_non_classic_seed_raises_even_with_no_source(self, tmp_path, caplog):
+        """First-cycle bring-up shape: a non-CLASSIC (HDF5) seed and NO
+        previous restart anywhere. Must still raise HotstartStagingError
+        -- the absence of a source must not suppress the format check."""
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        target = target_dir / f"{run}.t12z.20260802.init.nowcast.nc"
+
+        _make_rst(target, fmt="NETCDF4", time_seconds=0.0)
+        # No restart anywhere else in comout_root -- _find_hotstart() would
+        # return None if it were ever consulted.
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=12)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+
+        warnings: list = []
+        with caplog.at_level("WARNING", logger="nos_utils.forcing.hotstart"):
+            with pytest.raises(HotstartStagingError) as excinfo:
+                proc.stage_init_to_comout(
+                    target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
+                    warnings=warnings,
+                )
+
+        assert "NETCDF4" in str(excinfo.value)
+        assert "NETCDF4_CLASSIC" in str(excinfo.value)
+
+        # Seed itself untouched -- still HDF5.
+        with netCDF4.Dataset(str(target)) as ds:
+            assert ds.file_format == "NETCDF4"
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert any(
+            "NETCDF4" in r.message and "NETCDF4_CLASSIC" in r.message
+            for r in error_records
+        ), "expected an ERROR record naming the seed's actual format"
+        assert any("NETCDF4_CLASSIC" in w for w in warnings)
+
+    def test_classic_seed_with_no_source_is_used_as_is(self, tmp_path, caplog):
+        """First-cycle bring-up, the EXPECTED shape: a valid
+        NETCDF4_CLASSIC operator seed with NO previous restart anywhere to
+        compare against must be recognized and kept as the returned init
+        file, not treated as an anomaly and not blocked by the absence of
+        a source."""
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        target = target_dir / f"{run}.t12z.20260802.init.nowcast.nc"
+
+        _make_rst(target, fmt="NETCDF4_CLASSIC", time_seconds=0.0)
+        seeded_bytes = target.read_bytes()
+        # No restart anywhere else in comout_root.
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=12)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+
+        warnings: list = []
+        with caplog.at_level("WARNING", logger="nos_utils.forcing.hotstart"):
+            staged = proc.stage_init_to_comout(
+                target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
+                warnings=warnings,
+            )
+
+        assert staged == target
+        assert target.read_bytes() == seeded_bytes, "seed content must be untouched"
+        assert not any(
+            r.levelname == "WARNING" and "PRESERVED" in r.message
+            for r in caplog.records
+        ), "a valid first-cycle seed must not trip the anomaly/PRESERVED warning"
+
+
+class TestStageInitTransientProbeFailure:
+    """Round-3 review, finding 2 (blocker): a failed ``_netcdf_format``
+    probe on an UNPROVENANCED existing seed must never be treated as proof
+    of corruption. The probe can fail transiently (not only on genuine
+    corruption); silently re-staging over it can destroy a perfectly
+    healthy operator seed. The fix: only a target whose provenance sidecar
+    proves THIS method wrote it -- and whose stat is unchanged since --
+    may be treated as fine despite a failed probe (writes go through
+    temp+os.replace so they cannot be torn). Anything else must preserve
+    and raise, never silently restage.
+    """
+
+    def test_probe_failure_on_unprovenanced_seed_with_stale_restart_raises(
+        self, tmp_path, monkeypatch,
+    ):
+        """A genuinely valid CLASSIC seed with no provenance sidecar (an
+        operator-placed file, never written by this method), sitting next
+        to a stale restart the lookback would otherwise find, whose
+        format probe FAILS transiently (forced via monkeypatch, not real
+        corruption). Must be PRESERVED (content untouched) and must raise
+        HotstartStagingError -- never silently re-staged from the stale
+        restart."""
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        target = target_dir / f"{run}.t12z.20260802.init.nowcast.nc"
+
+        _make_rst(target, fmt="NETCDF4_CLASSIC", time_seconds=0.0)
+        seeded_bytes = target.read_bytes()
+
+        _make_rst(
+            comout_root / f"{run}.20260730" /
+            f"{run}.t00z.20260730.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=12)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+
+        # _netcdf_format is a @staticmethod -- patch it on the class.
+        monkeypatch.setattr(
+            HotstartProcessor, "_netcdf_format", staticmethod(lambda path: None),
+        )
+
+        warnings: list = []
+        with pytest.raises(HotstartStagingError):
+            proc.stage_init_to_comout(
+                target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
+                warnings=warnings,
+            )
+
+        assert target.read_bytes() == seeded_bytes, (
+            "a healthy seed behind a flaky probe must never be silently "
+            "overwritten by a stale restart"
+        )
+        assert warnings
+
+    def test_probe_failure_on_provenanced_target_is_preserved(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """A target THIS method staged (sidecar's recorded target stamp
+        matches its current stat) whose format probe fails transiently
+        must be treated as fine: no raise, no WARNING, an INFO log, and
+        the previously-staged path is returned untouched."""
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        _make_rst(
+            comout_root / f"{run}.20260801" /
+            f"{run}.t18z.20260801.rst.nowcast.nc",
+            time_seconds=21600.0, fmt="NETCDF4_CLASSIC",
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=0)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+        init_filename = f"{run}.t00z.20260802.init.nowcast.nc"
+
+        first = proc.stage_init_to_comout(target_dir, init_filename)
+        assert first is not None
+        staged_bytes = first.read_bytes()
+
+        monkeypatch.setattr(
+            HotstartProcessor, "_netcdf_format", staticmethod(lambda path: None),
+        )
+
+        warnings: list = []
+        with caplog.at_level("INFO", logger="nos_utils.forcing.hotstart"):
+            second = proc.stage_init_to_comout(
+                target_dir, init_filename, warnings=warnings,
+            )
+
+        assert second == first
+        assert second.read_bytes() == staged_bytes, "provenanced seed must be untouched"
+        assert warnings == [], "a proven-transient probe failure must not warn"
+        assert not any(r.levelname == "WARNING" for r in caplog.records)
+        assert any(
+            r.levelname == "INFO" and "transient" in r.message.lower()
+            for r in caplog.records
+        ), "expected an INFO record naming the transient probe failure"
 
 
 class TestStageInitProvenanceIdentity:
