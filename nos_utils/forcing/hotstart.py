@@ -17,6 +17,7 @@ Key SCHISM hotstart.nc variables:
   tr_nd  — [node, nVert, ntracers]: tracers at nodes
 """
 
+import json
 import logging
 import os
 import re
@@ -36,6 +37,20 @@ try:
     HAS_NETCDF4 = True
 except ImportError:
     HAS_NETCDF4 = False
+
+
+class HotstartStagingError(RuntimeError):
+    """Raised by :meth:`HotstartProcessor.stage_init_to_comout` when the
+    seed it must PRESERVE at the staged-init target is not
+    NETCDF4_CLASSIC.
+
+    The seed is left untouched -- this is never raised in a way that
+    destroys an operator-provided file. It exists so that condition turns
+    into a hard prep failure instead of a swallowed ``log.error()`` line:
+    a non-CLASSIC seed is guaranteed to fail or segfault SCHISM's
+    parallel-IO staging at rank scale, so prep must not report success
+    with such a seed in place.
+    """
 
 
 class HotstartInfo:
@@ -85,6 +100,11 @@ class HotstartProcessor(ForcingProcessor):
         "{run}.hotstart.nc",
         "{run}.t{cyc:02d}z.hotstart.nc",
     ]
+
+    # Sidecar recording the provenance (source + target identity) of a
+    # stage_init_to_comout write. Suffix is deliberately NOT `.nc` so it
+    # can never be picked up by find_input_files' `*.nc`-suffixed globs.
+    _PROVENANCE_SUFFIX = ".provenance.json"
 
     def __init__(
         self,
@@ -196,6 +216,13 @@ class HotstartProcessor(ForcingProcessor):
         Returns:
             Path to the staged init file, or ``None`` if no valid restart
             was found within the lookback window.
+
+        Raises:
+            HotstartStagingError: An existing target is being PRESERVED
+                (not overwritten) but is not NETCDF4_CLASSIC, so it cannot
+                be used by SCHISM's parallel-IO staging as-is. The seed
+                itself is left untouched; the caller must treat this as a
+                hard prep failure, not a warning.
         """
         source = self._find_hotstart()
         if source is None:
@@ -220,15 +247,24 @@ class HotstartProcessor(ForcingProcessor):
         # 60h-stale unrelated restart from earlier bring-up testing silently
         # overwrote a hand-seeded rest-state init because the old code only
         # skipped when target and source resolved to the identical file).
-        # _same_state distinguishes the two by content instead of assuming
-        # existence alone means "operator seed".
+        #
+        # Identity is decided by PROVENANCE, not by comparing time/iths
+        # scalars: every daily ihot=1 restart is relabeled to the same
+        # time_hotstart anchor, so every restart on a given cadence carries
+        # IDENTICAL time/iths scalars regardless of the actual ocean state
+        # (round-2 review finding: a target with eta2 from one state and a
+        # source restart with different eta2 but matching time/iths used to
+        # be misclassified as "identical restage"). The sidecar written by
+        # this method's own writes below instead records the literal source
+        # (path/size/mtime_ns) and target (size/mtime_ns) identity at the
+        # moment of the write; only an exact match on BOTH is "identical".
         if target.exists():
-            same = self._same_state(target, source)
-            if same is None:
-                # Target exists but can't be read -- a corrupt/truncated
-                # leftover from an interrupted prep, not a valid seed.
-                # Self-heal by re-staging over it rather than protecting it
-                # forever.
+            target_format = self._netcdf_format(target)
+            if target_format is None:
+                # Target exists but can't even be opened as netCDF -- a
+                # corrupt/truncated leftover from an interrupted prep, not
+                # a valid seed. Self-heal by re-staging over it rather than
+                # protecting it forever.
                 msg = (
                     f"Existing init file {target} could not be read (corrupt "
                     f"or truncated, likely from an interrupted prep); it is "
@@ -239,42 +275,52 @@ class HotstartProcessor(ForcingProcessor):
                 if warnings is not None:
                     warnings.append(msg)
                 # fall through to the normal copy/convert path below
-            elif same:
-                log.info(f"Init already staged at {target} from {source.name}")
-                return target
             else:
+                # The format must be verified BEFORE any identical-restage
+                # early return: a sidecar match alone is not sufficient,
+                # since stage_init_to_comout only ever writes CLASSIC, so a
+                # target that matches provenance but isn't CLASSIC means the
+                # file was tampered with or corrupted after the write.
+                if (
+                    target_format == "NETCDF4_CLASSIC"
+                    and self._is_identical_restage(target, source)
+                ):
+                    log.info(f"Init already staged at {target} from {source.name}")
+                    return target
+
                 msg = (
                     f"Existing init file {target} is being PRESERVED, not "
                     f"overwritten by restart {source.name}. stage_init_to_comout "
                     f"is the only normal producer of this file, so its prior "
-                    f"existence with a different model state almost always "
+                    f"existence without matching provenance almost always "
                     f"means it was hand-seeded by an operator (e.g. a "
-                    f"cold-start rest-state); if a refresh from {source.name} "
-                    f"was actually wanted, remove {target} manually and "
-                    f"re-run prep."
+                    f"cold-start rest-state), or that the previously staged "
+                    f"file was touched/replaced after staging; if a refresh "
+                    f"from {source.name} was actually wanted, remove "
+                    f"{target} manually and re-run prep."
                 )
                 log.warning(msg)
                 if warnings is not None:
                     warnings.append(msg)
 
-                seed_format = self._netcdf_format(target)
-                if seed_format != "NETCDF4_CLASSIC":
+                if target_format != "NETCDF4_CLASSIC":
                     fmt_msg = (
-                        f"Preserved seed {target} is "
-                        f"{seed_format or 'an unrecognized/unreadable'} "
-                        f"format, not NETCDF4_CLASSIC; SCHISM's parallel-IO "
-                        f"staging requires the classic model format and "
-                        f"this seed will fail or segfault at rank scale as-is "
+                        f"Preserved seed {target} is {target_format} format, "
+                        f"not NETCDF4_CLASSIC; SCHISM's parallel-IO staging "
+                        f"requires the classic model format and this seed "
+                        f"will fail or segfault at rank scale as-is "
                         f"(ush/nos_run.sh archives rst.nowcast.nc as HDF5, so "
                         f"`cp rst -> init` is a realistic way to end up here). "
                         f"The seed was preserved -- never destroying an "
                         f"operator file -- but it MUST be converted (e.g. "
                         f"nccopy -k 'netCDF-4 classic model') before the next "
-                        f"run."
+                        f"run. Failing prep now instead of continuing with a "
+                        f"seed guaranteed to fail at launch."
                     )
                     log.error(fmt_msg)
                     if warnings is not None:
                         warnings.append(fmt_msg)
+                    raise HotstartStagingError(fmt_msg)
                 return target
 
         src_format = self._netcdf_format(source)
@@ -282,6 +328,7 @@ class HotstartProcessor(ForcingProcessor):
             tmp_target = target.with_name(target.name + ".tmp")
             shutil.copy2(source, tmp_target)
             os.replace(tmp_target, target)
+            self._write_provenance(target, source)
             log.info(f"Staged init.nowcast.nc (already classic): {source.name} → {target}")
             return target
 
@@ -289,39 +336,90 @@ class HotstartProcessor(ForcingProcessor):
             log.error(f"Failed to convert {source} to NETCDF4_CLASSIC; init not staged")
             return None
 
+        self._write_provenance(target, source)
         log.info(
             f"Staged init.nowcast.nc (converted {src_format or '?'} "
             f"→ NETCDF4_CLASSIC): {source.name} → {target}"
         )
         return target
 
-    def _same_state(self, target: Path, source: Path) -> Optional[bool]:
-        """Compare scalar model state between an existing target and the
-        candidate source restart, via the existing ``_read_hotstart``.
+    @classmethod
+    def _provenance_path(cls, target: Path) -> Path:
+        """Sidecar path for a staged ``target``."""
+        return target.with_name(target.name + cls._PROVENANCE_SUFFIX)
 
-        Returns ``True`` when both are readable and their ``time``/``iths``
-        scalars match -- the ordinary case where a same-cycle prep re-run
-        (e.g. the forecast phase following the nowcast phase) already
-        staged ``target`` from this very ``source``. Returns ``False`` when
-        both are readable but the state differs -- ``target`` holds a
-        genuinely different state, almost always an operator-provided seed.
-        Returns ``None`` when ``target`` itself could not be read at all
-        (corrupt or truncated), which the caller must treat as an invalid
-        leftover rather than a seed worth protecting.
+    @staticmethod
+    def _stat_stamp(path: Path) -> dict:
+        st = path.stat()
+        return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+    def _write_provenance(self, target: Path, source: Path) -> None:
+        """Atomically record ``source``'s and ``target``'s identity next to
+        a freshly staged ``target``.
+
+        Written via temp+``os.replace`` so an interrupted write never
+        leaves a partial sidecar for a later call to misread. The source
+        stamp is captured from ``source`` as staged; the target stamp is
+        captured from ``target`` AFTER the write, so a later call can
+        detect an operator having touched/replaced the staged file even if
+        the original source restart is untouched.
         """
-        target_info = self._read_hotstart(target)
-        if target_info is None:
-            return None
-        source_info = self._read_hotstart(source)
-        if source_info is None:
-            # The source already passed _find_hotstart's size filter and is
-            # about to be staged either way; if it can't be read here there
-            # is no basis to call the states "same", so preserve target.
+        prov_path = self._provenance_path(target)
+        tmp_path = prov_path.with_name(prov_path.name + ".tmp")
+        # The stat calls stay inside the try: the sidecar is bookkeeping,
+        # and a source purged between staging and here must degrade to
+        # "no sidecar" (WARN path next cycle), not abort a prep whose
+        # staging work already succeeded.
+        try:
+            record = {
+                "source": {
+                    "path": str(source.resolve()),
+                    **self._stat_stamp(source),
+                },
+                "target": self._stat_stamp(target),
+            }
+            with open(tmp_path, "w") as fh:
+                json.dump(record, fh)
+            os.replace(tmp_path, prov_path)
+        except OSError as e:
+            log.warning(f"Could not write provenance sidecar {prov_path}: {e}")
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+    def _is_identical_restage(self, target: Path, source: Path) -> bool:
+        """True only when a provenance sidecar exists next to ``target``,
+        parses, and its recorded source AND target stamps both match the
+        current ``source``/``target`` stat exactly.
+
+        This is the ONLY condition under which a pre-existing target is
+        treated as an identical restage. Anything else -- no sidecar, an
+        unreadable/corrupt sidecar, a source that moved or changed, or a
+        target touched/replaced since it was staged -- returns False and
+        the caller falls into the preserve/WARNING path.
+        """
+        prov_path = self._provenance_path(target)
+        if not prov_path.exists():
             return False
-        return (
-            target_info.time_seconds == source_info.time_seconds
-            and target_info.iths == source_info.iths
-        )
+        try:
+            with open(prov_path) as fh:
+                record = json.load(fh)
+            recorded_source = record["source"]
+            recorded_target = record["target"]
+            source_stat = self._stat_stamp(source)
+            target_stat = self._stat_stamp(target)
+            return (
+                recorded_source.get("path") == str(source.resolve())
+                and recorded_source.get("size") == source_stat["size"]
+                and recorded_source.get("mtime_ns") == source_stat["mtime_ns"]
+                and recorded_target.get("size") == target_stat["size"]
+                and recorded_target.get("mtime_ns") == target_stat["mtime_ns"]
+            )
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log.warning(f"Could not read provenance sidecar {prov_path}: {e}")
+            return False
 
     @staticmethod
     def _netcdf_format(path: Path) -> Optional[str]:

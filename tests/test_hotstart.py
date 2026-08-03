@@ -1,17 +1,21 @@
 """Tests for HotstartProcessor."""
 
+import os
 import shutil
 from pathlib import Path
 
 import pytest
 
 from nos_utils.config import ForcingConfig
-from nos_utils.forcing.hotstart import HotstartProcessor, HotstartInfo
+from nos_utils.forcing.hotstart import (
+    HotstartProcessor, HotstartInfo, HotstartStagingError,
+)
 
 netCDF4 = pytest.importorskip("netCDF4")
 
 
-def _make_rst(path: Path, fmt: str = "NETCDF4", time_seconds: float = 21600.0):
+def _make_rst(path: Path, fmt: str = "NETCDF4", time_seconds: float = 21600.0,
+              eta2: float = 0.0):
     """Write a minimal SCHISM-shaped restart file in the given NetCDF format."""
     path.parent.mkdir(parents=True, exist_ok=True)
     ds = netCDF4.Dataset(str(path), "w", format=fmt)
@@ -22,7 +26,7 @@ def _make_rst(path: Path, fmt: str = "NETCDF4", time_seconds: float = 21600.0):
     iths = ds.createVariable("iths", "i4")
     iths[:] = 180
     eta = ds.createVariable("eta2", "f8", ("node",))
-    eta[:] = 0.0
+    eta[:] = eta2
     ds.test_marker = "rst-from-test"
     ds.close()
 
@@ -445,7 +449,10 @@ class TestStageInitPreservesSeededInit:
 
         # Operator hand-seeds the cold-start rest-state init. time_seconds
         # is the distinguishing marker: the seed's content must survive.
-        _make_rst(target, time_seconds=0.0)
+        # NETCDF4_CLASSIC so this test isolates the PRESERVE/overwrite
+        # behavior from the separate format-failure path covered by
+        # test_preserved_seed_non_classic_format_raises below.
+        _make_rst(target, fmt="NETCDF4_CLASSIC", time_seconds=0.0)
         seeded_mtime = target.stat().st_mtime
         seeded_size = target.stat().st_size
 
@@ -488,7 +495,9 @@ class TestStageInitPreservesSeededInit:
         comout_root = tmp_path / "com" / "nos"
         target_dir = comout_root / f"{run}.20260802"
         target = target_dir / f"{run}.t12z.20260802.init.nowcast.nc"
-        _make_rst(target, time_seconds=0.0)
+        # NETCDF4_CLASSIC -- isolates the preserve/warnings-plumbing
+        # behavior from the separate format-failure path.
+        _make_rst(target, fmt="NETCDF4_CLASSIC", time_seconds=0.0)
         _make_rst(
             comout_root / f"{run}.20260730" /
             f"{run}.t00z.20260730.rst.nowcast.nc",
@@ -621,14 +630,20 @@ class TestStageInitPreservesSeededInit:
             for r in caplog.records
         ), "expected a warning about re-staging the unreadable target"
 
-    def test_preserved_seed_non_classic_format_errors(self, tmp_path, caplog):
+    def test_preserved_seed_non_classic_format_raises(self, tmp_path, caplog):
         """A preserved operator seed that is HDF5 (NETCDF4) rather than
-        NETCDF4_CLASSIC must ERROR loudly: SCHISM's parallel-IO staging
+        NETCDF4_CLASSIC must FAIL PREP, not merely log an ERROR and
+        continue (round-2 review finding 2): SCHISM's parallel-IO staging
         requires classic and segfaults at rank scale on HDF5
         (ush/nos_run.sh archives rst.nowcast.nc as HDF5, so `cp rst ->
-        init` is a realistic operator mistake). The seed is still
-        preserved -- never destroyed -- but the ERROR must name the actual
-        format and also reach the caller's warnings list."""
+        init` is a realistic operator mistake). Letting prep report green
+        here meant SCHISM launched at rank scale with a seed the code
+        already knew would fail. The seed is still preserved -- never
+        destroyed -- but stage_init_to_comout must now raise
+        HotstartStagingError instead of returning normally, and the ERROR
+        log record plus the warnings-list entry (both consumed by the
+        orchestrator's ForcingResult.warnings) must still be produced
+        before the raise."""
         run = "stofs_3d_ak_ufs"
         comout_root = tmp_path / "com" / "nos"
         target_dir = comout_root / f"{run}.20260802"
@@ -646,13 +661,17 @@ class TestStageInitPreservesSeededInit:
 
         warnings: list = []
         with caplog.at_level("WARNING", logger="nos_utils.forcing.hotstart"):
-            staged = proc.stage_init_to_comout(
-                target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
-                warnings=warnings,
-            )
+            with pytest.raises(HotstartStagingError) as excinfo:
+                proc.stage_init_to_comout(
+                    target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
+                    warnings=warnings,
+                )
 
-        assert staged == target
-        # Seed itself must be untouched -- still HDF5, not converted.
+        assert "NETCDF4" in str(excinfo.value)
+        assert "NETCDF4_CLASSIC" in str(excinfo.value)
+
+        # Seed itself must be untouched -- still HDF5, not converted, not
+        # deleted, not overwritten.
         with netCDF4.Dataset(str(target)) as ds:
             assert ds.file_format == "NETCDF4"
 
@@ -664,6 +683,194 @@ class TestStageInitPreservesSeededInit:
         assert any(
             "NETCDF4_CLASSIC" in w for w in warnings
         ), "the format ERROR message must also land in the warnings list"
+
+
+class TestStageInitProvenanceIdentity:
+    """Round-2 review, finding 1: replace the weak scalar time/iths
+    identity test in stage_init_to_comout with a provenance sidecar.
+
+    Every daily ihot=1 restart carries IDENTICAL time/iths scalars --
+    SCHISM always relabels the restart to the same time_hotstart anchor
+    regardless of the restart's actual content -- so comparing only those
+    two scalars misclassifies a genuinely different ocean state as an
+    "identical restage". Worse, the old `elif same:` early return
+    bypassed the NETCDF4_CLASSIC format check entirely, so a non-CLASSIC
+    target with matching scalars returned silently.
+
+    The fix: `stage_init_to_comout` writes a `<target>.provenance.json`
+    sidecar (temp+os.replace) whenever it is the one that wrote `target`,
+    recording the source restart's (path, size, mtime_ns) AND target's
+    own post-write (size, mtime_ns). A LATER call is only an "identical
+    restage" when the sidecar exists, parses, and both stamps match the
+    CURRENT source/target exactly.
+    """
+
+    def test_matching_scalars_different_eta2_no_sidecar_is_preserved(
+        self, tmp_path, caplog,
+    ):
+        """Reviewer repro: target time=21600/iths=180/eta2=0 vs a
+        candidate source restart with the SAME time=21600/iths=180 but
+        eta2=1 -- a genuinely different ocean state that the old scalar
+        compare would have called "identical" (INFO, no warning). With no
+        provenance sidecar for this target, it must NOT be treated as an
+        identical restage: WARNING fired, seed preserved untouched.
+        NETCDF4_CLASSIC is used for the target so this isolates the
+        identity logic from the separate format-failure path.
+        """
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        target = target_dir / f"{run}.t12z.20260802.init.nowcast.nc"
+
+        _make_rst(target, fmt="NETCDF4_CLASSIC", time_seconds=21600.0, eta2=0.0)
+        _make_rst(
+            comout_root / f"{run}.20260730" /
+            f"{run}.t00z.20260730.rst.nowcast.nc",
+            time_seconds=21600.0, eta2=1.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=12)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+
+        warnings: list = []
+        with caplog.at_level("WARNING", logger="nos_utils.forcing.hotstart"):
+            staged = proc.stage_init_to_comout(
+                target_dir, f"{run}.t12z.20260802.init.nowcast.nc",
+                warnings=warnings,
+            )
+
+        assert staged == target
+        assert warnings, "matching scalars with no sidecar must still warn, not go silent"
+        assert any("PRESERVED" in w for w in warnings)
+        with netCDF4.Dataset(str(target)) as ds:
+            assert float(ds.variables["eta2"][:][0]) == 0.0, "target must be untouched"
+
+    def test_normal_two_phase_restage_uses_sidecar(self, tmp_path, caplog):
+        """The ordinary nowcast-then-forecast double call: phase 1 writes
+        target + sidecar from `source`; phase 2 finds the same source
+        (untouched) and the same target (untouched) and must classify
+        that as identical via the sidecar -- INFO, no warning, no
+        exception."""
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        _make_rst(
+            comout_root / f"{run}.20260801" /
+            f"{run}.t18z.20260801.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=0)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+        init_filename = f"{run}.t00z.20260802.init.nowcast.nc"
+
+        warnings: list = []
+        first = proc.stage_init_to_comout(
+            target_dir, init_filename, warnings=warnings,
+        )
+        assert first is not None
+        sidecar = first.with_name(first.name + ".provenance.json")
+        assert sidecar.exists(), "stage must write a provenance sidecar next to the target"
+
+        caplog.clear()
+        with caplog.at_level("INFO", logger="nos_utils.forcing.hotstart"):
+            second = proc.stage_init_to_comout(
+                target_dir, init_filename, warnings=warnings,
+            )
+
+        assert second == first
+        assert warnings == [], (
+            "a sidecar-matched restage must not append anything to the "
+            "caller's warnings list"
+        )
+        assert not any(
+            r.levelname == "WARNING" and "PRESERVED" in r.message
+            for r in caplog.records
+        )
+        assert any(
+            r.levelname == "INFO" and "already staged" in r.message
+            for r in caplog.records
+        )
+
+    def test_operator_overwrite_after_stage_breaks_sidecar_match(
+        self, tmp_path, caplog,
+    ):
+        """An operator touching/replacing the staged target after phase 1
+        must NOT be silently treated as identical just because the
+        source restart is unchanged: the sidecar's recorded TARGET stamp
+        no longer matches the target's current stat, so the preserve/
+        WARNING path must fire instead of the silent INFO path."""
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        _make_rst(
+            comout_root / f"{run}.20260801" /
+            f"{run}.t18z.20260801.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=0)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+        init_filename = f"{run}.t00z.20260802.init.nowcast.nc"
+
+        first = proc.stage_init_to_comout(target_dir, init_filename)
+        assert first is not None
+        target = first
+
+        # Operator touches the staged target well after staging -- content
+        # stays valid NETCDF4_CLASSIC, only the mtime changes, but that's
+        # enough to break the sidecar's recorded target stamp.
+        st = target.stat()
+        os.utime(target, (st.st_atime, st.st_mtime + 3600))
+
+        warnings: list = []
+        with caplog.at_level("WARNING", logger="nos_utils.forcing.hotstart"):
+            second = proc.stage_init_to_comout(
+                target_dir, init_filename, warnings=warnings,
+            )
+
+        assert second == target
+        assert warnings, "operator-touched target must not silently match the sidecar"
+        assert any("PRESERVED" in w for w in warnings)
+
+    def test_sidecar_not_matched_by_hotstart_discovery_globs(self, tmp_path):
+        """The provenance sidecar must never be discoverable as a
+        candidate hotstart/restart file by find_input_files -- verified
+        against the actual glob patterns, not assumed."""
+        import fnmatch
+
+        run = "stofs_3d_ak_ufs"
+        comout_root = tmp_path / "com" / "nos"
+        target_dir = comout_root / f"{run}.20260802"
+        _make_rst(
+            comout_root / f"{run}.20260801" /
+            f"{run}.t18z.20260801.rst.nowcast.nc",
+            time_seconds=21600.0,
+        )
+
+        cfg = ForcingConfig.for_secofs(pdy="20260802", cyc=0)
+        proc = HotstartProcessor(cfg, comout_root, tmp_path / "out", run_name=run)
+        init_filename = f"{run}.t00z.20260802.init.nowcast.nc"
+        staged = proc.stage_init_to_comout(target_dir, init_filename)
+        assert staged is not None
+        sidecar = staged.with_name(staged.name + ".provenance.json")
+        assert sidecar.exists()
+
+        for pattern in [
+            "hotstart*.nc",
+            f"{run}*hotstart*.nc",
+            f"{run}*.rst.nowcast.nc",
+            f"{run}*.init.nowcast.nc",
+            f"{run}*restart*.nc",
+        ]:
+            assert not fnmatch.fnmatch(sidecar.name, pattern), (
+                f"sidecar {sidecar.name} must not match discovery pattern {pattern}"
+            )
+
+        # Belt-and-suspenders: it must not actually turn up as a
+        # candidate from the real discovery walk either.
+        candidates = proc.find_input_files()
+        assert sidecar not in candidates
 
 
 class TestSearchRootFromCycleLeaf:
