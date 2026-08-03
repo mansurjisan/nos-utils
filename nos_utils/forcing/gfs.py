@@ -147,11 +147,12 @@ class GFSProcessor(ForcingProcessor):
             # Otherwise CDEPS aborts with
             #   (shr_stream_findBounds) ERROR: rDateIn lt rDatelvd limit true
             #
-            # No additional 3h buffer here: _compute_search_cycles only walks
-            # back to prev cycle (cycle - 6h), so requesting earlier data is
-            # an empty promise. The CDEPS check is strict `<`, so first record
-            # at exactly cycle-nowcast_hours equals SCHISM start time and the
-            # check passes (rDateIn < rDatelvd is false on equality).
+            # No additional 3h buffer here: _compute_search_cycles now walks
+            # back to cycle - nowcast_hours, so the earliest record needed is
+            # already covered by the oldest cycle searched. The CDEPS check
+            # is strict `<`, so first record at exactly cycle-nowcast_hours
+            # equals SCHISM start time and the check passes (rDateIn <
+            # rDatelvd is false on equality).
             if self.config.nws == 4:
                 t_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
             else:
@@ -256,7 +257,9 @@ class GFSProcessor(ForcingProcessor):
         order = sorted(range(len(parsed)), key=lambda i: parsed[i][0])
 
         # Keep first occurrence per valid time (matches _extract_all dedup:
-        # earliest in original list order — i.e. oldest cycle — wins).
+        # earliest in original list order wins -- oldest cycle first for
+        # nowcast, current/newest cycle first for forecast; see the
+        # ordering _compute_search_cycles returns for each phase).
         seen = {}
         for i in order:
             vt = parsed[i][0]
@@ -539,7 +542,14 @@ class GFSProcessor(ForcingProcessor):
         - Forecast: use ONLY the latest available cycle before cycle time
           (future cycles don't exist yet at runtime — extend with longer leads)
 
-        Returns cycles in chronological order (oldest first).
+        Cycle order matters downstream: _build_file_list preserves this
+        order when it assembles the file list, and the keep-first dedup on
+        duplicate valid times (_select_files_for_window, _extract_all)
+        keeps whichever file appears earliest in that order. Nowcast/full
+        return cycles oldest-first (chronological); forecast returns
+        cycles newest-first (current cycle, then progressively older
+        fallback cycles) so the keep-first dedup prefers the freshest
+        cycle covering each valid time -- see the forecast branch below.
         """
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
         cycle_dt = base_date + timedelta(hours=self.config.cyc)
@@ -563,21 +573,64 @@ class GFSProcessor(ForcingProcessor):
                 t -= timedelta(hours=6)
             cycles.reverse()
         else:
-            # Forecast: single cycle — the latest GFS cycle at or before cycle_dt.
-            # In production at t00z, this is typically the previous cycle (t18z)
-            # since t00z GFS may not be fully available yet.
-            # Use the same cycle as the last nowcast cycle for continuity.
+            # Forecast: the latest GFS cycle at or before cycle_dt, plus
+            # enough earlier fallback cycles to reach back to the
+            # forecast-phase window start.
+            #
+            # For nws=4 (UFS-Coastal/DATM), that start is
+            # cycle_dt - nowcast_hours: the same datm_forcing.nc this build
+            # produces is also read by the nowcast SCHISM execution (see
+            # _get_time_window), so its earliest record must cover
+            # cycle - nowcast_hours or CDEPS aborts with
+            #   (shr_stream_findBounds) ERROR: rDateIn lt rDatelvd limit true
+            # A fixed one-cycle (6h) fallback only covers nowcast_hours <= 6;
+            # for larger nowcast_hours (e.g. STOFS-3D-ATL/PAC at 24h) it left
+            # up to 18h of the nowcast window held-constant at start.
+            # For nws=2 (standalone sflux) the forecast window only needs
+            # the 3h pre-cycle buffer, same as before.
+            if self.config.nws == 4:
+                lookback_start = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+            else:
+                lookback_start = cycle_dt - timedelta(hours=3)
+
             cyc_hour = cycle_dt.hour - (cycle_dt.hour % 6)
             cyc_date = cycle_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            # Current (newest) cycle goes first. _build_file_list walks
+            # `cycles` in order to assemble the discovered file list, and
+            # every searched cycle gets leads out to the same forecast
+            # end (see max_fhr below), so an older cycle's files cover the
+            # same valid times as the current cycle's -- including times
+            # at and after cycle_dt. With the current cycle first, the
+            # keep-first dedup in _select_files_for_window / _extract_all
+            # ("keep first occurrence for each valid time (shortest lead
+            # preferred)") picks the current cycle for every valid time it
+            # has, and falls back to progressively older cycles only for
+            # the pre-cycle nowcast-overlap hours the current cycle can't
+            # reach. Emitting older cycles first (as before) let a stale
+            # cycle's long lead win valid times the current cycle already
+            # covers -- e.g. the entire forecast window being served from
+            # yesterday's data instead of today's.
             cycles = [(cyc_date, cyc_hour)]
 
-            # Also include the previous cycle as fallback
-            prev = cycle_dt - timedelta(hours=6)
-            prev_hour = prev.hour - (prev.hour % 6)
-            prev_date = prev.replace(hour=0, minute=0, second=0, microsecond=0)
-            # Put previous cycle first so it gets searched first;
-            # if current cycle exists, its files will also be found
-            cycles.insert(0, (prev_date, prev_hour))
+            # Walk backward in 6h steps -- mirroring the nowcast branch's
+            # cycle-snapping -- until a cycle's own start time reaches back
+            # to (or past) lookback_start. No extra safety margin beyond
+            # that: the CDEPS bound check is strict "<", so a cycle whose
+            # f000 lands exactly on lookback_start already satisfies it.
+            # This keeps the minimum-nowcast_hours=6 case identical to the
+            # previous fixed "one cycle back" fallback (single extra cycle),
+            # aside from the newest-first ordering above.
+            t = cycle_dt - timedelta(hours=6)
+            while True:
+                prev_hour = t.hour - (t.hour % 6)
+                prev_date = t.replace(hour=0, minute=0, second=0, microsecond=0)
+                # Append progressively older cycles after the current one,
+                # keeping the list newest-first (see comment above `cycles
+                # = [(cyc_date, cyc_hour)]`).
+                cycles.append((prev_date, prev_hour))
+                if prev_date + timedelta(hours=prev_hour) <= lookback_start:
+                    break
+                t -= timedelta(hours=6)
 
         # Deduplicate
         seen = set()
