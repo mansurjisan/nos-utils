@@ -187,6 +187,17 @@ class TestStalenessWarning:
         _make_rst(path)
         return path
 
+    @staticmethod
+    def _init_at(root: Path, run: str, dir_pdy: str, tag_pdy: str, cyc: int) -> Path:
+        """Lay down an init-staged file (stage_init_to_comout's output
+        naming): lives under ``{run}.{dir_pdy}`` but its own filename tag
+        is ``tag_pdy``/``cyc`` — normally the CONSUMING cycle, which may
+        differ from the content's true valid time.
+        """
+        path = root / f"{run}.{dir_pdy}" / f"{run}.t{cyc:02d}z.{tag_pdy}.init.nowcast.nc"
+        _make_rst(path)
+        return path
+
     def test_daily_cadence_warns_evolution_skipped(self, tmp_path):
         """Daily 00z cadence with nowcast_hours=6: only yesterday's 00z
         restart is available, 18h short of the 18z anchor a 6h nowcast
@@ -233,6 +244,59 @@ class TestStalenessWarning:
         assert result.warnings
         msg = " ".join(result.warnings)
         assert "3h will be re-simulated" in msg
+
+    def test_init_staged_restart_is_unverifiable(self, tmp_path):
+        """Reproduces the false negative: stage_init_to_comout copies
+        whatever restart it found for cycle C to a name tagged with C
+        itself, so the name encodes the CONSUMING cycle, not the
+        content's valid time. Here cycle 20260731 06z (nowcast_hours=6)
+        finds only secofs.t00z.20260731.init.nowcast.nc in COMOUT -- its
+        tag happens to parse to 00z, which equals the anchor
+        (06z - 6h), but the underlying content could genuinely be from
+        any earlier cycle (e.g. Jul 30 18z). The old code trusted the
+        name and went silent; it must instead flag the file as
+        unverifiable.
+        """
+        run = "secofs"
+        root = tmp_path / "com" / "nos"
+        self._init_at(root, run, dir_pdy="20260731", tag_pdy="20260731", cyc=0)
+
+        cfg = ForcingConfig.for_secofs(pdy="20260731", cyc=6)
+        proc = HotstartProcessor(cfg, root, tmp_path / "out", run_name=run)
+        result = proc.process()
+
+        assert result.success
+        assert result.warnings, "init-staged restart must be flagged, not silent"
+        msg = " ".join(result.warnings)
+        assert "cannot be verified" in msg
+        assert "init-staged" in msg
+        assert "skipped" not in msg
+
+    def test_init_staged_and_genuine_rst_tie_prefers_rst(self, tmp_path):
+        """When an init-staged copy and a genuine rst.nowcast.nc both
+        parse to the same valid time and both precede the cycle, the
+        rst must win the tie: find_input_files globs the
+        `*.rst.nowcast.nc` pattern before `*.init.nowcast.nc` (COMF vs.
+        init naming, in that literal list order), and _find_hotstart's
+        `scored.sort(..., reverse=True)` is stable, so equal-valid-time
+        candidates keep that discovery order and the rst is scored[0].
+        A genuine restart's name is trustworthy, so selecting it must
+        stay silent (warnings == []).
+        """
+        run = "secofs"
+        root = tmp_path / "com" / "nos"
+        rst = self._restart_at(root, run, "20260731", 0)
+        self._init_at(root, run, dir_pdy="20260731", tag_pdy="20260731", cyc=0)
+
+        cfg = ForcingConfig.for_secofs(pdy="20260731", cyc=6)
+        proc = HotstartProcessor(cfg, root, tmp_path / "out", run_name=run)
+
+        selected = proc._find_hotstart()
+        assert selected == rst, "genuine rst must win the tie over the init copy"
+
+        result = proc.process()
+        assert result.success
+        assert result.warnings == []
 
 
 class TestHotstartInfo:

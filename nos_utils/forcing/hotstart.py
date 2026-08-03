@@ -433,6 +433,19 @@ class HotstartProcessor(ForcingProcessor):
         self._check_staleness(unparsable[0], None, cycle_dt, warnings)
         return unparsable[0]
 
+    @staticmethod
+    def _is_init_staged(filepath: Path) -> bool:
+        """True if ``filepath`` follows the COMF init-staging convention
+        written by :meth:`stage_init_to_comout` and matched by the
+        ``*.init.nowcast.nc`` glob in :meth:`find_input_files`.
+
+        ``stage_init_to_comout`` copies whatever restart it finds for
+        cycle C (valid at C - nowcast_hours) to a name tagged with C
+        itself, so an init-staged file's name encodes the CONSUMING
+        cycle, not the content's valid time.
+        """
+        return filepath.name.endswith(".init.nowcast.nc")
+
     def _check_staleness(
         self,
         hotstart_file: Path,
@@ -446,6 +459,20 @@ class HotstartProcessor(ForcingProcessor):
         between them is silently skipped or re-simulated unless flagged here.
         """
         expected = cycle_dt - timedelta(hours=self.config.nowcast_hours)
+
+        if self._is_init_staged(hotstart_file):
+            msg = (
+                f"Hotstart {hotstart_file.name} is an init-staged copy "
+                f"(stage_init_to_comout renames whatever restart it found "
+                f"to a name tagged with the CONSUMING cycle, not the "
+                f"state's valid time); alignment with the time_hotstart "
+                f"anchor {expected:%Y-%m-%d %H:%M} cannot be verified "
+                f"from the filename"
+            )
+            log.warning(msg)
+            if warnings is not None:
+                warnings.append(msg)
+            return
 
         if file_dt is None:
             msg = (
