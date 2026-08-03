@@ -48,6 +48,14 @@ class TestGFSFileDiscovery:
         so its earliest searched cycle must reach back to cycle - nowcast_hours.
         STOFS-3D-ATL-UFS runs nowcast_hours=24; a fixed 6h-back fallback
         previously left 18h of the window uncovered.
+
+        One cycle further back than window_start is also searched (the
+        "margin cycle"): window_start (2026-08-01 12z) is itself a GFS
+        cycle boundary, and with the fhr-aware dedup in
+        _select_files_for_window / _extract_all, that boundary cycle's own
+        f000 (no DSWRF/DLWRF) is selected only as a last resort -- the
+        margin cycle's non-zero lead gives the dedup a real alternative
+        there. See _compute_search_cycles's forecast-branch comment.
         """
         cfg = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260802", cyc=12)
         proc = GFSProcessor(cfg, Path("/tmp"), Path("/tmp/out"), phase="forecast")
@@ -60,8 +68,9 @@ class TestGFSFileDiscovery:
         assert earliest <= window_start, (
             f"earliest searched cycle {earliest} does not cover window start {window_start}"
         )
-        # Minimum lookback -- not ballooned past what's needed to cover it.
-        assert earliest == window_start
+        # One 6h cycle further back than window_start -- the margin cycle
+        # that supplies a non-f000 candidate exactly at window_start.
+        assert earliest == window_start - timedelta(hours=6)
         # Newest-first: the current cycle must lead the list so downstream
         # keep-first dedup (_select_files_for_window / _extract_all) prefers
         # it over the older fallback cycles for every valid time it covers.
@@ -71,20 +80,29 @@ class TestGFSFileDiscovery:
             (datetime(2026, 8, 2), 0),
             (datetime(2026, 8, 1), 18),
             (datetime(2026, 8, 1), 12),
+            (datetime(2026, 8, 1), 6),
         ]
 
-    def test_compute_search_cycles_forecast_6h_nowcast_same_set_new_order(self):
-        """nowcast_hours=6 (SECOFS-UFS) forecast-phase search still covers
-        just one fallback cycle back (same set as the pre-fix fixed
-        "one cycle back" fallback), but newest-first instead of oldest-first.
+    def test_compute_search_cycles_forecast_6h_nowcast_grows_one_cycle_for_margin(self):
+        """nowcast_hours=6 (SECOFS-UFS) forecast-phase search now covers
+        TWO fallback cycles back (grew from 1 to 2 -- 3 cycles total), and
+        newest-first instead of oldest-first.
 
-        This is a deliberate behavior change, not a regression: the old
-        oldest-first order meant the 06z (older) cycle won the keep-first
-        dedup for every valid time it shared with 12z, so SECOFS-UFS's
-        forecast forcing was silently sourced from 06z. Newest-first makes
-        12z (the current, freshest cycle) win instead -- see
-        test_forecast_freshest_cycle_wins_at_and_after_cycle_time in
+        The newest-first reorder is a deliberate behavior change, not a
+        regression: the old oldest-first order meant the 06z (older) cycle
+        won the keep-first dedup for every valid time it shared with 12z,
+        so SECOFS-UFS's forecast forcing was silently sourced from 06z.
+        Newest-first makes 12z (the current, freshest cycle) win instead --
+        see test_forecast_freshest_cycle_wins_at_and_after_cycle_time in
         TestGFSFreshestCycleWins for the downstream file-selection proof.
+
+        The extra 00z margin cycle is a second, later correction: 06z
+        (window_start, cycle - nowcast_hours) is a GFS cycle boundary, and
+        the fhr-aware dedup in _select_files_for_window / _extract_all
+        selects that boundary cycle's own f000 (no DSWRF/DLWRF) only as a
+        last resort -- 00z's non-zero lead gives the dedup a real
+        alternative there. See TestGFSFreshestCycleWins's dedicated
+        radiation-safe-dedup regression test for the file-selection proof.
         """
         cfg = ForcingConfig.for_secofs_ufs(pdy="20260401", cyc=12)
         proc = GFSProcessor(cfg, Path("/tmp"), Path("/tmp/out"), phase="forecast")
@@ -93,10 +111,19 @@ class TestGFSFileDiscovery:
         assert cycles == [
             (datetime(2026, 4, 1), 12),
             (datetime(2026, 4, 1), 6),
+            (datetime(2026, 4, 1), 0),
         ]
 
     def test_compute_search_cycles_forecast_24h_nowcast_date_boundary(self):
-        """A 24h lookback from a t00z cycle must cross into the previous day."""
+        """A 24h lookback from a t00z cycle must cross into the previous day.
+
+        Includes the margin cycle (one further 6h step past window_start =
+        2026-08-01 00z, itself a cycle boundary) that gives the fhr-aware
+        dedup a non-f000 candidate there -- see
+        test_compute_search_cycles_forecast_24h_nowcast_covers_window_start.
+        The margin cycle pushes the earliest searched cycle back one more
+        day, to 2026-07-31.
+        """
         cfg = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260802", cyc=0)
         proc = GFSProcessor(cfg, Path("/tmp"), Path("/tmp/out"), phase="forecast")
         cycles = proc._compute_search_cycles()
@@ -107,10 +134,11 @@ class TestGFSFileDiscovery:
             (datetime(2026, 8, 1), 12),
             (datetime(2026, 8, 1), 6),
             (datetime(2026, 8, 1), 0),
+            (datetime(2026, 7, 31), 18),
         ]
         # Earliest (last, since newest-first) cycle's date rolled back to
-        # the previous day.
-        assert cycles[-1][0] == datetime(2026, 8, 1)
+        # the day before the previous day.
+        assert cycles[-1][0] == datetime(2026, 7, 31)
 
     def test_compute_search_cycles_forecast_nws2_unaffected_by_nowcast_hours(self):
         """Standalone sflux (nws=2) forecast search doesn't scale with
@@ -259,10 +287,10 @@ class TestGFSFreshestCycleWins:
 
     def test_forecast_freshest_cycle_wins_at_and_after_cycle_time(self, tmp_path):
         """nowcast_hours=24 forecast search (STOFS-3D-ATL-UFS shape):
-        every selected record at or after cycle time must come from the
-        CURRENT cycle; only pre-cycle nowcast-overlap hours may come from
-        older fallback cycles, and they must not all come from the single
-        oldest cycle.
+        every selected record strictly after cycle time must come from the
+        CURRENT cycle; only pre-cycle nowcast-overlap hours (including
+        cycle_dt itself -- see below) may come from older fallback cycles,
+        and they must not all come from the single oldest cycle.
 
         Regression proof: with the forecast branch's cycle order reverted
         to oldest-first (`cycles.insert(0, ...)` instead of
@@ -270,6 +298,13 @@ class TestGFSFreshestCycleWins:
         the oldest searched cycle's long lead wins the keep-first dedup
         for every valid time it covers, including the entire forecast
         window at and after cycle time.
+
+        Exactly AT cycle_dt is a deliberate exception, not covered by the
+        "current cycle wins" rule above: the current cycle's own file
+        there is f000 (fhr=0), which lacks DSWRF/DLWRF (see
+        _extract_all's NaN-fill), so the fhr-aware dedup in
+        _select_files_for_window prefers the previous (08-02 06z) cycle's
+        non-zero lead instead -- proven below.
         """
         pdy, cyc = "20260802", 12
         cfg = ForcingConfig.for_stofs_3d_atl_ufs(pdy=pdy, cyc=cyc)
@@ -283,9 +318,9 @@ class TestGFSFreshestCycleWins:
         probe = GFSProcessor(cfg, tmp_path, tmp_path / "out", phase="forecast")
         cycles = probe._compute_search_cycles()
         assert set(cycles) == {
-            (datetime(2026, 8, 1), 12), (datetime(2026, 8, 1), 18),
-            (datetime(2026, 8, 2), 0), (datetime(2026, 8, 2), 6),
-            (datetime(2026, 8, 2), 12),
+            (datetime(2026, 8, 1), 6), (datetime(2026, 8, 1), 12),
+            (datetime(2026, 8, 1), 18), (datetime(2026, 8, 2), 0),
+            (datetime(2026, 8, 2), 6), (datetime(2026, 8, 2), 12),
         }
 
         # Every cycle gets long leads (40h) so its files overlap valid
@@ -301,15 +336,30 @@ class TestGFSFreshestCycleWins:
         selected = proc._select_files_for_window(discovered)
         assert selected, "no files survived selection"
 
-        at_or_after = [f for f in selected if proc._parse_valid_time(f) >= cycle_dt]
-        assert at_or_after, "expected some records at/after cycle time"
-        for f in at_or_after:
+        # Strictly after cycle_dt: current cycle's own lead there is
+        # fhr > 0, so it wins on both the pre-existing (recency) and the
+        # new (fhr > 0 preferred) tie-break -- unaffected by this round's
+        # dedup change.
+        after = [f for f in selected if proc._parse_valid_time(f) > cycle_dt]
+        assert after, "expected some records after cycle time"
+        for f in after:
             source_cycle = self._source_cycle(f)
             vt = proc._parse_valid_time(f)
             assert source_cycle == current_cycle, (
-                f"valid time {vt} (>= cycle time {cycle_dt}) sourced from "
+                f"valid time {vt} (> cycle time {cycle_dt}) sourced from "
                 f"{source_cycle} instead of the current cycle {current_cycle}"
             )
+
+        # Exactly at cycle_dt: the current cycle's own file is f000: the
+        # dedup must reject it and prefer the previous cycle's fhr=6 file.
+        at_cycle_dt = [f for f in selected if proc._parse_valid_time(f) == cycle_dt]
+        assert len(at_cycle_dt) == 1
+        winner_at_cycle_dt = at_cycle_dt[0]
+        assert proc._parse_fhr(winner_at_cycle_dt) == 6, (
+            "expected the previous (08-02 06z) cycle's fhr=6 file to win "
+            "exactly at cycle_dt, not the current cycle's own f000"
+        )
+        assert self._source_cycle(winner_at_cycle_dt) == (datetime(2026, 8, 2), 6)
 
         pre_cycle = [
             (proc._parse_valid_time(f), self._source_cycle(f))
@@ -320,3 +370,62 @@ class TestGFSFreshestCycleWins:
             "all pre-cycle records sourced from the single oldest cycle -- "
             "freshest-wins dedup is not taking effect"
         )
+
+    def test_f000_never_wins_a_valid_time_another_cycle_covers(self, tmp_path):
+        """Dedicated regression for the radiation-safe dedup: an f000
+        analysis (no DSWRF/DLWRF -- the GFS extractor NaN-fills them, and
+        the blender then zero/mean-substitutes the resulting all-NaN slab)
+        must never win a valid time some other searched cycle also covers
+        with a real (fhr > 0) lead.
+
+        Uses the SECOFS-UFS (nowcast_hours=6) forecast-phase shape, whose
+        search now covers 3 cycles -- 12z (current), 06z, and the new 00z
+        margin cycle (see _compute_search_cycles) -- to exercise BOTH
+        cycle-boundary hours in the window in one fabricated layout:
+
+          - right edge (cycle_dt = 12z): the current cycle's own f000
+            coincides with the previous (06z) cycle's f006 at the same
+            valid time -- f006 must win.
+          - left edge (window_start = 06z, == cycle - nowcast_hours): only
+            the 00z margin cycle's f006 supplies a non-f000 candidate
+            there -- without the margin cycle this valid time would have
+            no fhr > 0 alternative at all.
+        """
+        pdy, cyc = "20260401", 12
+        cfg = ForcingConfig.for_secofs_ufs(pdy=pdy, cyc=cyc)
+        cycle_dt = datetime(2026, 4, 1, 12)
+        window_start = cycle_dt - timedelta(hours=cfg.nowcast_hours)  # 06z
+
+        probe = GFSProcessor(cfg, tmp_path, tmp_path / "out", phase="forecast")
+        cycles = probe._compute_search_cycles()
+        assert cycles == [
+            (datetime(2026, 4, 1), 12),
+            (datetime(2026, 4, 1), 6),
+            (datetime(2026, 4, 1), 0),
+        ]
+
+        # 18h leads are enough for every cycle to reach both boundary hours.
+        gfs_root = self._make_forecast_multicycle_dir(tmp_path, cycles, 18)
+        proc = GFSProcessor(cfg, gfs_root, tmp_path / "out", phase="forecast")
+        proc.MIN_FILE_SIZE = 0  # mock files are tiny
+
+        discovered = proc.find_input_files()
+        selected = proc._select_files_for_window(discovered)
+        by_vt = {proc._parse_valid_time(f): f for f in selected}
+
+        # Right edge: current cycle's f000 loses to the 06z cycle's f006.
+        # Selection-level proxy for "radiation is finite": f000 is the
+        # GFS lead documented to lack DSWRF/DLWRF (gfs.py's GRIB2_VARIABLES
+        # / _extract_all NaN-fill comment), so a selected file with
+        # fhr > 0 is guaranteed to carry real (non-NaN) radiation records;
+        # asserting fhr > 0 here is used in place of a full extraction
+        # because no real wgrib2/GRIB2 data is available in this unit test.
+        winner_at_cycle_dt = by_vt[cycle_dt]
+        assert proc._parse_fhr(winner_at_cycle_dt) == 6
+        assert self._source_cycle(winner_at_cycle_dt) == (datetime(2026, 4, 1), 6)
+
+        # Left edge: only the 00z margin cycle's f006 is a non-f000
+        # candidate at window_start.
+        winner_at_window_start = by_vt[window_start]
+        assert proc._parse_fhr(winner_at_window_start) == 6
+        assert self._source_cycle(winner_at_window_start) == (datetime(2026, 4, 1), 0)

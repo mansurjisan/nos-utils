@@ -225,6 +225,23 @@ class GFSProcessor(ForcingProcessor):
         except (ValueError, IndexError):
             return None
 
+    def _parse_fhr(self, gfs_file: Path) -> Optional[int]:
+        """Parse the forecast lead hour of a GFS file from its name.
+
+        Same fhr extraction ``_parse_valid_time`` performs internally
+        (``gfs_file.name.split(".f")[-1]``), factored out so the dedup
+        preference below can be computed without re-deriving the valid
+        time. Used to never let an f000 analysis -- which the GFS
+        extractor NaN-fills DSWRF/DLWRF for, since f000 is an analysis
+        record and carries no radiation fields (see ``_extract_all``) --
+        win a valid time some other searched cycle also covers with a
+        real (fhr > 0) forecast lead.
+        """
+        try:
+            return int(gfs_file.name.split(".f")[-1])
+        except (ValueError, IndexError):
+            return None
+
     def _select_files_for_window(self, gfs_files: List[Path]) -> List[Path]:
         """Prune the discovered file list to exactly what reaches output.
 
@@ -237,10 +254,20 @@ class GFSProcessor(ForcingProcessor):
         instead of being fully decoded and then discarded.
 
         Parity: input order is preserved from ``find_input_files``; Python's
-        ``sorted`` is stable, so for a repeated valid time the file earliest
-        in list order wins — identical to the old keep-first dedup. The
-        window bounds come from the same ``_get_time_window``. The surviving
-        (valid_time -> file) set is therefore byte-identical to before.
+        ``sorted`` is stable, so for a repeated valid time the candidates
+        keep their original relative order. The window bounds come from the
+        same ``_get_time_window``.
+
+        Dedup preference: a file with a real forecast lead (fhr > 0) always
+        wins a valid time over an f000 analysis, because f000 lacks
+        DSWRF/DLWRF and the extractor NaN-fills them (see ``_extract_all``,
+        which then get zero/mean-substituted downstream by the blender). An
+        f000 file is selected for a valid time only when it is the SOLE
+        candidate there. Within each preference tier, first occurrence in
+        list order still wins -- oldest cycle first for nowcast, newest
+        cycle first for forecast; see the ordering _compute_search_cycles
+        returns for each phase. Keep this in sync with _extract_all's
+        mirror dedup below.
         """
         parsed = []
         for f in gfs_files:
@@ -256,15 +283,23 @@ class GFSProcessor(ForcingProcessor):
         # Stable sort by valid time (matches _extract_all's sort).
         order = sorted(range(len(parsed)), key=lambda i: parsed[i][0])
 
-        # Keep first occurrence per valid time (matches _extract_all dedup:
-        # earliest in original list order wins -- oldest cycle first for
-        # nowcast, current/newest cycle first for forecast; see the
-        # ordering _compute_search_cycles returns for each phase).
-        seen = {}
+        # Two-pass keep-first dedup per valid time. Pass 1: only consider
+        # candidates with a real forecast lead (fhr > 0); first occurrence
+        # in list order wins, same tie-break as before. Pass 2: for any
+        # valid time still unresolved (every candidate is f000 -- it is the
+        # sole candidate there), fall back to first occurrence overall.
+        seen: Dict[datetime, int] = {}
+        for i in order:
+            vt, f = parsed[i]
+            if vt in seen:
+                continue
+            fhr = self._parse_fhr(f)
+            if fhr is not None and fhr > 0:
+                seen[vt] = i
         for i in order:
             vt = parsed[i][0]
             if vt not in seen:
-                seen[vt] = i
+                seen[vt] = i  # sole candidate for this valid time -- f000 accepted as last resort
         unique_idx = sorted(seen.values())
 
         # Phase time-window filter (matches _filter_to_time_window bounds).
@@ -559,6 +594,15 @@ class GFSProcessor(ForcingProcessor):
             # to cover nowcast window with +3h buffer (matches CDEPS DATM
             # interpolation requirements; missing buffer hours show up as
             # 6 missing timesteps in datm_forcing.nc — 3 at each end).
+            #
+            # No separate f000-radiation margin cycle is needed here (unlike
+            # the forecast branch below): the `- timedelta(hours=6)` slack
+            # already baked into the loop condition below walks one 6h
+            # cycle past nowcast_start on its own, and because this branch
+            # emits oldest-first, that margin cycle's non-zero lead already
+            # sits ahead of the window-start cycle's own f000 in dedup
+            # priority -- the sole-candidate f000 case the forecast branch's
+            # margin cycle guards against cannot arise here.
             nowcast_start = (
                 cycle_dt
                 - timedelta(hours=self.config.nowcast_hours)
@@ -614,12 +658,37 @@ class GFSProcessor(ForcingProcessor):
 
             # Walk backward in 6h steps -- mirroring the nowcast branch's
             # cycle-snapping -- until a cycle's own start time reaches back
-            # to (or past) lookback_start. No extra safety margin beyond
-            # that: the CDEPS bound check is strict "<", so a cycle whose
-            # f000 lands exactly on lookback_start already satisfies it.
-            # This keeps the minimum-nowcast_hours=6 case identical to the
-            # previous fixed "one cycle back" fallback (single extra cycle),
-            # aside from the newest-first ordering above.
+            # to (or past) lookback_start.
+            #
+            # nws=4 only: once that point is reached, take ONE further 6h
+            # step back (margin_cycles below). lookback_start is itself a
+            # GFS cycle boundary (cycle - nowcast_hours, both always
+            # multiples of 6h), and _select_files_for_window /
+            # _extract_all's dedup now prefers a file with a real forecast
+            # lead (fhr > 0) over an f000 analysis -- f000 lacks
+            # DSWRF/DLWRF (see _extract_all). Without a cycle older than
+            # lookback_start's own cycle, that cycle's f000 is the SOLE
+            # candidate at lookback_start and gets selected as the
+            # last-resort f000 case, feeding NaN-filled (then
+            # zero/mean-substituted by the blender) radiation into the
+            # window's own left edge. The margin cycle's non-zero lead at
+            # that valid time gives the dedup a real alternative. This is
+            # a strict requirement now, not just a nice-to-have: previously
+            # (oldest-first order, no fhr preference) a margin cycle here
+            # would have let a stale cycle's long lead win the *entire*
+            # window, which is why one was deliberately not added; under
+            # newest-first plus the fhr-aware dedup that risk is gone --
+            # the margin cycle can only ever win the single valid time at
+            # lookback_start, nothing past it.
+            #
+            # nws=2 (standalone sflux): no margin cycle. Its window start
+            # (cycle - 3h buffer) is never a GFS cycle boundary (cyc is
+            # always a multiple of 6h), so no searched cycle's f000 lands
+            # exactly on it and the sole-candidate case above cannot arise.
+            # This keeps the nws=2 / minimum-nowcast_hours=6 (nws=4) cases'
+            # cycle count matching the previous fixed "one cycle back"
+            # fallback except where noted above.
+            margin_cycles = 1 if self.config.nws == 4 else 0
             t = cycle_dt - timedelta(hours=6)
             while True:
                 prev_hour = t.hour - (t.hour % 6)
@@ -629,6 +698,10 @@ class GFSProcessor(ForcingProcessor):
                 # = [(cyc_date, cyc_hour)]`).
                 cycles.append((prev_date, prev_hour))
                 if prev_date + timedelta(hours=prev_hour) <= lookback_start:
+                    if margin_cycles > 0:
+                        margin_cycles -= 1
+                        t -= timedelta(hours=6)
+                        continue
                     break
                 t -= timedelta(hours=6)
 
@@ -662,6 +735,12 @@ class GFSProcessor(ForcingProcessor):
             if var in self.GRIB2_VARIABLES
         ]
 
+        # Forecast lead hour per kept file, aligned 1:1 with result["times"]
+        # (appended only when valid_time parses, same guard as below).
+        # Feeds the fhr-aware dedup preference after the sort below --
+        # keep in sync with _select_files_for_window's mirror dedup.
+        fhrs: List[Optional[int]] = []
+
         for gfs_file in gfs_files:
             # Compute valid time from filename (same parser as the
             # pre-extraction selection — parity by construction).
@@ -671,6 +750,7 @@ class GFSProcessor(ForcingProcessor):
                 continue
 
             result["times"].append(valid_time)
+            fhrs.append(self._parse_fhr(gfs_file))
 
             # One wgrib2 pass extracts every variable for this file. The
             # records, levels and arrays are identical to the previous
@@ -700,6 +780,7 @@ class GFSProcessor(ForcingProcessor):
         if result["times"]:
             sorted_idx = sorted(range(len(result["times"])), key=lambda i: result["times"][i])
             result["times"] = [result["times"][i] for i in sorted_idx]
+            fhrs = [fhrs[i] for i in sorted_idx]
             for var in result["data"]:
                 if result["data"][var]:
                     # All data arrays must be same length as times (NaN-filled for missing)
@@ -710,11 +791,24 @@ class GFSProcessor(ForcingProcessor):
                     else:
                         log.warning(f"{var}: data length {n_data} != times {n_times}, skipping sort")
 
-            # Deduplicate: keep first occurrence for each valid time (shortest lead preferred)
-            seen_times = {}
+            # Deduplicate: keep first occurrence for each valid time (shortest
+            # lead preferred), but never let an f000 analysis win a valid
+            # time some other cycle also covers with a real (fhr > 0) lead
+            # -- f000 lacks DSWRF/DLWRF and was NaN-filled above. Mirrors
+            # _select_files_for_window's dedup; keep both in sync. Pass 1:
+            # only fhr > 0 candidates, first occurrence wins. Pass 2: fill
+            # in any valid time left over (every candidate there is f000 --
+            # it is the sole candidate) with its first occurrence.
+            seen_times: Dict[datetime, int] = {}
+            for i, t in enumerate(result["times"]):
+                if t in seen_times:
+                    continue
+                fhr = fhrs[i]
+                if fhr is not None and fhr > 0:
+                    seen_times[t] = i
             for i, t in enumerate(result["times"]):
                 if t not in seen_times:
-                    seen_times[t] = i
+                    seen_times[t] = i  # sole candidate for this valid time -- f000 accepted as last resort
             unique_idx = sorted(seen_times.values())
 
             if len(unique_idx) < len(result["times"]):
