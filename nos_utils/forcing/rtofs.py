@@ -829,14 +829,45 @@ class RTOFSProcessor(ForcingProcessor):
         for t in range(nt):
             ssh_var[t] = all_ssh[t]
 
-        # Also write surf_el (scaled format expected by Fortran)
-        surf_el = nc.createVariable("surf_el", "f4", ("time", "ylat", "xlon"),
-                                    fill_value=-30000.0)
-        surf_el.scale_factor = 0.001
+        # surf_el: explicitly packed int16 format expected by Fortran
+        # gen_3Dth_from_hycom, which reads raw via nf90_get_var (auto-converts
+        # i2->f4, no scale/offset applied) then manually unpacks:
+        #   ssh = ssh * 1.e-3   (scale=0.001, add_offset=0)
+        # Mirrors operational rtofs/cvtZ.nco: surf_el=(ssh-0.)/0.001.
+        #
+        # int16 storage halves file size vs float32; packed value range for
+        # typical SSH (±5 m -> ±5000) fits well within int16 (±32767).
+        # fill value -30000 also fits (int16 min = -32768).
+        #
+        # We pack explicitly and disable auto mask-and-scale to prevent
+        # netCDF4 from re-applying scale_factor on write (double-pack).
+        # See test_ssh_packing_double_pack.py (demonstrates the double-pack
+        # failure) and test_nc_packing.py (pins the fix).
+        #
+        # Masked/extreme cells (|ssh| >= 10000 m) stored as fill -30000:
+        # Fortran unpack: -30000 * 1.e-3 = -30.0 m < rjunk+0.1 (-9.9 m)
+        # -> correctly flagged dry.  Prior code used -3000 -> -3.0 m (wet).
+        # Matches operational: 'where(ssh>10000) ssh=-30000' before packing.
+        _SSH_FILL_I2 = np.int16(-30000)
+        surf_el = nc.createVariable(
+            "surf_el", "i2", ("time", "ylat", "xlon"),
+            fill_value=_SSH_FILL_I2,
+        )
+        surf_el.set_auto_maskandscale(False)
+        surf_el.scale_factor = np.float32(0.001)
+        surf_el.add_offset = np.float32(0.0)
+        surf_el.missing_value = _SSH_FILL_I2
         for t in range(nt):
-            data = all_ssh[t].copy()
-            data = np.where(np.abs(data) < 10000, data * 1000.0, -3000.0)
-            surf_el[t] = data
+            real = np.asarray(all_ssh[t], dtype=np.float32)
+            # Explicit pack using the variable's own declared attrs:
+            #   stored = round((real - add_offset) / scale_factor)
+            # Clip to int16 range; mask extreme cells with fill.
+            packed = np.clip(
+                np.round((real - surf_el.add_offset) / surf_el.scale_factor),
+                np.iinfo(np.int16).min, np.iinfo(np.int16).max,
+            )
+            packed = np.where(np.abs(real) >= 10000, int(_SSH_FILL_I2), packed)
+            surf_el[t] = packed.astype(np.int16)
 
         nc.close()
         log.info(f"Created SSH_1.nc: {nt} times, {ny}x{nx} grid")
@@ -921,11 +952,48 @@ class RTOFSProcessor(ForcingProcessor):
         lat_var = nc.createVariable("ylat", "f4", ("ylat", "xlon"))
         lat_var[:] = all_lat
 
-        for name, data_list in [("temperature", all_temp), ("salinity", all_salt),
-                                ("water_u", all_u), ("water_v", all_v)]:
-            var = nc.createVariable(name, "f4", ("time", "lev", "ylat", "xlon"))
+        # Pack T/S/U/V explicitly as int16, matching operational NCO converters
+        # (rtofs/cvtST.nco, cvtUV.nco) and the Fortran manual unpack:
+        #   salt=salt*1.e-3+20; temp=temp*1.e-3+20; uvel/vvel=*1.e-3
+        # (stofs_3d_{atl,pac}_gen_3Dth_from_hycom.f90).
+        #
+        # int16 storage halves file size vs float32; packed value ranges:
+        #   T/S: (0-40 C/PSU - 20) / 0.001 = -20000..20000   fits i2
+        #   u/v: (-10..10 m/s)     / 0.001 = -10000..10000   fits i2
+        #   fill -30000                                        fits i2
+        #
+        # set_auto_maskandscale(False) prevents netCDF4 re-applying scale_factor
+        # on write (double-pack).  scale_factor/add_offset attrs are preserved
+        # for tools that auto-unpack on read (xarray, ncdump -C).
+        _TSUV_FILL_I2 = np.int16(-30000)
+        _pack_spec = [
+            # (varname,   data_list,  add_offset, scale_factor, fill_real)
+            ("temperature", all_temp, 20.0,  0.001, -30000.0),
+            ("salinity",    all_salt, 20.0,  0.001, -30000.0),
+            ("water_u",     all_u,     0.0,  0.001,  0.0),
+            ("water_v",     all_v,     0.0,  0.001,  0.0),
+        ]
+        for vname, data_list, add_offset, scale_factor, fill_real in _pack_spec:
+            var = nc.createVariable(
+                vname, "i2", ("time", "lev", "ylat", "xlon"),
+                fill_value=_TSUV_FILL_I2,
+            )
+            var.set_auto_maskandscale(False)
+            var.scale_factor = np.float32(scale_factor)
+            var.add_offset   = np.float32(add_offset)
+            var.missing_value = _TSUV_FILL_I2
             for t in range(nt):
-                var[t] = data_list[t]
+                real = np.asarray(data_list[t], dtype=np.float32)
+                # Explicit pack using the variable's own declared attrs:
+                #   stored = round((real - add_offset) / scale_factor)
+                # Preserve fill cells (originally fill_real from ma.filled above).
+                is_fill = np.abs(real - fill_real) < 1e-3
+                packed = np.clip(
+                    np.round((real - var.add_offset) / var.scale_factor),
+                    np.iinfo(np.int16).min, np.iinfo(np.int16).max,
+                )
+                packed = np.where(is_fill, int(_TSUV_FILL_I2), packed)
+                var[t] = packed.astype(np.int16)
 
         nc.close()
         log.info(f"Created TSUV_1.nc: {nt} times, {nz} levels, {ny}x{nx} grid")
