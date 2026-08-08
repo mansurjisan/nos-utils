@@ -1,12 +1,28 @@
 """Tests for WaveBoundaryProcessor (GFS-Wave boundary spectra -> nest.ww3).
 
 Fixtures under tests/data/wave_boundary/ are trimmed real-product samples:
-  - buoys_subset.txt: ~40 data lines cut from the operational
-    wave_gfs.buoys points file (Gulf-of-Alaska + North Pacific/Bering DAT
-    buoys, including the 3 AK extras 46035/46070/46071, plus a Bermuda
-    IBP block as non-AK noise). Note: the real file carries NO TYPE==IBP
-    points in the Alaska region at all -- that's why 46070/46071/46035
-    must be pulled in via extra_points rather than the window/TYPE filter.
+  - buoys_subset.txt: data lines cut from the operational wave_gfs.buoys
+    points file:
+      * Gulf-of-Alaska + North Pacific/Bering DAT buoys, including the 3
+        AK extras 46035/46070/46071 (real TYPE==DAT, not IBP -- they live
+        only in spec_tar.gz and must be pulled in via extra_points, not
+        the window/TYPE filter).
+      * NW-ALU51..55 -- real NCEP IBP boundary points in the Aleutians,
+        stored with NEGATIVE longitude (-177.00 .. -175.00), i.e. inside
+        the AK selection window once normalized to 0-360 (183-185E).
+        The operational file DOES carry IBP points across the Alaska
+        region (501 with lat > 45N in the full 4297-point file; 214 fall
+        inside a 150-210E/45-67.5N window) -- an earlier ad-hoc awk scan
+        of the raw file mis-split the quoted, space-padded NAME column
+        (whitespace inside the quotes shifts TYPE from field 5 to field
+        6 for any name shorter than the fixed 10-char width), which
+        produced a false "no AK IBP points" reading. The actual parser
+        below uses a regex anchored on the quotes, not naive whitespace
+        splitting, and is unaffected.
+      * NW-AJK51 and NW-AFG51..53 -- further real IBP points used to
+        exercise the lon-bound and lat-bound exclusion edges of the AK
+        window respectively (see TestWindowSelectionAgainstFixture).
+      * A Bermuda (BER5x) IBP block as non-AK (Atlantic) noise.
   - gfswave.BER51.spec: header + first 2 complete time records cut from a
     live gfswave.<NAME>.spec sample.
 """
@@ -84,9 +100,23 @@ def _make_tar(tar_path: Path, members: dict, gz: bool = False):
 class TestParsePointsFile:
     def test_parses_real_subset(self):
         points = parse_ww3_points_file(BUOYS_SUBSET)
-        assert len(points) == 43
+        assert len(points) == 52
         names = {p.name for p in points}
         assert {"46035", "46070", "46071"}.issubset(names)
+        assert {"NW-ALU51", "NW-AJK51", "NW-AFG51"}.issubset(names)
+
+    def test_negative_longitude_ak_ibp_points_present(self):
+        """Regression: the operational file DOES carry IBP boundary points
+        across the Alaska region, stored with negative longitude. An earlier
+        ad-hoc awk scan of the raw file mis-split the quoted, space-padded
+        NAME column (see module docstring) and produced a false "no AK IBP"
+        reading -- this pins the actual, verified-against-the-full-file
+        shape so that mistake can't silently recur."""
+        points = {p.name: p for p in parse_ww3_points_file(BUOYS_SUBSET)}
+        alu51 = points["NW-ALU51"]
+        assert alu51.point_type == "IBP"
+        assert alu51.lon == pytest.approx(-177.00)
+        assert alu51.lat == pytest.approx(51.00)
 
     def test_ak_dat_buoys_are_type_dat_not_ibp(self):
         """The 3 AK extras are real NDBC DAT buoys, not IBP boundary points --
@@ -142,6 +172,86 @@ class TestWindowSelection:
 
     def test_lat_bounds_respected(self):
         assert not _point_in_window(175.0, 30.0, 170.0, -155.0, 45.0, 65.0)
+
+
+# ------------------------------------------- window selection, real fixture
+
+class TestWindowSelectionAgainstFixture:
+    """Regression coverage for the AK IBP selection path end to end:
+    parse_ww3_points_file + _point_in_window against the real, trimmed
+    wave_gfs.buoys fixture. Counts below are pinned exactly (not just
+    "non-zero") so a reintroduced field-splitting or normalization bug
+    fails loudly instead of silently degrading to zero AK points again.
+
+    Full-file counts, verified directly against the untrimmed 4297-point
+    operational file (tests/data/wave_boundary/buoys_subset.txt is a
+    subset of it): 3093 total IBP points, 501 with lat > 45N; a
+    150-210E/45-67.5N window selects exactly 214 of them, westernmost
+    NW-ALU51 at -177.00 (== 183.00E); a 170-235E/45-75N window (the
+    forcing.waves.window example shipped in ForcingConfig.from_yaml)
+    selects 391.
+    """
+
+    def _ibp_names_in_window(self, lon_min, lon_max, lat_min, lat_max):
+        points = parse_ww3_points_file(BUOYS_SUBSET)
+        return {
+            p.name for p in points
+            if p.point_type == "IBP"
+            and _point_in_window(p.lon, p.lat, lon_min, lon_max, lat_min, lat_max)
+        }
+
+    def test_150_210_window_selects_exactly_the_aleutian_points(self):
+        selected = self._ibp_names_in_window(150.0, 210.0, 45.0, 67.5)
+        assert selected == {
+            "NW-ALU51", "NW-ALU52", "NW-ALU53", "NW-ALU54", "NW-ALU55",
+        }
+
+    def test_nw_alu51_is_selected_by_the_ak_window(self):
+        assert "NW-ALU51" in self._ibp_names_in_window(150.0, 210.0, 45.0, 67.5)
+
+    def test_170_235_window_widens_to_include_afg_and_ajk(self):
+        # Same NW-ALU core, plus NW-AFG51-53 (73N, now inside lat<=75) and
+        # NW-AJK51 (215.5E, now inside lon<=235).
+        selected = self._ibp_names_in_window(170.0, 235.0, 45.0, 75.0)
+        assert selected == {
+            "NW-ALU51", "NW-ALU52", "NW-ALU53", "NW-ALU54", "NW-ALU55",
+            "NW-AFG51", "NW-AFG52", "NW-AFG53",
+            "NW-AJK51",
+        }
+
+    def test_nw_afg51_excluded_by_latitude_in_tight_window(self):
+        # 73N is outside the 45-67.5N band even though its longitude
+        # (183.5E) is inside the lon band.
+        assert "NW-AFG51" not in self._ibp_names_in_window(150.0, 210.0, 45.0, 67.5)
+
+    def test_nw_ajk51_excluded_by_longitude_in_tight_window(self):
+        # 215.5E is east of the 150-210E band even though its latitude
+        # (53.9N) is inside the lat band.
+        assert "NW-AJK51" not in self._ibp_names_in_window(150.0, 210.0, 45.0, 67.5)
+
+    def test_bermuda_and_dat_extras_never_selected_by_ak_windows(self):
+        for lon_min, lon_max, lat_min, lat_max in (
+            (150.0, 210.0, 45.0, 67.5), (170.0, 235.0, 45.0, 75.0),
+        ):
+            selected = self._ibp_names_in_window(lon_min, lon_max, lat_min, lat_max)
+            assert not any(n.startswith("BER") for n in selected)
+            assert not {"46035", "46070", "46071"} & selected
+
+    def test_processor_select_points_matches_module_helper(self, mock_config):
+        """Same assertion via WaveBoundaryProcessor._select_points (the
+        actual production entry point), not just the module-level helpers,
+        so the class wiring itself is covered too."""
+        proc = WaveBoundaryProcessor(
+            mock_config, Path("."), Path("."),
+            points_file=BUOYS_SUBSET,
+            window={"lon_min": 150.0, "lon_max": 210.0, "lat_min": 45.0, "lat_max": 67.5},
+            extra_points=["46070", "46071", "46035"],
+        )
+        ibp_names, extra_names, _ = proc._select_points([])
+        assert sorted(ibp_names) == [
+            "NW-ALU51", "NW-ALU52", "NW-ALU53", "NW-ALU54", "NW-ALU55",
+        ]
+        assert sorted(extra_names) == ["46035", "46070", "46071"]
 
 
 # -------------------------------------------------------- cycle discovery

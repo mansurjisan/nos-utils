@@ -79,6 +79,27 @@ $ North Pacific and Behring Sea (PN) spectra (4) near S/SW Alaska Anchorage (8)
   -171.73   52.25  '46072     '   5.0   DAT  NDBC     360
   -168.000  55.883 '46020     ' 999.0   DAT  NDBC     360
 $
+$ NCEP IBP boundary points, Aleutians (North Pacific) -- real
+$ product coordinates, stored as NEGATIVE longitude. Inside the
+$ AK selection window (150-210E / 45-67.5N in 0-360 terms).
+  -177.00   51.00  'NW-ALU51  '  999.   IBP  NCEP      45
+  -176.50   51.00  'NW-ALU52  '  999.   IBP  NCEP      45
+  -176.00   51.00  'NW-ALU53  '  999.   IBP  NCEP      45
+  -175.50   51.00  'NW-ALU54  '  999.   IBP  NCEP      45
+  -175.00   51.00  'NW-ALU55  '  999.   IBP  NCEP      45
+$
+$ NCEP IBP boundary point further east (Gulf of Alaska /
+$ Juneau AFC) -- real coordinates, outside the 150-210E window
+$ (215.5E) but still IBP: exercises the lon-bound exclusion.
+  -144.50   53.90  'NW-AJK51  '  999.   IBP  NCEP      45
+$
+$ NCEP IBP boundary points, Arctic (Fairbanks AFC) -- real
+$ coordinates, inside the 150-210E lon band but at 73N, outside
+$ the 45-67.5N AK window: exercises the lat-bound exclusion.
+  -176.50   73.00  'NW-AFG51  '  999.   IBP  NCEP      45
+  -176.00   73.00  'NW-AFG52  '  999.   IBP  NCEP      45
+  -175.50   73.00  'NW-AFG53  '  999.   IBP  NCEP      45
+$
 $ Bermuda boundary data
 $
    -65.50   31.50  'BER51     '  999.   IBP  NCEP      45
