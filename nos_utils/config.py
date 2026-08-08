@@ -111,14 +111,22 @@ class ForcingConfig:
     # UFS-Coastal coupling resource layout (nws=4 only).
     # datm_tasks: PETs assigned to MED+ATM (DATM)
     # schism_tasks: PETs assigned to OCN (SCHISM)
-    # total_tasks: should equal datm_tasks + schism_tasks
+    # total_tasks: should equal datm_tasks + schism_tasks (+ wav_tasks)
     ufs_datm_tasks: int = 120
     ufs_schism_tasks: int = 1080
     ufs_total_tasks: int = 1200
+    # PETs assigned to WAV (WW3). 0 = no wave component (today's
+    # DATM+SCHISM 3-component layout); > 0 switches ufs.configure to the
+    # 4-component DATM+SCHISM+WW3 PET layout.
+    ufs_wav_tasks: int = 0
     # Forecast length in hours (for model_configure NHOURS)
     ufs_nhours_fcst: int = 48
     # Atmospheric coupling timestep (seconds, for model_configure DT_ATMOS)
     ufs_dt_atmos: int = 720
+    # NUOPC runSeq coupling interval in seconds. 0 = derive from model_dt
+    # (today's behavior, @<model_dt>); > 0 lets a wave system couple on a
+    # coarser window than SCHISM's own timestep (e.g. @360 with dt=120).
+    ufs_coupling_interval: int = 0
 
     # --- OBC (ocean boundary) settings ---
     # RTOFS ROI indices for 2D (ssh) extraction
@@ -934,8 +942,10 @@ class ForcingConfig:
                 ("datm_tasks", "ufs_datm_tasks"),
                 ("schism_tasks", "ufs_schism_tasks"),
                 ("total_tasks", "ufs_total_tasks"),
+                ("wav_tasks", "ufs_wav_tasks"),
                 ("nhours_fcst", "ufs_nhours_fcst"),
                 ("dt_atmos", "ufs_dt_atmos"),
+                ("coupling_interval", "ufs_coupling_interval"),
             ):
                 if ufs_coastal.get(yaml_key) is not None:
                     kwargs[attr] = int(ufs_coastal[yaml_key])
