@@ -52,6 +52,7 @@ _PROCESSOR_CATEGORY = {
     "DYNAMIC_ADJUST": "ocean",
     "NWM": "river",
     "ST_LAWRENCE": "river",
+    "WAVE_BC": "waves",
     "TIDAL": "tidal",
     "HOTSTART": "hotstart",
     "NUDGING": "nudging",

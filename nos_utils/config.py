@@ -262,6 +262,32 @@ class ForcingConfig:
     # "canadian_water" (with a "QC_..._hourly_hydrometric.csv" filename).
     st_lawrence_subdir: str = "can_streamgauge"
 
+    # GFS-Wave boundary spectra (STOFS-3D-AK WW3 coupling). When True, the
+    # orchestrator runs WaveBoundaryProcessor, which selects boundary points
+    # from a WW3 points file (wave_gfs.buoys format), extracts their spectra
+    # from $COMINgfswave's ibp_tar / spec_tar.gz, and runs ww3_bound to
+    # produce nest.ww3. Off by default -- no existing OFS uses WW3 yet.
+    waves_enabled: bool = False
+    # WW3 points file (columns: lon lat 'NAME' depth TYPE source interval).
+    wave_points_file: Optional[Path] = None
+    # Boundary point selection window (degrees). Points with TYPE == IBP
+    # inside this box are selected; all four must be set for window
+    # selection to run. Lon comparisons are dateline-safe (normalized to
+    # 0-360 via nos_utils.coords) so an AK-style window crossing 180 works
+    # whether bounds are authored in -180/180 or 0-360.
+    wave_lon_min: Optional[float] = None
+    wave_lon_max: Optional[float] = None
+    wave_lat_min: Optional[float] = None
+    wave_lat_max: Optional[float] = None
+    # Extra point names included regardless of TYPE/window -- e.g. the AK
+    # DAT buoys (46070, 46071, 46035) that live only in spec_tar.gz, not
+    # the IBP tar, and so can never be picked up by the window/TYPE filter.
+    wave_extra_points: List[str] = field(default_factory=list)
+    # How many additional 6h GFS-Wave cycles to try, walking backward, if
+    # the newest cycle at/before the nowcast start is missing ibp_tar or
+    # spec_tar.gz. 0 = only try that one cycle.
+    wave_max_cycle_fallback: int = 4
+
     # Dynamic SSH adjustment (STOFS-3D-ATL NOAA tide-gauge bias correction).
     # When True, the orchestrator runs DynamicAdjustProcessor after RTOFS
     # to subtract a per-cycle bias from elev2D.th.nc using 11 NOAA
@@ -809,6 +835,38 @@ class ForcingConfig:
                 kwargs["river_hourly_extra_hours"] = int(river["hourly_extra_hours"])
             if "th_extra_hours" in river:
                 kwargs["river_th_extra_hours"] = int(river["th_extra_hours"])
+
+        # GFS-Wave boundary spectra (forcing.waves). See the ``waves_enabled``
+        # / ``wave_*`` docstrings on ForcingConfig for what each key drives.
+        #
+        #   forcing:
+        #     waves:
+        #       enabled: true
+        #       points_file: /path/to/wave_gfs.buoys
+        #       extra_points: ["46070", "46071", "46035"]
+        #       window: {lon_min: 170.0, lon_max: 235.0, lat_min: 45.0, lat_max: 75.0}
+        #       max_cycle_fallback: 4
+        waves = forcing.get("waves", {}) if isinstance(forcing, dict) else {}
+        if isinstance(waves, dict) and waves:
+            kwargs["waves_enabled"] = bool(waves.get("enabled", False))
+            points_file = waves.get("points_file")
+            if points_file:
+                kwargs["wave_points_file"] = Path(points_file)
+            window = waves.get("window", {})
+            if isinstance(window, dict):
+                if window.get("lon_min") is not None:
+                    kwargs["wave_lon_min"] = float(window["lon_min"])
+                if window.get("lon_max") is not None:
+                    kwargs["wave_lon_max"] = float(window["lon_max"])
+                if window.get("lat_min") is not None:
+                    kwargs["wave_lat_min"] = float(window["lat_min"])
+                if window.get("lat_max") is not None:
+                    kwargs["wave_lat_max"] = float(window["lat_max"])
+            extra_points = waves.get("extra_points")
+            if extra_points:
+                kwargs["wave_extra_points"] = [str(p) for p in extra_points]
+            if waves.get("max_cycle_fallback") is not None:
+                kwargs["wave_max_cycle_fallback"] = int(waves["max_cycle_fallback"])
 
         # St. Lawrence River climatology flag
         if isinstance(river, dict):
