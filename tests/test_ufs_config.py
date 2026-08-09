@@ -74,6 +74,80 @@ _UFS_CONFIGURE = (
     "::\n"
 )
 
+# Expected output of the 3-component patch against _UFS_CONFIGURE with
+# datm_tasks=150, total_tasks=1500 -- deliberately different from the
+# template's own built-in 120/1199 bounds so the substitution actually has
+# to do something (see TestFourComponentWavePetBounds
+# .test_wav_tasks_zero_matches_hardcoded_three_component_output).
+_UFS_CONFIGURE_3COMPONENT_150_1500 = (
+    "# MED #\n"
+    "MED_model:                      cmeps\n"
+    "MED_petlist_bounds:             0 149\n"
+    "MED_omp_num_threads:            1\n"
+    "\n"
+    "# ATM #\n"
+    "ATM_model:                      datm\n"
+    "ATM_petlist_bounds:             0 149\n"
+    "ATM_omp_num_threads:            1\n"
+    "\n"
+    "# OCN #\n"
+    "OCN_model:                      schism\n"
+    "OCN_petlist_bounds:             150 1499\n"
+    "OCN_omp_num_threads:            1\n"
+    "\n"
+    "runSeq::\n"
+    "@120\n"
+    "  ATM -> MED :remapMethod=redist\n"
+    "  MED med_phases_prep_ocn_avg\n"
+    "  MED -> OCN :remapMethod=redist\n"
+    "  ATM\n"
+    "  OCN\n"
+    "@\n"
+    "::\n"
+)
+
+# Trimmed 4-component fixture, derived from a validated Alaska DATM+SCHISM+
+# WW3 coupled run configuration. Unlike ``_UFS_CONFIGURE`` above, MED spans
+# the full PET range rather than being confined to the DATM PETs.
+_UFS_CONFIGURE_WAVE = (
+    "# MED #\n"
+    "MED_model:                      cmeps\n"
+    "MED_petlist_bounds:             0 119\n"
+    "MED_omp_num_threads:            1\n"
+    "\n"
+    "# ATM #\n"
+    "ATM_model:                      datm\n"
+    "ATM_petlist_bounds:             0 119\n"
+    "ATM_omp_num_threads:            1\n"
+    "\n"
+    "# OCN #\n"
+    "OCN_model:                      schism\n"
+    "OCN_petlist_bounds:             120 1199\n"
+    "OCN_omp_num_threads:            1\n"
+    "\n"
+    "# WAV #\n"
+    "WAV_model:                      ww3\n"
+    "WAV_petlist_bounds:             1200 1200\n"
+    "WAV_omp_num_threads:            1\n"
+    "\n"
+    "runSeq::\n"
+    "@120\n"
+    "  MED med_phases_prep_atm\n"
+    "  MED med_phases_prep_ocn_avg\n"
+    "  MED med_phases_prep_wav_avg\n"
+    "  MED -> ATM :remapMethod=redist\n"
+    "  MED -> OCN :remapMethod=redist\n"
+    "  MED -> WAV :remapMethod=redist\n"
+    "  ATM\n"
+    "  OCN\n"
+    "  WAV\n"
+    "  ATM -> MED :remapMethod=redist\n"
+    "  OCN -> MED :remapMethod=redist\n"
+    "  WAV -> MED :remapMethod=redist\n"
+    "@\n"
+    "::\n"
+)
+
 
 def _write_full_fix(
     fix_dir: Path, *, include_optional: bool = True,
@@ -766,3 +840,376 @@ class TestDatmStreamsYearWindow:
         assert "yearLast01:                2026" in ds
         assert "yearAlign01:               2026" in ds
         assert "@[" not in ds, "Unsubstituted token in datm.streams"
+
+
+class TestFourComponentWavePetBounds:
+    """DATM+SCHISM+WW3 4-component PET layout.
+
+    Mirrors a validated Alaska DATM+SCHISM+WW3 coupled run configuration:
+    MED spans the FULL PET range here, unlike the 3-component layout above
+    where MED is confined to the DATM ranks -- see
+    ``UFSConfigProcessor._patch_pet_bounds``.
+    """
+
+    def test_four_component_pet_math(self, tmp_path):
+        """datm=120, schism=2794, wav=686, total=3600 -> the AK-validated split."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+        (fix / "ufs.configure").write_text(_UFS_CONFIGURE_WAVE)
+
+        cfg = ForcingConfig.for_secofs_ufs(
+            pdy="20260401", cyc=12,
+            ufs_datm_tasks=120, ufs_schism_tasks=2794, ufs_total_tasks=3600,
+            ufs_wav_tasks=686,
+        )
+        proc = UFSConfigProcessor(cfg, fix, out)
+        result = proc.process()
+        assert result.success, result.errors
+
+        uc = (out / "ufs.configure").read_text()
+        assert "ATM_petlist_bounds:             0 119" in uc
+        assert "OCN_petlist_bounds:             120 2913" in uc
+        assert "WAV_petlist_bounds:             2914 3599" in uc
+        assert "MED_petlist_bounds:             0 3599" in uc
+
+        assert result.metadata["wav_tasks"] == 686
+
+    def test_wav_tasks_zero_matches_hardcoded_three_component_output(self, tmp_path):
+        """wav_tasks=0 (the default) must reproduce the 3-component patch
+        exactly, byte for byte, against a hardcoded expected string.
+
+        Comparing the default-arg call against an explicit wav_tasks=0 call
+        (the original form of this test) only proves the default value is
+        0 -- it can't catch a regression in the 3-component branch body,
+        since both calls run the same code either way. Using datm/total
+        values that actually change the template's built-in 120/1199
+        bounds, and asserting against a hardcoded expected file, means a
+        broken substitution would actually fail this test.
+        """
+        fix = tmp_path / "fix"
+        _write_full_fix(fix)
+        content = (fix / "ufs.configure").read_text()
+
+        default_arg, default_applied = UFSConfigProcessor._patch_pet_bounds(
+            content, datm_tasks=150, total_tasks=1500,
+        )
+        explicit_zero, explicit_applied = UFSConfigProcessor._patch_pet_bounds(
+            content, datm_tasks=150, total_tasks=1500, wav_tasks=0,
+        )
+        assert default_applied is True
+        assert explicit_applied is True
+        assert default_arg == explicit_zero == _UFS_CONFIGURE_3COMPONENT_150_1500
+
+    def test_missing_petlist_line_returns_verbatim_untouched(self, tmp_path, caplog):
+        """A 3-component fix file missing one of the three expected
+        petlist lines (e.g. a hand-edited fix file that dropped the ATM
+        line) must return content completely unchanged rather than a
+        partially-patched string -- MED must NOT be edited even though
+        its own line is a valid, matchable regex target on its own --
+        and must log an error identifying the missing line. Mirrors
+        ``test_missing_wav_line_returns_verbatim_untouched`` below for the
+        4-component WAV line."""
+        fix = tmp_path / "fix"
+        _write_full_fix(fix)
+        content = (fix / "ufs.configure").read_text()
+        malformed = content.replace(
+            "ATM_petlist_bounds:             0 119\n", ""
+        )
+        assert "ATM_petlist_bounds" not in malformed
+
+        with caplog.at_level("ERROR", logger="nos_utils.forcing.ufs_config"):
+            patched, applied = UFSConfigProcessor._patch_pet_bounds(
+                malformed, datm_tasks=150, total_tasks=1500,
+            )
+        assert applied is False
+        assert patched == malformed
+        assert "MED_petlist_bounds:             0 149" not in patched
+        assert any(
+            "ATM_petlist_bounds" in r.message and "found 0" in r.message
+            for r in caplog.records
+        )
+
+    def test_wav_tasks_too_large_returns_verbatim(self, tmp_path, caplog):
+        """wav_tasks large enough to drive schism_tasks <= 0, with the sum
+        still balancing (datm=120, wav=1080, schism=0, total=1200) so this
+        exercises the schism_tasks<=0 guard specifically, not the separate
+        datm+schism+wav != total mismatch guard."""
+        fix = tmp_path / "fix"
+        _write_full_fix(fix)
+        content = (fix / "ufs.configure").read_text()
+
+        with caplog.at_level("WARNING", logger="nos_utils.forcing.ufs_config"):
+            patched, applied = UFSConfigProcessor._patch_pet_bounds(
+                content, datm_tasks=120, total_tasks=1200, wav_tasks=1080,
+                schism_tasks=0,
+            )
+        assert applied is False
+        assert patched == content
+        assert any(
+            "Wave PET layout looks off" in r.message for r in caplog.records
+        )
+
+    def test_missing_wav_line_returns_verbatim_untouched(self, tmp_path, caplog):
+        """wav_tasks > 0 against a fix file with no WAV_petlist_bounds line
+        (e.g. wav_tasks set in YAML before the wave fix file is deployed,
+        or after a fix-file rollback) must leave content completely
+        unchanged -- MED/ATM/OCN must NOT be edited even though their own
+        lines are individually valid regex targets -- and must log an
+        error identifying the problem."""
+        fix = tmp_path / "fix"
+        _write_full_fix(fix)  # ships _UFS_CONFIGURE: 3-component, no WAV line
+        content = (fix / "ufs.configure").read_text()
+
+        with caplog.at_level("ERROR", logger="nos_utils.forcing.ufs_config"):
+            patched, applied = UFSConfigProcessor._patch_pet_bounds(
+                content, datm_tasks=120, total_tasks=1200, wav_tasks=200,
+                schism_tasks=880,
+            )
+        assert applied is False
+        assert patched == content
+        assert "MED_petlist_bounds:             0 119" in patched
+        assert "MED_petlist_bounds:             0 1199" not in patched
+        assert any(
+            "WAV_petlist_bounds" in r.message for r in caplog.records
+        )
+
+    def test_missing_ocn_line_in_wave_fix_returns_verbatim_untouched(
+        self, tmp_path, caplog,
+    ):
+        """A 4-component fix file that HAS the WAV line but is missing one
+        of MED/ATM/OCN (e.g. a hand-edited fix file that dropped the OCN
+        line) must return content completely unchanged, including the WAV
+        line -- the WAV substitution alone must not be committed once
+        MED/ATM/OCN fails -- and must log an error identifying the
+        missing line."""
+        fix = tmp_path / "fix"
+        _write_full_fix(fix)
+        (fix / "ufs.configure").write_text(_UFS_CONFIGURE_WAVE)
+        content = (fix / "ufs.configure").read_text()
+        malformed = content.replace(
+            "OCN_petlist_bounds:             120 1199\n", ""
+        )
+        assert "OCN_petlist_bounds" not in malformed
+
+        with caplog.at_level("ERROR", logger="nos_utils.forcing.ufs_config"):
+            patched, applied = UFSConfigProcessor._patch_pet_bounds(
+                malformed, datm_tasks=120, total_tasks=3600,
+                wav_tasks=686, schism_tasks=2794,
+            )
+        assert applied is False
+        assert patched == malformed
+        # The WAV substitution must not have been committed either.
+        assert "WAV_petlist_bounds:             1200 1200" in patched
+        assert "WAV_petlist_bounds:             2914 3599" not in patched
+        assert "MED_petlist_bounds:             0 3599" not in patched
+        assert any(
+            "OCN_petlist_bounds" in r.message and "found 0" in r.message
+            for r in caplog.records
+        )
+
+    def test_pet_sum_mismatch_returns_verbatim(self, tmp_path, caplog):
+        """datm_tasks + schism_tasks + wav_tasks != total_tasks (e.g. an
+        operator adds wav_tasks to the YAML but forgets to bump
+        total_tasks) must error and leave content verbatim rather than
+        silently mis-sizing OCN while partition.prop and the PBS select
+        stay sized for the old total."""
+        fix = tmp_path / "fix"
+        _write_full_fix(fix)
+        (fix / "ufs.configure").write_text(_UFS_CONFIGURE_WAVE)
+        content = (fix / "ufs.configure").read_text()
+
+        # 120 + 2794 + 686 = 3600, but total_tasks is still the old 2914.
+        with caplog.at_level("ERROR", logger="nos_utils.forcing.ufs_config"):
+            patched, applied = UFSConfigProcessor._patch_pet_bounds(
+                content, datm_tasks=120, total_tasks=2914,
+                wav_tasks=686, schism_tasks=2794,
+            )
+        assert applied is False
+        assert patched == content
+        assert any(
+            "PET layout mismatch" in r.message for r in caplog.records
+        )
+
+
+class TestExplicitCouplingInterval:
+    """``ufs_coupling_interval`` lets a 4-component system couple on a
+    coarser window than SCHISM's own dt (WW3 needs @360 while SCHISM
+    steps @120; 360 is 3 SCHISM steps).
+    """
+
+    def test_coupling_interval_360_multiple_of_dt_120(self, tmp_path):
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_secofs_ufs(
+            pdy="20260401", cyc=12, ufs_coupling_interval=360,
+        )
+        assert cfg.model_dt == 120.0
+
+        proc = UFSConfigProcessor(cfg, fix, out)
+        result = proc.process()
+        assert result.success, result.errors
+
+        uc = (out / "ufs.configure").read_text()
+        assert "@360" in uc
+        assert "@120" not in uc
+        assert result.metadata["coupling_interval"] == 360
+
+    def test_coupling_interval_300_not_multiple_falls_back(self, tmp_path, caplog):
+        """300 is not a multiple of dt=120 -> rejected, falls back to @120."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_secofs_ufs(
+            pdy="20260401", cyc=12, ufs_coupling_interval=300,
+        )
+        assert cfg.model_dt == 120.0
+
+        with caplog.at_level("ERROR", logger="nos_utils.forcing.ufs_config"):
+            proc = UFSConfigProcessor(cfg, fix, out)
+            result = proc.process()
+        assert result.success, result.errors
+
+        uc = (out / "ufs.configure").read_text()
+        assert "@120" in uc
+        assert "@300" not in uc
+        assert result.metadata["coupling_interval"] == 120
+        assert any(
+            "coupling_interval=300" in r.message and "model_dt=120" in r.message
+            for r in caplog.records
+        )
+
+    def test_coupling_interval_zero_is_default_behavior(self, tmp_path):
+        """ufs_coupling_interval=0 (default) is unchanged: @<model_dt>."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_secofs_ufs(pdy="20260401", cyc=12)
+        assert cfg.ufs_coupling_interval == 0
+
+        proc = UFSConfigProcessor(cfg, fix, out)
+        result = proc.process()
+        assert result.success, result.errors
+
+        uc = (out / "ufs.configure").read_text()
+        assert "@120" in uc
+        assert result.metadata["coupling_interval"] == 120
+
+    def test_fractional_dt_valid_multiple_is_accepted(self):
+        """dt=2.5, coupling_interval=5: 5 IS an integer multiple of 2.5
+        (2 * 2.5 = 5), so it must be accepted. Checking against the
+        truncated dt (``int(2.5) == 2``) would wrongly reject it, since
+        ``5 % 2 == 1``. The divisibility check must use the actual
+        (fractional) model_dt, not the truncated value."""
+        content = "runSeq::\n@120\n  ATM\n@\n::\n"
+        patched, written = UFSConfigProcessor._patch_runseq_interval(
+            content, model_dt=2.5, coupling_interval=5,
+        )
+        assert written == 5
+        assert "@5\n" in patched
+
+    def test_fractional_dt_non_multiple_is_rejected(self, caplog):
+        """dt=2.5, coupling_interval=6: 6 is NOT an integer multiple of
+        2.5. Checking against the truncated dt (``int(2.5) == 2``) would
+        wrongly accept it, since ``6 % 2 == 0``. Must be rejected and
+        fall back to ``@<truncated dt>`` (@2), the same fallback behavior
+        as the non-fractional rejection case above."""
+        content = "runSeq::\n@120\n  ATM\n@\n::\n"
+        with caplog.at_level("ERROR", logger="nos_utils.forcing.ufs_config"):
+            patched, written = UFSConfigProcessor._patch_runseq_interval(
+                content, model_dt=2.5, coupling_interval=6,
+            )
+        assert written == 2
+        assert "@2\n" in patched
+        assert any(
+            "coupling_interval=6" in r.message and "model_dt=2.5" in r.message
+            for r in caplog.records
+        )
+
+    def test_zero_model_dt_with_coupling_interval_set_does_not_raise(self, tmp_path, caplog):
+        """int(model_dt) == 0 (dt < 1) used to reach ``ci % n`` with n=0 and
+        raise an uncaught ZeroDivisionError out of process(), aborting the
+        prep stage. A non-positive truncated dt must instead be rejected
+        with a guard-and-return-verbatim, matching the defensive style used
+        elsewhere in this function."""
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+
+        cfg = ForcingConfig.for_secofs_ufs(
+            pdy="20260401", cyc=12, model_dt=0.5, ufs_coupling_interval=360,
+        )
+
+        with caplog.at_level("ERROR", logger="nos_utils.forcing.ufs_config"):
+            proc = UFSConfigProcessor(cfg, fix, out)
+            result = proc.process()  # must not raise ZeroDivisionError
+        assert result.success, result.errors
+
+        uc = (out / "ufs.configure").read_text()
+        assert uc == (fix / "ufs.configure").read_text()
+        assert result.metadata["coupling_interval"] is None
+        assert any(
+            "model_dt=0.5" in r.message for r in caplog.records
+        )
+
+
+class TestFourComponentEndToEndFromYaml:
+    """``wav_tasks`` / ``coupling_interval`` in ``ufs_coastal:`` had no
+    coverage that actually went through ``ForcingConfig.from_yaml`` --
+    every other 4-component test above builds its config through the
+    ``for_secofs_ufs`` factory, which bypasses the YAML ``ufs_coastal``
+    parsing loop (``config.py``'s ``("wav_tasks", "ufs_wav_tasks")`` /
+    ``("coupling_interval", "ufs_coupling_interval")`` mapping) entirely.
+    """
+
+    _YAML = (
+        "system:\n  name: e2etest\n  prefix: e2etest\n"
+        "grid:\n"
+        "  domain: {lon_min: -90.0, lon_max: -60.0, lat_min: 15.0, lat_max: 40.0}\n"
+        "  files: {horizontal: e2etest.hgrid.gr3}\n"
+        "model:\n"
+        "  physics: {dt: 120.0}\n"
+        "  run: {nowcast_hours: 6, forecast_hours: 48}\n"
+        "ufs_coastal:\n"
+        "  enabled: true\n"
+        "  datm_tasks: 120\n"
+        "  schism_tasks: 2794\n"
+        "  total_tasks: 3600\n"
+        "  wav_tasks: 686\n"
+        "  coupling_interval: 360\n"
+    )
+
+    def test_yaml_wav_and_coupling_interval_reach_ufs_configure(self, tmp_path):
+        pytest.importorskip("yaml")
+        yaml_path = tmp_path / "cfg.yaml"
+        yaml_path.write_text(self._YAML)
+
+        cfg = ForcingConfig.from_yaml(yaml_path, pdy="20260401", cyc=12)
+        assert cfg.ufs_datm_tasks == 120
+        assert cfg.ufs_schism_tasks == 2794
+        assert cfg.ufs_total_tasks == 3600
+        assert cfg.ufs_wav_tasks == 686
+        assert cfg.ufs_coupling_interval == 360
+
+        fix = tmp_path / "fix"
+        out = tmp_path / "out"
+        _write_full_fix(fix)
+        (fix / "ufs.configure").write_text(_UFS_CONFIGURE_WAVE)
+
+        proc = UFSConfigProcessor(cfg, fix, out)
+        result = proc.process()
+        assert result.success, result.errors
+
+        uc = (out / "ufs.configure").read_text()
+        assert "ATM_petlist_bounds:             0 119" in uc
+        assert "OCN_petlist_bounds:             120 2913" in uc
+        assert "WAV_petlist_bounds:             2914 3599" in uc
+        assert "MED_petlist_bounds:             0 3599" in uc
+        assert "@360" in uc
+
+        assert result.metadata["wav_tasks"] == 686
+        assert result.metadata["coupling_interval"] == 360

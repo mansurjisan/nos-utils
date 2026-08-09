@@ -36,10 +36,16 @@ Token substitution mirrors the shell ``sed -e "s/@\\[TOKEN\\]/value/g"``:
                                           rendered file spans both the
                                           nowcast and forecast legs.
 
-ufs.configure additionally has its three petlist_bounds lines replaced based
-on ``config.ufs_datm_tasks`` and ``config.ufs_total_tasks`` so the v3.9
-SECOFS mesh (compute=2794) gets correct OCN PETs (120-2913) instead of the
-hardcoded template value (120-1199).
+ufs.configure additionally has its petlist_bounds lines replaced based on
+``config.ufs_datm_tasks`` and ``config.ufs_total_tasks`` so the v3.9 SECOFS
+mesh (compute=2794) gets correct OCN PETs (120-2913) instead of the
+hardcoded template value (120-1199). When ``config.ufs_wav_tasks`` is set
+(> 0), a fourth WAV_petlist_bounds line is also patched for a DATM+SCHISM+
+WW3 layout (see ``_patch_pet_bounds``). A wave system supplies its own
+``ufs.configure`` fix file carrying the WAV component stanza and the wave
+runSeq phases -- this module only patches PET bounds and the coupling
+interval in whatever ufs.configure it is handed; it never adds WW3 runtime
+files (ww3_shel.nml, mod_def.ww3, ww3_grid.nml) to ``_REQUIRED_TEMPLATES``.
 
 The model_t0 anchor matches the operational COMF convention used by
 ``param_nml.py`` and ``tidal.py``: every component of the coupled run --
@@ -55,7 +61,7 @@ import re
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from ..config import ForcingConfig
 from .base import ForcingProcessor, ForcingResult
@@ -280,15 +286,24 @@ class UFSConfigProcessor(ForcingProcessor):
         uc_src = self.fix_dir / "ufs.configure"
         uc_dst = self.output_path / "ufs.configure"
         content = uc_src.read_text()
-        patched = self._patch_pet_bounds(
+        wav_tasks = int(getattr(self.config, "ufs_wav_tasks", 0))
+        schism_tasks_cfg = int(getattr(self.config, "ufs_schism_tasks", 0))
+        model_dt = getattr(self.config, "model_dt", 120.0)
+        coupling_interval_cfg = int(getattr(self.config, "ufs_coupling_interval", 0))
+        patched, pet_applied = self._patch_pet_bounds(
             content,
             datm_tasks=int(self.config.ufs_datm_tasks),
             total_tasks=int(self.config.ufs_total_tasks),
+            wav_tasks=wav_tasks,
+            schism_tasks=schism_tasks_cfg,
         )
-        # Coupling interval must equal the SCHISM dt or ModelAdvance stalls
-        # at it=1 (template ships SECOFS @120; STOFS dt=150 needs @150).
-        patched = self._patch_runseq_interval(
-            patched, getattr(self.config, "model_dt", 120.0),
+        # Coupling interval must equal the SCHISM dt (or an integer multiple
+        # of it, for a 4-component wave system that couples on a coarser
+        # window) or ModelAdvance stalls at it=1 (template ships SECOFS
+        # @120; STOFS dt=150 needs @150; DATM+SCHISM+WW3 needs @360 while
+        # SCHISM steps @120).
+        patched, written_interval = self._patch_runseq_interval(
+            patched, model_dt, coupling_interval=coupling_interval_cfg,
         )
         uc_dst.write_text(patched)
         output_files.append(uc_dst)
@@ -316,9 +331,18 @@ class UFSConfigProcessor(ForcingProcessor):
                 "dt_atmos": int(subs["DT_ATMOS"]),
                 "nx_global": int(subs["NX_GLOBAL"]),
                 "ny_global": int(subs["NY_GLOBAL"]),
-                "datm_tasks": int(self.config.ufs_datm_tasks),
-                "schism_tasks": int(self.config.ufs_schism_tasks),
-                "total_tasks": int(self.config.ufs_total_tasks),
+                # None (not the config value) whenever _patch_pet_bounds
+                # bailed verbatim, so inputs.{stage}.json reports what
+                # actually landed in ufs.configure, not what would have
+                # applied if the layout had been valid.
+                "datm_tasks": int(self.config.ufs_datm_tasks) if pet_applied else None,
+                "schism_tasks": schism_tasks_cfg if pet_applied else None,
+                "total_tasks": int(self.config.ufs_total_tasks) if pet_applied else None,
+                "wav_tasks": wav_tasks if pet_applied else None,
+                # Likewise: the interval _patch_runseq_interval actually
+                # wrote, or None when it left the file untouched (no
+                # @<interval> line, or a non-positive model_dt).
+                "coupling_interval": written_interval,
             },
         )
 
@@ -505,77 +529,286 @@ class UFSConfigProcessor(ForcingProcessor):
         return dst
 
     @staticmethod
+    def _apply_exact_one_replacements(
+        content: str,
+        replacements: Tuple[Tuple[str, Callable[[re.Match], str]], ...],
+    ) -> Tuple[str, bool]:
+        """Apply each ``(pattern, repl)`` substitution, requiring exactly
+        one match per pattern.
+
+        Returns ``(patched, True)`` only when every pattern in
+        ``replacements`` matched exactly one line. If any pattern matches
+        zero or more than one line, the whole batch is rejected and
+        ``(content, False)`` is returned -- the pristine, untouched input,
+        not a partially-patched string -- so a malformed fix file (a
+        missing or duplicated petlist line) can never pass through
+        half-patched while the caller reports the bounds as written.
+        """
+        patched = content
+        for pattern, repl in replacements:
+            patched, count = re.subn(pattern, repl, patched, flags=re.MULTILINE)
+            if count != 1:
+                log.error(
+                    f"ufs.configure PET bounds patch failed: expected "
+                    f"exactly one match for {pattern!r} (found {count}); "
+                    "leaving ufs.configure verbatim"
+                )
+                return content, False
+        return patched, True
+
+    @staticmethod
     def _patch_pet_bounds(
-        content: str, datm_tasks: int, total_tasks: int,
-    ) -> str:
-        """Patch the three PET bounds lines in ``ufs.configure``.
+        content: str, datm_tasks: int, total_tasks: int, wav_tasks: int = 0,
+        schism_tasks: int = 0,
+    ) -> Tuple[str, bool]:
+        """Patch the PET bounds lines in ``ufs.configure``.
 
         The shell pipeline copies ufs.configure verbatim with the hardcoded
         bounds ``MED 0 119 / ATM 0 119 / OCN 120 1199``. With the v3.9 SECOFS
-        mesh (compute=2794) OCN needs PETs ``120 2913``. Patch all three
-        based on the YAML-driven resource layout so the generated file always
-        matches the actual job submission.
+        mesh (compute=2794) OCN needs PETs ``120 2913``. Patch based on the
+        YAML-driven resource layout so the generated file always matches the
+        actual job submission.
 
-        - MED uses PETs ``0 .. datm_tasks-1`` (co-located with ATM)
-        - ATM uses PETs ``0 .. datm_tasks-1``
-        - OCN uses PETs ``datm_tasks .. total_tasks-1``
+        Returns ``(content, applied)``: ``applied`` is False whenever a
+        guard bailed and ``content`` was handed back verbatim, so callers
+        (and ``process()`` metadata) have a single source of truth for
+        whether the PET bounds actually reflect the config rather than
+        re-deriving the same yes/no from the input values.
+
+        Two layouts, selected by ``wav_tasks``:
+
+        * ``wav_tasks <= 0`` -- today's 3-component DATM+SCHISM layout:
+            - MED uses PETs ``0 .. datm_tasks-1`` (co-located with ATM)
+            - ATM uses PETs ``0 .. datm_tasks-1``
+            - OCN uses PETs ``datm_tasks .. total_tasks-1``
+          ``schism_tasks`` is unused here -- kept only so the call site
+          can always pass it uniformly.
+
+        * ``wav_tasks > 0`` -- 4-component DATM+SCHISM+WW3 layout, mirroring
+          the validated Alaska DATM+SCHISM+WW3 reference config:
+            - ATM uses PETs ``0 .. datm_tasks-1``
+            - OCN uses PETs ``datm_tasks .. datm_tasks+schism_tasks-1``
+            - WAV uses PETs ``datm_tasks+schism_tasks .. total_tasks-1``
+            - MED spans the FULL PET range ``0 .. total_tasks-1``. This is
+              a deliberate deviation from the 3-component layout above,
+              where MED is confined to the DATM ranks: the working Alaska
+              config spans MED across the union of ATM+OCN+WAV, not just
+              ATM, and that is the pattern this layout follows.
+
+          ``schism_tasks`` here must be the *configured*
+          ``config.ufs_schism_tasks`` -- it is cross-checked against
+          ``datm_tasks + schism_tasks + wav_tasks == total_tasks`` rather
+          than re-derived by subtraction, so a stale ``total_tasks`` (an
+          operator bumps ``wav_tasks`` without bumping ``total_tasks``, or
+          vice versa) is caught instead of silently mis-sizing OCN while
+          partition.prop and the PBS ``select`` stay sized for the old
+          total. On mismatch the whole patch is rejected and ``content``
+          is returned verbatim -- including the WAV substitution, which is
+          only ever committed once it is independently confirmed present
+          (see below).
         """
         if datm_tasks <= 0 or total_tasks <= datm_tasks:
             log.warning(
                 f"PET layout looks off (datm_tasks={datm_tasks}, "
                 f"total_tasks={total_tasks}); leaving ufs.configure verbatim"
             )
-            return content
+            return content, False
 
-        med_atm_hi = datm_tasks - 1
+        if wav_tasks <= 0:
+            med_atm_hi = datm_tasks - 1
+            ocn_lo = datm_tasks
+            ocn_hi = total_tasks - 1
+
+            replacements = (
+                (
+                    r"^(\s*MED_petlist_bounds:\s*).*$",
+                    lambda m: f"{m.group(1)}0 {med_atm_hi}",
+                ),
+                (
+                    r"^(\s*ATM_petlist_bounds:\s*).*$",
+                    lambda m: f"{m.group(1)}0 {med_atm_hi}",
+                ),
+                (
+                    r"^(\s*OCN_petlist_bounds:\s*).*$",
+                    lambda m: f"{m.group(1)}{ocn_lo} {ocn_hi}",
+                ),
+            )
+            return UFSConfigProcessor._apply_exact_one_replacements(
+                content, replacements
+            )
+
+        # 4-component layout below. Validate the configured split before
+        # touching anything: this is the same check the operator's job
+        # submission implicitly makes (datm + schism + wav ranks == the
+        # PBS select count), so a mismatch here means the file we are
+        # about to write would not match the ranks actually reserved.
+        task_sum = datm_tasks + schism_tasks + wav_tasks
+        if task_sum != total_tasks:
+            log.error(
+                f"PET layout mismatch: datm_tasks={datm_tasks} + "
+                f"schism_tasks={schism_tasks} + wav_tasks={wav_tasks} = "
+                f"{task_sum} != total_tasks={total_tasks}; leaving "
+                "ufs.configure verbatim"
+            )
+            return content, False
+
+        if schism_tasks <= 0:
+            log.warning(
+                f"Wave PET layout looks off (datm_tasks={datm_tasks}, "
+                f"wav_tasks={wav_tasks}, total_tasks={total_tasks} -> "
+                f"schism_tasks={schism_tasks}); leaving ufs.configure "
+                "verbatim"
+            )
+            return content, False
+
+        atm_hi = datm_tasks - 1
         ocn_lo = datm_tasks
-        ocn_hi = total_tasks - 1
+        ocn_hi = datm_tasks + schism_tasks - 1
+        wav_lo = ocn_hi + 1
+        wav_hi = total_tasks - 1
+        med_hi = total_tasks - 1
+
+        # Commit the WAV edit first, and only if the fix file actually has
+        # a WAV_petlist_bounds line. A fix file deployed before the wave
+        # system's ufs.configure lands (or rolled back to a pre-wave
+        # version) has no WAV component at all -- re.sub would silently
+        # no-op on that line while MED/ATM/OCN still got widened/truncated
+        # for a WAV component that doesn't exist, orphaning PETs. Using
+        # re.subn here and checking the count means the MED/ATM/OCN edits
+        # below are only ever applied once WAV is confirmed patched. The
+        # MED/ATM/OCN substitutions below go through the same exactly-
+        # once re.subn guard (``_apply_exact_one_replacements``), so a
+        # malformed fix file missing any one of those lines is rejected
+        # wholesale rather than partially patched.
+        content_with_wav, wav_count = re.subn(
+            r"^(\s*WAV_petlist_bounds:\s*).*$",
+            lambda m: f"{m.group(1)}{wav_lo} {wav_hi}",
+            content,
+            flags=re.MULTILINE,
+        )
+        if not wav_count:
+            log.error(
+                "ufs.configure has no WAV_petlist_bounds line; a wave "
+                "system must supply a wave-enabled ufs.configure fix file "
+                "before wav_tasks > 0 can be patched. Leaving "
+                "ufs.configure verbatim"
+            )
+            return content, False
 
         replacements = (
             (
                 r"^(\s*MED_petlist_bounds:\s*).*$",
-                lambda m: f"{m.group(1)}0 {med_atm_hi}",
+                lambda m: f"{m.group(1)}0 {med_hi}",
             ),
             (
                 r"^(\s*ATM_petlist_bounds:\s*).*$",
-                lambda m: f"{m.group(1)}0 {med_atm_hi}",
+                lambda m: f"{m.group(1)}0 {atm_hi}",
             ),
             (
                 r"^(\s*OCN_petlist_bounds:\s*).*$",
                 lambda m: f"{m.group(1)}{ocn_lo} {ocn_hi}",
             ),
         )
+        patched, ok = UFSConfigProcessor._apply_exact_one_replacements(
+            content_with_wav, replacements
+        )
+        if not ok:
+            # MED/ATM/OCN failed even though WAV matched above -- do not
+            # return content_with_wav (WAV patched, MED/ATM/OCN not); that
+            # is itself a partial patch. Fall back to the pristine input.
+            return content, False
 
-        for pattern, repl in replacements:
-            content = re.sub(pattern, repl, content, flags=re.MULTILINE)
-
-        return content
+        return patched, True
 
     @staticmethod
-    def _patch_runseq_interval(content: str, model_dt: float) -> str:
-        """Patch the NUOPC ``runSeq::`` coupling interval to ``@<model_dt>``.
+    def _patch_runseq_interval(
+        content: str, model_dt: float, coupling_interval: int = 0,
+    ) -> Tuple[str, Optional[int]]:
+        """Patch the NUOPC ``runSeq::`` coupling interval.
 
         The driver hands SCHISM a coupling window equal to the runSeq
         interval; SCHISM must be able to land exactly on it, so the interval
-        has to equal the SCHISM timestep (``dt``). The template ships a
-        SECOFS value (``@120``), which is wrong for STOFS-3D-ATL (dt=150):
-        the driver gives SCHISM a 120s window it can't step (150 > 120) and
-        ``ModelAdvance`` is stuck at ``it=1`` -- the nowcast inits clean but
-        never timesteps (no hotstart, empty output, false ``rc=0`` PASS).
+        has to equal the SCHISM timestep (``dt``), or an integer multiple of
+        it. The template ships a SECOFS value (``@120``), which is wrong for
+        STOFS-3D-ATL (dt=150): the driver gives SCHISM a 120s window it
+        can't step (150 > 120) and ``ModelAdvance`` is stuck at ``it=1`` --
+        the nowcast inits clean but never timesteps (no hotstart, empty
+        output, false ``rc=0`` PASS).
+
+        ``coupling_interval`` covers the DATM+SCHISM+WW3 case, where WW3
+        needs a coarser coupling window than SCHISM's own dt (e.g. @360
+        while SCHISM steps @120 -- 360 = 3 SCHISM steps); the old code could
+        only ever emit ``@<model_dt>``. When set (> 0) it is used as the
+        runSeq interval, but only if it is an integer multiple of
+        ``model_dt`` -- SCHISM must still land exactly on the coupling
+        window. A non-multiple (e.g. @300 with dt=120) is rejected with a
+        clear error naming both values, and the interval falls back to
+        ``@<model_dt>`` rather than silently emitting an unsteppable window.
+        When ``coupling_interval <= 0`` (default), behavior is unchanged
+        from before: the interval is always ``@<model_dt>``.
 
         Only the numeric interval line inside the runSeq block is replaced
         (``^@\\d+$``). The trailing bare ``@`` line (no digits) that closes
-        the block is left untouched.
+        the block is left untouched. The anchor also assumes the
+        conventional NUOPC layout where a nested fast-rate loop is indented
+        -- a flush-left nested ``@N`` line would be collapsed along with the
+        outer interval.
+
+        Returns ``(content, written_interval)``: ``written_interval`` is
+        the integer actually substituted into the runSeq line, or ``None``
+        when nothing was written (no ``@<interval>`` line found, or the
+        ``model_dt`` guard below rejected the input) -- callers must report
+        this, not a value re-derived from config, as the coupling interval
+        that ended up in the file.
         """
         n = int(model_dt)
+        if n <= 0:
+            log.error(
+                f"ufs.configure model_dt={model_dt} truncates to a "
+                f"non-positive interval ({n}); leaving runSeq coupling "
+                "interval verbatim"
+            )
+            return content, None
+
+        if model_dt != n:
+            log.warning(
+                f"ufs.configure model_dt={model_dt} is fractional; if no "
+                f"coupling_interval is set, the runSeq interval falls "
+                f"back to the truncated value ({n})"
+            )
+
+        if coupling_interval and int(coupling_interval) > 0:
+            ci = int(coupling_interval)
+            # Validate against the actual (possibly fractional) model_dt,
+            # not the truncated ``n`` above -- checking ``ci % n`` would
+            # accept/reject the wrong intervals whenever dt is fractional
+            # (e.g. dt=2.5 truncates to n=2, so ci=6 would wrongly pass
+            # ``6 % 2 == 0`` while the valid ci=5 would wrongly fail
+            # ``5 % 2 == 1``). A small tolerance absorbs float remainder
+            # noise from the modulo itself.
+            remainder = ci % float(model_dt)
+            is_multiple = (
+                remainder <= 1e-6 or (float(model_dt) - remainder) <= 1e-6
+            )
+            if is_multiple:
+                n = ci
+            else:
+                log.error(
+                    f"ufs.configure coupling_interval={ci} is not an "
+                    f"integer multiple of model_dt={model_dt}; SCHISM "
+                    "cannot land exactly on that window. Falling back to "
+                    f"@{n}."
+                )
+
         new_content, count = re.subn(
             r"(?m)^@\d+\s*$", f"@{n}", content
         )
         if count:
-            log.info(f"  ufs.configure runSeq -> @{n} (model_dt)")
+            log.info(f"  ufs.configure runSeq -> @{n}")
+            return new_content, n
         else:
             log.warning(
                 "ufs.configure has no @<interval> runSeq line; "
                 "leaving coupling interval verbatim"
             )
-        return new_content
+            return content, None
