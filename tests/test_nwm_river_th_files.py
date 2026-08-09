@@ -426,3 +426,35 @@ GRID_ID NODE_ID ELE_ID DIR FLAG RiverID_Q Q_Scale RiverID_T T_Scale Name
         assert rows[r2, 1] == pytest.approx(-(savannah_flows[2] * Q_SCALE), abs=0.02)
         # Cooper unaffected at the masked hour.
         assert rows[r3, 7] == pytest.approx(-(cooper_flows[3] * Q_SCALE), abs=0.02)
+
+    def test_negative_streamflow_clamped_to_zero_flux(self, tmp_path):
+        """A negative NWM streamflow value (NWM occasionally emits small
+        negative streamflow) must clamp to zero Q -- schism_flux.th must
+        never flip to an outflow (positive) sign at that hour."""
+        proc = _make_proc(tmp_path)
+        (tmp_path / "nwm.reach.dat").write_text(REACH_DAT_TEXT)
+
+        start = proc._phase_start_time()
+        n_hours = 7
+        savannah_flows = [50.0 + 10 * h for h in range(n_hours + 1)]
+        cooper_flows = [45.0 + 2 * h for h in range(n_hours + 1)]
+        savannah_flows[3] = -25.0  # negative at hour 3
+        _stage_analysis_files(tmp_path, start, n_hours, savannah_flows, cooper_flows)
+
+        ctl_cfg = _ctl_cfg()
+        nwm_files = proc.find_input_files()
+        proc._write_river_th_files([], ctl_cfg, nwm_files)
+
+        flux_lines = (tmp_path / "out" / "schism_flux.th").read_text().strip().splitlines()
+        rows = np.array([[float(v) for v in line.split()] for line in flux_lines])
+
+        dt = 120.0  # ForcingConfig.schism_dt default
+        r3 = int(3 * 3600 / dt)
+        r2 = int(2 * 3600 / dt)
+        # Negative Q clamps to 0 -> flux is exactly 0.0, never positive
+        # (an unclamped negative Q would write a positive/outflow flux).
+        assert rows[r3, 1] == 0.0
+        # Neighboring hour still carries its (negated, inflow) NWM value.
+        assert rows[r2, 1] == pytest.approx(-(savannah_flows[2] * Q_SCALE), abs=0.02)
+        # Cooper unaffected at that hour.
+        assert rows[r3, 7] == pytest.approx(-(cooper_flows[3] * Q_SCALE), abs=0.02)

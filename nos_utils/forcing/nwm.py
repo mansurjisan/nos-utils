@@ -1027,10 +1027,12 @@ class NWMProcessor(ForcingProcessor):
                     # A masked netCDF element assigns as NaN on a plain
                     # float array, which would flow straight into the
                     # output files — treat masked/non-finite like absent.
-                    if val is None or not np.isfinite(val):
+                    if val is None or np.ma.is_masked(val):
                         flows[r_idx] = river_cfg.clim_flows[r_idx]
                     else:
-                        flows[r_idx] = val
+                        fval = float(val)
+                        flows[r_idx] = (fval if np.isfinite(fval)
+                                        else river_cfg.clim_flows[r_idx])
 
                 # Resolve valid time -> hours from model_t0
                 model_time: Optional[datetime] = None
@@ -1632,6 +1634,7 @@ class NWMProcessor(ForcingProcessor):
 
     def _extract_boundary_nwm_flow(
         self, ctl_cfg: RiverConfig, nwm_files: List[Path], n_hours: int,
+        station_q: Optional[Dict[int, float]] = None,
     ) -> Optional[Tuple[np.ndarray, Dict[int, int], set]]:
         """Per-station hourly NWM streamflow for the COMF-style boundary
         rivers.
@@ -1688,7 +1691,9 @@ class NWMProcessor(ForcingProcessor):
                 "fallback for those column(s)"
             )
 
-        fallback_q = [ctl_cfg.stations_q_mean.get(sid, 50.0) for sid in station_ids]
+        station_q = station_q or {}
+        fallback_q = [station_q.get(sid, ctl_cfg.stations_q_mean.get(sid, 50.0))
+                      for sid in station_ids]
         boundary_rc = RiverConfig(
             feature_ids=feature_ids,
             node_indices=list(range(len(feature_ids))),
@@ -1868,7 +1873,7 @@ class NWMProcessor(ForcingProcessor):
         n_nwm_cols = 0
         if use_production_formula and nwm_files:
             nwm_overlay = self._extract_boundary_nwm_flow(
-                ctl_cfg, nwm_files, sim_hours,
+                ctl_cfg, nwm_files, sim_hours, station_q=station_q,
             )
             if nwm_overlay is not None:
                 hourly_q, station_col, covered_stations = nwm_overlay
