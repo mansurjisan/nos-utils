@@ -634,11 +634,13 @@ class NWMProcessor(ForcingProcessor):
                 output_files.append(vsink)
 
         # SECOFS-UFS open-boundary rivers (river.ctl). Loaded separately
-        # from sources.json; the two mechanisms coexist. Climatological Q
-        # for the smoke test; per-cycle USGS observations are a TODO.
+        # from sources.json; the two mechanisms coexist. Q is sampled from
+        # the same NWM streamflow files fetched above for the mapped
+        # reaches (see _write_river_th_files), falling back to USGS
+        # climatology when a reach isn't mapped or isn't in the files.
         ctl_cfg = self._load_ctl_river_config()
         if ctl_cfg is not None and ctl_cfg.n_rivers > 0:
-            river_th_files = self._write_river_th_files(times, ctl_cfg)
+            river_th_files = self._write_river_th_files(times, ctl_cfg, nwm_files)
             output_files.extend(river_th_files)
 
         source_sink = self._write_source_sink()
@@ -967,7 +969,9 @@ class NWMProcessor(ForcingProcessor):
                  f"(target={n_target}, min={n_min})")
         return result
 
-    def _extract_streamflow(self, nwm_files: List[Path]) -> Tuple[np.ndarray, List[float]]:
+    def _extract_streamflow(
+        self, nwm_files: List[Path], river_cfg: Optional[RiverConfig] = None,
+    ) -> Tuple[np.ndarray, List[float]]:
         """Extract streamflow for configured rivers from NWM files.
 
         Time axis anchor: ``t=0`` is the phase start time (see
@@ -984,9 +988,19 @@ class NWMProcessor(ForcingProcessor):
         misaligned with SCHISM's ``model_t0``. Using actual valid times
         anchors the axis at the phase ``start_time`` and lets
         ``_normalize_to_simulation_grid`` drop / back-fill correctly.
+
+        Args:
+            nwm_files: NWM channel_rt files to read, in valid-time order.
+            river_cfg: RiverConfig whose ``feature_ids`` are extracted.
+                Defaults to ``self.river_config`` (the interior vsource
+                sources) -- pass an explicit ad-hoc RiverConfig to reuse
+                this same extraction path for a different, smaller set of
+                reaches (e.g. the COMF boundary-flux rivers in
+                ``_write_river_th_files``).
         """
-        n_rivers = self.river_config.n_rivers
-        feature_ids = set(self.river_config.feature_ids)
+        river_cfg = river_cfg if river_cfg is not None else self.river_config
+        n_rivers = river_cfg.n_rivers
+        feature_ids = set(river_cfg.feature_ids)
 
         start_time = self._phase_start_time()
 
@@ -1007,11 +1021,16 @@ class NWMProcessor(ForcingProcessor):
 
                 # Extract flow for each configured river
                 flows = np.zeros(n_rivers, dtype=np.float32)
-                for r_idx, fid in enumerate(self.river_config.feature_ids):
-                    if fid in fid_to_idx:
-                        flows[r_idx] = streamflow[fid_to_idx[fid]]
+                for r_idx, fid in enumerate(river_cfg.feature_ids):
+                    val = (streamflow[fid_to_idx[fid]]
+                           if fid in fid_to_idx else None)
+                    # A masked netCDF element assigns as NaN on a plain
+                    # float array, which would flow straight into the
+                    # output files — treat masked/non-finite like absent.
+                    if val is None or not np.isfinite(val):
+                        flows[r_idx] = river_cfg.clim_flows[r_idx]
                     else:
-                        flows[r_idx] = self.river_config.clim_flows[r_idx]
+                        flows[r_idx] = val
 
                 # Resolve valid time -> hours from model_t0
                 model_time: Optional[datetime] = None
@@ -1477,8 +1496,223 @@ class NWMProcessor(ForcingProcessor):
             log.warning(f"Failed to load river.ctl: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # Boundary-river (river.ctl) real-time NWM streamflow
+    # ------------------------------------------------------------------
+    #
+    # The pre-operational Fortran generator drives the COMF open-boundary
+    # rivers (Savannah, Cooper, etc.) with real-time USGS flow. Python's
+    # river.ctl path only ever had climatology (annual Q_mean, or the daily
+    # 3-day-average from river.clim.usgs.nc), held CONSTANT for the whole
+    # cycle -- the docstring below used to list "USGS observation
+    # timeseries" as a TODO. In low-flow seasons that over-supplies the
+    # Savannah River 2.4-2.8x vs. the real gauge, producing a persistent
+    # up-river water-level bias.
+    #
+    # NWM streamflow assimilates the same USGS gauges, so sampling it for
+    # the mapped reach tracks real-time obs without a new BUFR/internet
+    # dependency, and it comes from the exact same channel_rt files already
+    # fetched for the interior vsource sources. The three helpers below
+    # wire that in while leaving the climatology path as a graceful
+    # fallback when a reach isn't mapped or isn't present in the files.
+
+    def _find_nwm_reach_file(self) -> Optional[Path]:
+        """Locate the FIX file mapping river.ctl boundary-river stations to
+        NWM reach feature_ids (``river.files.nwm_reach`` in the OFS YAML,
+        e.g. ``secofs_ufs.nwm.reach.dat``).
+
+        Not wired through ``ForcingConfig`` as a dedicated field -- resolved
+        here by candidate name across the same FIX directories
+        ``_copy_static_vsink`` / ``_copy_static_msource`` already search.
+        """
+        candidates = [
+            "secofs_ufs.nwm.reach.dat",
+            "secofs.nwm.reach.dat",
+            "nwm.reach.dat",
+        ]
+        for fix_dir in self._fix_search_dirs():
+            for name in candidates:
+                p = fix_dir / name
+                if p.exists():
+                    return p
+        return None
+
+    def _load_nwm_reach_map(self, ctl_cfg: RiverConfig) -> Dict[int, int]:
+        """Map river.ctl RiverIDs (Section 1 station keys) to NWM reach
+        feature_ids via the nwm_reach FIX file.
+
+        The nwm_reach file (header, bare count, then ``feature_id flag``
+        pairs, e.g. ``20104159 1``) carries no station identifier of its
+        own. It is a companion file to river.ctl (same ``river.files``
+        YAML block, same boundary rivers -- for SECOFS-UFS, Savannah/Clyo
+        and Cooper/Moultrie), authored in the same order, so the
+        RiverID<->feature_id association is by file order (station N in
+        river.ctl Section 1 <-> reach N in the reach file). This is the
+        legacy Fortran contract: ``nos_ofs_nwm_river.f`` reads
+        ``Id_riv(j), Ius_riv(j)`` positionally and aborts when the reach
+        count differs from the control file's NRIVERS.
+
+        The file is parsed here directly (NOT via ``RiverConfig.from_text``,
+        whose Format-1 parser drops flag=0 rows and would shift every
+        later station's positional slot). Per the Fortran ``Ius`` semantics
+        a flag=0 row keeps its slot but marks the station as outside the
+        NWM domain -- that station is omitted from the returned map, so it
+        falls back to climatology while later stations still map correctly.
+
+        A missing file, empty station/reach list, or a count mismatch
+        between the two files means the mapping can't be trusted -- returns
+        ``{}`` and callers fall back to climatology for every boundary
+        river.
+        """
+        reach_path = self._find_nwm_reach_file()
+        if reach_path is None:
+            log.warning(
+                "NWM reach map FIX file not found (river.files.nwm_reach); "
+                "boundary river flow uses climatology, not real-time NWM"
+            )
+            return {}
+        reach_rows: List[Tuple[int, int]] = []  # (feature_id, flag), file order
+        try:
+            for line in reach_path.read_text().splitlines():
+                parts = line.split()
+                if len(parts) < 2:
+                    continue  # blank / bare count line
+                try:
+                    reach_rows.append((int(parts[0]), int(parts[1])))
+                except ValueError:
+                    continue  # header line
+        except Exception as e:
+            log.warning(f"Failed to parse NWM reach map {reach_path}: {e}")
+            return {}
+
+        station_ids = list(ctl_cfg.station_usgs_ids)  # RiverIDs, Section-1 order
+
+        if not station_ids or not reach_rows:
+            return {}
+        if len(station_ids) != len(reach_rows):
+            log.warning(
+                f"NWM reach map station-count mismatch: river.ctl declares "
+                f"{len(station_ids)} boundary station(s) but {reach_path.name} "
+                f"lists {len(reach_rows)} reach(es); skipping real-time NWM "
+                "flow for boundary rivers (climatology fallback in effect)"
+            )
+            return {}
+
+        mapping: Dict[int, int] = {}
+        for sid, (fid, flag) in zip(station_ids, reach_rows):
+            if flag != 1:
+                log.info(
+                    f"NWM reach {fid} flagged outside NWM domain "
+                    f"(RiverID {sid}); climatology for that station"
+                )
+                continue
+            mapping[sid] = fid
+        return mapping
+
+    def _reach_coverage(self, nwm_files: List[Path],
+                        feature_ids: List[int]) -> set:
+        """Subset of *feature_ids* present in the NWM channel_rt files'
+        ``feature_id`` variable.
+
+        Checked against the first openable file -- a channel_rt product
+        carries a fixed reach list for its domain, so one file is
+        representative of every file staged for this cycle.
+        """
+        wanted = set(int(f) for f in feature_ids)
+        for nwm_file in nwm_files:
+            try:
+                ds = Dataset(str(nwm_file))
+                file_features = set(int(f) for f in ds.variables["feature_id"][:])
+                ds.close()
+                return wanted & file_features
+            except Exception as e:
+                log.warning(f"Failed to read feature_id from {nwm_file.name}: {e}")
+                continue
+        return set()
+
+    def _extract_boundary_nwm_flow(
+        self, ctl_cfg: RiverConfig, nwm_files: List[Path], n_hours: int,
+    ) -> Optional[Tuple[np.ndarray, Dict[int, int], set]]:
+        """Per-station hourly NWM streamflow for the COMF-style boundary
+        rivers.
+
+        Reuses ``_extract_streamflow`` (per-reach lookup against the
+        already-opened NWM files) and ``_normalize_to_simulation_grid``
+        (dense hourly grid, same anchor as vsource.th) against the small
+        set of boundary reach feature_ids resolved from the NWM reach FIX
+        file, instead of writing separate NWM I/O.
+
+        Returns ``(hourly_q, station_col, covered_stations)`` where:
+          - ``hourly_q`` has shape ``(n_hours + 1, n_stations)`` -- hourly
+            streamflow for hours ``0..n_hours`` from the phase start time
+            (the same anchor ``_write_vsource`` uses).
+          - ``station_col`` maps river.ctl RiverID -> column index into
+            ``hourly_q``.
+          - ``covered_stations`` is the subset of RiverIDs whose mapped
+            reach feature_id was actually found in *nwm_files* (as opposed
+            to being silently filled from ``clim_flows`` by
+            ``_extract_streamflow``'s own per-file fallback).
+
+        Returns ``None`` when the reach map is unavailable/mismatched or
+        none of the mapped reaches are present in *nwm_files* -- callers
+        must use the existing climatology formula for every boundary river.
+        """
+        station_to_feature = self._load_nwm_reach_map(ctl_cfg)
+        if not station_to_feature:
+            return None
+
+        station_ids = list(station_to_feature)
+        feature_ids = [station_to_feature[sid] for sid in station_ids]
+        station_col = {sid: i for i, sid in enumerate(station_ids)}
+
+        covered_features = self._reach_coverage(nwm_files, feature_ids)
+        covered_stations = {
+            sid for sid in station_ids
+            if station_to_feature[sid] in covered_features
+        }
+        if not covered_stations:
+            log.warning(
+                "None of the NWM reach map's feature_ids "
+                f"({feature_ids}) were found in the staged NWM channel_rt "
+                "files; boundary river flow falls back to climatology"
+            )
+            return None
+
+        uncovered = set(station_ids) - covered_stations
+        if uncovered:
+            names = [ctl_cfg.station_names.get(sid, str(sid)) for sid in
+                     sorted(uncovered)]
+            log.warning(
+                f"NWM reach not found for boundary station(s) {names} "
+                f"(RiverID {sorted(uncovered)}); using climatology "
+                "fallback for those column(s)"
+            )
+
+        fallback_q = [ctl_cfg.stations_q_mean.get(sid, 50.0) for sid in station_ids]
+        boundary_rc = RiverConfig(
+            feature_ids=feature_ids,
+            node_indices=list(range(len(feature_ids))),
+            clim_flows=fallback_q,
+        )
+        raw_flows, raw_times = self._extract_streamflow(nwm_files, river_cfg=boundary_rc)
+        if raw_flows.size == 0:
+            return None
+
+        hourly_q, hourly_times = self._normalize_to_simulation_grid(
+            raw_flows, raw_times, n_target=n_hours + 1,
+        )
+        if hourly_q.size == 0:
+            return None
+
+        # NWM can emit small negative streamflow; a negative Q would flip
+        # the written flux sign to outflow. Clamp like the aggregated path.
+        hourly_q = np.maximum(hourly_q, 0.0)
+
+        return hourly_q, station_col, covered_stations
+
     def _write_river_th_files(self, times: List[float],
-                              ctl_cfg: RiverConfig) -> List[Path]:
+                              ctl_cfg: RiverConfig,
+                              nwm_files: Optional[List[Path]] = None) -> List[Path]:
         """Write SCHISM open-boundary forcing: schism_flux.th / temp.th / salt.th.
 
         Mirrors legacy Fortran ``nos_ofs_create_forcing_river.f`` formula
@@ -1497,15 +1731,27 @@ class NWMProcessor(ForcingProcessor):
             - Time written as Fortran-style ``F12.0`` with trailing dot
               (``"        120."`` not ``"         120"``)
 
-        Q/T source priority (highest first):
-            1. USGS observation timeseries (TODO: BUFR or NWIS fetcher)
-            2. Daily climatology from ``river.clim.usgs.nc`` (TODO once
-               file is available)
-            3. Annual ``Q_mean`` / ``T_mean`` from river.ctl Section 1
-               (current path — smoke-test fallback)
+        Q source priority (highest first):
+            1. Real-time NWM streamflow for the grid point's mapped reach
+               (``_extract_boundary_nwm_flow`` / ``_load_nwm_reach_map``) --
+               time-varying, sampled onto this method's ``dt`` grid.
+            2. Daily climatology from ``river.clim.usgs.nc`` (3-day centered
+               average), when the reach isn't mapped or isn't present in
+               *nwm_files*.
+            3. Annual ``Q_mean`` from river.ctl Section 1, when the daily
+               climatology file/station isn't available either.
+        T source priority is unchanged (climatology / annual T_mean only --
+        NWM streamflow files carry no water temperature).
 
         Salt is hardcoded 0.005 PSU per the Fortran reference — the legacy
         does NOT read salt observations.
+
+        Args:
+            nwm_files: The same NWM channel_rt files already fetched for
+                the interior vsource sources (``process()``'s
+                ``find_input_files()`` result). When falsy, every grid
+                point uses the climatology Q (no real-time overlay
+                attempted).
         """
         n_riv = ctl_cfg.n_rivers
         if n_riv == 0:
@@ -1607,28 +1853,62 @@ class NWMProcessor(ForcingProcessor):
         n_steps = int(round(end_sec / dt)) + 1
         time_grid_sec = [k * dt for k in range(n_steps)]
 
+        # --- Real-time NWM streamflow overlay (per boundary station) ---
+        # q_per_river above is the constant climatology baseline written
+        # for the whole run. Start every column from that baseline, then
+        # overwrite the columns whose station maps to a reach found in
+        # *nwm_files* with a genuinely time-varying series (hourly NWM
+        # streamflow, held constant within each hour -- NWM's own
+        # resolution -- across the dt sub-steps of that hour). Columns
+        # without a mapped/covered reach keep the climatology value
+        # unchanged, so this degrades to the prior constant-Q behavior
+        # exactly when NWM data for a reach is unavailable.
+        q_matrix = np.tile(np.array(q_per_river, dtype=np.float64),
+                           (len(time_grid_sec), 1))
+        n_nwm_cols = 0
+        if use_production_formula and nwm_files:
+            nwm_overlay = self._extract_boundary_nwm_flow(
+                ctl_cfg, nwm_files, sim_hours,
+            )
+            if nwm_overlay is not None:
+                hourly_q, station_col, covered_stations = nwm_overlay
+                max_h = hourly_q.shape[0] - 1
+                for i in range(n_riv):
+                    sid_q = ctl_cfg.river_id_q[i]
+                    if sid_q not in covered_stations:
+                        continue
+                    col = station_col[sid_q]
+                    scale = ctl_cfg.q_scale[i]
+                    for t_idx, t_sec in enumerate(time_grid_sec):
+                        h_idx = min(int(t_sec // 3600.0), max_h)
+                        q_matrix[t_idx, i] = float(hourly_q[h_idx, col]) * scale
+                    n_nwm_cols += 1
+
         try:
             with open(flux_path, "w") as ff, \
                  open(temp_path, "w") as tf, \
                  open(salt_path, "w") as sf:
-                for t_sec in time_grid_sec:
+                for t_idx, t_sec in enumerate(time_grid_sec):
                     t_str = _fmt_f12_0(t_sec)
                     ff.write(t_str
-                             + "".join(f"{-q:12.2f}" for q in q_per_river)
+                             + "".join(f"{-q:12.2f}" for q in q_matrix[t_idx])
                              + "\n")
                     tf.write(t_str
                              + "".join(f"{t:12.4f}" for t in t_per_river)
                              + "\n")
                     sf.write(t_str
-                             + "".join(f"{salt_const:12.4f}" for _ in q_per_river)
+                             + "".join(f"{salt_const:12.4f}" for _ in range(n_riv))
                              + "\n")
 
             mode = "production formula (per-grid station × Q_Scale)" \
                 if use_production_formula else "legacy clim_flows fallback"
+            nwm_note = (f" (+ real-time NWM for {n_nwm_cols}/{n_riv} columns)"
+                        if n_nwm_cols else "")
+            avg_q = float(np.mean(q_matrix))
             log.info(f"Created schism_flux/temp/salt.th: {n_riv} grid points, "
                      f"{len(time_grid_sec)} rows at {dt:.0f}-sec cadence, "
-                     f"{mode}, Q/T source = {clim_label}; "
-                     f"avg Q={sum(q_per_river)/n_riv:.1f} m^3/s, "
+                     f"{mode}, Q source = {clim_label}{nwm_note}; "
+                     f"avg Q={avg_q:.1f} m^3/s, "
                      f"avg T={sum(t_per_river)/n_riv:.2f}C, S={salt_const:.4f}")
             return [flux_path, temp_path, salt_path]
         except Exception as e:
