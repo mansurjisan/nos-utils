@@ -468,15 +468,20 @@ class WaveBoundaryProcessor(ForcingProcessor):
 
     @staticmethod
     def _match_member(members: List[str], name: str) -> Optional[str]:
-        """Find *name*'s tar member, tolerating ``./`` prefix / bare names."""
+        """Find *name*'s tar-root member, tolerating a ``./`` prefix.
+
+        Only an exact match against ``target`` or ``./target`` is accepted.
+        Nested-directory members (``subdir/target``) and anything reached
+        via ``..`` segments (``../target``) are rejected: _extract_members
+        assumes extracted files land directly in dest_dir, and a member
+        spelled with ``..`` must never be treated as equivalent to the
+        bare target name.
+        """
         target = f"gfswave.{name}.spec"
         member_set = set(members)
-        for candidate in (f"./{target}", target):
+        for candidate in (target, f"./{target}"):
             if candidate in member_set:
                 return candidate
-        for m in members:
-            if m == target or m.lstrip("./") == target or m.endswith("/" + target):
-                return m
         return None
 
     @staticmethod
@@ -499,23 +504,32 @@ class WaveBoundaryProcessor(ForcingProcessor):
     def _extract_members(
         tar_path: Path, members: List[str], dest_dir: Path, gz: bool = False,
     ) -> List[Path]:
-        extracted: List[Path] = []
+        """Extract *members* from *tar_path* in a single tar invocation.
+
+        *members* must already be exact archive-listed spellings (as
+        returned by ``_match_member`` against ``_list_tar_members``), so
+        every name is expected to exist -- a nonzero exit is logged as an
+        actionable warning rather than raised, and whichever members did
+        land on disk are still collected and returned.
+        """
+        if not members:
+            return []
         flag = "-xzf" if gz else "-xf"
+        try:
+            result = subprocess.run(
+                ["tar", flag, str(tar_path), "-C", str(dest_dir), *members],
+                capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.warning(f"Failed to extract {members} from {tar_path}: {e}")
+            return []
+        if result.returncode != 0:
+            log.warning(
+                f"tar extract failed for {members} from {tar_path}: "
+                f"{result.stderr[:200]}"
+            )
+        extracted: List[Path] = []
         for member in members:
-            try:
-                result = subprocess.run(
-                    ["tar", flag, str(tar_path), "-C", str(dest_dir), member],
-                    capture_output=True, text=True, timeout=120,
-                )
-            except (OSError, subprocess.TimeoutExpired) as e:
-                log.warning(f"Failed to extract {member} from {tar_path}: {e}")
-                continue
-            if result.returncode != 0:
-                log.warning(
-                    f"tar extract failed for {member} from {tar_path}: "
-                    f"{result.stderr[:200]}"
-                )
-                continue
             out_path = dest_dir / Path(member).name
             if out_path.exists():
                 extracted.append(out_path)

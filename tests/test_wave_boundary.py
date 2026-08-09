@@ -36,6 +36,7 @@ from pathlib import Path
 
 import pytest
 
+import nos_utils.forcing.wave_boundary as wave_boundary_module
 from nos_utils.config import ForcingConfig
 from nos_utils.orchestrator import PrepOrchestrator
 from nos_utils.forcing.wave_boundary import (
@@ -369,6 +370,59 @@ class TestTarExtraction:
             ["./gfswave.BER51.spec"], "NOPE",
         ) is None
 
+    def test_match_member_rejects_path_traversal_member(self):
+        """A ``../``-escaping member must never be treated as the target,
+        even though naive character-set stripping would collapse it to
+        the bare name."""
+        assert WaveBoundaryProcessor._match_member(
+            ["../gfswave.BER51.spec"], "BER51",
+        ) is None
+
+    def test_match_member_rejects_nested_member(self):
+        """A member under a subdirectory must not match: _extract_members
+        assumes the extracted file lands directly in dest_dir root."""
+        assert WaveBoundaryProcessor._match_member(
+            ["subdir/gfswave.BER51.spec"], "BER51",
+        ) is None
+
+    def test_match_member_accepts_dot_slash_and_bare_root_spellings(self):
+        assert WaveBoundaryProcessor._match_member(
+            ["./gfswave.BER51.spec"], "BER51",
+        ) == "./gfswave.BER51.spec"
+        assert WaveBoundaryProcessor._match_member(
+            ["gfswave.BER51.spec"], "BER51",
+        ) == "gfswave.BER51.spec"
+
+    def test_path_traversal_member_is_not_extracted_even_when_present(
+        self, tmp_path,
+    ):
+        """End-to-end: a tar carrying only a ``../``-escaping member for
+        the requested point must be treated as if the point were absent
+        -- no extraction is attempted."""
+        ibp_tar = tmp_path / "gfswave.t06z.ibp_tar"
+        _make_tar(ibp_tar, {"../gfswave.BER51.spec": "evil\n"})
+        members = WaveBoundaryProcessor._list_tar_members(ibp_tar)
+        assert "../gfswave.BER51.spec" in members
+
+        m = WaveBoundaryProcessor._match_member(members, "BER51")
+        assert m is None
+
+        dest = tmp_path / "work"
+        dest.mkdir()
+        assert WaveBoundaryProcessor._extract_members(ibp_tar, [], dest) == []
+        assert list(dest.iterdir()) == []
+        # the escaped path must not have landed anywhere either
+        assert not (tmp_path / "gfswave.BER51.spec").exists()
+
+    def test_nested_member_is_not_extracted_even_when_present(self, tmp_path):
+        ibp_tar = tmp_path / "gfswave.t06z.ibp_tar"
+        _make_tar(ibp_tar, {"subdir/gfswave.BER51.spec": "nested\n"})
+        members = WaveBoundaryProcessor._list_tar_members(ibp_tar)
+        assert "subdir/gfswave.BER51.spec" in members
+
+        m = WaveBoundaryProcessor._match_member(members, "BER51")
+        assert m is None
+
     def test_only_the_requested_member_is_extracted(self, tmp_path):
         ibp_tar = tmp_path / "gfswave.t06z.ibp_tar"
         _make_tar(ibp_tar, {
@@ -383,6 +437,62 @@ class TestTarExtraction:
         extracted = WaveBoundaryProcessor._extract_members(ibp_tar, [m], dest)
         assert [p.name for p in extracted] == ["gfswave.BER52.spec"]
         assert sorted(p.name for p in dest.iterdir()) == ["gfswave.BER52.spec"]
+
+    def test_multi_member_extraction_is_a_single_tar_invocation(
+        self, tmp_path, monkeypatch,
+    ):
+        """Requesting several members must shell out to tar exactly once,
+        not once per member."""
+        ibp_tar = tmp_path / "gfswave.t06z.ibp_tar"
+        _make_tar(ibp_tar, {
+            "./gfswave.BER51.spec": "a\n",
+            "./gfswave.BER52.spec": "b\n",
+            "./gfswave.HNL51.spec": "c\n",
+        })
+        members = WaveBoundaryProcessor._list_tar_members(ibp_tar)
+        matched = [
+            WaveBoundaryProcessor._match_member(members, n)
+            for n in ("BER51", "BER52", "HNL51")
+        ]
+        dest = tmp_path / "work"
+        dest.mkdir()
+
+        real_run = wave_boundary_module.subprocess.run
+        calls = []
+
+        def counting_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(wave_boundary_module.subprocess, "run", counting_run)
+
+        extracted = WaveBoundaryProcessor._extract_members(ibp_tar, matched, dest)
+
+        assert len(calls) == 1
+        assert sorted(p.name for p in extracted) == [
+            "gfswave.BER51.spec", "gfswave.BER52.spec", "gfswave.HNL51.spec",
+        ]
+        assert sorted(p.name for p in dest.iterdir()) == [
+            "gfswave.BER51.spec", "gfswave.BER52.spec", "gfswave.HNL51.spec",
+        ]
+
+    def test_extract_members_with_empty_list_does_not_invoke_tar(
+        self, tmp_path, monkeypatch,
+    ):
+        """No requested members must mean no subprocess call at all --
+        calling tar with zero member args would extract the whole
+        archive rather than nothing."""
+        ibp_tar = tmp_path / "gfswave.t06z.ibp_tar"
+        _make_tar(ibp_tar, {"./gfswave.BER51.spec": "a\n"})
+        dest = tmp_path / "work"
+        dest.mkdir()
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("tar should not be invoked for an empty member list")
+
+        monkeypatch.setattr(wave_boundary_module.subprocess, "run", fail_if_called)
+
+        assert WaveBoundaryProcessor._extract_members(ibp_tar, [], dest) == []
 
 
 # ------------------------------------------------------------- inp emit
