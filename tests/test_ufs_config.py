@@ -901,6 +901,35 @@ class TestFourComponentWavePetBounds:
         assert explicit_applied is True
         assert default_arg == explicit_zero == _UFS_CONFIGURE_3COMPONENT_150_1500
 
+    def test_missing_petlist_line_returns_verbatim_untouched(self, tmp_path, caplog):
+        """A 3-component fix file missing one of the three expected
+        petlist lines (e.g. a hand-edited fix file that dropped the ATM
+        line) must return content completely unchanged rather than a
+        partially-patched string -- MED must NOT be edited even though
+        its own line is a valid, matchable regex target on its own --
+        and must log an error identifying the missing line. Mirrors
+        ``test_missing_wav_line_returns_verbatim_untouched`` below for the
+        4-component WAV line."""
+        fix = tmp_path / "fix"
+        _write_full_fix(fix)
+        content = (fix / "ufs.configure").read_text()
+        malformed = content.replace(
+            "ATM_petlist_bounds:             0 119\n", ""
+        )
+        assert "ATM_petlist_bounds" not in malformed
+
+        with caplog.at_level("ERROR", logger="nos_utils.forcing.ufs_config"):
+            patched, applied = UFSConfigProcessor._patch_pet_bounds(
+                malformed, datm_tasks=150, total_tasks=1500,
+            )
+        assert applied is False
+        assert patched == malformed
+        assert "MED_petlist_bounds:             0 149" not in patched
+        assert any(
+            "ATM_petlist_bounds" in r.message and "found 0" in r.message
+            for r in caplog.records
+        )
+
     def test_wav_tasks_too_large_returns_verbatim(self, tmp_path, caplog):
         """wav_tasks large enough to drive schism_tasks <= 0, with the sum
         still balancing (datm=120, wav=1080, schism=0, total=1200) so this
@@ -943,6 +972,40 @@ class TestFourComponentWavePetBounds:
         assert "MED_petlist_bounds:             0 1199" not in patched
         assert any(
             "WAV_petlist_bounds" in r.message for r in caplog.records
+        )
+
+    def test_missing_ocn_line_in_wave_fix_returns_verbatim_untouched(
+        self, tmp_path, caplog,
+    ):
+        """A 4-component fix file that HAS the WAV line but is missing one
+        of MED/ATM/OCN (e.g. a hand-edited fix file that dropped the OCN
+        line) must return content completely unchanged, including the WAV
+        line -- the WAV substitution alone must not be committed once
+        MED/ATM/OCN fails -- and must log an error identifying the
+        missing line."""
+        fix = tmp_path / "fix"
+        _write_full_fix(fix)
+        (fix / "ufs.configure").write_text(_UFS_CONFIGURE_WAVE)
+        content = (fix / "ufs.configure").read_text()
+        malformed = content.replace(
+            "OCN_petlist_bounds:             120 1199\n", ""
+        )
+        assert "OCN_petlist_bounds" not in malformed
+
+        with caplog.at_level("ERROR", logger="nos_utils.forcing.ufs_config"):
+            patched, applied = UFSConfigProcessor._patch_pet_bounds(
+                malformed, datm_tasks=120, total_tasks=3600,
+                wav_tasks=686, schism_tasks=2794,
+            )
+        assert applied is False
+        assert patched == malformed
+        # The WAV substitution must not have been committed either.
+        assert "WAV_petlist_bounds:             1200 1200" in patched
+        assert "WAV_petlist_bounds:             2914 3599" not in patched
+        assert "MED_petlist_bounds:             0 3599" not in patched
+        assert any(
+            "OCN_petlist_bounds" in r.message and "found 0" in r.message
+            for r in caplog.records
         )
 
     def test_pet_sum_mismatch_returns_verbatim(self, tmp_path, caplog):
@@ -1035,6 +1098,37 @@ class TestExplicitCouplingInterval:
         uc = (out / "ufs.configure").read_text()
         assert "@120" in uc
         assert result.metadata["coupling_interval"] == 120
+
+    def test_fractional_dt_valid_multiple_is_accepted(self):
+        """dt=2.5, coupling_interval=5: 5 IS an integer multiple of 2.5
+        (2 * 2.5 = 5), so it must be accepted. Checking against the
+        truncated dt (``int(2.5) == 2``) would wrongly reject it, since
+        ``5 % 2 == 1``. The divisibility check must use the actual
+        (fractional) model_dt, not the truncated value."""
+        content = "runSeq::\n@120\n  ATM\n@\n::\n"
+        patched, written = UFSConfigProcessor._patch_runseq_interval(
+            content, model_dt=2.5, coupling_interval=5,
+        )
+        assert written == 5
+        assert "@5\n" in patched
+
+    def test_fractional_dt_non_multiple_is_rejected(self, caplog):
+        """dt=2.5, coupling_interval=6: 6 is NOT an integer multiple of
+        2.5. Checking against the truncated dt (``int(2.5) == 2``) would
+        wrongly accept it, since ``6 % 2 == 0``. Must be rejected and
+        fall back to ``@<truncated dt>`` (@2), the same fallback behavior
+        as the non-fractional rejection case above."""
+        content = "runSeq::\n@120\n  ATM\n@\n::\n"
+        with caplog.at_level("ERROR", logger="nos_utils.forcing.ufs_config"):
+            patched, written = UFSConfigProcessor._patch_runseq_interval(
+                content, model_dt=2.5, coupling_interval=6,
+            )
+        assert written == 2
+        assert "@2\n" in patched
+        assert any(
+            "coupling_interval=6" in r.message and "model_dt=2.5" in r.message
+            for r in caplog.records
+        )
 
     def test_zero_model_dt_with_coupling_interval_set_does_not_raise(self, tmp_path, caplog):
         """int(model_dt) == 0 (dt < 1) used to reach ``ci % n`` with n=0 and

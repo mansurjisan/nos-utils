@@ -61,7 +61,7 @@ import re
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from ..config import ForcingConfig
 from .base import ForcingProcessor, ForcingResult
@@ -529,6 +529,34 @@ class UFSConfigProcessor(ForcingProcessor):
         return dst
 
     @staticmethod
+    def _apply_exact_one_replacements(
+        content: str,
+        replacements: Tuple[Tuple[str, Callable[[re.Match], str]], ...],
+    ) -> Tuple[str, bool]:
+        """Apply each ``(pattern, repl)`` substitution, requiring exactly
+        one match per pattern.
+
+        Returns ``(patched, True)`` only when every pattern in
+        ``replacements`` matched exactly one line. If any pattern matches
+        zero or more than one line, the whole batch is rejected and
+        ``(content, False)`` is returned -- the pristine, untouched input,
+        not a partially-patched string -- so a malformed fix file (a
+        missing or duplicated petlist line) can never pass through
+        half-patched while the caller reports the bounds as written.
+        """
+        patched = content
+        for pattern, repl in replacements:
+            patched, count = re.subn(pattern, repl, patched, flags=re.MULTILINE)
+            if count != 1:
+                log.error(
+                    f"ufs.configure PET bounds patch failed: expected "
+                    f"exactly one match for {pattern!r} (found {count}); "
+                    "leaving ufs.configure verbatim"
+                )
+                return content, False
+        return patched, True
+
+    @staticmethod
     def _patch_pet_bounds(
         content: str, datm_tasks: int, total_tasks: int, wav_tasks: int = 0,
         schism_tasks: int = 0,
@@ -605,9 +633,9 @@ class UFSConfigProcessor(ForcingProcessor):
                     lambda m: f"{m.group(1)}{ocn_lo} {ocn_hi}",
                 ),
             )
-            for pattern, repl in replacements:
-                content = re.sub(pattern, repl, content, flags=re.MULTILINE)
-            return content, True
+            return UFSConfigProcessor._apply_exact_one_replacements(
+                content, replacements
+            )
 
         # 4-component layout below. Validate the configured split before
         # touching anything: this is the same check the operator's job
@@ -647,7 +675,11 @@ class UFSConfigProcessor(ForcingProcessor):
         # no-op on that line while MED/ATM/OCN still got widened/truncated
         # for a WAV component that doesn't exist, orphaning PETs. Using
         # re.subn here and checking the count means the MED/ATM/OCN edits
-        # below are only ever applied once WAV is confirmed patched.
+        # below are only ever applied once WAV is confirmed patched. The
+        # MED/ATM/OCN substitutions below go through the same exactly-
+        # once re.subn guard (``_apply_exact_one_replacements``), so a
+        # malformed fix file missing any one of those lines is rejected
+        # wholesale rather than partially patched.
         content_with_wav, wav_count = re.subn(
             r"^(\s*WAV_petlist_bounds:\s*).*$",
             lambda m: f"{m.group(1)}{wav_lo} {wav_hi}",
@@ -663,7 +695,6 @@ class UFSConfigProcessor(ForcingProcessor):
             )
             return content, False
 
-        content = content_with_wav
         replacements = (
             (
                 r"^(\s*MED_petlist_bounds:\s*).*$",
@@ -678,10 +709,16 @@ class UFSConfigProcessor(ForcingProcessor):
                 lambda m: f"{m.group(1)}{ocn_lo} {ocn_hi}",
             ),
         )
-        for pattern, repl in replacements:
-            content = re.sub(pattern, repl, content, flags=re.MULTILINE)
+        patched, ok = UFSConfigProcessor._apply_exact_one_replacements(
+            content_with_wav, replacements
+        )
+        if not ok:
+            # MED/ATM/OCN failed even though WAV matched above -- do not
+            # return content_with_wav (WAV patched, MED/ATM/OCN not); that
+            # is itself a partial patch. Fall back to the pristine input.
+            return content, False
 
-        return content, True
+        return patched, True
 
     @staticmethod
     def _patch_runseq_interval(
@@ -735,20 +772,32 @@ class UFSConfigProcessor(ForcingProcessor):
 
         if model_dt != n:
             log.warning(
-                f"ufs.configure model_dt={model_dt} is fractional; the "
-                f"runSeq divisibility check below uses the truncated "
-                f"value ({n})"
+                f"ufs.configure model_dt={model_dt} is fractional; if no "
+                f"coupling_interval is set, the runSeq interval falls "
+                f"back to the truncated value ({n})"
             )
 
         if coupling_interval and int(coupling_interval) > 0:
             ci = int(coupling_interval)
-            if ci % n == 0:
+            # Validate against the actual (possibly fractional) model_dt,
+            # not the truncated ``n`` above -- checking ``ci % n`` would
+            # accept/reject the wrong intervals whenever dt is fractional
+            # (e.g. dt=2.5 truncates to n=2, so ci=6 would wrongly pass
+            # ``6 % 2 == 0`` while the valid ci=5 would wrongly fail
+            # ``5 % 2 == 1``). A small tolerance absorbs float remainder
+            # noise from the modulo itself.
+            remainder = ci % float(model_dt)
+            is_multiple = (
+                remainder <= 1e-6 or (float(model_dt) - remainder) <= 1e-6
+            )
+            if is_multiple:
                 n = ci
             else:
                 log.error(
                     f"ufs.configure coupling_interval={ci} is not an "
-                    f"integer multiple of model_dt={n}; SCHISM cannot land "
-                    f"exactly on that window. Falling back to @{n}."
+                    f"integer multiple of model_dt={model_dt}; SCHISM "
+                    "cannot land exactly on that window. Falling back to "
+                    f"@{n}."
                 )
 
         new_content, count = re.subn(
