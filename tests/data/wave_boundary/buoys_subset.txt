@@ -1,0 +1,128 @@
+$
+$ Global output point data file for multi-grid wave model
+$
+$ Key to data in file:
+$
+$   LON      Longitude, east positive
+$   LAT      Latitude
+$   NAME     Output point name C*10, no blanks in name allowed
+$   AH       Anemometer height, dummy value for none-data points
+$   TYPE     Buoy type indicator, used for plotting and postprocessing
+$             DAT      Data point
+$             XDT      Former data point
+$             BPT      Boundary data for non-NCEP models.
+$             IBP      Boundary data for NCEP models.
+$             VBY      'NWS Virtual buoy'
+$             NBY      'Non-NWS Virtual buoy'
+$   SOURCE   Source of data point
+$             ENCAN    Environment Canada
+$             GOMOOS   Gulf of Maine OOS
+$             IDT      Irish Department of Transportation
+$             METFR    Meteo France
+$             NCEP     Boundary and other data points
+$             NDBC     National Data Buoy Center
+$             PRIV     Private and incidental data sources
+$             SCRIPPS  Scripps
+$             UKMO     UK Met Office
+$             PDES     Puertos del Estados
+$             SHOM     Service Hydrographique et Oceanographique de la Marine
+$             OCNOR    Fugro Oceanor
+$             WHOI     Woods Hole Oceanographic Institute
+$             SKOREA   South Korea
+$             MVEW     Ministerie van Verkeer en Waterstaat
+$             CORMP    Coastal Ocean Research and Monitoring Program
+$             DIMAR    Direccion General Maritima (Columbia)
+$             BP       British Petroleum
+$   SCALE    Scale indicator for plotting of locations on map
+$            Point will only be plotted if SCALE =< DX in our
+$            GrADS scripts, DX is width of plot in logitude
+$
+$ Notes:
+$
+$  - The '$' at the first position identifies comments for WAVEWATCH III
+$    input.
+$  - The first three data columns are used by the forecats code, the other
+$    are used by postprocessing scripts.
+$
+$   LON     LAT     NAME          AH   TYPE  SOURCE  SCALE
+$ ---------------------------------------------------------
+$
+$ AWIPS Data section (most actual observational sites)
+$ AWIPS code indicated prior and after each AWIPS section
+$
+$AGGA48
+$
+$ --- subset for nos-utils wave boundary fixtures ---
+$ Gulf of Alaska (AG) Spectral data (4) near S/SW Alaska Anchorage (8) 
+  -148.02   56.31  '46001     '   5.0   DAT  NDBC     360
+  -154.98   52.70  '46066     '   5.0   DAT  NDBC     360
+  -146.83   60.22  '46061     '   5.0   DAT  NDBC      90
+  -160.81   53.93  '46075     '   5.0   DAT  NDBC     360
+  -148.00   59.50  '46076     '   5.0   DAT  NDBC     360
+  -152.45   56.05  '46078     '   5.0   DAT  NDBC     360
+  -152.09   59.76  '46106     '   999   DAT  NDBC     75
+  -150.00   58.00  '46080     '   5.0   DAT  NDBC     360
+  -151.829  59.597 '46108     '   5.0   DAT  NDBC      45
+  -160.000  57.700 '46021     ' 999.0   DAT  NDBC      45
+  -146.805  60.584 '46060     '   5.0   DAT  NDBC      45
+  -154.175  57.910 '46077     '   5.0   DAT  NDBC      45
+$
+  -151.700  57.480 '46264     ' 999.0   DAT  NDBC      45
+$AGPZ47
+$
+$AGPN48
+$ North Pacific and Behring Sea (PN) spectra (4) near S/SW Alaska Anchorage (8)
+  -177.58   57.05  '46035     '  10.0   DAT  NDBC     360
+   175.28   55.00  '46070     '   5.0   DAT  NDBC     360
+  -172.03   54.94  '46073     '  10.0   DAT  NDBC     360
+   179.05   51.16  '46071     '   5.0   DAT  NDBC     360
+  -171.73   52.25  '46072     '   5.0   DAT  NDBC     360
+  -168.000  55.883 '46020     ' 999.0   DAT  NDBC     360
+$
+$ NCEP IBP boundary points, Aleutians (North Pacific) -- real
+$ product coordinates, stored as NEGATIVE longitude. Inside the
+$ AK selection window (150-210E / 45-67.5N in 0-360 terms).
+  -177.00   51.00  'NW-ALU51  '  999.   IBP  NCEP      45
+  -176.50   51.00  'NW-ALU52  '  999.   IBP  NCEP      45
+  -176.00   51.00  'NW-ALU53  '  999.   IBP  NCEP      45
+  -175.50   51.00  'NW-ALU54  '  999.   IBP  NCEP      45
+  -175.00   51.00  'NW-ALU55  '  999.   IBP  NCEP      45
+$
+$ NCEP IBP boundary point further east (Gulf of Alaska /
+$ Juneau AFC) -- real coordinates, outside the 150-210E window
+$ (215.5E) but still IBP: exercises the lon-bound exclusion.
+  -144.50   53.90  'NW-AJK51  '  999.   IBP  NCEP      45
+$
+$ NCEP IBP boundary points, Arctic (Fairbanks AFC) -- real
+$ coordinates, inside the 150-210E lon band but at 73N, outside
+$ the 45-67.5N AK window: exercises the lat-bound exclusion.
+  -176.50   73.00  'NW-AFG51  '  999.   IBP  NCEP      45
+  -176.00   73.00  'NW-AFG52  '  999.   IBP  NCEP      45
+  -175.50   73.00  'NW-AFG53  '  999.   IBP  NCEP      45
+$
+$ Bermuda boundary data
+$
+   -65.50   31.50  'BER51     '  999.   IBP  NCEP      45
+   -65.25   31.50  'BER52     '  999.   IBP  NCEP      45
+   -65.00   31.50  'BER53     '  999.   IBP  NCEP      45
+   -64.75   31.50  'BER54     '  999.   IBP  NCEP      45
+   -64.50   31.50  'BER55     '  999.   IBP  NCEP      45
+   -64.25   31.50  'BER56     '  999.   IBP  NCEP      45
+   -64.00   31.50  'BER57     '  999.   IBP  NCEP      45
+   -64.00   31.75  'BER58     '  999.   IBP  NCEP      45
+   -64.00   32.00  'BER59     '  999.   IBP  NCEP      45
+   -64.00   32.25  'BER60     '  999.   IBP  NCEP      45
+   -64.00   32.50  'BER61     '  999.   IBP  NCEP      45
+   -64.00   32.75  'BER62     '  999.   IBP  NCEP      45
+   -64.00   33.00  'BER63     '  999.   IBP  NCEP      45
+   -64.25   33.00  'BER64     '  999.   IBP  NCEP      45
+   -64.50   33.00  'BER65     '  999.   IBP  NCEP      45
+   -64.75   33.00  'BER66     '  999.   IBP  NCEP      45
+   -64.00   33.00  'BER67     '  999.   IBP  NCEP      45
+   -65.25   33.00  'BER68     '  999.   IBP  NCEP      45
+   -65.50   33.00  'BER69     '  999.   IBP  NCEP      45
+   -65.50   32.75  'BER70     '  999.   IBP  NCEP      45
+   -65.50   32.50  'BER71     '  999.   IBP  NCEP      45
+   -65.50   32.25  'BER72     '  999.   IBP  NCEP      45
+   -65.50   32.00  'BER73     '  999.   IBP  NCEP      45
+   -65.50   31.75  'BER74     '  999.   IBP  NCEP      45

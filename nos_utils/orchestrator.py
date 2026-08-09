@@ -99,6 +99,8 @@ class PrepOrchestrator:
     8. (UFS only) DATM blending + ESMF mesh generation
     9. (UFS only) UFS-Coastal config files (model_configure, datm_in,
        datm.streams, ufs.configure, fd_ufs.yaml, noahmptable.tbl)
+    10. (waves_enabled) GFS-Wave boundary spectra — WW3 boundary conditions
+        (nest.ww3) for coupled SCHISM+WW3 runs
     """
 
     # Steps that can be handled by Python vs legacy shell
@@ -258,6 +260,16 @@ class PrepOrchestrator:
             log.info(
                 "st_lawrence_enabled but 'law' path not provided — skipping "
                 "St. Lawrence River forcing"
+            )
+
+        # GFS-Wave boundary spectra (WW3 nest.ww3): independent of
+        # GFS/HRRR/NWM/RTOFS, only needs its own COMINgfswave tree.
+        if self.config.waves_enabled and "gfswave" in self.paths:
+            results.append(self._run_wave_boundary(output_dir))
+        elif self.config.waves_enabled:
+            log.info(
+                "waves_enabled but 'gfswave' path not provided — skipping "
+                "GFS-Wave boundary spectra"
             )
 
         # RTOFS OBC: heavy NetCDF I/O + Delaunay interpolation
@@ -481,6 +493,39 @@ class PrepOrchestrator:
             sflux_rad_file=sflux_rad,
             prev_rerun_dir=prev_rerun,
             archive_prefix=archive_prefix,
+        )
+        return proc.process()
+
+    def _run_wave_boundary(self, output_dir: Path) -> ForcingResult:
+        """GFS-Wave boundary spectra: builds WW3 nest.ww3.
+
+        Reads ``ibp_tar`` / ``spec_tar.gz`` from
+        ``$COMINgfswave/gfs.<pdy>/<cyc>/wave/station/``, selects boundary
+        points (window + extras) from ``wave_points_file``, and runs
+        ``ww3_bound`` to produce ``nest.ww3``. Degrades gracefully (still
+        emits ``ww3_bound.inp`` + extracted spectra) when the executable is
+        unavailable.
+        """
+        from .forcing.wave_boundary import WaveBoundaryProcessor
+
+        window = None
+        if all(
+            getattr(self.config, attr, None) is not None
+            for attr in ("wave_lon_min", "wave_lon_max", "wave_lat_min", "wave_lat_max")
+        ):
+            window = {
+                "lon_min": self.config.wave_lon_min,
+                "lon_max": self.config.wave_lon_max,
+                "lat_min": self.config.wave_lat_min,
+                "lat_max": self.config.wave_lat_max,
+            }
+
+        proc = WaveBoundaryProcessor(
+            self.config, self.paths["gfswave"], output_dir,
+            points_file=self.config.wave_points_file,
+            window=window,
+            extra_points=self.config.wave_extra_points,
+            max_cycle_fallback=self.config.wave_max_cycle_fallback,
         )
         return proc.process()
 
@@ -1303,6 +1348,13 @@ class PrepOrchestrator:
             "source_sink.in": f"{prefix}.source_sink.in",
             "sflux_inputs.txt": "sflux_inputs.txt",
             "partition.prop": "partition.prop",
+            # WW3 boundary conditions (waves_enabled). ww3_bound.inp is
+            # archived alongside nest.ww3 as an audit trail of which
+            # extracted spectra fed it -- cheap and matches the
+            # bctides.in.<phase> precedent of keeping the generator's own
+            # input next to its output.
+            "nest.ww3": f"{prefix}.{cycle}.nest.ww3",
+            "ww3_bound.inp": f"{prefix}.{cycle}.ww3_bound.inp",
             # UFS-Coastal config files (nws=4). Names match what the
             # legacy exnos_ofs_prep.sh archives (lines 361-363):
             # `cp $DATA/<f> $COMOUT/${RUN}.${cycle}.<f>`.
@@ -1349,6 +1401,14 @@ class PrepOrchestrator:
                 shutil.copy2(src, dst)
                 archived.append(dst)
 
+        # Wave boundary cycle/point-selection metadata: written alongside
+        # nest.ww3 whenever WaveBoundaryProcessor ran (success or failure),
+        # so a missing ww3_bound executable still leaves a diagnosable
+        # record of which cycle and points were chosen in $COMOUT.
+        wave_meta_path = self._write_wave_bc_metadata(result, comout)
+        if wave_meta_path is not None:
+            archived.append(wave_meta_path)
+
         # Input manifest: list (filenames only) the input files prep
         # consumed this run, grouped by category/source. Written last so it
         # reflects every processor that ran.
@@ -1359,6 +1419,56 @@ class PrepOrchestrator:
 
         log.info(f"Archived {len(archived)} files to {comout}")
         return archived
+
+    def _write_wave_bc_metadata(
+        self, result: PrepResult, comout: Path
+    ) -> Optional[Path]:
+        """Write WAVE_BC cycle/point-selection metadata to $COMOUT.
+
+        Best-effort audit trail alongside ``nest.ww3``: which GFS-Wave
+        cycle was used, how many cycles were walked back, and how many
+        boundary points were selected/extracted. Written whenever
+        WaveBoundaryProcessor ran, success or failure, so a missing
+        ``ww3_bound`` executable still leaves a diagnosable record.
+        Returns ``None`` (not an error) when the wave step didn't run at
+        all this cycle.
+        """
+        import json
+        from datetime import timezone
+
+        wave_result = next(
+            (r for r in result.results if r.source == "WAVE_BC"), None
+        )
+        if wave_result is None:
+            return None
+
+        comout = Path(comout)
+        prefix = self.run_name
+        cycle = f"t{self.config.cyc:02d}z"
+        pdy = self.config.pdy
+
+        payload = {
+            "ofs": prefix,
+            "pdy": pdy,
+            "cyc": f"{self.config.cyc:02d}",
+            "stage": "prep",
+            "source": "WAVE_BC",
+            "success": wave_result.success,
+            "errors": wave_result.errors,
+            "warnings": wave_result.warnings,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            **wave_result.metadata,
+        }
+
+        meta_path = comout / f"{prefix}.{cycle}.{pdy}.wave_bc.json"
+        try:
+            with open(meta_path, "w") as fh:
+                json.dump(payload, fh, indent=2)
+            log.info(f"  Wrote wave boundary metadata -> {meta_path.name}")
+            return meta_path
+        except OSError as e:
+            log.warning(f"  Failed to write wave boundary metadata: {e}")
+            return None
 
     def _write_inputs_manifest(
         self, result: PrepResult, comout: Path
