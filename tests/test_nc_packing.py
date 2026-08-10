@@ -322,3 +322,57 @@ class TestTSUVPacking:
                 f"{name}: Fortran-unpack={fortran}, want {r}"
             )
         ds.close()
+
+    def test_zero_current_is_not_fill(self, tmp_path):
+        """A genuine slack-water current (u=v=0.0 m/s) must pack to 0, NOT be
+        misclassified as missing (-30000). This pins the fix for conflating
+        real zero currents with the -30000 fill sentinel."""
+        proc = _make_proc(tmp_path)
+        nz, ny, nx = 1, 2, 2
+        temp = np.full((nz, ny, nx), 15.0, dtype=np.float32)
+        salt = np.full((nz, ny, nx), 34.0, dtype=np.float32)
+        u    = np.zeros((nz, ny, nx), dtype=np.float32)   # real slack water
+        v    = np.zeros((nz, ny, nx), dtype=np.float32)
+        lon  = np.zeros((ny, nx), dtype=np.float32)
+        lat  = np.zeros((ny, nx), dtype=np.float32)
+        dep  = np.array([5.0], dtype=np.float32)
+
+        work = tmp_path / "work"
+        work.mkdir(exist_ok=True)
+        out = proc._write_tsuv_nc(work, [temp], [salt], [u], [v], lon, lat, dep)
+
+        ds = Dataset(str(out))
+        ds.set_auto_maskandscale(False)
+        for name in ("water_u", "water_v"):
+            raw = int(ds.variables[name][0, 0, 0, 0])
+            assert raw == 0, (
+                f"{name}: zero current stored as {raw}, want 0 "
+                f"(must not be flagged as -30000 fill)"
+            )
+        ds.close()
+
+    def test_missing_current_is_fill(self, tmp_path):
+        """A missing current cell (-30000, from ma.filled) must be stored as
+        the -30000 int16 fill sentinel, matching operational change_miss."""
+        proc = _make_proc(tmp_path)
+        nz, ny, nx = 1, 2, 2
+        temp = np.full((nz, ny, nx), 15.0, dtype=np.float32)
+        salt = np.full((nz, ny, nx), 34.0, dtype=np.float32)
+        u    = np.full((nz, ny, nx), -30000.0, dtype=np.float32)  # missing
+        v    = np.full((nz, ny, nx), -30000.0, dtype=np.float32)
+        lon  = np.zeros((ny, nx), dtype=np.float32)
+        lat  = np.zeros((ny, nx), dtype=np.float32)
+        dep  = np.array([5.0], dtype=np.float32)
+
+        work = tmp_path / "work"
+        work.mkdir(exist_ok=True)
+        out = proc._write_tsuv_nc(work, [temp], [salt], [u], [v], lon, lat, dep)
+
+        ds = Dataset(str(out))
+        ds.set_auto_maskandscale(False)
+        for name in ("water_u", "water_v"):
+            raw = int(ds.variables[name][0, 0, 0, 0])
+            assert raw == -30000, (
+                f"{name}: missing current stored as {raw}, want -30000 fill"
+            )
+        ds.close()
