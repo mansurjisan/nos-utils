@@ -912,8 +912,11 @@ class RTOFSProcessor(ForcingProcessor):
                 for t in range(subset["temperature"].shape[0]):
                     all_temp.append(np.ma.filled(subset["temperature"][t], fill_value=-30000.0))
                     all_salt.append(np.ma.filled(subset["salinity"][t], fill_value=-30000.0))
-                    all_u.append(np.ma.filled(subset["u"][t], fill_value=0.0))
-                    all_v.append(np.ma.filled(subset["v"][t], fill_value=0.0))
+                    # Missing u/v -> -30000 (operational cvtUV.nco change_miss(-30000)),
+                    # NOT 0.0: a genuine slack-water current (u=0) is a valid value
+                    # and must not be conflated with missing data.
+                    all_u.append(np.ma.filled(subset["u"][t], fill_value=-30000.0))
+                    all_v.append(np.ma.filled(subset["v"][t], fill_value=-30000.0))
 
                 if all_lon is None:
                     all_lon = np.array(subset["Longitude"])
@@ -968,10 +971,13 @@ class RTOFSProcessor(ForcingProcessor):
         _TSUV_FILL_I2 = np.int16(-30000)
         _pack_spec = [
             # (varname,   data_list,  add_offset, scale_factor, fill_real)
+            # fill_real is the real-space sentinel written by ma.filled above;
+            # all four use -30000 (operational change_miss(-30000)), so a real
+            # zero current (u=0) is packed normally, not treated as missing.
             ("temperature", all_temp, 20.0,  0.001, -30000.0),
             ("salinity",    all_salt, 20.0,  0.001, -30000.0),
-            ("water_u",     all_u,     0.0,  0.001,  0.0),
-            ("water_v",     all_v,     0.0,  0.001,  0.0),
+            ("water_u",     all_u,     0.0,  0.001, -30000.0),
+            ("water_v",     all_v,     0.0,  0.001, -30000.0),
         ]
         for vname, data_list, add_offset, scale_factor, fill_real in _pack_spec:
             var = nc.createVariable(
