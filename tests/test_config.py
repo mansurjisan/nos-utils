@@ -301,6 +301,32 @@ class TestNCOBridgePaths:
         assert "law" not in paths
         assert "adt" not in paths
 
+    def test_comingfswave_maps_to_gfswave_path(self, monkeypatch, tmp_path):
+        """Regression guard: without this mapping, PrepOrchestrator's
+
+        ``self.config.waves_enabled and "gfswave" in self.paths`` gate
+        (orchestrator.py) can never be true via config_from_env(), so
+        WaveBoundaryProcessor silently never runs for any wave-coupled
+        system prepped through the NCO bridge.
+        """
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        gfswave_dir = tmp_path / "gfswave"
+        monkeypatch.setenv("COMINgfswave", str(gfswave_dir))
+
+        _, paths = config_from_env()
+        assert paths.get("gfswave") == str(gfswave_dir)
+
+    def test_gfswave_absent_when_unset(self, monkeypatch, tmp_path):
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        monkeypatch.delenv("COMINgfswave", raising=False)
+
+        _, paths = config_from_env()
+        assert "gfswave" not in paths
+
 
 # A STOFS-shaped YAML that, like the real stofs_3d_atl_ufs.yaml, declares
 # model.physics.nws=4 (UFS NUOPC coupling). Used to prove execution.mode

@@ -103,6 +103,7 @@ def config_from_env(
         "rtofs": "COMINrtofs",
         "law": "COMINlaw",
         "adt": "COMINadt",
+        "gfswave": "COMINgfswave",
         "prev_rerun": "COMINrerun",
         "fix": "FIXofs",
         "output": "DATA",
