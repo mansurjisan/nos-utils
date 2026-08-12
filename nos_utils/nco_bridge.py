@@ -201,6 +201,14 @@ def config_from_env(
             resolved = fix_path / config.grid_file
             if resolved.exists():
                 config.grid_file = resolved
+        # WW3 boundary points file (wave_gfs.buoys format). Without this,
+        # a bare name from forcing.waves.points_file is handed to
+        # WaveBoundaryProcessor unresolved, and Path.exists() is checked
+        # against the prep job's cwd (not FIXofs) -- silently never found.
+        if config.wave_points_file and not Path(config.wave_points_file).is_absolute():
+            resolved = fix_path / config.wave_points_file
+            if resolved.exists():
+                config.wave_points_file = resolved
 
     return config, paths
 

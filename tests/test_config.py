@@ -1,5 +1,7 @@
 """Tests for ForcingConfig."""
 
+from pathlib import Path
+
 import pytest
 from nos_utils.config import ForcingConfig
 
@@ -326,6 +328,66 @@ class TestNCOBridgePaths:
 
         _, paths = config_from_env()
         assert "gfswave" not in paths
+
+    def _wave_yaml(self, points_file="secofs_ufs.ww3_bound_points.list"):
+        return f"""\
+system:
+  name: secofs_wave_shaped
+grid:
+  domain: {{lon_min: -88.0, lon_max: -63.0, lat_min: 17.0, lat_max: 40.0}}
+forcing:
+  atmospheric: {{met_num: 2}}
+  waves:
+    enabled: true
+    points_file: {points_file}
+model:
+  run: {{nowcast_hours: 6, forecast_hours: 48}}
+"""
+
+    def test_wave_points_file_resolved_relative_to_fixofs(self, monkeypatch, tmp_path):
+        """A bare ``points_file`` name (the same FIXofs-relative convention
+
+        every other fix file in this codebase uses -- grid_file,
+        bctides_template, river_config_file) must resolve against FIXofs,
+        the same as those. Without this, WaveBoundaryProcessor checks
+        ``points_file.exists()`` against the prep job's cwd, not FIXofs,
+        and a correctly-staged file is never found.
+        """
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        fix_dir = tmp_path / "fix"
+        fix_dir.mkdir()
+        points_file = fix_dir / "secofs_ufs.ww3_bound_points.list"
+        points_file.write_text("$ header\n")
+        monkeypatch.setenv("FIXofs", str(fix_dir))
+        monkeypatch.setenv(
+            "OFS_CONFIG", str(_write_yaml(tmp_path, self._wave_yaml())),
+        )
+
+        config, _ = config_from_env()
+        assert config.wave_points_file == points_file
+
+    def test_wave_points_file_left_bare_when_not_staged(self, monkeypatch, tmp_path):
+        """Not-yet-staged points_file stays a bare relative Path rather than
+
+        being silently resolved to a nonexistent FIXofs path -- matches
+        grid_file/bctides_template's own "only resolve if it actually
+        exists" behavior, so the downstream "points_file not found"
+        warning in WaveBoundaryProcessor reports the intended bare name.
+        """
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        fix_dir = tmp_path / "fix"
+        fix_dir.mkdir()
+        monkeypatch.setenv("FIXofs", str(fix_dir))
+        monkeypatch.setenv(
+            "OFS_CONFIG", str(_write_yaml(tmp_path, self._wave_yaml())),
+        )
+
+        config, _ = config_from_env()
+        assert config.wave_points_file == Path("secofs_ufs.ww3_bound_points.list")
 
 
 # A STOFS-shaped YAML that, like the real stofs_3d_atl_ufs.yaml, declares
