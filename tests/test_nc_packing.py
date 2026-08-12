@@ -76,18 +76,19 @@ def _expected_packed(real_f32, offset_f32, scale_f32):
 class TestSSHPacking:
     """surf_el must be stored as int16, explicitly packed, single-packed."""
 
-    def _write_ssh(self, tmp_path):
+    def _write_ssh(self, tmp_path, real_ssh=None):
         """Write a minimal SSH_1.nc using _stofs_prepare_ssh with a synthetic
         fixture containing known real SSH values."""
         proc = _make_proc(tmp_path)
 
         ny, nx = 3, 4
-        # Real SSH values in metres: mix of positive, negative, and an extreme.
-        real_ssh = np.array([
-            [0.5,  -1.25, 0.0,   2.0],
-            [-0.8,  0.3, -2.5,   1.1],
-            [0.01, -0.07, 0.9,  15000.0],  # last cell is extreme -> fill
-        ], dtype=np.float32)
+        if real_ssh is None:
+            # Real SSH in metres: mix of positive, negative, and an extreme.
+            real_ssh = np.array([
+                [0.5,  -1.25, 0.0,   2.0],
+                [-0.8,  0.3, -2.5,   1.1],
+                [0.01, -0.07, 0.9,  15000.0],  # last cell is extreme -> fill
+            ], dtype=np.float32)
 
         fpath = tmp_path / "rtofs.20260331" / "rtofs_glo_2ds_n012_diag.nc"
         fpath.parent.mkdir(parents=True, exist_ok=True)
@@ -217,6 +218,22 @@ class TestSSHPacking:
             f"fill cell Fortran unpack={fortran} not < {rjunk_threshold}: "
             f"would not be flagged dry"
         )
+
+    def test_nan_cell_is_fill(self, tmp_path):
+        """A raw NaN SSH cell (an unmasked source gap, not the -30000
+        sentinel) must store as the -30000 int16 fill, not an undefined
+        int16 cast of NaN that would read as a spurious wet node."""
+        real_ssh = np.array([
+            [0.5,  -1.25, 0.0,   2.0],
+            [-0.8,  0.3, -2.5,   1.1],
+            [0.01, -0.07, 0.9,  np.nan],  # NaN -> fill
+        ], dtype=np.float32)
+        out, _ = self._write_ssh(tmp_path, real_ssh)
+        ds = Dataset(str(out))
+        ds.set_auto_maskandscale(False)
+        raw = int(ds.variables["surf_el"][0, 2, 3])
+        ds.close()
+        assert raw == -30000, f"NaN cell stored as {raw}, want -30000 fill"
 
 
 # ---------------------------------------------------------------------------
@@ -374,5 +391,33 @@ class TestTSUVPacking:
             raw = int(ds.variables[name][0, 0, 0, 0])
             assert raw == -30000, (
                 f"{name}: missing current stored as {raw}, want -30000 fill"
+            )
+        ds.close()
+
+    def test_nan_cell_is_fill(self, tmp_path):
+        """A NaN T/S/U/V cell (an unmasked source gap) must store as the
+        -30000 int16 fill, not an undefined int16 cast of NaN."""
+        proc = _make_proc(tmp_path)
+        nz, ny, nx = 1, 2, 2
+        temp = np.full((nz, ny, nx), 15.0, dtype=np.float32)
+        salt = np.full((nz, ny, nx), 34.0, dtype=np.float32)
+        u    = np.full((nz, ny, nx),  0.1, dtype=np.float32)
+        v    = np.full((nz, ny, nx), -0.1, dtype=np.float32)
+        for arr in (temp, salt, u, v):
+            arr[0, 0, 0] = np.nan   # unmasked source gap
+        lon  = np.zeros((ny, nx), dtype=np.float32)
+        lat  = np.zeros((ny, nx), dtype=np.float32)
+        dep  = np.array([5.0], dtype=np.float32)
+
+        work = tmp_path / "work"
+        work.mkdir(exist_ok=True)
+        out = proc._write_tsuv_nc(work, [temp], [salt], [u], [v], lon, lat, dep)
+
+        ds = Dataset(str(out))
+        ds.set_auto_maskandscale(False)
+        for name in ("temperature", "salinity", "water_u", "water_v"):
+            raw = int(ds.variables[name][0, 0, 0, 0])
+            assert raw == -30000, (
+                f"{name}: NaN cell stored as {raw}, want -30000 fill"
             )
         ds.close()
