@@ -277,7 +277,10 @@ class ADTBlender:
                         np.round((real - surf_el.add_offset) / surf_el.scale_factor),
                         np.iinfo(np.int16).min, np.iinfo(np.int16).max,
                     )
-                    packed = np.where(np.abs(real) >= 10000, int(fill), packed)
+                    packed = np.where(
+                        (np.abs(real) >= 10000) | ~np.isfinite(real),
+                        int(fill), packed,
+                    )
                     ds.variables["surf_el"][t, :, :] = packed.astype(np.int16)
 
             ds.close()

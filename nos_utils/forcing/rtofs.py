@@ -861,12 +861,17 @@ class RTOFSProcessor(ForcingProcessor):
             real = np.asarray(all_ssh[t], dtype=np.float32)
             # Explicit pack using the variable's own declared attrs:
             #   stored = round((real - add_offset) / scale_factor)
-            # Clip to int16 range; mask extreme cells with fill.
+            # Clip to int16 range; mask extreme and non-finite (NaN/inf) cells
+            # with fill -- otherwise round()/astype(int16) of a NaN yields a
+            # platform-undefined int16 (often -32768 or 0), a spurious wet node.
             packed = np.clip(
                 np.round((real - surf_el.add_offset) / surf_el.scale_factor),
                 np.iinfo(np.int16).min, np.iinfo(np.int16).max,
             )
-            packed = np.where(np.abs(real) >= 10000, int(_SSH_FILL_I2), packed)
+            packed = np.where(
+                (np.abs(real) >= 10000) | ~np.isfinite(real),
+                int(_SSH_FILL_I2), packed,
+            )
             surf_el[t] = packed.astype(np.int16)
 
         nc.close()
@@ -1016,7 +1021,9 @@ class RTOFSProcessor(ForcingProcessor):
                 # Explicit pack using the variable's own declared attrs:
                 #   stored = round((real - add_offset) / scale_factor)
                 # Preserve fill cells (originally fill_real from ma.filled above).
-                is_fill = np.abs(real - fill_real) < 1e-3
+                # Non-finite (NaN/inf) source cells also map to the fill, else
+                # round()/astype(int16) of a NaN yields an undefined int16.
+                is_fill = (np.abs(real - fill_real) < 1e-3) | ~np.isfinite(real)
                 packed = np.clip(
                     np.round((real - var.add_offset) / var.scale_factor),
                     np.iinfo(np.int16).min, np.iinfo(np.int16).max,
