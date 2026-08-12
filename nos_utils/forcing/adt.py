@@ -262,12 +262,23 @@ class ADTBlender:
                                              -30000.0, ssh_corrected)
                     ssh[t, :, :] = ssh_corrected
 
-            # Update surf_el with scaled values
+            # Update surf_el: single-pack int16 to match _stofs_prepare_ssh.
+            # auto-maskandscale is ON for this r+ handle, so disable it on the
+            # variable and pack manually with its own declared attrs; otherwise
+            # netCDF re-applies scale_factor and double-packs (ssh*1e6, int16
+            # overflow). Masked/extreme cells use the variable's -30000 fill.
             if "surf_el" in ds.variables:
+                surf_el = ds.variables["surf_el"]
+                surf_el.set_auto_maskandscale(False)
+                fill = np.int16(getattr(surf_el, "missing_value", -30000))
                 for t in range(nt):
-                    data = ssh[t, :, :].copy()
-                    data = np.where(np.abs(data) < 1000, data * 1000.0, -3000.0)
-                    ds.variables["surf_el"][t, :, :] = data
+                    real = np.ma.filled(ssh[t, :, :], -30000.0).astype(np.float32)
+                    packed = np.clip(
+                        np.round((real - surf_el.add_offset) / surf_el.scale_factor),
+                        np.iinfo(np.int16).min, np.iinfo(np.int16).max,
+                    )
+                    packed = np.where(np.abs(real) >= 10000, int(fill), packed)
+                    ds.variables["surf_el"][t, :, :] = packed.astype(np.int16)
 
             ds.close()
             log.info(f"ADT blending applied to {output.name}")
