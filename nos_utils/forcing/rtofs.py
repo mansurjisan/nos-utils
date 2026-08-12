@@ -932,6 +932,29 @@ class RTOFSProcessor(ForcingProcessor):
             return None
 
         # Write TSUV_1.nc (matching Fortran input format)
+        return self._write_tsuv_nc(
+            work_dir, all_temp, all_salt, all_u, all_v,
+            all_lon, all_lat, all_depth,
+        )
+
+    def _write_tsuv_nc(
+        self, work_dir: Path,
+        all_temp: List[np.ndarray], all_salt: List[np.ndarray],
+        all_u: List[np.ndarray], all_v: List[np.ndarray],
+        all_lon: np.ndarray, all_lat: np.ndarray,
+        all_depth: Optional[np.ndarray] = None,
+    ) -> Optional[Path]:
+        """Write TSUV_1.nc with T/S/U/V explicitly packed as int16.
+
+        Split out of _stofs_prepare_tsuv so the packing is unit-testable.
+        Each list holds one (nz, ny, nx) array per time step; all_lon/all_lat
+        are (ny, nx); all_depth is the (nz,) level depths. Cells equal to the
+        -30000 real-space sentinel (from ma.filled in the caller) are stored
+        as the int16 fill.
+        """
+        if not all_temp:
+            return None
+
         output = work_dir / "TSUV_1.nc"
         nc = Dataset(str(output), "w", format="NETCDF4")
 
