@@ -31,6 +31,7 @@ import numpy as np
 
 from ..config import ForcingConfig
 from ..coords import normalize_lon, lon_convention
+from .rtofs import _pack_int16
 
 log = logging.getLogger(__name__)
 
@@ -273,15 +274,10 @@ class ADTBlender:
                 fill = np.int16(getattr(surf_el, "missing_value", -30000))
                 for t in range(nt):
                     real = np.ma.filled(ssh[t, :, :], -30000.0).astype(np.float32)
-                    packed = np.clip(
-                        np.round((real - surf_el.add_offset) / surf_el.scale_factor),
-                        np.iinfo(np.int16).min, np.iinfo(np.int16).max,
+                    ds.variables["surf_el"][t, :, :] = _pack_int16(
+                        real, surf_el.scale_factor, surf_el.add_offset,
+                        fill, fill_mask=np.abs(real) >= 10000,
                     )
-                    packed = np.where(
-                        (np.abs(real) >= 10000) | ~np.isfinite(real),
-                        int(fill), packed,
-                    )
-                    ds.variables["surf_el"][t, :, :] = packed.astype(np.int16)
 
             ds.close()
             log.info(f"ADT blending applied to {output.name}")
