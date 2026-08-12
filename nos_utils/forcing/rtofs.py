@@ -58,6 +58,30 @@ except ImportError:
     HAS_NETCDF4 = False
 
 
+def _pack_int16(real, scale, offset, fill_i2, fill_mask=None):
+    """Pack a float field to int16 exactly as the Fortran gen_3Dth expects.
+
+    stored = round((real - offset) / scale), clipped to the int16 range;
+    the Fortran unpacks it downstream as raw * scale + offset. Cells selected
+    by ``fill_mask``, plus any non-finite (NaN/inf) cell, are stored as
+    ``fill_i2`` -- never cast through astype(int16), whose result for NaN is
+    platform-undefined (often -32768 or 0, a spurious wet/garbage node).
+
+    Single source of truth for the SSH writer, the TSUV writer, and the ADT
+    blend so the packing convention cannot drift between surf_el and TSUV.
+    """
+    real = np.asarray(real, dtype=np.float32)
+    packed = np.clip(
+        np.round((real - offset) / scale),
+        np.iinfo(np.int16).min, np.iinfo(np.int16).max,
+    )
+    mask = ~np.isfinite(real)
+    if fill_mask is not None:
+        mask = mask | fill_mask
+    packed = np.where(mask, int(fill_i2), packed)
+    return packed.astype(np.int16)
+
+
 class RTOFSProcessor(ForcingProcessor):
     """
     RTOFS ocean boundary condition processor for SCHISM.
@@ -841,8 +865,8 @@ class RTOFSProcessor(ForcingProcessor):
         #
         # We pack explicitly and disable auto mask-and-scale to prevent
         # netCDF4 from re-applying scale_factor on write (double-pack).
-        # See test_ssh_packing_double_pack.py (demonstrates the double-pack
-        # failure) and test_nc_packing.py (pins the fix).
+        # See tests/test_nc_packing.py::TestSSHPacking, which pins the
+        # single-pack (raw stored == round(real/scale), no double-pack).
         #
         # Masked/extreme cells (|ssh| >= 10000 m) stored as fill -30000:
         # Fortran unpack: -30000 * 1.e-3 = -30.0 m < rjunk+0.1 (-9.9 m)
@@ -859,20 +883,12 @@ class RTOFSProcessor(ForcingProcessor):
         surf_el.missing_value = _SSH_FILL_I2
         for t in range(nt):
             real = np.asarray(all_ssh[t], dtype=np.float32)
-            # Explicit pack using the variable's own declared attrs:
-            #   stored = round((real - add_offset) / scale_factor)
-            # Clip to int16 range; mask extreme and non-finite (NaN/inf) cells
-            # with fill -- otherwise round()/astype(int16) of a NaN yields a
-            # platform-undefined int16 (often -32768 or 0), a spurious wet node.
-            packed = np.clip(
-                np.round((real - surf_el.add_offset) / surf_el.scale_factor),
-                np.iinfo(np.int16).min, np.iinfo(np.int16).max,
+            # Extreme cells (|SSH| >= 10000 m) map to fill; _pack_int16 also
+            # sends non-finite cells there and single-packs to int16.
+            surf_el[t] = _pack_int16(
+                real, surf_el.scale_factor, surf_el.add_offset,
+                _SSH_FILL_I2, fill_mask=np.abs(real) >= 10000,
             )
-            packed = np.where(
-                (np.abs(real) >= 10000) | ~np.isfinite(real),
-                int(_SSH_FILL_I2), packed,
-            )
-            surf_el[t] = packed.astype(np.int16)
 
         nc.close()
         log.info(f"Created SSH_1.nc: {nt} times, {ny}x{nx} grid")
@@ -1018,18 +1034,13 @@ class RTOFSProcessor(ForcingProcessor):
             var.missing_value = _TSUV_FILL_I2
             for t in range(nt):
                 real = np.asarray(data_list[t], dtype=np.float32)
-                # Explicit pack using the variable's own declared attrs:
-                #   stored = round((real - add_offset) / scale_factor)
-                # Preserve fill cells (originally fill_real from ma.filled above).
-                # Non-finite (NaN/inf) source cells also map to the fill, else
-                # round()/astype(int16) of a NaN yields an undefined int16.
-                is_fill = (np.abs(real - fill_real) < 1e-3) | ~np.isfinite(real)
-                packed = np.clip(
-                    np.round((real - var.add_offset) / var.scale_factor),
-                    np.iinfo(np.int16).min, np.iinfo(np.int16).max,
+                # Cells equal to the real-space sentinel (fill_real from
+                # ma.filled in the caller) map to fill; _pack_int16 also sends
+                # non-finite cells there and single-packs to int16.
+                var[t] = _pack_int16(
+                    real, var.scale_factor, var.add_offset,
+                    _TSUV_FILL_I2, fill_mask=np.abs(real - fill_real) < 1e-3,
                 )
-                packed = np.where(is_fill, int(_TSUV_FILL_I2), packed)
-                var[t] = packed.astype(np.int16)
 
         nc.close()
         log.info(f"Created TSUV_1.nc: {nt} times, {nz} levels, {ny}x{nx} grid")
