@@ -1523,10 +1523,33 @@ class NWMProcessor(ForcingProcessor):
         NWM reach feature_ids (``river.files.nwm_reach`` in the OFS YAML,
         e.g. ``secofs_ufs.nwm.reach.dat``).
 
-        Not wired through ``ForcingConfig`` as a dedicated field -- resolved
-        here by candidate name across the same FIX directories
-        ``_copy_static_vsink`` / ``_copy_static_msource`` already search.
+        Honors ``ForcingConfig.nwm_reach_file`` when the YAML sets it --
+        an absolute path is used as-is, a relative one is resolved against
+        the same FIX directories ``_copy_static_vsink`` / ``_copy_static_msource``
+        already search. Falls back to searching those directories for the
+        hardcoded candidate basenames only when the field is unset
+        (preserves prior behavior for configs that don't set it).
         """
+        configured = self.config.nwm_reach_file
+        if configured is not None:
+            configured = Path(configured)
+            if configured.is_absolute():
+                if configured.exists():
+                    log.info(f"Using configured NWM reach map: {configured}")
+                    return configured
+                log.warning(f"Configured river.files.nwm_reach not found: {configured}")
+                return None
+            for fix_dir in self._fix_search_dirs():
+                p = fix_dir / configured
+                if p.exists():
+                    log.info(f"Using configured NWM reach map: {p}")
+                    return p
+            log.warning(
+                f"Configured river.files.nwm_reach ({configured}) not found "
+                "in any FIX search dir"
+            )
+            return None
+
         candidates = [
             "secofs_ufs.nwm.reach.dat",
             "secofs.nwm.reach.dat",
