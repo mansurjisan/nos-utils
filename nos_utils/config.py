@@ -204,6 +204,12 @@ class ForcingConfig:
     # Q_mean/T_mean from river.ctl Section 1 — closes most of the value
     # gap to production output.
     river_clim_file: Optional[Path] = None
+    # FIX file mapping river.ctl boundary-river stations to NWM reach
+    # feature_ids (companion to river_ctl_file, same river.files YAML
+    # block). When set, _find_nwm_reach_file uses this path directly;
+    # when unset, it falls back to searching _fix_search_dirs() for the
+    # hardcoded candidate basenames (e.g. secofs_ufs.nwm.reach.dat).
+    nwm_reach_file: Optional[Path] = None
     # SCHISM model time step (seconds). Used by `_write_river_th_files`
     # to generate the time grid for ``schism_flux/temp/salt.th``. Default
     # 120s matches typical SECOFS production. Set higher (e.g. 3600) for
@@ -1029,6 +1035,11 @@ class ForcingConfig:
         clim_file = river_files.get("clim_file")
         if clim_file:
             kwargs["river_clim_file"] = Path(clim_file)
+        # NWM reach map — companion FIX file to ctl_file, resolved by
+        # _find_nwm_reach_file (real-time boundary-river overlay).
+        nwm_reach_file = river_files.get("nwm_reach")
+        if nwm_reach_file:
+            kwargs["nwm_reach_file"] = Path(nwm_reach_file)
         if bctides_template:
             kwargs["bctides_template"] = Path(bctides_template)
         if grid_file:
