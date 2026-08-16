@@ -329,7 +329,8 @@ class TestNCOBridgePaths:
         _, paths = config_from_env()
         assert "gfswave" not in paths
 
-    def _wave_yaml(self, points_file="secofs_ufs.ww3_bound_points.list"):
+    def _wave_yaml(self, points_file="secofs_ufs.ww3_bound_points.list", mod_def=None):
+        mod_def_line = f"\n    mod_def: {mod_def}" if mod_def else ""
         return f"""\
 system:
   name: secofs_wave_shaped
@@ -339,7 +340,7 @@ forcing:
   atmospheric: {{met_num: 2}}
   waves:
     enabled: true
-    points_file: {points_file}
+    points_file: {points_file}{mod_def_line}
 model:
   run: {{nowcast_hours: 6, forecast_hours: 48}}
 """
@@ -388,6 +389,95 @@ model:
 
         config, _ = config_from_env()
         assert config.wave_points_file == Path("secofs_ufs.ww3_bound_points.list")
+
+    def test_wave_mod_def_defaults_to_run_dot_mod_def_ww3(self, monkeypatch, tmp_path):
+        """ww3_bound reads mod_def.ww3 from its CWD, not an argument, and
+        the processor stages whatever config.wave_mod_def resolves to.
+        Without a default, a system that never sets forcing.waves.mod_def
+        explicitly (the common case -- RUN already matches the fix-file
+        prefix) would leave wave_mod_def unset and WaveBoundaryProcessor
+        would fail every cycle. The default follows the same
+        {prefix}.<bare> convention wave_points_file/grid_file/
+        bctides_template already use, keyed off RUN.
+        """
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("RUN", "secofs_ufs")
+        fix_dir = tmp_path / "fix"
+        fix_dir.mkdir()
+        mod_def = fix_dir / "secofs_ufs.mod_def.ww3"
+        mod_def.write_text("fake mod_def\n")
+        monkeypatch.setenv("FIXofs", str(fix_dir))
+        monkeypatch.setenv(
+            "OFS_CONFIG", str(_write_yaml(tmp_path, self._wave_yaml())),
+        )
+
+        config, _ = config_from_env()
+        assert config.wave_mod_def == mod_def
+
+    def test_wave_mod_def_default_left_bare_when_not_staged(self, monkeypatch, tmp_path):
+        """Matches wave_points_file/grid_file/bctides_template's own "only
+        resolve if it actually exists" behavior: the default name is still
+        recorded so WaveBoundaryProcessor's own missing-mod_def error names
+        the exact expected path, but it isn't silently pointed at a
+        nonexistent FIXofs location.
+        """
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("RUN", "secofs_ufs")
+        fix_dir = tmp_path / "fix"
+        fix_dir.mkdir()
+        monkeypatch.setenv("FIXofs", str(fix_dir))
+        monkeypatch.setenv(
+            "OFS_CONFIG", str(_write_yaml(tmp_path, self._wave_yaml())),
+        )
+
+        config, _ = config_from_env()
+        assert config.wave_mod_def == Path("secofs_ufs.mod_def.ww3")
+
+    def test_wave_mod_def_explicit_yaml_override_wins_over_default(
+        self, monkeypatch, tmp_path,
+    ):
+        """A wave-coupled variant yaml whose RUN name diverges from its
+        fix-file prefix (e.g. stofs_3d_ak_ufs_ww3, which deliberately keeps
+        its base system's "stofs_3d_ak_ufs" prefix for every bare-name fix
+        file) must be able to override the "{RUN}.mod_def.ww3" default via
+        forcing.waves.mod_def.
+        """
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("RUN", "stofs_3d_ak_ufs_ww3")
+        fix_dir = tmp_path / "fix"
+        fix_dir.mkdir()
+        mod_def = fix_dir / "stofs_3d_ak_ufs.mod_def.ww3"
+        mod_def.write_text("fake mod_def\n")
+        monkeypatch.setenv("FIXofs", str(fix_dir))
+        monkeypatch.setenv(
+            "OFS_CONFIG",
+            str(_write_yaml(
+                tmp_path,
+                self._wave_yaml(mod_def="stofs_3d_ak_ufs.mod_def.ww3"),
+            )),
+        )
+
+        config, _ = config_from_env()
+        assert config.wave_mod_def == mod_def
+
+    def test_wave_mod_def_not_defaulted_when_waves_disabled(self, monkeypatch, tmp_path):
+        """Systems that don't use WW3 at all (no forcing.waves block) must
+        not pick up a spurious "{RUN}.mod_def.ww3" default."""
+        from nos_utils.nco_bridge import config_from_env
+
+        self._base_env(monkeypatch, tmp_path)
+        fix_dir = tmp_path / "fix"
+        fix_dir.mkdir()
+        monkeypatch.setenv("FIXofs", str(fix_dir))
+
+        config, _ = config_from_env()
+        assert config.wave_mod_def is None
 
 
 # A STOFS-shaped YAML that, like the real stofs_3d_atl_ufs.yaml, declares

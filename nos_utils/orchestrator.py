@@ -501,10 +501,11 @@ class PrepOrchestrator:
 
         Reads ``ibp_tar`` / ``spec_tar.gz`` from
         ``$COMINgfswave/gfs.<pdy>/<cyc>/wave/station/``, selects boundary
-        points (window + extras) from ``wave_points_file``, and runs
-        ``ww3_bound`` to produce ``nest.ww3``. Degrades gracefully (still
-        emits ``ww3_bound.inp`` + extracted spectra) when the executable is
-        unavailable.
+        points (window + extras) from ``wave_points_file``, stages
+        ``wave_mod_def`` into the working dir (ww3_bound reads mod_def.ww3
+        from its CWD, not an argument), and runs ``ww3_bound`` to produce
+        ``nest.ww3``. Degrades gracefully (still emits ``ww3_bound.inp`` +
+        extracted spectra) when the executable is unavailable.
         """
         from .forcing.wave_boundary import WaveBoundaryProcessor
 
@@ -526,6 +527,7 @@ class PrepOrchestrator:
             window=window,
             extra_points=self.config.wave_extra_points,
             max_cycle_fallback=self.config.wave_max_cycle_fallback,
+            mod_def=self.config.wave_mod_def,
         )
         return proc.process()
 

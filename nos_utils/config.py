@@ -270,6 +270,17 @@ class ForcingConfig:
     waves_enabled: bool = False
     # WW3 points file (columns: lon lat 'NAME' depth TYPE source interval).
     wave_points_file: Optional[Path] = None
+    # WW3 model definition file (mod_def.ww3). ww3_bound reads this from its
+    # working directory (no command-line argument for it), so
+    # WaveBoundaryProcessor stages whatever this resolves to into
+    # output_path before invoking ww3_bound. When unset, config_from_env()
+    # defaults it to "{RUN}.mod_def.ww3" under FIXofs -- the same
+    # {prefix}.<bare> convention grid_file/bctides_template/wave_points_file
+    # already follow. Set this explicitly (forcing.waves.mod_def) only when
+    # a system's mod_def prefix diverges from its own RUN name (e.g. a
+    # wave-coupled variant yaml that keeps its base system's fix-file
+    # prefix).
+    wave_mod_def: Optional[Path] = None
     # Boundary point selection window (degrees). Points with TYPE == IBP
     # inside this box are selected; all four must be set for window
     # selection to run. Lon comparisons are dateline-safe (normalized to
@@ -843,6 +854,7 @@ class ForcingConfig:
         #     waves:
         #       enabled: true
         #       points_file: /path/to/wave_gfs.buoys
+        #       mod_def: /path/to/mod_def.ww3   # optional; see wave_mod_def
         #       extra_points: ["46070", "46071", "46035"]
         #       window: {lon_min: 170.0, lon_max: 235.0, lat_min: 45.0, lat_max: 75.0}
         #       max_cycle_fallback: 4
@@ -852,6 +864,9 @@ class ForcingConfig:
             points_file = waves.get("points_file")
             if points_file:
                 kwargs["wave_points_file"] = Path(points_file)
+            mod_def = waves.get("mod_def")
+            if mod_def:
+                kwargs["wave_mod_def"] = Path(mod_def)
             window = waves.get("window", {})
             if isinstance(window, dict):
                 if window.get("lon_min") is not None:

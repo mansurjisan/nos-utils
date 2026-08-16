@@ -209,6 +209,20 @@ def config_from_env(
             resolved = fix_path / config.wave_points_file
             if resolved.exists():
                 config.wave_points_file = resolved
+        # WW3 model definition file (mod_def.ww3). ww3_bound reads this from
+        # its CWD, not a CLI argument -- WaveBoundaryProcessor stages
+        # whatever config.wave_mod_def resolves to into the working dir
+        # before invoking ww3_bound. Default to "{RUN}.mod_def.ww3" (the
+        # same {prefix}.<bare> convention as wave_points_file/grid_file/
+        # bctides_template) when the YAML didn't set forcing.waves.mod_def
+        # explicitly -- an explicit value is only needed when a system's
+        # mod_def prefix diverges from its own RUN name.
+        if config.waves_enabled and config.wave_mod_def is None:
+            config.wave_mod_def = Path(f"{ofs}.mod_def.ww3")
+        if config.wave_mod_def and not Path(config.wave_mod_def).is_absolute():
+            resolved = fix_path / config.wave_mod_def
+            if resolved.exists():
+                config.wave_mod_def = resolved
 
     return config, paths
 

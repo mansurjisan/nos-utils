@@ -42,6 +42,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -177,6 +178,7 @@ class WaveBoundaryProcessor(ForcingProcessor):
         window: Optional[dict] = None,
         extra_points: Optional[List[str]] = None,
         max_cycle_fallback: int = 4,
+        mod_def: Optional[Path] = None,
     ) -> None:
         """
         Args:
@@ -194,6 +196,10 @@ class WaveBoundaryProcessor(ForcingProcessor):
             max_cycle_fallback: Extra 6h cycles to try walking backward if
                 the newest cycle at/before the nowcast start is missing
                 either tar.
+            mod_def: WW3 model definition file (``mod_def.ww3``). ww3_bound
+                reads this from its working directory, not a command-line
+                argument, so it's staged into ``output_path`` before
+                ww3_bound is invoked.
         """
         super().__init__(config, input_path, output_path)
         self.points_file = Path(points_file) if points_file else None
@@ -202,6 +208,7 @@ class WaveBoundaryProcessor(ForcingProcessor):
             str(p).strip() for p in (extra_points or []) if str(p).strip()
         ]
         self.max_cycle_fallback = max(0, int(max_cycle_fallback))
+        self.mod_def = Path(mod_def) if mod_def else None
         # None = not yet searched; False = searched, nothing found;
         # tuple = (cycle_date, cycle_hour, ibp_tar, spec_targz).
         self._cycle_cache = None
@@ -259,6 +266,20 @@ class WaveBoundaryProcessor(ForcingProcessor):
                 "No wave boundary points selected (empty window match and "
                 "no extra_points)"
             )
+            return ForcingResult(
+                success=False, source=self.SOURCE_NAME, errors=errors,
+                warnings=warnings, metadata=metadata,
+            )
+
+        # ww3_bound reads mod_def.ww3 from its working directory (no
+        # command-line argument for it), so it must be staged before
+        # ww3_bound runs. Checked here -- before the tar extraction below --
+        # so a missing mod_def fails immediately instead of after minutes
+        # spent extracting spectra that ww3_bound will never get to use.
+        mod_def_error = self._stage_mod_def()
+        if mod_def_error:
+            log.warning(mod_def_error)
+            errors.append(mod_def_error)
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME, errors=errors,
                 warnings=warnings, metadata=metadata,
@@ -536,6 +557,36 @@ class WaveBoundaryProcessor(ForcingProcessor):
             else:
                 log.warning(f"Extracted {member} but {out_path} not found")
         return extracted
+
+    # ----------------------------------------------------------- mod_def
+
+    def _stage_mod_def(self) -> Optional[str]:
+        """Stage mod_def.ww3 into ``output_path`` for ww3_bound to find.
+
+        ww3_bound reads ``mod_def.ww3`` from its current working directory
+        -- there's no command-line argument for it -- and ``process()`` runs
+        it with ``cwd=self.output_path``. Symlinks by default (the file is
+        typically hundreds of MB); falls back to a copy if symlinking isn't
+        available (e.g. some Windows/test filesystems).
+
+        Returns an error message if ``self.mod_def`` isn't set or doesn't
+        exist on disk, None on success.
+        """
+        if self.mod_def is None or not self.mod_def.exists():
+            return (
+                f"WW3 mod_def not found: {self.mod_def or '<not configured>'} "
+                "-- ww3_bound reads mod_def.ww3 from its working directory "
+                "and cannot run without it. Set forcing.waves.mod_def (or "
+                "stage the default '{RUN}.mod_def.ww3' under FIXofs)."
+            )
+        dest = self.output_path / "mod_def.ww3"
+        if dest.exists() or dest.is_symlink():
+            return None
+        try:
+            dest.symlink_to(self.mod_def)
+        except OSError:
+            shutil.copy2(self.mod_def, dest)
+        return None
 
     # ------------------------------------------------------------ emission
 

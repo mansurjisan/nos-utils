@@ -519,6 +519,83 @@ class TestWW3BoundInpEmission:
         assert lines[list_idx + 1].strip() == "$"
 
 
+# --------------------------------------------------------- mod_def staging
+
+class TestModDefStaging:
+    def test_symlinks_mod_def_into_workdir(self, tmp_path, mock_config):
+        work = tmp_path / "work"
+        work.mkdir()
+        mod_def = tmp_path / "secofs_ufs.mod_def.ww3"
+        mod_def.write_bytes(b"fake mod_def contents")
+
+        proc = WaveBoundaryProcessor(mock_config, tmp_path, work, mod_def=mod_def)
+        error = proc._stage_mod_def()
+
+        assert error is None
+        staged = work / "mod_def.ww3"
+        assert staged.exists()
+        assert staged.read_bytes() == b"fake mod_def contents"
+
+    def test_falls_back_to_copy_when_symlink_unavailable(
+        self, tmp_path, mock_config, monkeypatch,
+    ):
+        """Some filesystems (Windows, certain CI sandboxes) reject
+        symlink_to -- the processor must still land a usable mod_def.ww3
+        by copying instead of raising."""
+        work = tmp_path / "work"
+        work.mkdir()
+        mod_def = tmp_path / "secofs_ufs.mod_def.ww3"
+        mod_def.write_bytes(b"fake mod_def contents")
+
+        def fail_symlink(self, target):
+            raise OSError("symlinks not supported")
+
+        monkeypatch.setattr(Path, "symlink_to", fail_symlink)
+
+        proc = WaveBoundaryProcessor(mock_config, tmp_path, work, mod_def=mod_def)
+        error = proc._stage_mod_def()
+
+        assert error is None
+        staged = work / "mod_def.ww3"
+        assert staged.exists()
+        assert not staged.is_symlink()
+        assert staged.read_bytes() == b"fake mod_def contents"
+
+    def test_does_not_restage_if_already_present(self, tmp_path, mock_config):
+        """Idempotent: a second call (e.g. process() re-run) must not choke
+        on an already-staged mod_def.ww3."""
+        work = tmp_path / "work"
+        work.mkdir()
+        mod_def = tmp_path / "secofs_ufs.mod_def.ww3"
+        mod_def.write_bytes(b"x")
+
+        proc = WaveBoundaryProcessor(mock_config, tmp_path, work, mod_def=mod_def)
+        assert proc._stage_mod_def() is None
+        assert proc._stage_mod_def() is None  # no error on the second call
+
+    def test_missing_mod_def_returns_actionable_error(self, tmp_path, mock_config):
+        work = tmp_path / "work"
+        work.mkdir()
+        mod_def = tmp_path / "does_not_exist.mod_def.ww3"
+
+        proc = WaveBoundaryProcessor(mock_config, tmp_path, work, mod_def=mod_def)
+        error = proc._stage_mod_def()
+
+        assert error is not None
+        assert "mod_def" in error
+        assert str(mod_def) in error
+        assert not (work / "mod_def.ww3").exists()
+
+    def test_unset_mod_def_returns_actionable_error(self, tmp_path, mock_config):
+        work = tmp_path / "work"
+        work.mkdir()
+        proc = WaveBoundaryProcessor(mock_config, tmp_path, work)  # mod_def=None
+        error = proc._stage_mod_def()
+
+        assert error is not None
+        assert "not configured" in error
+
+
 # --------------------------------------------------------- end-to-end
 
 class TestProcessEndToEnd:
@@ -545,12 +622,15 @@ class TestProcessEndToEnd:
 
         root = self._build_tree(tmp_path)
         work = tmp_path / "work"
+        mod_def = tmp_path / "mock_config.mod_def.ww3"
+        _touch(mod_def)
 
         proc = WaveBoundaryProcessor(
             mock_config, root, work,
             points_file=BUOYS_SUBSET,
             window={"lon_min": -66.0, "lon_max": -64.0, "lat_min": 31.0, "lat_max": 34.0},
             extra_points=["46070", "46071", "46035"],
+            mod_def=mod_def,
         )
         result = proc.process()
 
@@ -585,8 +665,11 @@ class TestProcessEndToEnd:
         for var in ("EXECofs", "EXECstofs3d"):
             monkeypatch.delenv(var, raising=False)
 
+        mod_def = tmp_path / "mock_config.mod_def.ww3"
+        _touch(mod_def)
+
         proc = WaveBoundaryProcessor(
-            mock_config, root, work, extra_points=["46070"],
+            mock_config, root, work, extra_points=["46070"], mod_def=mod_def,
         )
         result = proc.process()
 
@@ -594,6 +677,9 @@ class TestProcessEndToEnd:
         assert (work / "nest.ww3").exists()
         assert result.metadata["mode"] == "ww3_bound"
         assert any(p.name == "nest.ww3" for p in result.output_files)
+        # mod_def.ww3 must be staged in the working dir before ww3_bound
+        # runs -- it reads it from cwd, not from an argument.
+        assert (work / "mod_def.ww3").exists()
 
     def test_no_points_selected_fails_cleanly(self, tmp_path, mock_config):
         root = self._build_tree(tmp_path)
@@ -610,6 +696,28 @@ class TestProcessEndToEnd:
         result = proc.process()
         assert result.success is False
         assert "No GFS-Wave cycle" in result.errors[0]
+
+    @pytest.mark.skipif(not HAS_TAR, reason="tar binary not available")
+    def test_missing_mod_def_fails_before_extraction(self, tmp_path, mock_config):
+        """A missing mod_def must fail immediately -- before the tar
+        extraction step -- not after minutes spent extracting spectra that
+        ww3_bound would never get to use (the real production failure: 439
+        spectra extracted, then ``ERROR IN OPENING mod_def.ww3``)."""
+        root = self._build_tree(tmp_path)
+        work = tmp_path / "work"
+
+        proc = WaveBoundaryProcessor(
+            mock_config, root, work, extra_points=["46070"],
+        )  # no mod_def configured
+        result = proc.process()
+
+        assert result.success is False
+        assert any("mod_def" in e for e in result.errors)
+        # Extraction never ran: no spec files landed in the work dir and
+        # n_extracted was never recorded.
+        assert "n_extracted" not in result.metadata
+        assert result.output_files == []
+        assert list(work.glob("gfswave.*.spec")) == []
 
 
 # ------------------------------------------------------- config threading
@@ -634,6 +742,7 @@ class TestWaveConfigThreading:
         cfg = self._cfg(tmp_path, "")
         assert cfg.waves_enabled is False
         assert cfg.wave_points_file is None
+        assert cfg.wave_mod_def is None
         assert cfg.wave_extra_points == []
         assert cfg.wave_lon_min is None
         assert cfg.wave_max_cycle_fallback == 4
@@ -644,6 +753,7 @@ class TestWaveConfigThreading:
             "  waves:\n"
             "    enabled: true\n"
             "    points_file: /fix/wave_gfs.buoys\n"
+            "    mod_def: /fix/mod_def.ww3\n"
             "    extra_points: [\"46070\", \"46071\", \"46035\"]\n"
             "    window: {lon_min: 170.0, lon_max: 235.0, lat_min: 45.0, lat_max: 75.0}\n"
             "    max_cycle_fallback: 6\n"
@@ -651,12 +761,24 @@ class TestWaveConfigThreading:
         cfg = self._cfg(tmp_path, extra)
         assert cfg.waves_enabled is True
         assert cfg.wave_points_file == Path("/fix/wave_gfs.buoys")
+        assert cfg.wave_mod_def == Path("/fix/mod_def.ww3")
         assert cfg.wave_extra_points == ["46070", "46071", "46035"]
         assert cfg.wave_lon_min == 170.0
         assert cfg.wave_lon_max == 235.0
         assert cfg.wave_lat_min == 45.0
         assert cfg.wave_lat_max == 75.0
         assert cfg.wave_max_cycle_fallback == 6
+
+    def test_mod_def_omitted_stays_none(self, tmp_path):
+        """Without forcing.waves.mod_def, ForcingConfig.from_yaml() itself
+        leaves wave_mod_def unset -- the "{RUN}.mod_def.ww3" default is
+        applied later, by config_from_env() (see TestNCOBridgePaths in
+        tests/test_config.py), which is the only place that knows RUN.
+        """
+        extra = "forcing:\n  waves:\n    enabled: true\n"
+        cfg = self._cfg(tmp_path, extra)
+        assert cfg.waves_enabled is True
+        assert cfg.wave_mod_def is None
 
     def test_partial_window_leaves_missing_keys_none(self, tmp_path):
         extra = (
@@ -747,7 +869,13 @@ class TestOrchestratorWaveArchive:
         for var in ("EXECofs", "EXECstofs3d"):
             monkeypatch.delenv(var, raising=False)
 
-        cfg = replace(mock_config, waves_enabled=True, wave_extra_points=["46070"])
+        mod_def = tmp_path / "stofs_3d_ak_ufs.mod_def.ww3"
+        _touch(mod_def)
+
+        cfg = replace(
+            mock_config, waves_enabled=True, wave_extra_points=["46070"],
+            wave_mod_def=mod_def,
+        )
         paths = dict(orch_paths)
         paths["gfswave"] = str(root)
         orch = PrepOrchestrator(cfg, paths, run_name="stofs_3d_ak_ufs")
