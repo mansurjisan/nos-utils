@@ -29,7 +29,7 @@ Pipeline:
      buoys 46070/46071/46035, which sit in the Bering Sea / Aleutians and
      are not carried in the operational IBP list).
   3. Extraction -- pulls only the needed members from each tar.
-  4. Emission -- writes ``ww3_bound.inp`` (READ mode) listing the
+  4. Emission -- writes ``ww3_bound.inp`` (WRITE mode) listing the
      extracted spectra, then runs ``ww3_bound`` to produce ``nest.ww3``.
      If the executable isn't found, the inputs are still emitted and the
      processor reports failure with an actionable message; the
@@ -591,31 +591,42 @@ class WaveBoundaryProcessor(ForcingProcessor):
     # ------------------------------------------------------------ emission
 
     def _write_ww3_bound_inp(self, spec_files: List[Path]) -> Path:
-        """Write ww3_bound.inp in READ mode listing the extracted spectra.
+        """Write ww3_bound.inp in WRITE mode to build nest.ww3 from spectra.
 
-        Format follows the classic single-grid WAVEWATCH III ww3_bound
-        input: a quoted 'READ'/'WRITE' mode line, followed by one quoted
-        spectra filename per line, terminated by a '$' line. ww3_bound is
-        run with cwd set to ``self.output_path`` (which holds this file and
-        the extracted spec files), so filenames are written bare (no path).
+        Format matches ww3_bound.F90's actual reader (verified line-by-line
+        against the oceanmodeling/WW3 source at the build commit used here):
+        the first line is read with '(A)' and its first character sets the
+        in-file comment character (must be '$'); MODE, INTERP, and VERBOSE
+        are each read via NEXTLN (skips comment lines) + list-directed READ,
+        so they must be list-directed-readable tokens (quoted string for
+        MODE, bare integers for INTERP/VERBOSE); the spectra filenames are
+        then read raw with '(A120)' and passed verbatim to
+        OPEN(..., FILE=SPECFILES(IP), status='old'), so they must be BARE
+        (unquoted, no path -- ww3_bound is run with cwd set to
+        ``self.output_path``); and the file list is terminated by a line
+        that equals the quoted literal 'STOPSTRING' (quotes included in the
+        comparison), not a comment line.
+
+        MODE is 'WRITE', not 'READ': in ww3_bound, 'READ' opens an
+        *existing* nest.ww3 (status='old') to verify/dump it, while 'WRITE'
+        is the generation branch (ww3_bound.F90:413, gated on FLBPI from
+        mod_def's active boundary points) that builds nest.ww3 from the
+        listed spectra -- which is what this processor needs.
         """
         inp_path = self.output_path / "ww3_bound.inp"
         lines = [
-            "$ WAVEWATCH III Boundary input file",
-            "$ -------------------------------------------------",
-            "$ Boundary option: 'READ' reads existing spectra for boundary input.",
+            "$ WAVEWATCH III ww3_bound input (WRITE mode: build nest.ww3 "
+            "from spectra)",
+            "'WRITE'",
             "$",
-            "   'READ'",
-            "$",
-            "$ List of spectra files, terminated by a line starting with '$'.",
-            "$",
+            " 2",
+            "$ INTERP=2: linear spatial interpolation",
+            " 1",
+            "$ VERBOSE=1",
         ]
         for f in spec_files:
-            lines.append(f"'{f.name}'")
-        lines.append("$")
-        lines.append("$ -------------------------------------------------")
-        lines.append("$ End of input file")
-        lines.append("$ -------------------------------------------------")
+            lines.append(f.name)
+        lines.append("'STOPSTRING'")
         inp_path.write_text("\n".join(lines) + "\n")
         return inp_path
 

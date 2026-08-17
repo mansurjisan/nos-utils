@@ -498,7 +498,7 @@ class TestTarExtraction:
 # ------------------------------------------------------------- inp emit
 
 class TestWW3BoundInpEmission:
-    def test_writes_read_mode_and_bare_filenames(self, tmp_path, mock_config):
+    def test_writes_write_mode_and_bare_filenames(self, tmp_path, mock_config):
         work = tmp_path / "work"
         work.mkdir()
         proc = WaveBoundaryProcessor(mock_config, tmp_path, work)
@@ -510,13 +510,55 @@ class TestWW3BoundInpEmission:
 
         assert inp == work / "ww3_bound.inp"
         text = inp.read_text()
-        assert "'READ'" in text
-        assert "'gfswave.BER51.spec'" in text
-        assert "'gfswave.46070.spec'" in text
-        # terminated by a '$' line after the file list
-        lines = [ln for ln in text.splitlines() if ln.strip()]
-        list_idx = lines.index("'gfswave.46070.spec'")
-        assert lines[list_idx + 1].strip() == "$"
+
+        # First character of the first line defines the in-file comment
+        # character -- must be '$' or NEXTLN can't find the real values.
+        assert text.startswith("$")
+
+        assert "'WRITE'" in text
+        assert "'READ'" not in text
+
+        lines = [ln for ln in text.splitlines()]
+        stripped = [ln.strip() for ln in lines if ln.strip()]
+
+        # MODE, then INTERP and VERBOSE as bare integer tokens, in order
+        # (comment lines between them are fine -- NEXTLN skips them).
+        mode_idx = stripped.index("'WRITE'")
+        value_lines = [ln for ln in stripped[mode_idx + 1:] if not ln.startswith("$")]
+        assert value_lines[0] == "2"
+        assert value_lines[1] == "1"
+
+        # Filenames are bare (no quotes) -- ww3_bound reads them with
+        # '(A120)' and OPENs the string verbatim.
+        assert "gfswave.BER51.spec" in stripped
+        assert "gfswave.46070.spec" in stripped
+        assert "'gfswave.BER51.spec'" not in text
+        assert "'gfswave.46070.spec'" not in text
+
+        # Terminated by the quoted literal 'STOPSTRING', not a comment line.
+        assert stripped[-1] == "'STOPSTRING'"
+
+    def test_no_quoted_filename_lines(self, tmp_path, mock_config):
+        """No spec filename may appear quoted anywhere in the file -- the
+        real ww3_bound OPENs SPECFILES(IP) verbatim as read via '(A120)',
+        so a quoted filename would fail to open (status='old')."""
+        work = tmp_path / "work"
+        work.mkdir()
+        proc = WaveBoundaryProcessor(mock_config, tmp_path, work)
+        spec_files = [
+            work / "gfswave.BER51.spec",
+            work / "gfswave.46070.spec",
+            work / "gfswave.46071.spec",
+        ]
+        for f in spec_files:
+            f.write_text("x\n")
+
+        inp = proc._write_ww3_bound_inp(spec_files)
+        text = inp.read_text()
+
+        for f in spec_files:
+            assert f"'{f.name}'" not in text
+            assert f.name in text
 
 
 # --------------------------------------------------------- mod_def staging
