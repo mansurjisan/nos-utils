@@ -26,10 +26,17 @@ The pylib dependency of the ops script is replaced:
   come from the scribe stacks), matching ops usage.
 * ``read_schism_bpfile``/``read_station_file`` -> :func:`read_station_in`.
 
-The zeta datum labeling ("water surface elevation above navd88") is
-replicated as-is from ops: the actual xGEOID -> NAVD88 shift is applied
-downstream by ``ncap2 -S ..._sta_cwl_xgeoid_to_navd.nco`` in the shell
-driver, never in the extractor.
+The zeta datum labeling is MSL ("water surface elevation above msl" /
+"sea_surface_height_above_msl"), matching the v3.1 output datum: the
+actual xGEOID -> MSL shift is applied downstream by
+``ncap2 -S ..._sta_cwl_xgeoid_to_msl.nco`` in the shell driver, never
+in the extractor. This mirrors the ``elev`` entry of the ops
+staout-nc variable definitions (``stofs_3d_atl_staout_nc.json``,
+``long_name: "water surface elevation above msl"``). Ops's own
+``get_stations_profile.py`` still hardcodes the stale v2.1
+"...above navd88" text even though it now applies the MSL shift --
+a known ops bug (the values are MSL, the label is not) that is
+deliberately not replicated here.
 """
 from __future__ import annotations
 
@@ -412,8 +419,8 @@ def write_station_profiles(
         zv = fout.createVariable(
             "zeta", "f4", ("time", "station"), fill_value=FILL_VALUE
         )
-        zv.long_name = "water surface elevation above navd88"
-        zv.standard_name = "sea_surface_height_above_navd88"
+        zv.long_name = "water surface elevation above msl"
+        zv.standard_name = "sea_surface_height_above_msl"
         zv.units = "m"
         zv[:, :] = np.asarray(series2d["elevation"])
 

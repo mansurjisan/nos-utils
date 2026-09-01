@@ -137,10 +137,10 @@ def test_profile_values_single_stack(tmp_path):
         expect_zeta = [[1.01, 3.01], [1.02, 3.02]]
         assert np.allclose(ds["zeta"][:], expect_zeta)
         assert ds["zeta"].long_name == (
-            "water surface elevation above navd88"
+            "water surface elevation above msl"
         )
         assert ds["zeta"].standard_name == (
-            "sea_surface_height_above_navd88"
+            "sea_surface_height_above_msl"
         )
         assert ds["zeta"]._FillValue == np.float32(FILL_VALUE)
 
