@@ -19,3 +19,6 @@ PREPROCESSING_FLOWCHART.md
 PRESENTATION.md
 *.md
 docs/_build/
+
+# GitHub PR template is the one tracked markdown file
+!.github/PULL_REQUEST_TEMPLATE.md
