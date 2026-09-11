@@ -26,17 +26,26 @@ The pylib dependency of the ops script is replaced:
   come from the scribe stacks), matching ops usage.
 * ``read_schism_bpfile``/``read_station_file`` -> :func:`read_station_in`.
 
-The zeta datum labeling is MSL ("water surface elevation above msl" /
-"sea_surface_height_above_msl"), matching the v3.1 output datum: the
-actual xGEOID -> MSL shift is applied downstream by
-``ncap2 -S ..._sta_cwl_xgeoid_to_msl.nco`` in the shell driver, never
-in the extractor. This mirrors the ``elev`` entry of the ops
-staout-nc variable definitions (``stofs_3d_atl_staout_nc.json``,
-``long_name: "water surface elevation above msl"``). Ops's own
-``get_stations_profile.py`` still hardcodes the stale v2.1
-"...above navd88" text even though it now applies the MSL shift --
-a known ops bug (the values are MSL, the label is not) that is
-deliberately not replicated here.
+Ops shifts ``zeta`` from xGEOID20B to MSL downstream of the extractor,
+with ``ncap2 -S ..._sta_cwl_xgeoid_to_msl.nco`` in the shell driver
+(per-station constants *subtracted*). That step is folded in here as
+``datum_offsets`` (same convention as
+:func:`nos_utils.post.stations.write_station_timeseries`'s parameter
+of the same name): per-station values *added* to ``zeta``, so pass the
+negated .nco constants to reproduce ops. The zeta attributes track
+whether a shift was actually applied instead of asserting MSL
+unconditionally: with ``datum_offsets`` given, ``zeta`` is labeled MSL
+("water surface elevation above msl" /
+"sea_surface_height_above_msl"), matching the ``elev`` entry of the
+ops staout-nc variable definitions
+(``stofs_3d_atl_staout_nc.json``); with ``datum_offsets=None`` (the
+default), ``zeta`` keeps the raw model datum and is labeled as such
+("water surface elevation" / "sea_surface_height", plus a ``datum``
+attribute of ``"xGEOID20B"``) rather than overstating it. Ops's own
+``get_stations_profile.py`` has no such hook -- it always emits the
+MSL-branded label (v3.1; stale "...above navd88" text pre-v3.1) even
+on a run of the extractor alone, so a bare ops-parity run is mislabeled
+by construction; that ops bug is not replicated here.
 """
 from __future__ import annotations
 
@@ -259,6 +268,7 @@ def write_station_profiles(
     lats: Optional[Sequence[float]] = None,
     names: Optional[Sequence[str]] = None,
     outside: str = "nearest",
+    datum_offsets: Optional[Sequence[float]] = None,
 ) -> Path:
     """Interpolate stack outputs to stations and write the profile nc.
 
@@ -272,6 +282,15 @@ def write_station_profiles(
     ``YYYY-MM-DD-HH``). ``outside="nearest"`` keeps pylib's
     nearest-node fallback for out-of-mesh stations; ``"error"``
     replicates the ops driver's abort.
+
+    ``datum_offsets`` (shape ``(nsta,)``, station.in order) is added to
+    ``zeta`` at every valid record -- the fold-in of the ops
+    xGEOID20B->MSL ``ncap2`` shift; see the module docstring for the
+    sign convention and how the ``zeta`` attributes depend on whether
+    it is given. A record that fell back to :data:`FILL_VALUE` (a
+    missing out2d ``elevation`` var, or a masked/dry source value) is
+    left at the fill value rather than shifted, so a filled cell still
+    reads as filled downstream.
 
     Deviations from ops, all documented here: ``windSpeedX/Y`` missing
     from an out2d stack write fill values instead of crashing; masked
@@ -310,6 +329,12 @@ def write_station_profiles(
     nsta = lons.size
     if lats.size != nsta or len(names) != nsta:
         raise ValueError("lons, lats and names lengths differ")
+    if datum_offsets is not None:
+        datum_offsets = np.asarray(datum_offsets, dtype=float)
+        if datum_offsets.shape != (nsta,):
+            raise ValueError(
+                f"datum_offsets shape {datum_offsets.shape} != ({nsta},)"
+            )
 
     grid = SchismGrid.read(hgrid_path, read_boundaries=False)
     elnode = _read_elements(hgrid_path, grid.n_nodes, grid.n_elements)
@@ -419,10 +444,21 @@ def write_station_profiles(
         zv = fout.createVariable(
             "zeta", "f4", ("time", "station"), fill_value=FILL_VALUE
         )
-        zv.long_name = "water surface elevation above msl"
-        zv.standard_name = "sea_surface_height_above_msl"
+        zeta = np.asarray(series2d["elevation"])
+        if datum_offsets is not None:
+            zv.long_name = "water surface elevation above msl"
+            zv.standard_name = "sea_surface_height_above_msl"
+            # Filled records (missing out2d elevation, or a masked/dry
+            # source value) stay at FILL_VALUE rather than being shifted,
+            # so a filled cell still reads as filled downstream.
+            valid = zeta != FILL_VALUE
+            zeta = np.where(valid, zeta + datum_offsets[np.newaxis, :], zeta)
+        else:
+            zv.long_name = "water surface elevation"
+            zv.standard_name = "sea_surface_height"
+            zv.datum = "xGEOID20B"
         zv.units = "m"
-        zv[:, :] = np.asarray(series2d["elevation"])
+        zv[:, :] = zeta
 
         zc = fout.createVariable(
             "zCoordinates", "f4", ("time", "station", "siglay"),

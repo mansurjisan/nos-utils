@@ -136,12 +136,10 @@ def test_profile_values_single_stack(tmp_path):
         # elevation: factor + h/100
         expect_zeta = [[1.01, 3.01], [1.02, 3.02]]
         assert np.allclose(ds["zeta"][:], expect_zeta)
-        assert ds["zeta"].long_name == (
-            "water surface elevation above msl"
-        )
-        assert ds["zeta"].standard_name == (
-            "sea_surface_height_above_msl"
-        )
+        # No datum_offsets given -> honest model-datum labeling, not MSL.
+        assert ds["zeta"].long_name == "water surface elevation"
+        assert ds["zeta"].standard_name == "sea_surface_height"
+        assert ds["zeta"].datum == "xGEOID20B"
         assert ds["zeta"]._FillValue == np.float32(FILL_VALUE)
 
         # 3D vars: factor*10 + k + h/100, identical law for all five
@@ -165,6 +163,69 @@ def test_profile_values_single_stack(tmp_path):
         assert _station_names(ds) == ["STA_A", "STA_B"]
         assert ds.title == "SCHISM Model output"
         assert ds.references == "http://ccrm.vims.edu/schismweb/"
+
+
+def test_profile_datum_offsets_applied(tmp_path):
+    hgrid, vgrid = _mesh(tmp_path)
+    stack = _make_stack(tmp_path, 1, hours=[1, 2])
+    out = tmp_path / "profile.nc"
+
+    write_station_profiles(
+        [stack], hgrid, vgrid, out, base_date="2026-07-10-00",
+        lons=STA_LON, lats=STA_LAT, names=["STA_A", "STA_B"],
+        datum_offsets=[0.5, -0.25],
+    )
+    with netCDF4.Dataset(out) as ds:
+        # elevation (factor + h/100) plus the per-station offset, added
+        # (not subtracted) -- same sign convention as
+        # write_station_timeseries's datum_offsets.
+        expect_zeta = [[1.01 + 0.5, 3.01 - 0.25], [1.02 + 0.5, 3.02 - 0.25]]
+        assert np.allclose(ds["zeta"][:], expect_zeta)
+        assert ds["zeta"].long_name == "water surface elevation above msl"
+        assert ds["zeta"].standard_name == "sea_surface_height_above_msl"
+        assert not hasattr(ds["zeta"], "datum")
+
+
+def test_profile_datum_offsets_skip_fill_values(tmp_path):
+    """A record with no source elevation stays FILL_VALUE, not shifted."""
+    hgrid, vgrid = _mesh(tmp_path)
+    out2d_path = tmp_path / "out2d_1.nc"
+    with netCDF4.Dataset(out2d_path, "w", format="NETCDF4") as ds:
+        ds.createDimension("time", None)
+        ds.createDimension("nSCHISM_hgrid_node", 4)
+        tv = ds.createVariable("time", "f8", ("time",))
+        tv.units = "seconds since 2026-07-10 00:00:00"
+        tv[:] = [3600.0]
+        # deliberately no "elevation" variable
+    stack = {"out2d": out2d_path}
+    for var in VARS_3D:
+        stack[var] = write_var3d_stack(
+            tmp_path / f"{var}_1.nc", var, hours=[1]
+        )
+    out = tmp_path / "profile.nc"
+
+    write_station_profiles(
+        [stack], hgrid, vgrid, out, base_date="2026-07-10-00",
+        lons=STA_LON, lats=STA_LAT, names=["STA_A", "STA_B"],
+        datum_offsets=[0.5, -0.25],
+    )
+    with netCDF4.Dataset(out) as ds:
+        # elevation missing entirely -> every record is FILL_VALUE, and
+        # the offset must not be added on top of it.
+        assert np.ma.getmaskarray(ds["zeta"][:]).all()
+
+
+def test_profile_datum_offsets_shape_mismatch(tmp_path):
+    hgrid, vgrid = _mesh(tmp_path)
+    stack = _make_stack(tmp_path, 1, hours=[1])
+    out = tmp_path / "profile.nc"
+
+    with pytest.raises(ValueError, match="datum_offsets shape"):
+        write_station_profiles(
+            [stack], hgrid, vgrid, out, base_date="2026-07-10-00",
+            lons=STA_LON, lats=STA_LAT, names=["STA_A", "STA_B"],
+            datum_offsets=[0.5],
+        )
 
 
 def test_wind_interpolated_when_present(tmp_path):
