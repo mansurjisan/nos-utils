@@ -13,11 +13,12 @@ f8 data with fill -99999 and attrs taken from the staout-nc JSON
 variable definitions (whose ``stardard_name`` typo key is honoured).
 
 Ops then shifts ``zeta`` from xGEOID20B to the output datum with ncap2
-(``stofs_3d_atl_sta_cwl_xgeoid_to_navd.nco``, per-station constants
-*subtracted*). That step is folded in as ``datum_offsets``: per-station
-values *added* to the staout_1 (elevation) variable, so pass the
-negated .nco constants to reproduce ops; None applies no shift (the
-raw pre-ncap2 product).
+(v3.1: ``stofs_3d_atl_sta_cwl_xgeoid_to_msl.nco``, per-station constants
+*subtracted*, output datum MSL -- supersedes the v2.1
+``..._xgeoid_to_navd.nco``/NAVD88 file of the same shape). That step is
+folded in as ``datum_offsets``: per-station values *added* to the
+staout_1 (elevation) variable, so pass the negated .nco constants to
+reproduce ops; None applies no shift (the raw pre-ncap2 product).
 """
 from __future__ import annotations
 
@@ -131,8 +132,9 @@ def write_station_timeseries(
     ``base_date`` is stamped verbatim into the time units/attr (ops
     format ``YYYY-MM-DD HH:00:00 UTC``, the nowcast begin).
     ``datum_offsets`` (shape ``(nstation,)``) is added to the staout_1
-    variable -- the fold-in of the ops xGEOID20B->NAVD88 ncap2 shift,
-    whose .nco constants are subtracted, so negate them here.
+    variable -- the fold-in of the ops xGEOID20B->MSL ncap2 shift (v3.1:
+    ``stofs_3d_atl_sta_cwl_xgeoid_to_msl.nco``), whose .nco constants
+    are subtracted, so negate them here.
     """
     from netCDF4 import Dataset
 
