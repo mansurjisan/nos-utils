@@ -58,28 +58,21 @@ except ImportError:
     HAS_NETCDF4 = False
 
 
-def _pack_int16(real, scale, offset, fill_i2, fill_mask=None):
-    """Pack a float field to int16 exactly as the Fortran gen_3Dth expects.
-
-    stored = round((real - offset) / scale), clipped to the int16 range;
-    the Fortran unpacks it downstream as raw * scale + offset. Cells selected
-    by ``fill_mask``, plus any non-finite (NaN/inf) cell, are stored as
-    ``fill_i2`` -- never cast through astype(int16), whose result for NaN is
-    platform-undefined (often -32768 or 0, a spurious wet/garbage node).
+def _pack_for_fortran(real, scale, offset, fill, fill_mask=None):
+    """
+    Pack a float field to float exactly as the Fortran gen_*_hycom expects.
+    stored = (real - offset) / scale
 
     Single source of truth for the SSH writer, the TSUV writer, and the ADT
     blend so the packing convention cannot drift between surf_el and TSUV.
     """
     real = np.asarray(real, dtype=np.float32)
-    packed = np.clip(
-        np.round((real - offset) / scale),
-        np.iinfo(np.int16).min, np.iinfo(np.int16).max,
-    )
+    packed = (real - offset) / scale
     mask = ~np.isfinite(real)
     if fill_mask is not None:
         mask = mask | fill_mask
-    packed = np.where(mask, int(fill_i2), packed)
-    return packed.astype(np.int16)
+    packed = np.where(mask, fill, packed)
+    return packed
 
 
 class RTOFSProcessor(ForcingProcessor):
@@ -853,41 +846,22 @@ class RTOFSProcessor(ForcingProcessor):
         for t in range(nt):
             ssh_var[t] = all_ssh[t]
 
-        # surf_el: explicitly packed int16 format expected by Fortran
-        # gen_3Dth_from_hycom, which reads raw via nf90_get_var (auto-converts
-        # i2->f4, no scale/offset applied) then manually unpacks:
-        #   ssh = ssh * 1.e-3   (scale=0.001, add_offset=0)
-        # Mirrors operational rtofs/cvtZ.nco: surf_el=(ssh-0.)/0.001.
-        #
-        # int16 storage halves file size vs float32; packed value range for
-        # typical SSH (±5 m -> ±5000) fits well within int16 (±32767).
-        # fill value -30000 also fits (int16 min = -32768).
-        #
-        # We pack explicitly and disable auto mask-and-scale to prevent
-        # netCDF4 from re-applying scale_factor on write (double-pack).
-        # See tests/test_nc_packing.py::TestSSHPacking, which pins the
-        # single-pack (raw stored == round(real/scale), no double-pack).
-        #
-        # Masked/extreme cells (|ssh| >= 10000 m) stored as fill -30000:
-        # Fortran unpack: -30000 * 1.e-3 = -30.0 m < rjunk+0.1 (-9.9 m)
-        # -> correctly flagged dry.  Prior code used -3000 -> -3.0 m (wet).
-        # Matches operational: 'where(ssh>10000) ssh=-30000' before packing.
-        _SSH_FILL_I2 = np.int16(-30000)
+        _SSH_FILL = -30000.0
         surf_el = nc.createVariable(
-            "surf_el", "i2", ("time", "ylat", "xlon"),
-            fill_value=_SSH_FILL_I2,
+            "surf_el", "f4", ("time", "ylat", "xlon"),
+            fill_value=_SSH_FILL,
         )
         surf_el.set_auto_maskandscale(False)
         surf_el.scale_factor = np.float32(0.001)
         surf_el.add_offset = np.float32(0.0)
-        surf_el.missing_value = _SSH_FILL_I2
+        surf_el.missing_value = _SSH_FILL
         for t in range(nt):
             real = np.asarray(all_ssh[t], dtype=np.float32)
-            # Extreme cells (|SSH| >= 10000 m) map to fill; _pack_int16 also
-            # sends non-finite cells there and single-packs to int16.
-            surf_el[t] = _pack_int16(
+            # Extreme cells (|SSH| >= 10000 m) map to fill; _pack_for_fortran also
+            # sends non-finite cells there
+            surf_el[t] = _pack_for_fortran(
                 real, surf_el.scale_factor, surf_el.add_offset,
-                _SSH_FILL_I2, fill_mask=np.abs(real) >= 10000,
+                _SSH_FILL, fill_mask=np.abs(real) >= 10000,
             )
 
         nc.close()
@@ -933,9 +907,7 @@ class RTOFSProcessor(ForcingProcessor):
                 for t in range(subset["temperature"].shape[0]):
                     all_temp.append(np.ma.filled(subset["temperature"][t], fill_value=-30000.0))
                     all_salt.append(np.ma.filled(subset["salinity"][t], fill_value=-30000.0))
-                    # Missing u/v -> -30000 (operational cvtUV.nco change_miss(-30000)),
-                    # NOT 0.0: a genuine slack-water current (u=0) is a valid value
-                    # and must not be conflated with missing data.
+                    # Missing u/v -> -30000 (ops cvtUV.nco change_miss(-30000)),
                     all_u.append(np.ma.filled(subset["u"][t], fill_value=-30000.0))
                     all_v.append(np.ma.filled(subset["v"][t], fill_value=-30000.0))
 
@@ -965,13 +937,12 @@ class RTOFSProcessor(ForcingProcessor):
         all_lon: np.ndarray, all_lat: np.ndarray,
         all_depth: Optional[np.ndarray] = None,
     ) -> Optional[Path]:
-        """Write TSUV_1.nc with T/S/U/V explicitly packed as int16.
+        """Write TSUV_1.nc with T/S/U/V explicitly packed
 
         Split out of _stofs_prepare_tsuv so the packing is unit-testable.
         Each list holds one (nz, ny, nx) array per time step; all_lon/all_lat
         are (ny, nx); all_depth is the (nz,) level depths. Cells equal to the
-        -30000 real-space sentinel (from ma.filled in the caller) are stored
-        as the int16 fill.
+        -30000 real-space sentinel (from ma.filled in the caller) are stored.
         """
         if not all_temp:
             return None
@@ -999,25 +970,12 @@ class RTOFSProcessor(ForcingProcessor):
         lat_var = nc.createVariable("ylat", "f4", ("ylat", "xlon"))
         lat_var[:] = all_lat
 
-        # Pack T/S/U/V explicitly as int16, matching operational NCO converters
-        # (rtofs/cvtST.nco, cvtUV.nco) and the Fortran manual unpack:
-        #   salt=salt*1.e-3+20; temp=temp*1.e-3+20; uvel/vvel=*1.e-3
-        # (stofs_3d_{atl,pac}_gen_3Dth_from_hycom.f90).
-        #
-        # int16 storage halves file size vs float32; packed value ranges:
-        #   T/S: (0-40 C/PSU - 20) / 0.001 = -20000..20000   fits i2
-        #   u/v: (-10..10 m/s)     / 0.001 = -10000..10000   fits i2
-        #   fill -30000                                        fits i2
-        #
+        # Pack T/S/U/V explicitly, matching operational NCO converters
         # set_auto_maskandscale(False) prevents netCDF4 re-applying scale_factor
-        # on write (double-pack).  scale_factor/add_offset attrs are preserved
-        # for tools that auto-unpack on read (xarray, ncdump -C).
-        _TSUV_FILL_I2 = np.int16(-30000)
+        # on write (double-pack).
+        _TSUV_FILL = -30000.0
         _pack_spec = [
-            # (varname,   data_list,  add_offset, scale_factor, fill_real)
-            # fill_real is the real-space sentinel written by ma.filled above;
-            # all four use -30000 (operational change_miss(-30000)), so a real
-            # zero current (u=0) is packed normally, not treated as missing.
+            # (varname,   data_list,  add_offset, scale_factor, unpacked_fill)
             ("temperature", all_temp, 20.0,  0.001, -30000.0),
             ("salinity",    all_salt, 20.0,  0.001, -30000.0),
             ("water_u",     all_u,     0.0,  0.001, -30000.0),
@@ -1025,21 +983,21 @@ class RTOFSProcessor(ForcingProcessor):
         ]
         for vname, data_list, add_offset, scale_factor, fill_real in _pack_spec:
             var = nc.createVariable(
-                vname, "i2", ("time", "lev", "ylat", "xlon"),
-                fill_value=_TSUV_FILL_I2,
+                vname, "f4", ("time", "lev", "ylat", "xlon"),
+                fill_value=_TSUV_FILL,
             )
             var.set_auto_maskandscale(False)
             var.scale_factor = np.float32(scale_factor)
-            var.add_offset   = np.float32(add_offset)
-            var.missing_value = _TSUV_FILL_I2
+            var.add_offset = np.float32(add_offset)
+            var.missing_value = _TSUV_FILL
             for t in range(nt):
                 real = np.asarray(data_list[t], dtype=np.float32)
                 # Cells equal to the real-space sentinel (fill_real from
-                # ma.filled in the caller) map to fill; _pack_int16 also sends
-                # non-finite cells there and single-packs to int16.
-                var[t] = _pack_int16(
+                # ma.filled in the caller) map to fill; _pack_for_fortran also sends
+                # non-finite cells there
+                var[t] = _pack_for_fortran(
                     real, var.scale_factor, var.add_offset,
-                    _TSUV_FILL_I2, fill_mask=np.abs(real - fill_real) < 1e-3,
+                    _TSUV_FILL, fill_mask=np.abs(real - fill_real) < 1e-3,
                 )
 
         nc.close()
@@ -1426,7 +1384,6 @@ class RTOFSProcessor(ForcingProcessor):
         n_bnd = len(self._bnd_lons)
 
         # Delaunay interpolation with corner points (matching Fortran INTERP_REMESH)
-        # target_pts uses the mesh boundary convention (same as self._bnd_lons)
         target_pts = np.column_stack([self._bnd_lons, self._bnd_lats])
 
         # Flatten RTOFS grid

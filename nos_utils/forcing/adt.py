@@ -31,7 +31,7 @@ import numpy as np
 
 from ..config import ForcingConfig
 from ..coords import normalize_lon, lon_convention
-from .rtofs import _pack_int16
+from .rtofs import _pack_for_fortran
 
 log = logging.getLogger(__name__)
 
@@ -263,18 +263,18 @@ class ADTBlender:
                                              -30000.0, ssh_corrected)
                     ssh[t, :, :] = ssh_corrected
 
-            # Update surf_el: single-pack int16 to match _stofs_prepare_ssh.
+            # Update surf_el: pack to match _stofs_prepare_ssh.
             # auto-maskandscale is ON for this r+ handle, so disable it on the
             # variable and pack manually with its own declared attrs; otherwise
-            # netCDF re-applies scale_factor and double-packs (ssh*1e6, int16
-            # overflow). Masked/extreme cells use the variable's -30000 fill.
+            # netCDF re-applies scale_factor and double-packs.
+            # Masked/extreme cells use the variable's -30000 fill.
             if "surf_el" in ds.variables:
                 surf_el = ds.variables["surf_el"]
                 surf_el.set_auto_maskandscale(False)
-                fill = np.int16(getattr(surf_el, "missing_value", -30000))
+                fill = getattr(surf_el, "missing_value", -30000)
                 for t in range(nt):
                     real = np.ma.filled(ssh[t, :, :], -30000.0).astype(np.float32)
-                    ds.variables["surf_el"][t, :, :] = _pack_int16(
+                    ds.variables["surf_el"][t, :, :] = _pack_for_fortran(
                         real, surf_el.scale_factor, surf_el.add_offset,
                         fill, fill_mask=np.abs(real) >= 10000,
                     )
