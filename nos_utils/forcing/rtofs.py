@@ -58,6 +58,23 @@ except ImportError:
     HAS_NETCDF4 = False
 
 
+def _pack_for_fortran(real, scale, offset, fill, fill_mask=None):
+    """
+    Pack a float field to float exactly as the Fortran gen_*_hycom expects.
+    stored = (real - offset) / scale
+
+    Single source of truth for the SSH writer, the TSUV writer, and the ADT
+    blend so the packing convention cannot drift between surf_el and TSUV.
+    """
+    real = np.asarray(real, dtype=np.float32)
+    packed = (real - offset) / scale
+    mask = ~np.isfinite(real)
+    if fill_mask is not None:
+        mask = mask | fill_mask
+    packed = np.where(mask, fill, packed)
+    return packed
+
+
 class RTOFSProcessor(ForcingProcessor):
     """
     RTOFS ocean boundary condition processor for SCHISM.
@@ -829,14 +846,23 @@ class RTOFSProcessor(ForcingProcessor):
         for t in range(nt):
             ssh_var[t] = all_ssh[t]
 
-        # Also write surf_el (scaled format expected by Fortran)
-        surf_el = nc.createVariable("surf_el", "f4", ("time", "ylat", "xlon"),
-                                    fill_value=-30000.0)
-        surf_el.scale_factor = 0.001
+        _SSH_FILL = -30000.0
+        surf_el = nc.createVariable(
+            "surf_el", "f4", ("time", "ylat", "xlon"),
+            fill_value=_SSH_FILL,
+        )
+        surf_el.set_auto_maskandscale(False)
+        surf_el.scale_factor = np.float32(0.001)
+        surf_el.add_offset = np.float32(0.0)
+        surf_el.missing_value = _SSH_FILL
         for t in range(nt):
-            data = all_ssh[t].copy()
-            data = np.where(np.abs(data) < 10000, data * 1000.0, -3000.0)
-            surf_el[t] = data
+            real = np.asarray(all_ssh[t], dtype=np.float32)
+            # Extreme cells (|SSH| >= 10000 m) map to fill; _pack_for_fortran also
+            # sends non-finite cells there
+            surf_el[t] = _pack_for_fortran(
+                real, surf_el.scale_factor, surf_el.add_offset,
+                _SSH_FILL, fill_mask=np.abs(real) >= 10000,
+            )
 
         nc.close()
         log.info(f"Created SSH_1.nc: {nt} times, {ny}x{nx} grid")
@@ -881,8 +907,9 @@ class RTOFSProcessor(ForcingProcessor):
                 for t in range(subset["temperature"].shape[0]):
                     all_temp.append(np.ma.filled(subset["temperature"][t], fill_value=-30000.0))
                     all_salt.append(np.ma.filled(subset["salinity"][t], fill_value=-30000.0))
-                    all_u.append(np.ma.filled(subset["u"][t], fill_value=0.0))
-                    all_v.append(np.ma.filled(subset["v"][t], fill_value=0.0))
+                    # Missing u/v -> -30000 (ops cvtUV.nco change_miss(-30000)),
+                    all_u.append(np.ma.filled(subset["u"][t], fill_value=-30000.0))
+                    all_v.append(np.ma.filled(subset["v"][t], fill_value=-30000.0))
 
                 if all_lon is None:
                     all_lon = np.array(subset["Longitude"])
@@ -898,6 +925,28 @@ class RTOFSProcessor(ForcingProcessor):
             return None
 
         # Write TSUV_1.nc (matching Fortran input format)
+        return self._write_tsuv_nc(
+            work_dir, all_temp, all_salt, all_u, all_v,
+            all_lon, all_lat, all_depth,
+        )
+
+    def _write_tsuv_nc(
+        self, work_dir: Path,
+        all_temp: List[np.ndarray], all_salt: List[np.ndarray],
+        all_u: List[np.ndarray], all_v: List[np.ndarray],
+        all_lon: np.ndarray, all_lat: np.ndarray,
+        all_depth: Optional[np.ndarray] = None,
+    ) -> Optional[Path]:
+        """Write TSUV_1.nc with T/S/U/V explicitly packed
+
+        Split out of _stofs_prepare_tsuv so the packing is unit-testable.
+        Each list holds one (nz, ny, nx) array per time step; all_lon/all_lat
+        are (ny, nx); all_depth is the (nz,) level depths. Cells equal to the
+        -30000 real-space sentinel (from ma.filled in the caller) are stored.
+        """
+        if not all_temp:
+            return None
+
         output = work_dir / "TSUV_1.nc"
         nc = Dataset(str(output), "w", format="NETCDF4")
 
@@ -921,11 +970,35 @@ class RTOFSProcessor(ForcingProcessor):
         lat_var = nc.createVariable("ylat", "f4", ("ylat", "xlon"))
         lat_var[:] = all_lat
 
-        for name, data_list in [("temperature", all_temp), ("salinity", all_salt),
-                                ("water_u", all_u), ("water_v", all_v)]:
-            var = nc.createVariable(name, "f4", ("time", "lev", "ylat", "xlon"))
+        # Pack T/S/U/V explicitly, matching operational NCO converters
+        # set_auto_maskandscale(False) prevents netCDF4 re-applying scale_factor
+        # on write (double-pack).
+        _TSUV_FILL = -30000.0
+        _pack_spec = [
+            # (varname,   data_list,  add_offset, scale_factor, unpacked_fill)
+            ("temperature", all_temp, 20.0,  0.001, -30000.0),
+            ("salinity",    all_salt, 20.0,  0.001, -30000.0),
+            ("water_u",     all_u,     0.0,  0.001, -30000.0),
+            ("water_v",     all_v,     0.0,  0.001, -30000.0),
+        ]
+        for vname, data_list, add_offset, scale_factor, fill_real in _pack_spec:
+            var = nc.createVariable(
+                vname, "f4", ("time", "lev", "ylat", "xlon"),
+                fill_value=_TSUV_FILL,
+            )
+            var.set_auto_maskandscale(False)
+            var.scale_factor = np.float32(scale_factor)
+            var.add_offset = np.float32(add_offset)
+            var.missing_value = _TSUV_FILL
             for t in range(nt):
-                var[t] = data_list[t]
+                real = np.asarray(data_list[t], dtype=np.float32)
+                # Cells equal to the real-space sentinel (fill_real from
+                # ma.filled in the caller) map to fill; _pack_for_fortran also sends
+                # non-finite cells there
+                var[t] = _pack_for_fortran(
+                    real, var.scale_factor, var.add_offset,
+                    _TSUV_FILL, fill_mask=np.abs(real - fill_real) < 1e-3,
+                )
 
         nc.close()
         log.info(f"Created TSUV_1.nc: {nt} times, {nz} levels, {ny}x{nx} grid")
@@ -1311,7 +1384,6 @@ class RTOFSProcessor(ForcingProcessor):
         n_bnd = len(self._bnd_lons)
 
         # Delaunay interpolation with corner points (matching Fortran INTERP_REMESH)
-        # target_pts uses the mesh boundary convention (same as self._bnd_lons)
         target_pts = np.column_stack([self._bnd_lons, self._bnd_lats])
 
         # Flatten RTOFS grid
