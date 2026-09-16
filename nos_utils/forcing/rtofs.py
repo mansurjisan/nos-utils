@@ -835,7 +835,8 @@ class RTOFSProcessor(ForcingProcessor):
             time_var[:] = np.arange(nt) * 21600.0  # 6-hourly default
 
         lon_var = nc.createVariable("xlon", "f4", ("ylat", "xlon"))
-        lon_var[:] = all_lon
+        # TODO: Check validity for pacific
+        lon_var[:] = all_lon - 360
 
         lat_var = nc.createVariable("ylat", "f4", ("ylat", "xlon"))
         lat_var[:] = all_lat
@@ -962,8 +963,8 @@ class RTOFSProcessor(ForcingProcessor):
         time_var[:] = np.arange(nt) * 21600.0
 
         if all_depth is not None:
-            lev_var = nc.createVariable("lev", "f4", ("lev",))
-            lev_var[:] = all_depth
+            dep_var = nc.createVariable("depth", "f4", ("lev",))
+            dep_var[:] = all_depth
 
         lon_var = nc.createVariable("xlon", "f4", ("ylat", "xlon"))
         lon_var[:] = all_lon
