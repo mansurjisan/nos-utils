@@ -22,6 +22,15 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+def _fields(line: str) -> List[str]:
+    """Whitespace fields of a vgrid.in line, ignoring a trailing ``!`` comment.
+
+    SCHISM reads these lines list-directed, so text after the numbers is
+    ignored; ops v3.1 writes ``1    !average # of layers=...`` on line 1. MJ (09/28/26)
+    """
+    return line.split("!", 1)[0].split()
+
+
 @dataclass
 class SchismVgrid:
     """Parsed SCHISM vertical grid."""
@@ -62,7 +71,7 @@ class SchismVgrid:
 
             # kbp line
             kbp_line = f.readline()
-            kbp_all = kbp_line.split()
+            kbp_all = _fields(kbp_line)
             self.node_kbp = np.array([int(kbp_all[i]) for i in bnd_indices])
 
             # Read level lines, extract boundary columns
@@ -155,7 +164,7 @@ class SchismVgrid:
             line0 = f.readline()
             line1 = f.readline()
 
-        parts0 = line0.split()
+        parts0 = _fields(line0)
 
         # Detect format: simple has 3+ values on line 0 (nvrt kz h_s)
         # LSC2 has just 1 value on line 0 (ivcor)
@@ -164,7 +173,7 @@ class SchismVgrid:
             return cls._read_simple(filepath)
         else:
             # LSC2 format — extract nvrt, store filepath for lazy boundary sigma loading
-            nvrt = int(line1.strip().split()[0])
+            nvrt = int(_fields(line1)[0])
             log.info(f"Read LSC2 vgrid.in: nvrt={nvrt} (per-node sigma available via load_boundary_sigma)")
             return cls(
                 nvrt=nvrt, kz=0, h_s=100.0,
@@ -181,7 +190,7 @@ class SchismVgrid:
         with open(filepath) as f:
             lines = f.readlines()
 
-        parts = lines[0].split()
+        parts = _fields(lines[0])
         nvrt = int(parts[0])
         kz = int(parts[1])
         h_s = float(parts[2])
