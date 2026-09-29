@@ -253,13 +253,14 @@ class ForcingConfig:
     # St. Lawrence River climatology (STOFS-3D-ATL only).
     # When True, the orchestrator runs StLawrenceProcessor which reads the
     # Environment Canada hydrometric CSV at $COMINlaw/<pdy>/can_streamgauge/
-    # and produces flux.th / TEM_1.th. Falls back to previous-day CSV and
-    # then to the previous cycle's archived .riv.obs.* files.
+    # and produces flux.th / TEM_1.th. Falls back to the previous-day CSV,
+    # then the day-of-year climatology, then the previous cycle's archived
+    # .riv.obs.* files. MJ (09/28/26)
     st_lawrence_enabled: bool = False
     st_lawrence_csv_name: str = "02OA016_hydrometric.csv"
     # Subdirectory under $COMINlaw/<pdy>/ holding the hydrometric CSV.
-    # Legacy default "can_streamgauge"; operational WCOSS2 uses
-    # "canadian_water" (with a "QC_..._hourly_hydrometric.csv" filename).
+    # Ops v3.1 uses "can_streamgauge" (02OA016_hydrometric.csv); v2.1 used
+    # "canadian_water" (QC_02OA016_hourly_hydrometric.csv). MJ (09/28/26)
     st_lawrence_subdir: str = "can_streamgauge"
     # Day-of-year climatology in the fix dir, used when no obs file yields data.  MJ (09/28/26)
     st_lawrence_clim_name: str = "stofs_3d_atl_StLawrence_clim.txt"
@@ -490,9 +491,9 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
-            # St. Lawrence climatology — always on for STOFS-3D-ATL.
-            # Operational WCOSS2 layout: $COMINlaw/<pdy>/canadian_water/
-            # QC_02OA016_hourly_hydrometric.csv
+            # St. Lawrence river forcing — always on for STOFS-3D-ATL.
+            # Ops v3.1 WCOSS2 layout: $COMINlaw/<pdy>/can_streamgauge/
+            # 02OA016_hydrometric.csv, then the day-of-year climatology. MJ (09/28/26)
             st_lawrence_enabled=True,
             st_lawrence_subdir="can_streamgauge",
             st_lawrence_csv_name="02OA016_hydrometric.csv",
@@ -539,8 +540,8 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
-            # Operational WCOSS2 layout: $COMINlaw/<pdy>/canadian_water/
-            # QC_02OA016_hourly_hydrometric.csv
+            # Ops v3.1 WCOSS2 layout: $COMINlaw/<pdy>/can_streamgauge/
+            # 02OA016_hydrometric.csv, then the day-of-year climatology. MJ (09/28/26)
             st_lawrence_enabled=True,
             st_lawrence_subdir="can_streamgauge",
             st_lawrence_csv_name="02OA016_hydrometric.csv",

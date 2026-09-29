@@ -678,3 +678,27 @@ class TestStLawrenceFailLoud:
         res = self._prep(tmp_path, law_ok=True)
         assert (tmp_path / "work" / "flux.th").exists()
         assert res.success is True
+
+
+def test_archive_flux_still_uses_current_sflux_for_temperature(tmp_path):
+    """Archive flux must not drag the archived TEM_1.th along when sflux exists."""
+    arch = tmp_path / "prev"
+    arch.mkdir()
+    (arch / "x.riv.obs.flux.th").write_text(
+        "\n".join(f"{i*86400} -1000.000" for i in range(7)) + "\n")
+    (arch / "x.riv.obs.tem_1.th").write_text(
+        "\n".join(f"{i*86400} 99.000" for i in range(7)) + "\n")
+    sflux_file = tmp_path / "sflux" / "sflux_rad_1.0001.nc"
+    _write_fake_sflux_rad(sflux_file, datetime(2026, 9, 26, 12, 0, 0), n_times=192)
+    out = tmp_path / "out"
+
+    res = StLawrenceProcessor(
+        _cfg(), tmp_path / "in", out, prev_rerun_dir=arch,
+        sflux_rad_file=sflux_file,
+    ).process()
+
+    assert res.success, res.errors
+    assert res.metadata["flux_source"].startswith("previous-cycle archive")
+    temps = np.loadtxt(out / "TEM_1.th")[:, 1]
+    expected = AIR_TO_WATER_SLOPE * 10.0 + AIR_TO_WATER_INTERCEPT
+    assert np.allclose(temps, expected, atol=0.01)
