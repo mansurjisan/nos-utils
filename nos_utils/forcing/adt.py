@@ -192,7 +192,7 @@ class ADTBlender:
             adt_var = "adt" if "adt" in ds.variables else "surf_el"
             # 0.45 from NCO file
             # TODO: Should be different for different systems, e.g. PAC
-            adt_data = ds.variables[adt_var] - 0.45
+            adt_data = ds.variables[adt_var][...] - 0.45
             if adt_data.ndim == 3:
                 # (time, lat, lon) — take mean across time if multiple
                 subset = np.ma.filled(
