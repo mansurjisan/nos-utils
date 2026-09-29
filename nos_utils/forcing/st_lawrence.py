@@ -337,10 +337,13 @@ class StLawrenceProcessor(ForcingProcessor):
         return self._to_utc_index(sub, "date_local")
 
     def _read_climatology(self, start: datetime, datevectors_full) -> _StLawrenceSeries:
-        """Ops v3.1 clim fallback: day-of-year rows for days 0..5 from model_t0.
+        """Ops v3.1 clim fallback: one day-of-year row per day from model_t0.
 
         Values are written as ``%.3f`` of the file value with no sign change
-        (the clim file already stores negative inflow).
+        (the clim file already stores negative inflow). Ops writes a fixed 6
+        rows (0..120 h), which ends 12 h short of a 24 h + 108 h run and SCHISM
+        aborts at the missing record; write one row per entry of
+        ``datevectors_full``, the same span the observation path covers. MJ (09/28/26)
         """
         if self.clim_file is None or not self.clim_file.is_file():
             raise FileNotFoundError("climatology file not found")
@@ -353,15 +356,16 @@ class StLawrenceProcessor(ForcingProcessor):
                 except ValueError:
                     continue
         base = datetime(start.year, start.month, start.day)
+        n_rows = len(datevectors_full)
         lines: List[str] = []
-        for i in range(6):
+        for i in range(n_rows):
             doy = (base + timedelta(days=i)).timetuple().tm_yday
             if doy in by_doy:
                 lines.append(f"{i * 86400} {by_doy[doy]:.3f}")
-        if len(lines) < 6:
+        if len(lines) < n_rows:
             raise ValueError(
                 f"climatology {self.clim_file} lacks day-of-year rows "
-                f"(got {len(lines)} of 6)"
+                f"(got {len(lines)} of {n_rows})"
             )
         secs = [int((dt - datevectors_full[0]).total_seconds())
                 for dt in datevectors_full]
