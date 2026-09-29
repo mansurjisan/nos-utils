@@ -135,8 +135,8 @@ class TestStLawrenceFluxTh:
 
         result = proc.process()
         assert not result.success
-        assert any("no previous-cycle archive" in e.lower() or
-                   "csv missing" in e.lower() for e in result.errors)
+        assert any("paths tried" in e and "obs: no file at" in e
+                   for e in result.errors)
 
     def test_previous_day_fallback(self, tmp_path):
         pdy = "20260402"
@@ -493,3 +493,186 @@ class TestADTDcomrootFallback:
         cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
         blender = ADTBlender(cfg, tmp_path / "rtofs")
         assert blender._find_adt_data() is None
+
+
+REAL_HEADER = (
+    "ID,Date,Parameter/Paramètre,Value/Valeur,Qualifier/Qualificatif,"
+    "Symbol/Symbole,Approval/Approbation,Grade/Classification,"
+    "Qualifiers/Qualificatifs"
+)
+CLIM = Path(__file__).parent / "data" / "stofs_3d_atl_StLawrence_clim.txt"
+
+
+def _write_long_csv(path: Path, start="2026-09-25T00:00:00Z", n_steps=3 * 288,
+                    with_47=True, flow0=8000.0):
+    """v3.1 long file: 5-min rows, Z timestamps, 46 interleaved with 47."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    t0 = pd.Timestamp(start)
+    lines = [REAL_HEADER]
+    for i in range(n_steps):
+        ts = (t0 + pd.Timedelta(minutes=5 * i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines.append(f"02OA016,{ts},46,1.243,,,Provisional/Provisoire,,")
+        if with_47:
+            day = i / 288.0
+            lines.append(
+                f"02OA016,{ts},47,{flow0 + day * 10:.3f},,,Provisional/Provisoire,,"
+            )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _cfg(pdy="20260927"):
+    return ForcingConfig.for_stofs_3d_atl(pdy=pdy, cyc=12)
+
+
+def _long_path(root, day):
+    return root / day / "can_streamgauge" / "02OA016_hydrometric.csv"
+
+
+class TestStLawrenceV31Long:
+    def test_long_parse_and_sign(self, tmp_path):
+        _write_long_csv(_long_path(tmp_path / "in", "20260927"))
+        out = tmp_path / "out"
+        res = StLawrenceProcessor(_cfg(), tmp_path / "in", out).process()
+        assert res.success, res.errors
+        rows = (out / "flux.th").read_text().split("\n")[:-1]
+        assert len(rows) == 7
+        # t0 = 2026-09-26 12:00Z is 1.5 days into the file
+        assert rows[0] == "0 -8015.000"
+        assert rows[1] == "86400 -8025.000"
+        assert "obs file" in res.metadata["flux_source"]
+
+    def test_lookup_times_exist_in_5min_data(self, tmp_path):
+        _write_long_csv(_long_path(tmp_path / "in", "20260927"))
+        proc = StLawrenceProcessor(_cfg(), tmp_path / "in", tmp_path / "out")
+        df = proc._load_flow_frame(_long_path(tmp_path / "in", "20260927"))
+        for dt in proc._daily_range(proc._cycle_datetime(), days=1):
+            assert dt in df.index
+
+    def test_wide_still_works(self, tmp_path):
+        _write_hydrometric_csv(
+            tmp_path / "in" / "20260927" / "can_streamgauge" / "02OA016_hydrometric.csv",
+            start_date="2026-09-26", flow_cms=7000.0,
+        )
+        res = StLawrenceProcessor(_cfg(), tmp_path / "in", tmp_path / "out").process()
+        assert res.success, res.errors
+        assert (tmp_path / "out" / "flux.th").read_text().startswith("0 -7000.000")
+
+    def test_no_47_rows_falls_to_climatology(self, tmp_path):
+        _write_long_csv(_long_path(tmp_path / "in", "20260927"), with_47=False)
+        out = tmp_path / "out"
+        res = StLawrenceProcessor(
+            _cfg(), tmp_path / "in", out, clim_file=CLIM
+        ).process()
+        assert res.success, res.errors
+        assert res.metadata["flux_source"].startswith("climatology")
+        rows = (out / "flux.th").read_text().split("\n")[:-1]
+        assert len(rows) == 6
+
+    def test_existing_first_file_without_data_skips_yesterday(self, tmp_path):
+        # ops breaks at the first existing file, then goes to climatology
+        root = tmp_path / "in"
+        _write_long_csv(_long_path(root, "20260927"), with_47=False)
+        _write_long_csv(_long_path(root, "20260926"))
+        res = StLawrenceProcessor(_cfg(), root, tmp_path / "out", clim_file=CLIM).process()
+        assert res.metadata["flux_source"].startswith("climatology")
+
+    def test_yesterday_file_used_when_today_absent(self, tmp_path):
+        root = tmp_path / "in"
+        _write_long_csv(_long_path(root, "20260926"), start="2026-09-24T00:00:00Z")
+        res = StLawrenceProcessor(_cfg(), root, tmp_path / "out", clim_file=CLIM).process()
+        assert res.metadata["flux_source"].startswith("obs file")
+        assert "20260926" in res.metadata["flux_source"]
+
+
+class TestStLawrenceClimatology:
+    def test_rows_match_ops_loop(self, tmp_path):
+        out = tmp_path / "out"
+        res = StLawrenceProcessor(
+            _cfg(), tmp_path / "in", out, clim_file=CLIM
+        ).process()
+        assert res.success, res.errors
+        rows = (out / "flux.th").read_text().split("\n")[:-1]
+        # nowcast start 2026-09-26 = doy 269, then 270 ...
+        assert rows[0] == "0 -7590.000"
+        assert rows[1] == "86400 -7490.000"
+        assert [r.split()[0] for r in rows] == [
+            "0", "86400", "172800", "259200", "345600", "432000"
+        ]
+
+    def test_year_wrap_doy(self, tmp_path):
+        out = tmp_path / "out"
+        StLawrenceProcessor(
+            _cfg("20261231"), tmp_path / "in", out, clim_file=CLIM
+        ).process()
+        rows = (out / "flux.th").read_text().split("\n")[:-1]
+        assert rows[0].startswith("0 -")  # doy 364 (2026-12-30)
+        assert rows[2] == "172800 -7360.000"  # 2027-01-01 -> doy 1
+
+    def test_order_clim_before_archive(self, tmp_path):
+        arch = tmp_path / "prev"
+        arch.mkdir()
+        (arch / "x.riv.obs.flux.th").write_text(
+            "\n".join(f"{i*86400} -1.000" for i in range(7)) + "\n")
+        res = StLawrenceProcessor(
+            _cfg(), tmp_path / "in", tmp_path / "out",
+            clim_file=CLIM, prev_rerun_dir=arch,
+        ).process()
+        assert res.metadata["flux_source"].startswith("climatology")
+
+    def test_archive_flux_copied_unshifted(self, tmp_path):
+        arch = tmp_path / "prev"
+        arch.mkdir()
+        (arch / "x.riv.obs.flux.th").write_text(
+            "\n".join(f"{i*86400} {-1000.0 - i:.3f}" for i in range(7)) + "\n")
+        out = tmp_path / "out"
+        res = StLawrenceProcessor(
+            _cfg(), tmp_path / "in", out, prev_rerun_dir=arch
+        ).process()
+        assert res.success, res.errors
+        assert res.metadata["flux_source"].startswith("previous-cycle archive")
+        assert (out / "flux.th").read_text().split("\n")[1] == "86400 -1001.000"
+
+
+class TestStLawrenceFailLoud:
+    def test_error_names_paths_tried(self, tmp_path):
+        res = StLawrenceProcessor(
+            _cfg(), tmp_path / "in", tmp_path / "out",
+            clim_file=tmp_path / "missing_clim.txt",
+            prev_rerun_dir=tmp_path / "noprev",
+        ).process()
+        assert not res.success
+        msg = res.errors[0]
+        assert "02OA016_hydrometric.csv" in msg
+        assert "missing_clim.txt" in msg
+        assert "noprev" in msg
+        assert not (tmp_path / "out" / "flux.th").exists()
+
+    def _prep(self, tmp_path, law_ok):
+        from nos_utils.orchestrator import PrepOrchestrator
+        fix = tmp_path / "fix"
+        fix.mkdir(exist_ok=True)
+        (fix / "param.nml").write_text(
+            "&CORE\n  rnday = rnday_value\n  dt = 120.\n/\n"
+            "&OPT\n  start_year = start_year_value\n"
+            "  start_month = start_month_value\n"
+            "  start_day = start_day_value\n"
+            "  start_hour = start_hour_value\n/\n"
+        )
+        if law_ok:
+            (fix / CLIM.name).write_text(CLIM.read_text())
+        cfg = _cfg()
+        cfg.st_lawrence_enabled = True
+        cfg.critical_sources = []
+        paths = {"output": str(tmp_path / "work"), "fix": str(fix)}
+        return PrepOrchestrator(cfg, paths, run_name="stofs_3d_atl_ufs").run(
+            phase="nowcast")
+
+    def test_prep_fails_when_nothing_produced(self, tmp_path):
+        res = self._prep(tmp_path, law_ok=False)
+        assert res.success is False
+        assert any(r.source == "ST_LAWRENCE" and not r.success for r in res.results)
+
+    def test_prep_passes_via_climatology(self, tmp_path):
+        res = self._prep(tmp_path, law_ok=True)
+        assert (tmp_path / "work" / "flux.th").exists()
+        assert res.success is True

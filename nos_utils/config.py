@@ -261,6 +261,8 @@ class ForcingConfig:
     # Legacy default "can_streamgauge"; operational WCOSS2 uses
     # "canadian_water" (with a "QC_..._hourly_hydrometric.csv" filename).
     st_lawrence_subdir: str = "can_streamgauge"
+    # Day-of-year climatology in the fix dir, used when no obs file yields data.
+    st_lawrence_clim_name: str = "stofs_3d_atl_StLawrence_clim.txt"
 
     # GFS-Wave boundary spectra (STOFS-3D-AK WW3 coupling). When True, the
     # orchestrator runs WaveBoundaryProcessor, which selects boundary points
@@ -492,8 +494,8 @@ class ForcingConfig:
             # Operational WCOSS2 layout: $COMINlaw/<pdy>/canadian_water/
             # QC_02OA016_hourly_hydrometric.csv
             st_lawrence_enabled=True,
-            st_lawrence_subdir="canadian_water",
-            st_lawrence_csv_name="QC_02OA016_hourly_hydrometric.csv",
+            st_lawrence_subdir="can_streamgauge",
+            st_lawrence_csv_name="02OA016_hydrometric.csv",
             # Dynamic SSH adjust — operational default for STOFS-3D-ATL.
             dynamic_adjust_enabled=True,
             # OBC dim QC threshold (operational N_dim_cr_max).
@@ -540,8 +542,8 @@ class ForcingConfig:
             # Operational WCOSS2 layout: $COMINlaw/<pdy>/canadian_water/
             # QC_02OA016_hourly_hydrometric.csv
             st_lawrence_enabled=True,
-            st_lawrence_subdir="canadian_water",
-            st_lawrence_csv_name="QC_02OA016_hourly_hydrometric.csv",
+            st_lawrence_subdir="can_streamgauge",
+            st_lawrence_csv_name="02OA016_hydrometric.csv",
             dynamic_adjust_enabled=True,
             obc_min_timesteps=21,
             # DATM forcing grid (ATLANTIC preset, slightly narrower than model)
@@ -894,6 +896,9 @@ class ForcingConfig:
                 subdir = stl.get("subdir")
                 if subdir:
                     kwargs["st_lawrence_subdir"] = str(subdir)
+                clim_name = stl.get("clim_name")
+                if clim_name:
+                    kwargs["st_lawrence_clim_name"] = str(clim_name)
 
         # STOFS-like YAMLs are identified by the presence of OBC ROI indices
         # (index-based RTOFS subsetting is STOFS-only).

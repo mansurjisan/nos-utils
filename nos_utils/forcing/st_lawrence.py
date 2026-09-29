@@ -62,6 +62,12 @@ DEFAULT_CSV_NAME = "02OA016_hydrometric.csv"
 # Legacy default; operational WCOSS2 uses "canadian_water".
 DEFAULT_SUBDIR = "can_streamgauge"
 
+# Day-of-year climatology (fix file) used when no observation file yields data.
+DEFAULT_CLIM_NAME = "stofs_3d_atl_StLawrence_clim.txt"
+
+# v3.1 long-format parameter codes (gen_fluxth_st_lawrence_riv.py).
+PARAM_DISCHARGE = 47
+
 
 @dataclass
 class _StLawrenceSeries:
@@ -70,6 +76,9 @@ class _StLawrenceSeries:
     seconds_from_start: List[int]
     flow_cms: List[float]
     temp_c: List[float]
+    # Pre-formatted flux.th rows (climatology path); None = derive from flow_cms.
+    flux_lines: Optional[List[str]] = None
+    temp_from_sflux: bool = False
 
 
 class StLawrenceProcessor(ForcingProcessor):
@@ -102,6 +111,7 @@ class StLawrenceProcessor(ForcingProcessor):
         sflux_rad_file: Optional[Path] = None,
         prev_rerun_dir: Optional[Path] = None,
         archive_prefix: Optional[str] = None,
+        clim_file: Optional[Path] = None,
     ) -> None:
         super().__init__(config, input_path, output_path)
         self.csv_name = csv_name
@@ -113,6 +123,7 @@ class StLawrenceProcessor(ForcingProcessor):
         # Archive prefix like "stofs_3d_atl.t12z" — determines the fallback
         # archive filenames (…riv.obs.flux.th / …riv.obs.tem_1.th).
         self.archive_prefix = archive_prefix
+        self.clim_file = Path(clim_file) if clim_file else None
 
     # ------------------------------------------------------------------ API
 
@@ -144,8 +155,12 @@ class StLawrenceProcessor(ForcingProcessor):
         warnings: List[str] = []
         output_files: List[Path] = []
 
+        # Ops v3.1 picks the FIRST existing obs file (today, then yesterday)
+        # and, if it yields no usable data, goes straight to climatology.
         csv_path = self._find_csv(pdy_dt)
         series: Optional[_StLawrenceSeries] = None
+        tried: List[str] = []
+        source_used = None
 
         if csv_path is not None:
             log.info(f"St. Lawrence CSV: {csv_path}")
@@ -153,9 +168,28 @@ class StLawrenceProcessor(ForcingProcessor):
                 series = self._read_hydrometric_csv(
                     csv_path, datevectors_hindcast, datevectors_full
                 )
+                source_used = f"obs file {csv_path}"
             except Exception as exc:
                 warnings.append(f"Failed to parse CSV {csv_path}: {exc}")
+                tried.append(f"obs {csv_path}: {exc}")
                 series = None
+        else:
+            tried.append(
+                "obs: no file at "
+                + " or ".join(str(self._csv_path_for(pdy_dt - timedelta(days=d)))
+                              for d in (0, 1))
+            )
+
+        if series is None:
+            try:
+                series = self._read_climatology(start, datevectors_full)
+                source_used = f"climatology {self.clim_file}"
+                warnings.append(
+                    "St. Lawrence obs unavailable; using climatology "
+                    f"{self.clim_file}"
+                )
+            except Exception as exc:
+                tried.append(f"climatology {self.clim_file}: {exc}")
 
         # If we have series data, overwrite temperature with the sflux-based
         # regression when a rad file is available (matches operational flow:
@@ -167,45 +201,56 @@ class StLawrenceProcessor(ForcingProcessor):
                 )
                 if temp_from_sflux is not None:
                     series.temp_c = temp_from_sflux
+                    series.temp_from_sflux = True
             except Exception as exc:
                 warnings.append(f"Failed to read sflux rad {self.sflux_rad_file}: {exc}")
 
         if series is not None:
             flux_path = self._write_flux_th(series)
-            temp_path = self._write_tem_1_th(series)
             if flux_path:
                 output_files.append(flux_path)
-            if temp_path:
-                output_files.append(temp_path)
-
-        # Fallback: previous cycle's archive if either file is missing.
-        if len(output_files) < 2 and self.prev_rerun_dir is not None:
-            missing = {"flux.th", "TEM_1.th"} - {p.name for p in output_files}
-            for name in sorted(missing):
+            # No sflux temperature: ops reuses the previous cycle's TEM_1.th.
+            if not series.temp_from_sflux and self.prev_rerun_dir is not None:
+                archived = self._fallback_from_archive("TEM_1.th")
+                if archived is not None:
+                    output_files.append(archived)
+                    warnings.append("Using previous-cycle archive for TEM_1.th")
+            if not any(p.name == "TEM_1.th" for p in output_files):
+                temp_path = self._write_tem_1_th(series)
+                if temp_path:
+                    output_files.append(temp_path)
+        else:
+            # Last resort: previous cycle's archive (ops copies it unchanged).
+            tried.append(f"previous-cycle archive in {self.prev_rerun_dir}")
+            for name in ("flux.th", "TEM_1.th"):
                 archived = self._fallback_from_archive(name)
                 if archived is not None:
                     output_files.append(archived)
-                    warnings.append(
-                        f"Using previous-cycle archive for {name}"
-                    )
+                    warnings.append(f"Using previous-cycle archive for {name}")
+            if any(p.name == "flux.th" for p in output_files):
+                source_used = f"previous-cycle archive {self.prev_rerun_dir}"
 
-        if not output_files:
+        if not any(p.name == "flux.th" for p in output_files):
+            msg = (
+                "No St. Lawrence flux.th could be produced; paths tried: "
+                + "; ".join(tried)
+            )
+            log.error(msg)
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
-                errors=[
-                    "No St. Lawrence data available: CSV missing and no "
-                    "previous-cycle archive found",
-                ],
-                warnings=warnings,
+                errors=[msg], warnings=warnings,
             )
 
+        log.info(f"St. Lawrence flux.th source: {source_used}")
         return ForcingResult(
-            success=len(output_files) >= 1,
+            success=True,
             source=self.SOURCE_NAME,
             output_files=output_files,
             warnings=warnings,
             metadata={
-                "csv_used": str(csv_path) if csv_path else None,
+                "flux_source": source_used,
+                "csv_used": str(csv_path) if csv_path and source_used
+                and source_used.startswith("obs") else None,
                 "sflux_used": str(self.sflux_rad_file) if self.sflux_rad_file else None,
                 "n_timesteps": len(series.seconds_from_start) if series else 0,
             },
@@ -223,6 +268,109 @@ class StLawrenceProcessor(ForcingProcessor):
         return found
 
     # -------------------------------------------------------------- CSV read
+
+    def _load_flow_frame(self, csv_path: Path):
+        """Return a UTC-indexed frame with a ``flow`` column.
+
+        The layout is chosen from the content: the v3.1 long file has 9
+        columns with a small set of integer parameter codes in column 2;
+        anything else is treated as the v2.1 wide export.
+        """
+        df = pd.read_csv(csv_path, sep=",", na_values="")
+        if self._is_long_layout(df):
+            log.info("St. Lawrence CSV layout: v3.1 long (parameter-coded)")
+            return self._flow_frame_long(df)
+        log.info("St. Lawrence CSV layout: v2.1 wide")
+        return self._flow_frame_wide(df, csv_path)
+
+    @staticmethod
+    def _is_long_layout(df) -> bool:
+        if df.shape[1] != 9:
+            return False
+        code = pd.to_numeric(df.iloc[:, 2], errors="coerce")
+        if code.isna().all():
+            return False
+        vals = code.dropna()
+        return bool((vals == vals.round()).all() and vals.nunique() <= 20)
+
+    @staticmethod
+    def _to_utc_index(frame, date_col: str):
+        ts = pd.to_datetime(frame[date_col], errors="coerce")
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize("UTC")
+        else:
+            ts = ts.dt.tz_convert("UTC")
+        frame = frame.assign(date_utc=ts).dropna(subset=["date_utc"])
+        frame = frame[~frame["date_utc"].duplicated(keep="first")]
+        return frame.set_index("date_utc")
+
+    def _flow_frame_long(self, df):
+        """Ops v3.1: drop cols [0,4..8]; rows with parameter == 47 are discharge."""
+        sub = pd.DataFrame(
+            {
+                "date_local": df.iloc[:, 1].values,
+                "parameter": pd.to_numeric(df.iloc[:, 2], errors="coerce").values,
+                "flow": pd.to_numeric(df.iloc[:, 3], errors="coerce").values,
+            }
+        )
+        sub = sub[sub["parameter"] == PARAM_DISCHARGE]
+        if sub.empty:
+            raise ValueError(f"no parameter {PARAM_DISCHARGE} (discharge) rows")
+        return self._to_utc_index(sub[["date_local", "flow"]], "date_local")
+
+    def _flow_frame_wide(self, df, csv_path: Path):
+        DATE_COL = 1
+        FLOW_COL = 6
+        if df.shape[1] <= FLOW_COL:
+            raise ValueError(
+                f"St. Lawrence CSV {csv_path} has only {df.shape[1]} columns; "
+                f"expected the wide ECCC hydrometric layout with discharge at "
+                f"column {FLOW_COL} (>= {FLOW_COL + 1} columns), or the v3.1 "
+                "9-column parameter-coded layout."
+            )
+        sub = pd.DataFrame(
+            {
+                "date_local": df.iloc[:, DATE_COL].values,
+                "flow": pd.to_numeric(df.iloc[:, FLOW_COL], errors="coerce").values,
+            }
+        )
+        return self._to_utc_index(sub, "date_local")
+
+    def _read_climatology(self, start: datetime, datevectors_full) -> _StLawrenceSeries:
+        """Ops v3.1 clim fallback: day-of-year rows for days 0..5 from model_t0.
+
+        Values are written as ``%.3f`` of the file value with no sign change
+        (the clim file already stores negative inflow).
+        """
+        if self.clim_file is None or not self.clim_file.is_file():
+            raise FileNotFoundError("climatology file not found")
+        by_doy = {}
+        for line in self.clim_file.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    by_doy.setdefault(int(float(parts[0])), float(parts[1]))
+                except ValueError:
+                    continue
+        base = datetime(start.year, start.month, start.day)
+        lines: List[str] = []
+        for i in range(6):
+            doy = (base + timedelta(days=i)).timetuple().tm_yday
+            if doy in by_doy:
+                lines.append(f"{i * 86400} {by_doy[doy]:.3f}")
+        if len(lines) < 6:
+            raise ValueError(
+                f"climatology {self.clim_file} lacks day-of-year rows "
+                f"(got {len(lines)} of 6)"
+            )
+        secs = [int((dt - datevectors_full[0]).total_seconds())
+                for dt in datevectors_full]
+        return _StLawrenceSeries(
+            seconds_from_start=secs,
+            flow_cms=[0.0] * len(secs),
+            temp_c=[-9999.0] * len(secs),
+            flux_lines=lines,
+        )
 
     def _read_hydrometric_csv(
         self,
@@ -266,44 +414,15 @@ class StLawrenceProcessor(ForcingProcessor):
         operational ``gen_temp_1_st_lawrence_riv.py`` (which never reads the
         CSV for temperature).
         """
-        df = pd.read_csv(csv_path, sep=",", na_values="")
-        # Wide ECCC layout: keep column 1 (local date) and column 6
-        # (discharge), discarding ID + water-level + the grade/symbol/approval
-        # qualifier columns — exactly the operational
-        # ``df.drop(df.columns[[0,2,3,4,5,7,8,9]])``. Read positionally so the
-        # bilingual header strings don't matter.
-        DATE_COL = 1
-        FLOW_COL = 6
-        if df.shape[1] <= FLOW_COL:
-            raise ValueError(
-                f"St. Lawrence CSV {csv_path} has only {df.shape[1]} columns; "
-                f"expected the wide ECCC hydrometric layout with discharge at "
-                f"column {FLOW_COL} (>= {FLOW_COL + 1} columns). This looks "
-                "like a water-level-only or unexpected export."
-            )
-        df_flow = pd.DataFrame(
-            {
-                "date_local": df.iloc[:, DATE_COL].values,
-                "flow": pd.to_numeric(df.iloc[:, FLOW_COL], errors="coerce").values,
-            }
-        )
-        # Local timestamps carry a UTC offset (e.g. "-05:00"); convert to UTC
-        # so the index aligns with the tz-aware UTC lookup keys. Operational:
-        # ``pd.to_datetime(date_local).dt.tz_convert('UTC')``. Localize naive
-        # timestamps to UTC as a defensive fallback (real dcom is offset-aware).
-        ts = pd.to_datetime(df_flow["date_local"], errors="coerce")
-        if getattr(ts.dt, "tz", None) is None:
-            ts = ts.dt.tz_localize("UTC")
-        else:
-            ts = ts.dt.tz_convert("UTC")
-        df_flow["date_utc"] = ts
-        df_flow = df_flow.dropna(subset=["date_utc"]).set_index("date_utc")
+        df_flow = self._load_flow_frame(csv_path)
 
         data_flow: List[float] = []
         last_flow_idx = -1
         for i, dt in enumerate(datevectors_hindcast):
             try:
                 value = float(df_flow.loc[dt]["flow"])
+                if np.isnan(value):
+                    raise KeyError(dt)
                 data_flow.append(round(value, 3))
                 last_flow_idx = i
             except KeyError:
@@ -457,6 +576,9 @@ class StLawrenceProcessor(ForcingProcessor):
     def _write_flux_th(self, series: _StLawrenceSeries) -> Optional[Path]:
         output_file = self.output_path / "flux.th"
         try:
+            if series.flux_lines is not None:
+                output_file.write_text("\n".join(series.flux_lines) + "\n")
+                return output_file
             data = np.array(
                 [
                     [t, -flow]  # negative sign = inflow in SCHISM convention
@@ -537,6 +659,9 @@ class StLawrenceProcessor(ForcingProcessor):
                 # Last row keeps the second-to-last new value (matches
                 # the idx_2 = (N-2)*2+3 branch in the shell).
                 shifted_vals[-1] = raw[-1, 1]
+            if kind == "flux":
+                # Ops copies the previous flux.th unchanged.
+                shifted_vals = raw[:, 1].copy()
             out = np.column_stack([shifted_times.astype(int), shifted_vals])
             output_file = self.output_path / output_name
             np.savetxt(output_file, out, fmt=["%d", "%.3f"])
