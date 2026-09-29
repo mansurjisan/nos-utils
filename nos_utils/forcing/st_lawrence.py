@@ -62,10 +62,10 @@ DEFAULT_CSV_NAME = "02OA016_hydrometric.csv"
 # Legacy default; operational WCOSS2 uses "canadian_water".
 DEFAULT_SUBDIR = "can_streamgauge"
 
-# Day-of-year climatology (fix file) used when no observation file yields data.
+# Day-of-year climatology (fix file) used when no observation file yields data.  MJ (09/28/26)
 DEFAULT_CLIM_NAME = "stofs_3d_atl_StLawrence_clim.txt"
 
-# v3.1 long-format parameter codes (gen_fluxth_st_lawrence_riv.py).
+# v3.1 long-format parameter codes (gen_fluxth_st_lawrence_riv.py).  MJ (09/28/26)
 PARAM_DISCHARGE = 47
 
 
@@ -76,7 +76,7 @@ class _StLawrenceSeries:
     seconds_from_start: List[int]
     flow_cms: List[float]
     temp_c: List[float]
-    # Pre-formatted flux.th rows (climatology path); None = derive from flow_cms.
+    # Pre-formatted flux.th rows (climatology path); None = derive from flow_cms.  MJ (09/28/26)
     flux_lines: Optional[List[str]] = None
     temp_from_sflux: bool = False
 
@@ -156,7 +156,7 @@ class StLawrenceProcessor(ForcingProcessor):
         output_files: List[Path] = []
 
         # Ops v3.1 picks the FIRST existing obs file (today, then yesterday)
-        # and, if it yields no usable data, goes straight to climatology.
+        # and, if it yields no usable data, goes straight to climatology.  MJ (09/28/26)
         csv_path = self._find_csv(pdy_dt)
         series: Optional[_StLawrenceSeries] = None
         tried: List[str] = []
@@ -209,7 +209,7 @@ class StLawrenceProcessor(ForcingProcessor):
             flux_path = self._write_flux_th(series)
             if flux_path:
                 output_files.append(flux_path)
-            # No sflux temperature: ops reuses the previous cycle's TEM_1.th.
+            # No sflux temperature: ops reuses the previous cycle's TEM_1.th.  MJ (09/28/26)
             if not series.temp_from_sflux and self.prev_rerun_dir is not None:
                 archived = self._fallback_from_archive("TEM_1.th")
                 if archived is not None:
@@ -220,7 +220,7 @@ class StLawrenceProcessor(ForcingProcessor):
                 if temp_path:
                     output_files.append(temp_path)
         else:
-            # Last resort: previous cycle's archive (ops copies it unchanged).
+            # Last resort: previous cycle's archive (ops copies it unchanged).  MJ (09/28/26)
             tried.append(f"previous-cycle archive in {self.prev_rerun_dir}")
             for name in ("flux.th", "TEM_1.th"):
                 archived = self._fallback_from_archive(name)
@@ -660,7 +660,7 @@ class StLawrenceProcessor(ForcingProcessor):
                 # the idx_2 = (N-2)*2+3 branch in the shell).
                 shifted_vals[-1] = raw[-1, 1]
             if kind == "flux":
-                # Ops copies the previous flux.th unchanged.
+                # Ops copies the previous flux.th unchanged.  MJ (09/28/26)
                 shifted_vals = raw[:, 1].copy()
             out = np.column_stack([shifted_times.astype(int), shifted_vals])
             output_file = self.output_path / output_name

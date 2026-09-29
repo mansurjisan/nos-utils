@@ -536,7 +536,7 @@ class TestStLawrenceV31Long:
         assert res.success, res.errors
         rows = (out / "flux.th").read_text().split("\n")[:-1]
         assert len(rows) == 7
-        # t0 = 2026-09-26 12:00Z is 1.5 days into the file
+        # t0 = 2026-09-26 12:00Z is 1.5 days into the file  MJ (09/28/26)
         assert rows[0] == "0 -8015.000"
         assert rows[1] == "86400 -8025.000"
         assert "obs file" in res.metadata["flux_source"]
@@ -569,7 +569,7 @@ class TestStLawrenceV31Long:
         assert len(rows) == 6
 
     def test_existing_first_file_without_data_skips_yesterday(self, tmp_path):
-        # ops breaks at the first existing file, then goes to climatology
+        # ops breaks at the first existing file, then goes to climatology  MJ (09/28/26)
         root = tmp_path / "in"
         _write_long_csv(_long_path(root, "20260927"), with_47=False)
         _write_long_csv(_long_path(root, "20260926"))
@@ -592,7 +592,7 @@ class TestStLawrenceClimatology:
         ).process()
         assert res.success, res.errors
         rows = (out / "flux.th").read_text().split("\n")[:-1]
-        # nowcast start 2026-09-26 = doy 269, then 270 ...
+        # nowcast start 2026-09-26 = doy 269, then 270 ...  MJ (09/28/26)
         assert rows[0] == "0 -7590.000"
         assert rows[1] == "86400 -7490.000"
         assert [r.split()[0] for r in rows] == [

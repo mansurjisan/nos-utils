@@ -261,7 +261,7 @@ class ForcingConfig:
     # Legacy default "can_streamgauge"; operational WCOSS2 uses
     # "canadian_water" (with a "QC_..._hourly_hydrometric.csv" filename).
     st_lawrence_subdir: str = "can_streamgauge"
-    # Day-of-year climatology in the fix dir, used when no obs file yields data.
+    # Day-of-year climatology in the fix dir, used when no obs file yields data.  MJ (09/28/26)
     st_lawrence_clim_name: str = "stofs_3d_atl_StLawrence_clim.txt"
 
     # GFS-Wave boundary spectra (STOFS-3D-AK WW3 coupling). When True, the

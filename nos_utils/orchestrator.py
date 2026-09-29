@@ -362,7 +362,7 @@ class PrepOrchestrator:
                 success = any(r.success for r in results)
 
         # A missing St. Lawrence flux.th kills pschism at open (flow-only
-        # boundary), so it is always critical when enabled.
+        # boundary), so it is always critical when enabled.  MJ (09/28/26)
         if getattr(self.config, "st_lawrence_enabled", False) and "ST_LAWRENCE" in failed:
             log.error("Critical prep source ST_LAWRENCE FAILED: no flux.th produced")
             success = False
