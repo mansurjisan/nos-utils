@@ -142,6 +142,25 @@ def test_two_day_adt_is_averaged(setup):
         np.testing.assert_allclose(np.array(ds["ssh"][0]), 1.00 - 0.45, atol=1e-5)
 
 
+def test_adt_inputs_reach_manifest(setup):
+    from nos_utils.forcing._log import (
+        drain_input_capture, reset_input_capture, start_input_capture,
+    )
+    cfg, proc, files, ssh_1, work, tmp = setup
+    _write_adt(tmp / "adt_20260331.nc", lambda lo, la: np.full_like(lo, 1.10))
+    reset_input_capture()
+    start_input_capture()
+    try:
+        _blend(cfg, tmp, ssh_1, work, lambda lo, la: np.full_like(lo, 0.90))
+        entries = {(e["category"], e["source"]): e for e in drain_input_capture()}
+    finally:
+        reset_input_capture()
+    adt = entries[("ocean", "ADT")]
+    assert adt["count"] == 2
+    assert sorted(f.rsplit("/", 1)[-1] for f in adt["files"]) == [
+        "adt_20260331.nc", "adt_20260401.nc"]
+
+
 def test_adt_unavailable_equals_raw(setup):
     cfg, proc, files, ssh_1, work, tmp = setup
     assert ADTBlender(cfg, tmp).blend_ssh(ssh_1, work) is None

@@ -81,6 +81,11 @@ class ADTBlender:
             return None
 
         adt_files = self._find_adt_files()
+        from ._log import log_input_files
+        log_input_files(
+            "ADT", adt_files, source="ADT", category="ocean",
+            note=f"pdy={self.config.pdy} n={len(adt_files)}",
+        )
         if not adt_files:
             log.warning("No ADT satellite data available — using RTOFS-only SSH")
             return None
