@@ -188,6 +188,22 @@ class NudgingProcessor(ForcingProcessor):
         return self._process_python()
 
     def _process_stofs(self) -> ForcingResult:
+        """STOFS mode: the ops-equivalent port under obc_ops_timeline, else (or on failure) the legacy path."""
+        reason = None
+        if self.config.obc_ops_timeline:
+            try:
+                return self._process_ops()
+            except Exception as e:
+                reason = f"{type(e).__name__}: {e}"
+                log.warning(f"Nudging: ops-equivalent path unavailable ({reason}); using the fallback")
+        result = self._process_stofs_legacy()
+        if reason:
+            result.warnings.append(
+                f"nudging fell back to {result.metadata.get('nudge_interp', 'legacy')}: "
+                f"ops-equivalent path unavailable ({reason}); TEM_nu/SAL_nu will differ from ops")
+        return result
+
+    def _process_stofs_legacy(self) -> ForcingResult:
         """STOFS mode: prepare data with nudge-specific ROI, call Fortran exe.
 
         IMPORTANT: The nudge ROI (422,600,94,835) is wider than the OBC 3D ROI
@@ -229,10 +245,145 @@ class NudgingProcessor(ForcingProcessor):
                     "timescale_seconds": self.config.nudging_timescale_seconds,
                     "n_levels": self.config.n_levels,
                     "fortran_used": fortran_ok,
+                    "nudge_interp": "fortran",
                 },
             )
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _process_ops(self) -> ForcingResult:
+        """Ops gen_nudge port: same-day RTOFS records, ops-effective phase files; raises to fall back."""
+        import time as _time
+        from . import nudge_ops as no
+        from ..io.schism_grid import SchismGrid
+        from .rtofs import RTOFSProcessor
+
+        t_start = _time.time()
+        roi = self.config.nudge_roi_3d
+        nudge_file, grid_file = self._nudge_file(), self.config.grid_file
+        if not (nudge_file and Path(nudge_file).exists()):
+            raise ValueError("no nudge gr3 (nudge_weight_file / FIX *.nudge.gr3)")
+        if not (grid_file and Path(grid_file).exists()):
+            raise ValueError("no grid_file (hgrid.ll) in the config")
+        warnings: List[str] = []
+
+        rtofs_proc = RTOFSProcessor(
+            self.config, self.rtofs_input_path or self.input_path, self.output_path,
+            phase=self.phase, buffer_hours=self.buffer_hours,
+        )
+        if not rtofs_proc._ops_timeline:
+            raise ValueError("RTOFS processor is not on the ops timeline")
+        _, files = rtofs_proc.find_input_files_by_type()
+        warnings += list(getattr(rtofs_proc, "_select_notes", []))
+
+        sim_start, _, duration = self._get_output_window()
+        nowcast_s = float(self.config.nowcast_hours) * 3600.0
+        offset = nowcast_s if self.phase == "forecast" else 0.0
+        n_out, ratio, off, aligned, need = no.phase_plan(offset, duration)
+        if not aligned:
+            warnings.append(
+                f"nudging: phase offset {offset:.0f} s is not a multiple of {no.NU_DT:.0f} s, so "
+                f"SCHISM's linear read of the file does not reproduce the ops-effective field exactly")
+        if len(files) < need:
+            raise ValueError(f"the ops-effective field needs {need} RTOFS 3D files, found {len(files)}")
+        t0 = sim_start - timedelta(seconds=offset)
+        for k in range(need):
+            vt = rtofs_proc.valid_time(files[k])
+            want = t0 + timedelta(seconds=no.NU_DT * k)
+            if vt != want:
+                warnings.append(f"nudging: ops record {k} is {files[k].name} valid {vt:%Y%m%d %Hz}, "
+                                f"the ops slot is {want:%Y%m%d %Hz}")
+
+        values = SchismGrid.read_gr3_values(nudge_file)[3]
+        xl, yl, dp, elnode = no.read_grid(grid_file)
+        if len(values) != len(xl):
+            raise ValueError(f"nudge gr3 has {len(values)} nodes, grid {len(xl)}")
+        zone = no.nudge_zone(values, elnode)
+
+        def read_raw(path):
+            with Dataset(str(path)) as ds:
+                ys, xs = slice(roi["y1"], roi["y2"] + 1), slice(roi["x1"], roi["x2"] + 1)
+                out = []
+                for nme in ("temperature", "salinity"):
+                    v = ds.variables[nme]
+                    out.append(no.pack_ts(v[0, :, ys, xs] if v.ndim == 4 else v[:, ys, xs]))
+                grid = [np.ma.filled(ds.variables[n][ys, xs], np.nan).astype(np.float32)
+                        for n in ("Longitude", "Latitude")]
+                return out[0], out[1], grid[0], grid[1], np.asarray(ds.variables["Depth"][:], np.float32)
+
+        t_raw, s_raw, lon, lat, depth = read_raw(files[0])
+        if not np.all(np.diff(depth) > 0):
+            raise ValueError("RTOFS Depth is not increasing")
+        if lon.max() > 180.0:
+            xl = np.asarray(xl, np.float64) % 360.0
+        elif xl.max() > 180.0:
+            xl = np.where(xl > 180.0, xl - 360.0, xl)
+        xl = np.asarray(xl, np.float32)
+        cand = (zone & (xl >= lon.min()) & (xl <= lon.max()) & (yl >= lat.min()) & (yl <= lat.max()))
+        if not cand.any():
+            raise ValueError("no nudge node inside the RTOFS ROI")
+        vg = self._load_vgrid()
+        if vg is None or vg._filepath is None:
+            raise ValueError("no LSC2 vgrid.in")
+        cidx = np.flatnonzero(cand)
+        kbp_v, sigma = no.read_vgrid_nodes(vg._filepath, cidx)
+        z = no.node_z(dp[cidx], sigma, kbp_v)
+
+        state, _ = no.build_state(lon, lat, depth, xl, yl, cand, z, s_raw)
+        n = len(state.sel)
+        log.info(f"Nudge ops: {n:,} nodes ({int(zone.sum()):,} in the zone, {state.outside} without "
+                 f"a parent), {state.nz} RTOFS levels, {need} ops records, {n_out} output records")
+
+        rec_t, rec_s = [], []
+        for k in range(need):
+            if k:
+                t_raw, s_raw, lon_k, lat_k, depth_k = read_raw(files[k])
+                if t_raw.shape != (state.nz,) + lon.shape or not np.array_equal(lon_k, lon):
+                    raise ValueError(f"{files[k].name} is not on the same RTOFS ROI grid")
+            tt, ss = no.interpolate_record(state, t_raw, s_raw)
+            rec_t.append(tt)
+            rec_s.append(ss)
+
+        out_files = []
+        for name, rec in (("TEM_nu.nc", rec_t), ("SAL_nu.nc", rec_s)):
+            path = self.output_path / name
+            self._write_ops_nu(path, rec, state.sel + 1, n_out, off, ratio, no)
+            out_files.append(path)
+        log.info(f"Nudge ops: wrote {n_out} records at {no.NU_DT:.0f} s in {_time.time() - t_start:.0f} s")
+        return ForcingResult(
+            success=True, source=self.SOURCE_NAME, output_files=out_files, warnings=warnings,
+            metadata={
+                "timescale_seconds": self.config.nudging_timescale_seconds,
+                "n_levels": int(sigma.shape[0]),
+                "n_nudge_nodes": n,
+                "n_timesteps": n_out,
+                "dt_seconds": no.NU_DT,
+                "step_nu_tr": no.NU_DT,
+                "ops_records": need,
+                "fortran_used": False,
+                "precomputed_weights": False,
+                "nudge_interp": "ops",
+            },
+        )
+
+    @staticmethod
+    def _write_ops_nu(path, records, node_ids, n_out, off, ratio, no):
+        """Ops layout, one record at a time: time (days) double, map_to_global_node, tracer float32."""
+        n, nvrt = records[0].shape
+        nc = Dataset(str(path), "w", format="NETCDF4_CLASSIC")
+        nc.createDimension("node", n)
+        nc.createDimension("nLevels", nvrt)
+        nc.createDimension("one", 1)
+        nc.createDimension("time", None)
+        tv = nc.createVariable("time", "f8", ("time",))
+        mv = nc.createVariable("map_to_global_node", "i4", ("node",))
+        var = nc.createVariable("tracer_concentration", "f4", ("time", "node", "nLevels", "one"))
+        mv[:] = np.asarray(node_ids, np.int32)
+        for j in range(n_out):
+            k, num = divmod(off + j, ratio)
+            tv[j] = j * no.NU_DT / 86400.0
+            var[j, :, :, 0] = no.effective(records, k, num, ratio)
+        nc.close()
 
     def _prepare_nudge_tsuv(self, work_dir: Path) -> Optional[Path]:
         """Prepare TS_1.nc with nudge-specific ROI (wider than OBC ROI).
@@ -795,6 +946,7 @@ class NudgingProcessor(ForcingProcessor):
                 "dt_seconds": dt_out,
                 "fortran_used": False,
                 "precomputed_weights": use_precomputed,
+                "nudge_interp": "precomputed" if use_precomputed else "delaunay",
             },
         )
 
@@ -1046,6 +1198,20 @@ class NudgingProcessor(ForcingProcessor):
     _cached_nudge_nodes = None  # (file_path, node_ids, lons, lats, depths)
     _cached_vgrid = None        # (file_path, vgrid_object)
 
+    def _nudge_file(self) -> Optional[Path]:
+        """The configured nudge gr3, else the first *.nudge.gr3 / *.TEM_nudge.gr3 in the FIX dirs."""
+        if self.nudge_weight_file is not None:
+            return self.nudge_weight_file
+        for env_var in ["FIXofs", "FIXstofs3d"]:
+            fix_dir = os.environ.get(env_var)
+            if not fix_dir:
+                continue
+            for pattern in ["*.nudge.gr3", "*.TEM_nudge.gr3"]:
+                matches = sorted(Path(fix_dir).glob(pattern))
+                if matches:
+                    return matches[0]
+        return None
+
     def _load_nudge_nodes(self):
         """Load nudging node IDs, coordinates, and depths.
 
@@ -1061,20 +1227,7 @@ class NudgingProcessor(ForcingProcessor):
         """
         from ..io.schism_grid import SchismGrid
 
-        nudge_file = self.nudge_weight_file
-        if nudge_file is None:
-            # Try to find it from FIX environment
-            for env_var in ["FIXofs", "FIXstofs3d"]:
-                fix_dir = os.environ.get(env_var)
-                if not fix_dir:
-                    continue
-                for pattern in ["*.nudge.gr3", "*.TEM_nudge.gr3"]:
-                    matches = sorted(Path(fix_dir).glob(pattern))
-                    if matches:
-                        nudge_file = matches[0]
-                        break
-                if nudge_file:
-                    break
+        nudge_file = self._nudge_file()
 
         if nudge_file is None or not Path(nudge_file).exists():
             log.warning(f"Nudge weight file not found: {nudge_file}")

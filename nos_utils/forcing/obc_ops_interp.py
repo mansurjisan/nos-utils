@@ -111,13 +111,15 @@ def parent_weights_2d(lon, lat, x, y, small1=1e-2, chunk=4000, single=False):
             kk = (ci[acc] % ncx) * (ny - 1) + ci[acc] // ncx
             np.minimum.at(key, s0 + pi[acc], kk)
     found = key < np.iinfo(np.int64).max
-    # A node inside the grid's bounding box with no KD candidate accepted: scan every cell in the
-    # f90 order. MJ (10/02/26)
-    allc = np.arange(len(diag))
+    # A node inside the grid's bounding box with no KD candidate accepted: rescan every cell whose
+    # centre is within 3 largest diagonals (a cell passing the 1% test is closer). MJ (10/02/26)
+    dmax = 3.0 * float(diag.max())
     for k_ in np.flatnonzero(~found & (x >= lon.min()) & (x <= lon.max())
                              & (y >= lat.min()) & (y <= lat.max())):
-        ok = np.flatnonzero(_accepted(X, Y, np.full(allc.size, x[k_]), np.full(allc.size, y[k_]),
-                                      allc, small1))
+        near = np.asarray(tree.query_ball_point([x[k_], y[k_]], dmax), int)
+        if near.size == 0:
+            continue
+        ok = near[_accepted(X, Y, np.full(near.size, x[k_]), np.full(near.size, y[k_]), near, small1)]
         if ok.size:
             key[k_] = ((ok % ncx) * (ny - 1) + ok // ncx).min()
     found = key < np.iinfo(np.int64).max
