@@ -114,8 +114,8 @@ class TestStLawrenceFluxTh:
         flux_path = out_dir / "flux.th"
         assert flux_path.exists()
         data = np.loadtxt(flux_path)
-        # 5 days + 1 -> 6 rows (120h/24 = 5, +1 = 6)
-        assert data.shape == (6, 2)
+        # Ops span start..start+6 d -> 7 rows, whatever the run length
+        assert data.shape == (7, 2)
         # Time column starts at 0 (= model_t0 = cycle - nowcast_hours) and
         # steps by 86400 seconds.
         assert data[0, 0] == 0
@@ -566,7 +566,7 @@ class TestStLawrenceV31Long:
         assert res.success, res.errors
         assert res.metadata["flux_source"].startswith("climatology")
         rows = (out / "flux.th").read_text().split("\n")[:-1]
-        assert len(rows) == 7
+        assert len(rows) == 6
 
     def test_existing_first_file_without_data_skips_yesterday(self, tmp_path):
         # ops breaks at the first existing file, then goes to climatology  MJ (09/28/26)
@@ -595,11 +595,10 @@ class TestStLawrenceClimatology:
         # nowcast start 2026-09-26 = doy 269, then 270 ...  MJ (09/28/26)
         assert rows[0] == "0 -7590.000"
         assert rows[1] == "86400 -7490.000"
-        # One row per day of the 24 h + 108 h run, one more than ops' 6. MJ (09/28/26)
+        # One row per day of the 24 h + 96 h run, the same 6 rows as ops. MJ (10/02/26)
         assert [r.split()[0] for r in rows] == [
-            "0", "86400", "172800", "259200", "345600", "432000", "518400"
+            "0", "86400", "172800", "259200", "345600", "432000"
         ]
-        assert rows[6] == "518400 -7490.000"  # doy 275, 2026-10-02
 
     def test_year_wrap_doy(self, tmp_path):
         out = tmp_path / "out"
