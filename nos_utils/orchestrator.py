@@ -292,7 +292,7 @@ class PrepOrchestrator:
         # Dynamic SSH adjust: NOAA tide-gauge bias correction on elev2D.th.nc.
         # Must run after RTOFS has produced the non-adjusted file.
         if self.config.dynamic_adjust_enabled:
-            results.append(self._run_dynamic_adjust(output_dir))
+            results.append(self._run_dynamic_adjust(output_dir, phase))
 
         # Nudging needs RTOFS to have completed
         if self.config.nudging_enabled and "rtofs" in self.paths:
@@ -728,7 +728,7 @@ class PrepOrchestrator:
             },
         )
 
-    def _run_dynamic_adjust(self, output_dir: Path) -> ForcingResult:
+    def _run_dynamic_adjust(self, output_dir: Path, phase: str = "nowcast") -> ForcingResult:
         """Apply NOAA tide-gauge bias correction to elev2D.th.nc.
 
         Resolves the several supporting paths required by the operational
@@ -790,6 +790,10 @@ class PrepOrchestrator:
                     prev_avg_bias = ab
                     break
 
+        # Ops ramps from the nowcast start; the forecast file starts nowcast_hours later. MJ (10/02/26)
+        offset = (int(self.config.nowcast_hours)
+                  if phase == "forecast" and self.config.obc_ops_timeline else 0)
+
         proc = DynamicAdjustProcessor(
             self.config,
             input_path=output_dir,
@@ -802,6 +806,7 @@ class PrepOrchestrator:
             prev_avg_bias_file=prev_avg_bias,
             elev2d_th_nc=output_dir / "elev2D.th.nc",
             bias_window_days=self.config.dynamic_adjust_window_days,
+            start_offset_hours=offset,
         )
         return proc.process()
 

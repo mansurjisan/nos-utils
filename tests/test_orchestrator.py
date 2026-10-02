@@ -518,3 +518,28 @@ class TestPrepResult:
             ],
         )
         assert r.all_errors == ["no files"]
+
+
+def test_dynamic_adjust_phase_offset(tmp_path, monkeypatch):
+    """Forecast under the ops timeline starts nowcast_hours into the ramp; nowcast and non-ops stay at 0."""
+    from nos_utils.config import ForcingConfig
+    from nos_utils.forcing import dynamic_adjust as da
+    from nos_utils.orchestrator import PrepOrchestrator
+
+    seen = []
+
+    class Stub:
+        def __init__(self, *a, start_offset_hours=0, **k):
+            seen.append(start_offset_hours)
+
+        def process(self):
+            return None
+
+    monkeypatch.setattr(da, "DynamicAdjustProcessor", Stub)
+    cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260402", cyc=12)
+    orch = PrepOrchestrator(cfg, {"output": tmp_path}, run_name="stofs_3d_atl")
+    orch._run_dynamic_adjust(tmp_path, "nowcast")
+    orch._run_dynamic_adjust(tmp_path, "forecast")
+    cfg.obc_ops_timeline = False
+    orch._run_dynamic_adjust(tmp_path, "forecast")
+    assert seen == [0, cfg.nowcast_hours, 0]

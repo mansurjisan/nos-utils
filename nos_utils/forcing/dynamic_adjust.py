@@ -551,8 +551,12 @@ def apply_ssh_time_varying_adjust(
     adj0: float,
     adj1: float,
     var_name: str = "time_series",
+    start_offset_hours: int = 0,
 ) -> bool:
     """Subtract a time-varying bias from ``time_series`` in ``elev_nc``.
+
+    ``start_offset_hours`` is the file's start measured from the nowcast start, so the ramp
+    runs on absolute time (a forecast file starting at 24 h gets adj1 on every record).
 
     The operational ex-script applies:
         * t=0  -> value - adj0
@@ -592,11 +596,10 @@ def apply_ssh_time_varying_adjust(
             if np.ma.isMaskedArray(data):
                 data = data.filled(np.nan)
             data = np.asarray(data, dtype=np.float64)
-            data[0] = data[0] - adj0_f
-            if n_t > 1:
-                data[1] = data[1] - avg
-            if n_t > 2:
-                data[2:] = data[2:] - adj1_f
+            k = int(start_offset_hours) + np.arange(n_t)
+            data[k <= 0] -= adj0_f
+            data[k == 1] -= avg
+            data[k >= 2] -= adj1_f
             var[:] = data.astype(var.dtype, copy=False)
         log.info(
             f"Applied SSH dynamic adjust to {elev_nc.name}: "
@@ -653,8 +656,10 @@ class DynamicAdjustProcessor(ForcingProcessor):
         station_lats: Sequence[float] = DEFAULT_STATION_LATS,
         bias_window_days: int = 2,
         nan_threshold: float = DEFAULT_NAN_THRESHOLD,
+        start_offset_hours: int = 0,
     ) -> None:
         super().__init__(config, input_path, output_path)
+        self.start_offset_hours = int(start_offset_hours)
         self.obs_dir = (
             Path(obs_dir) if obs_dir
             else self._resolve_obs_dir(config.pdy)
@@ -754,6 +759,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
             self.elev2d_th_nc,
             adj0=adj_prev if adj_prev is not None else float("nan"),
             adj1=adj_today if adj_today is not None else float("nan"),
+            start_offset_hours=self.start_offset_hours,
         )
         if not applied:
             errors.append(f"Failed to apply SSH adjust to {self.elev2d_th_nc}")
