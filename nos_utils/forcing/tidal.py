@@ -103,6 +103,8 @@ class TidalProcessor(ForcingProcessor):
 
         # Find template (needed for both Fortran and template modes)
         template = self._select_template(output_file.parent)
+        if template:
+            log.info(f"bctides template: {template}")
 
         # Mode 0: Fortran tide_fac executable (production, most accurate)
         if template and Path(template).exists():
@@ -183,7 +185,8 @@ class TidalProcessor(ForcingProcessor):
                 return f
         if cfg and Path(cfg).exists():
             return Path(cfg)
-        return None
+        # FIXofs unset: input dir is the work dir, keep its copy. MJ (10/01/26)
+        return work_copy if work_copy.exists() else None
 
     def find_input_files(self) -> List[Path]:
         """Find bctides template or static files."""

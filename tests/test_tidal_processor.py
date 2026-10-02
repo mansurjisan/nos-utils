@@ -191,3 +191,15 @@ class TestFortranTideFacTwoPhase:
         t.write_text("X\n")
         proc = TidalProcessor(mock_config, work, work)
         assert proc._call_fortran_tide_fac(t, work / "bctides.in")
+
+    def test_work_dir_only_template_is_used(self, mock_config, tmp_path, monkeypatch):
+        """No FIXofs: the work copy is the only template and still drives Fortran."""
+        self._stub_exe(tmp_path, monkeypatch)
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "bctides.in_template").write_text("ONLY\n")
+        mock_config.bctides_template = None
+        res = self._run(mock_config, work, work, "forecast")
+        assert res.success
+        assert res.metadata["mode"] == "fortran_tide_fac"
+        assert (work / "bctides.in").read_text() == "ONLY\n"
