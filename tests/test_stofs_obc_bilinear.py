@@ -183,6 +183,17 @@ class TestCurvilinear:
             else:
                 assert (w[k] == 0).all()
 
+    def test_node_missed_by_kd_candidates_found_by_full_scan(self):
+        xs = np.concatenate([np.linspace(0.0, 0.04, 41), [10.04]])
+        ys = np.linspace(0.0, 0.04, 41)
+        lon, lat = np.meshgrid(xs, ys)
+        # the huge last cell's centre is far outside the KD ball built from the 25 nearest tiny cells
+        ix, iy, w, found = oi.parent_weights_2d(lon, lat, [0.06], [0.0205])
+        assert found[0] and (ix[0], iy[0]) == (40, 20)
+        (rx, ry, rw, rf), = _ref_mode1(lon, lat, [0.06], [0.0205])
+        assert rf and (rx, ry) == (40, 20)
+        np.testing.assert_allclose(w[0], rw, atol=1e-12)
+
     def test_rejects_non_monotonic_grid(self):
         lon, lat = _curvi()
         with pytest.raises(ValueError):
@@ -224,6 +235,7 @@ class TestSshFill:
         p = _proc(tmp_path, [0.5, 9.0], [1.0, 1.0])
         out = p._ops_ssh_boundary(path, 1)
         np.testing.assert_allclose(out[0], [1.0, 0.0])
+        assert any("1 of 2 boundary nodes are outside" in m for m in p._ops_warnings)
 
     def test_step_count_mismatch_falls_back(self, tmp_path):
         path = _write_ssh1(tmp_path / "s.nc", XAX, YAX, [np.zeros((3, 3))] * 2)
@@ -326,6 +338,7 @@ class TestTS:
         temp, salt = p._ops_ts_profiles(path, nt)
         np.testing.assert_array_equal(temp[0][1], 20.0)
         np.testing.assert_array_equal(salt[0][1], 33.0)
+        assert any("T/S: 1 of 2 boundary nodes are outside" in m for m in p._ops_warnings)
 
     def test_dry_lower_left_corner_uses_parent_surface_values(self, tmp_path):
         p, path, nt = _tsuv_proc(tmp_path, [-59.5], [30.5], [40.0], SIGMA, dry=True)
@@ -448,6 +461,22 @@ class TestWiring:
         proc._ssh1_path = tmp_path / "SSH_1.nc"
         proc._tsuv1_path = tmp_path / "TSUV_1.nc"
         np.testing.assert_array_equal(self._elev(proc._process_2d(files)), ref)
+
+    @pytest.mark.parametrize("nowcast_hours, want", [(6, 0.30), (9, 0.15)])
+    def test_hold_is_the_value_at_the_nowcast_start_when_in_window(self, tmp_path, nowcast_hours, want):
+        cfg, proc, files, ssh_1, work = self._setup(tmp_path)
+        cfg.nowcast_hours = nowcast_hours  # cycle 12z; files are 00z..24z with ssh 0.05 m per hour
+        proc._ssh1_path = ssh_1
+        held = self._elev(proc._process_2d(files))
+        np.testing.assert_allclose(held, want + 0.04, atol=1e-5)
+        assert not any("hold reference" in m for m in proc._ops_warnings)
+
+    def test_hold_outside_window_uses_record_0_and_warns(self, tmp_path):
+        cfg, proc, files, ssh_1, work = self._setup(tmp_path)
+        proc._ssh1_path = ssh_1
+        held = self._elev(proc._process_2d(files))
+        np.testing.assert_allclose(held, 0.04, atol=1e-5)
+        assert any("hold reference differs from ops" in m for m in proc._ops_warnings)
 
     def test_hold_first_record_flag(self, tmp_path):
         cfg, proc, files, ssh_1, work = self._setup(tmp_path)
@@ -618,8 +647,10 @@ class TestStofsResult:
 
     def test_ssh_tsuv_grid_mismatch_is_reported(self, tmp_path, monkeypatch):
         proc, res = self._run(tmp_path, monkeypatch, curvi_ssh=False)
-        assert res.metadata["ts_interp"] == "ops"
-        assert any("dry mask fell back to surface T" in w for w in res.warnings)
+        assert res.metadata["ts_interp"] == "ops+surfT-mask"
+        assert any("dry mask fell back to surface T" in w and "may differ from ops" in w
+                   for w in res.warnings)
+        assert not any("T/S: fell back" in w for w in res.warnings)
 
     def test_step_count_mismatch_is_reported(self, tmp_path, monkeypatch):
         proc, res = self._run(tmp_path, monkeypatch, ssh_nt=4)
@@ -691,3 +722,26 @@ def test_160k_nodes_mode1_curvilinear_in_seconds():
     _, _, w, found = oi.parent_weights_2d(lon, lat, px, py)
     assert found.mean() > 0.99 and np.abs(w[found].sum(1) - 1.0).max() < 0.05
     assert time.perf_counter() - t0 < 20.0
+
+
+def test_fallback_reasons_are_kept_per_product(tmp_path):
+    p = _proc(tmp_path, [0.5], [1.0])
+    p._ops_note("steps mismatch", "elev2D")
+    p._ops_note("dry mask", "T/S")
+    p._ops_note("generic")
+    assert p._ops_reasons == {"elev2D": ["steps mismatch"], "T/S": ["dry mask"]}
+    assert p._ops_warnings == ["steps mismatch", "dry mask", "generic"]
+
+
+@pytest.mark.parametrize("raw, want", [("false", False), ("False", False), ("no", False),
+                                       ("0", False), ("true", True), ("YES", True), ("1", True)])
+def test_yaml_bools_are_strict_strings(tmp_path, raw, want):
+    cfg = _yaml_cfg(tmp_path, "stofs_3d_atl_ufs",
+                    f"      ssh_hold_first_record: '{raw}'\n      use_fortran_gen3dth: '{raw}'\n")
+    assert cfg.obc_ssh_hold_first_record is want and cfg.obc_use_fortran_gen3dth is want
+
+
+@pytest.mark.parametrize("key", ["ssh_hold_first_record", "use_fortran_gen3dth"])
+def test_yaml_bool_garbage_raises(tmp_path, key):
+    with pytest.raises(ValueError, match=key):
+        _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", f"      {key}: maybe\n")

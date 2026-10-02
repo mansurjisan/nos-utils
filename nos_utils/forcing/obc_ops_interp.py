@@ -52,6 +52,18 @@ def _signa(x1, x2, x3, y1, y2, y3):
     return np.abs(((x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)) / 2)
 
 
+def _accepted(X, Y, px, py, ci, small1):
+    """Area-test acceptance (f90:709-722) of points (px, py) against cells ci."""
+    c = [(X[m][ci], Y[m][ci]) for m in range(4)]
+    a1 = _signa(px, c[0][0], c[1][0], py, c[0][1], c[1][1])
+    a2 = _signa(px, c[1][0], c[2][0], py, c[1][1], c[2][1])
+    a3 = _signa(px, c[2][0], c[3][0], py, c[2][1], c[3][1])
+    a4 = _signa(px, c[3][0], c[0][0], py, c[3][1], c[0][1])
+    b1 = _signa(c[0][0], c[1][0], c[2][0], c[0][1], c[1][1], c[2][1])
+    b2 = _signa(c[0][0], c[2][0], c[3][0], c[0][1], c[2][1], c[3][1])
+    return np.abs(a1 + a2 + a3 + a4 - b1 - b2) / (b1 + b2) < small1
+
+
 def parent_weights_2d(lon, lat, x, y, small1=1e-2, chunk=4000):
     """ops interp_mode=1 on a general 2-D quad grid (f90:709-760); lon/lat are [j, i].
 
@@ -90,18 +102,20 @@ def parent_weights_2d(lon, lat, x, y, small1=1e-2, chunk=4000):
             continue
         pi = np.repeat(np.arange(len(pts)), lens)
         ci = np.concatenate([np.asarray(a, int) for a in lists if len(a)])
-        px, py = pts[pi, 0], pts[pi, 1]
-        c = [(X[m][ci], Y[m][ci]) for m in range(4)]
-        a1 = _signa(px, c[0][0], c[1][0], py, c[0][1], c[1][1])
-        a2 = _signa(px, c[1][0], c[2][0], py, c[1][1], c[2][1])
-        a3 = _signa(px, c[2][0], c[3][0], py, c[2][1], c[3][1])
-        a4 = _signa(px, c[3][0], c[0][0], py, c[3][1], c[0][1])
-        b1 = _signa(c[0][0], c[1][0], c[2][0], c[0][1], c[1][1], c[2][1])
-        b2 = _signa(c[0][0], c[2][0], c[3][0], c[0][1], c[2][1], c[3][1])
-        acc = np.abs(a1 + a2 + a3 + a4 - b1 - b2) / (b1 + b2) < small1
+        acc = _accepted(X, Y, pts[pi, 0], pts[pi, 1], ci, small1)
         if acc.any():
             kk = (ci[acc] % ncx) * (ny - 1) + ci[acc] // ncx
             np.minimum.at(key, s0 + pi[acc], kk)
+    found = key < np.iinfo(np.int64).max
+    # A node inside the grid's bounding box with no KD candidate accepted: scan every cell in the
+    # f90 order. MJ (10/02/26)
+    allc = np.arange(len(diag))
+    for k_ in np.flatnonzero(~found & (x >= lon.min()) & (x <= lon.max())
+                             & (y >= lat.min()) & (y <= lat.max())):
+        ok = np.flatnonzero(_accepted(X, Y, np.full(allc.size, x[k_]), np.full(allc.size, y[k_]),
+                                      allc, small1))
+        if ok.size:
+            key[k_] = ((ok % ncx) * (ny - 1) + ok // ncx).min()
     found = key < np.iinfo(np.int64).max
     kf = np.where(found, key, 0)
     ix, iy = kf // (ny - 1), kf % (ny - 1)

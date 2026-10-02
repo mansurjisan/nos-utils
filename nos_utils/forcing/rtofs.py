@@ -173,8 +173,19 @@ class RTOFSProcessor(ForcingProcessor):
         self._wl_bias_info = None   # Outcome of the WL bias correction (see _apply_wl_bias)
         self._ssh_blended_used = False
         self._ops_warnings = []
-        self._elev2d_interp = None  # "ops" | "delaunay" | "raw", for the ForcingResult metadata
+        self._ops_reasons = {"elev2D": [], "T/S": []}  # fallback reasons kept apart per product
+        # Interpolation labels in the ForcingResult metadata:
+        #   ops         Python gen_3Dth-equivalent from SSH_1(_adt).nc / TSUV_1.nc
+        #   ops+surfT-mask  as ops, but the T/S dry mask came from surface T, not SSH_1
+        #   fortran     output of the gen_3Dth executable
+        #   delaunay    Delaunay interpolation of the ADT-blended SSH_1 (elev2D) or of the raw
+        #               3D files (T/S)
+        #   precomputed REMESH weights applied to the raw RTOFS files
+        #   raw         raw RTOFS 2D files with Delaunay, no ADT (elev2D only)
+        # MJ (10/02/26)
+        self._elev2d_interp = None
         self._ts_interp = None
+        self._ts_mask_fallback = False
         self._ssh1_path = None  # SSH_1.nc (ADT-blended when available) for the ops-equivalent elev2D
         self._tsuv1_path = None  # TSUV_1.nc for the ops-equivalent T/S
         # Discovery diagnostics, reset by find_input_files_by_type(). Values
@@ -628,6 +639,8 @@ class RTOFSProcessor(ForcingProcessor):
         work_dir = self._stofs_work_dir(keep)
         log.info(f"STOFS OBC work dir: {work_dir} ({'kept' if keep else 'removed on exit'})")
         self._ops_warnings = []
+        self._ops_reasons = {"elev2D": [], "T/S": []}
+        self._ts_mask_fallback = False
         self._elev2d_interp = self._ts_interp = None
 
         try:
@@ -764,9 +777,10 @@ class RTOFSProcessor(ForcingProcessor):
                 )
 
             if not fortran_ok:
-                reasons = "; ".join(self._ops_warnings) or "SSH_1/TSUV_1 unavailable"
                 for label, used in (("elev2D", self._elev2d_interp), ("T/S", self._ts_interp)):
-                    if used not in (None, "ops"):
+                    reasons = "; ".join(dict.fromkeys(self._ops_reasons[label])) \
+                        or "SSH_1/TSUV_1 unavailable"
+                    if used is not None and not used.startswith("ops"):
                         warnings.append(f"{label}: fell back from the ops-equivalent path to "
                                         f"{used} ({reasons})")
                 warnings.extend(m for m in dict.fromkeys(self._ops_warnings)
@@ -1187,6 +1201,27 @@ class RTOFSProcessor(ForcingProcessor):
             cands += [d / ops_name for d in dirs]
             out[link] = (next((c for c in cands if c.is_file()), None), required)
         return out
+
+    def _hold_at_nowcast_start(self, ssh_array, rtofs_times, model_t0):
+        """Hold elev2D at its value at the nowcast start, as ops holds record 0 (n012) for the run.
+
+        rtofs_times are seconds from model_t0. When the nowcast start is outside the file window
+        (usually in the forecast phase) record 0 is held and a warning is recorded. MJ (10/02/26)
+        """
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + timedelta(hours=self.config.cyc)
+        ref = (cycle_dt - timedelta(hours=self.config.nowcast_hours) - model_t0).total_seconds()
+        order = np.argsort(rtofs_times)
+        t, a = rtofs_times[order], ssh_array[order]
+        if t[0] <= ref <= t[-1]:
+            i = int(np.clip(np.searchsorted(t, ref, side="right") - 1, 0, max(len(t) - 2, 0)))
+            f = 0.0 if len(t) == 1 or t[i + 1] == t[i] else (ref - t[i]) / (t[i + 1] - t[i])
+            row = a[i] * (1 - f) + a[min(i + 1, len(t) - 1)] * f
+            log.info("elev2D: held at the nowcast-start value (ops non_adjust)")
+        else:
+            row = ssh_array[0]
+            self._ops_note("elev2D hold reference differs from ops: the nowcast start is outside "
+                           "the RTOFS window, so the first file is held (only matters without ADT)")
+        return np.repeat(row[None, :], ssh_array.shape[0], axis=0)
 
     @staticmethod
     def _hold_first_record(elev_path: Path) -> None:
@@ -1815,7 +1850,7 @@ class RTOFSProcessor(ForcingProcessor):
             blended = self._load_blended_ssh(ssh_source, files_2d)
         self._ssh_blended_used = bool(ssh_source) and (ops_ssh is not None or blended is not None)
         self._elev2d_interp = "ops" if ops_ssh is not None else (
-            "delaunay" if blended is not None else "raw")
+            "delaunay" if blended is not None else ("precomputed" if ssh_weights else "raw"))
         if ops_ssh is None:
             if blended is not None:
                 log.info("elev2D: SSH taken from the ADT-blended SSH_1 file")
@@ -1858,9 +1893,6 @@ class RTOFSProcessor(ForcingProcessor):
                 return None
 
             ssh_array = np.stack(all_ssh, axis=0)
-            if self.is_stofs_mode and self.config.obc_ssh_hold_first_record:
-                ssh_array = np.repeat(ssh_array[:1], ssh_array.shape[0], axis=0)
-                log.info("elev2D: held at the first record (ops non_adjust)")
 
             # Fill NaN nodes (e.g., nodes 0-3 that fall outside RTOFS domain)
             # by propagating from nearest valid boundary node
@@ -1909,6 +1941,8 @@ class RTOFSProcessor(ForcingProcessor):
                  for h in file_hours],
                 dtype=np.float64,
             )
+            if self.is_stofs_mode and self.config.obc_ssh_hold_first_record:
+                ssh_array = self._hold_at_nowcast_start(ssh_array, rtofs_times, model_t0)
 
             # Route B coverage strategy (backfill, not previous-cycle reload):
             #   - Output must span [0, sim_duration] at model_dt intervals.
@@ -2033,9 +2067,12 @@ class RTOFSProcessor(ForcingProcessor):
             log.error(traceback.format_exc())
             return None
 
-    def _ops_note(self, msg):
+    def _ops_note(self, msg, kind=None):
+        """Record a warning; kind ("elev2D" or "T/S") files it under that product's fallback reason."""
         log.warning(msg)
         self._ops_warnings.append(msg)
+        if kind:
+            self._ops_reasons[kind].append(msg)
 
     def _ops_weights(self, lon, lat):
         """Ops parent cell/weights for the boundary nodes; raises ValueError with the reason."""
@@ -2069,7 +2106,7 @@ class RTOFSProcessor(ForcingProcessor):
                 lon, lat = ds.variables["xlon"][:], ds.variables["ylat"][:]
             if ssh.shape[0] != n_files:
                 self._ops_note(f"{Path(ssh_path).name} has {ssh.shape[0]} steps for {n_files} 2D "
-                               f"files — elev2D not from the ops-equivalent path")
+                               f"files — elev2D not from the ops-equivalent path", "elev2D")
                 return None
             ssh = np.where(np.isfinite(ssh), ssh, -30000.0)
             ix, iy, w, inside = self._ops_weights(lon, lat)
@@ -2083,10 +2120,14 @@ class RTOFSProcessor(ForcingProcessor):
                 n_fix += n
                 out[t] = (w * s_t[cj, ci].T).sum(axis=1)
         except Exception as e:
-            self._ops_note(f"ops-equivalent elev2D unavailable ({e})")
+            self._ops_note(f"ops-equivalent elev2D unavailable ({e})", "elev2D")
             return None
+        n_out = int((~inside).sum())
+        if n_out:
+            self._ops_note(f"elev2D: {n_out} of {len(ix)} boundary nodes are outside the RTOFS "
+                           f"grid (set to 0 m before the offset, as ops)")
         log.info(f"elev2D: {self._ops_label()} (gen_3Dth-equivalent), {len(ix)} nodes, "
-                 f"{int((~inside).sum())} outside grid, {n_dry + n_fix} filled")
+                 f"{n_out} outside grid, {n_dry + n_fix} filled")
         return out
 
     def _ops_node_z(self, nvrt) -> Optional[np.ndarray]:
@@ -2118,18 +2159,20 @@ class RTOFSProcessor(ForcingProcessor):
                 s0 = np.ma.filled(sd.variables["ssh"][0], -30000.0).astype(np.float64)
                 lon_s, lat_s = self._grid2d(sd.variables["xlon"][:], sd.variables["ylat"][:])
         except Exception as e:
-            self._ops_note(f"T/S dry mask fell back to surface T: SSH_1 unreadable ({e})")
+            self._ops_note(f"T/S dry mask fell back to surface T: SSH_1 unreadable ({e}); "
+                           f"the T/S result may differ from ops", "T/S")
             return None
         lon_t, lat_t = self._grid2d(lon_t, lat_t)
         if s0.shape != lon_t.shape:
             self._ops_note(f"T/S dry mask fell back to surface T: SSH_1 grid {s0.shape} != "
-                           f"TSUV_1 grid {lon_t.shape}")
+                           f"TSUV_1 grid {lon_t.shape}; the T/S result may differ from ops", "T/S")
             return None
         dlon = np.abs((lon_s - lon_t + 180.0) % 360.0 - 180.0).max()
         dlat = np.abs(lat_s - lat_t).max()
         if dlon > 1e-3 or dlat > 1e-3:
             self._ops_note(f"T/S dry mask fell back to surface T: SSH_1 and TSUV_1 coordinates "
-                           f"differ (max {dlon:.4f} deg lon, {dlat:.4f} deg lat)")
+                           f"differ (max {dlon:.4f} deg lon, {dlat:.4f} deg lat); "
+                           f"the T/S result may differ from ops", "T/S")
             return None
         return np.where(np.isfinite(s0), s0, -30000.0) >= DRY_SSH
 
@@ -2138,7 +2181,7 @@ class RTOFSProcessor(ForcingProcessor):
         nvrt = self._vgrid.nvrt if self._vgrid else None
         z = self._ops_node_z(nvrt) if nvrt else None
         if z is None:
-            self._ops_note("no vgrid for the ops-equivalent T/S")
+            self._ops_note("no vgrid for the ops-equivalent T/S", "T/S")
             return None
         try:
             with Dataset(str(tsuv_path)) as ds:
@@ -2148,12 +2191,12 @@ class RTOFSProcessor(ForcingProcessor):
                 nt = ds.dimensions["time"].size
                 if nt != n_files:
                     self._ops_note(f"{Path(tsuv_path).name} has {nt} steps for {n_files} 3D files "
-                                   f"— T/S not from the ops-equivalent path")
+                                   f"— T/S not from the ops-equivalent path", "T/S")
                     return None
                 lon_t, lat_t = ds.variables["xlon"][:], ds.variables["ylat"][:]
                 depth = np.asarray(ds.variables["depth"][:], np.float64)
                 if not np.all(np.diff(depth) > 0):
-                    self._ops_note("TSUV_1 depth is not increasing — T/S not from the ops-equivalent path")
+                    self._ops_note("TSUV_1 depth is not increasing — T/S not from the ops-equivalent path", "T/S")
                     return None
                 zm = -depth[::-1]
                 ix, iy, w, inside = self._ops_weights(lon_t, lat_t)
@@ -2166,8 +2209,12 @@ class RTOFSProcessor(ForcingProcessor):
                     m = self._ssh_dry_mask(ssh_path, lon_t, lat_t)
                     if m is not None and m.shape == wet.shape:
                         wet = m
+                    else:
+                        self._ts_mask_fallback = True
                 else:
-                    self._ops_note("T/S dry mask from surface T: no SSH_1 in this run")
+                    self._ops_note("T/S dry mask from surface T: no SSH_1 in this run; "
+                                   "the T/S result may differ from ops", "T/S")
+                    self._ts_mask_fallback = True
                 ll_dry = ~wet[cj[0], ci[0]]
                 pj, pi, n_dry = dry_parents(wet, cj, ci)
                 cells, inv = np.unique(pj * wet.shape[1] + pi, return_inverse=True)
@@ -2204,10 +2251,15 @@ class RTOFSProcessor(ForcingProcessor):
                     all_temp.append(row[0])
                     all_salt.append(row[1])
         except Exception as e:
-            self._ops_note(f"ops-equivalent T/S unavailable ({e})")
+            self._ops_note(f"ops-equivalent T/S unavailable ({e})", "T/S")
             return None
+        n_out = int((~inside).sum())
+        if n_out:
+            self._ops_note(f"T/S: {n_out} of {n} boundary nodes are outside the RTOFS grid "
+                           f"(set to {self.config.obc_tem_outside:g} C / "
+                           f"{self.config.obc_sal_outside:g} psu, as ops)")
         log.info(f"T/S: {self._ops_label()} (gen_3Dth-equivalent), {n} nodes, "
-                 f"{int((~inside).sum())} outside grid, {n_dry + n_mid} filled")
+                 f"{n_out} outside grid, {n_dry + n_mid} filled")
         return all_temp, all_salt
 
     def _compute_3d_roi(self, ds) -> Optional[Tuple[int, int, int, int]]:
@@ -2298,8 +2350,9 @@ class RTOFSProcessor(ForcingProcessor):
                       if self.is_stofs_mode and self._tsuv1_path else None)
             if ops_ts is not None:
                 all_temp, all_salt = ops_ts
-            self._ts_interp = "ops" if ops_ts is not None else (
-                "raw" if (weights_3d or ssh_weights) else "delaunay")
+            self._ts_interp = (
+                "ops+surfT-mask" if self._ts_mask_fallback else "ops") if ops_ts is not None else (
+                "precomputed" if (weights_3d or ssh_weights) else "delaunay")
             for f in (files_3d if ops_ts is None else []):
                 ds = Dataset(str(f))
 

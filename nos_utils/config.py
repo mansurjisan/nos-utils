@@ -38,6 +38,22 @@ def _nudging_timescale_seconds(nudge) -> float:
     return _DEFAULT_NUDGING_TIMESCALE_S
 
 
+def _strict_bool(val, key, default):
+    """true/false, yes/no, 1/0 (case-insensitive) or a bool; None gives default; else ValueError."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int) and val in (0, 1):
+        return bool(val)
+    t = str(val).strip().lower()
+    if t in ("true", "yes", "1"):
+        return True
+    if t in ("false", "no", "0"):
+        return False
+    raise ValueError(f"{key} must be true/false, yes/no or 1/0, got {val!r}")
+
+
 @dataclass
 class ForcingConfig:
     """
@@ -783,7 +799,8 @@ class ForcingConfig:
         # Only the ATL ops chain holds elev2D at its first record. MJ (10/02/26)
         _hold = obc.get("ssh_hold_first_record") if isinstance(obc, dict) else None
         _sys = data.get("system", {}) if isinstance(data.get("system"), dict) else {}
-        _hold = str(_sys.get("name", "")).startswith("stofs_3d_atl") if _hold is None else bool(_hold)
+        _hold = _strict_bool(_hold, "obc.ssh_hold_first_record",
+                             str(_sys.get("name", "")).startswith("stofs_3d_atl"))
         if obc_elev_segments is not None:
             obc_elev_segments = [int(i) for i in obc_elev_segments]
 
@@ -841,7 +858,9 @@ class ForcingConfig:
             nudging_timescale_seconds=_nudging_timescale_seconds(nudge),
             obc_ssh_offset=obc_ssh_offset,
             obc_elev_segments=obc_elev_segments,
-            obc_use_fortran_gen3dth=bool(obc.get("use_fortran_gen3dth", False)) if isinstance(obc, dict) else False,
+            obc_use_fortran_gen3dth=_strict_bool(
+                obc.get("use_fortran_gen3dth") if isinstance(obc, dict) else None,
+                "obc.use_fortran_gen3dth", False),
             obc_interp_mode=_interp_mode,
             obc_ssh_hold_first_record=_hold,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
