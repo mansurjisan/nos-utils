@@ -1350,8 +1350,7 @@ class RTOFSProcessor(ForcingProcessor):
         file_info = []
         for f in files:
             hour, is_nowcast = self._parse_rtofs_hour(f)
-            back = 24 if (is_nowcast and self._ops_timeline) else 0
-            valid_time = cycle_date + timedelta(hours=hour - back)
+            valid_time = cycle_date + timedelta(hours=hour)
             file_info.append((valid_time, is_nowcast, f))
 
         # Sort by valid time; for ties, forecast first (is_nowcast=False < True)

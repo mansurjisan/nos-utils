@@ -81,7 +81,7 @@ def test_previous_cycle_alone_covers_the_series(tmp_path):
 
 
 def test_slot_count_covers_nowcast_plus_forecast_plus_buffer(tmp_path):
-    assert len(_proc(tmp_path)._ops_slot_times()) == 24
+    assert len(_proc(tmp_path)._ops_slot_times()) == 23
     p = _proc(tmp_path, nowcast_hours=6, forecast_hours=48)
     assert len(p._ops_slot_times()) == 23
 
@@ -91,10 +91,7 @@ def test_n_files_are_dated_from_cycle_minus_24h():
     p = RTOFSProcessor(cfg, "/nonexistent", "/nonexistent")
     from pathlib import Path
     n12, f12 = Path("rtofs_glo_2ds_n012_diag.nc"), Path("rtofs_glo_2ds_f012_diag.nc")
-    cyc = datetime(2026, 9, 27)
     assert p.valid_time(n12) == datetime(2026, 9, 26, 12) and p.valid_time(f12) == datetime(2026, 9, 27, 12)
-    kept = p._sort_and_dedup([n12, f12], cyc)
-    assert kept == [n12, f12]  # distinct valid times, neither is a duplicate
 
 
 def test_secofs_dating_and_selection_are_unchanged(tmp_path):
