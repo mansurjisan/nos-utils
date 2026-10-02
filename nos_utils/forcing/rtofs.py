@@ -705,13 +705,17 @@ class RTOFSProcessor(ForcingProcessor):
             adt_blended = False
             adt_regrid = None
             if ssh_path and self.config.adt_enabled:
-                from .adt import ADTBlender
+                from .adt import ADTBlender, ADTUnavailableError
                 blender = ADTBlender(
                     self.config, self.input_path, keep=keep,
                     archive_path=(self.output_path / self.adt_archive_name
                                   if self.adt_archive_name else None),
-                    prev_dirs=self.adt_prev_dirs)
-                blended = blender.blend_ssh(ssh_path, work_dir)
+                    prev_dirs=self.adt_prev_dirs, ops_numerics=self._ops_timeline)
+                try:
+                    blended = blender.blend_ssh(ssh_path, work_dir)
+                except ADTUnavailableError as e:
+                    return ForcingResult(success=False, source=self.SOURCE_NAME,
+                                         errors=[str(e)], warnings=warnings)
                 adt_regrid = blender.regrid if blended else None
                 warnings.extend(blender.warnings)
                 if blended:

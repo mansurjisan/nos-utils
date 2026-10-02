@@ -71,7 +71,7 @@ def test_blend_record_0_is_the_adt_field_bit_exact(setup):
         ny, nx = ds["ssh"].shape[1:]
     adt = (np.random.default_rng(1).uniform(-0.3, 0.9, (ny, nx))).astype(f32)
     adt[0, :3] = np.nan
-    out = ADTBlender(cfg, tmp)._apply_adt_blend(ssh_1, None, work, adt_dst=adt)
+    out = ADTBlender(cfg, tmp, ops_numerics=True)._apply_adt_blend(ssh_1, None, work, adt_dst=adt)
     with Dataset(str(out)) as ds:
         ds.set_auto_maskandscale(False)
         s0, e0, e3 = ds["ssh"][0], ds["surf_el"][0], ds["surf_el"][3]

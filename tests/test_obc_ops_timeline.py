@@ -179,3 +179,45 @@ class TestThreeDTimeline:
         assert dt == 10800.0
         uv, _, _ = self._ts(names["uv3D.th.nc"])
         assert (uv == 0).all()
+
+
+def _adt_stage_proc(tmp_path, monkeypatch, ops):
+    from nos_utils.config import ForcingConfig
+    from nos_utils.forcing import adt
+
+    cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+    cfg.obc_ops_timeline = ops
+    out = tmp_path / "out"
+    out.mkdir(exist_ok=True)
+    proc = RTOFSProcessor(cfg, tmp_path, out, phase="nowcast")
+    cfg.rtofs_3d_region = None
+    proc.find_input_files_by_type = lambda: ([tmp_path / "f.nc"], [])
+    proc._stofs_prepare_ssh = lambda files, work: tmp_path / "ssh.nc"
+    seen = {}
+
+    class Blender:
+        regrid = None
+        warnings = []
+
+        def __init__(self, *a, ops_numerics=False, **k):
+            seen["ops"] = ops_numerics
+
+        def blend_ssh(self, ssh, work):
+            if seen["ops"]:
+                raise adt.ADTUnavailableError("no ADT; paths tried: /a; /b")
+            return None
+
+    monkeypatch.setattr(adt, "ADTBlender", Blender)
+    return proc, seen
+
+
+def test_missing_adt_fails_rtofs_under_ops_timeline(tmp_path, monkeypatch):
+    proc, seen = _adt_stage_proc(tmp_path, monkeypatch, True)
+    res = proc._process_stofs()
+    assert seen["ops"] is True and not res.success and "paths tried" in res.errors[0]
+
+
+def test_non_ops_timeline_keeps_old_adt_path(tmp_path, monkeypatch):
+    proc, seen = _adt_stage_proc(tmp_path, monkeypatch, False)
+    proc._process_stofs()
+    assert seen["ops"] is False

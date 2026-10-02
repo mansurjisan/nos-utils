@@ -29,7 +29,8 @@ def _blend(tmp_path, archive=None, prev=(), with_adt=True):
         _adt_file(tmp_path / "adt_20260401.nc", {})
     work = tmp_path / "work"
     work.mkdir(exist_ok=True)
-    b = ADTBlender(_cfg(_map(tmp_path / "wt.nc")), tmp_path, archive_path=archive, prev_dirs=prev)
+    b = ADTBlender(_cfg(_map(tmp_path / "wt.nc")), tmp_path, archive_path=archive, prev_dirs=prev,
+                   ops_numerics=True)
     return b, b.blend_ssh(_ssh1(tmp_path / "SSH_1.nc"), work)
 
 
@@ -48,7 +49,7 @@ def test_field_is_archived_with_ops_fill(tmp_path):
 def test_missing_cells_are_written_as_ops_fill(tmp_path):
     arc = tmp_path / NAME
     _adt_file(tmp_path / "adt_20260401.nc", {(0, 2): np.nan})
-    b = ADTBlender(_cfg(_map(tmp_path / "wt.nc")), tmp_path, archive_path=arc)
+    b = ADTBlender(_cfg(_map(tmp_path / "wt.nc")), tmp_path, archive_path=arc, ops_numerics=True)
     (tmp_path / "work").mkdir()
     b.blend_ssh(_ssh1(tmp_path / "SSH_1.nc"), tmp_path / "work")
     with Dataset(str(arc)) as ds:
@@ -74,9 +75,29 @@ def test_no_adt_reuses_previous_archive_with_warning(tmp_path):
     assert (out_dir / NAME).is_file()
 
 
-def test_no_adt_and_no_archive_returns_none(tmp_path):
-    b, out = _blend(tmp_path, prev=[tmp_path / "nowhere"], with_adt=False)
-    assert out is None
+def test_no_adt_and_no_archive_fails_naming_every_path(tmp_path):
+    from nos_utils.forcing.adt import ADTUnavailableError
+    with pytest.raises(ADTUnavailableError) as e:
+        _blend(tmp_path, prev=[tmp_path / "nowhere"], with_adt=False)
+    msg = str(e.value)
+    assert "adt_20260401.nc" in msg and "adt_20260331.nc" in msg
+    assert str(tmp_path / "nowhere" / "adt_aft_cvtz_cln.nc") in msg
+
+
+def test_first_cycle_seeded_from_bare_ops_name(tmp_path):
+    seed = tmp_path / "rerun"
+    seed.mkdir()
+    b0, _ = _blend(tmp_path, archive=seed / "adt_aft_cvtz_cln.nc")
+    for f in tmp_path.glob("adt_*.nc"):
+        f.unlink()
+    b, out = _blend(tmp_path, prev=[seed], with_adt=False)
+    assert out is not None and b.regrid == "previous"
+
+
+def test_non_ops_numerics_keeps_rtofs_only_fallback(tmp_path):
+    (tmp_path / "work").mkdir()
+    b = ADTBlender(_cfg(_map(tmp_path / "wt.nc")), tmp_path)
+    assert b.blend_ssh(_ssh1(tmp_path / "SSH_1.nc"), tmp_path / "work") is None
 
 
 def test_archive_of_wrong_shape_is_skipped(tmp_path):
@@ -87,8 +108,9 @@ def test_archive_of_wrong_shape_is_skipped(tmp_path):
         ds.createDimension("y", 3)
         ds.createDimension("x", 3)
         ds.createVariable("surf_el", "f4", ("time", "y", "x"))[:] = 0.1
-    b, out = _blend(tmp_path, prev=[prev], with_adt=False)
-    assert out is None
+    from nos_utils.forcing.adt import ADTUnavailableError
+    with pytest.raises(ADTUnavailableError):
+        _blend(tmp_path, prev=[prev], with_adt=False)
 
 
 def test_orchestrator_prev_dirs_and_archive_copy(tmp_path):

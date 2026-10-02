@@ -79,7 +79,7 @@ def _run(tmp_path, cfg, day0, day1=None, keep=False):
     work = tmp_path / "work"
     work.mkdir(exist_ok=True)
     ssh = _ssh1(tmp_path / "SSH_1.nc")
-    b = ADTBlender(cfg, tmp_path, keep=keep)
+    b = ADTBlender(cfg, tmp_path, keep=keep, ops_numerics=True)
     out = b.blend_ssh(ssh, work)
     return b, out, work
 
@@ -140,7 +140,7 @@ def test_days_are_rounded_to_float32_before_the_mean(tmp_path, monkeypatch):
     d1 = {(0, 2): 0.7777777777}
     _adt_file(tmp_path / "adt_20260401.nc", d0)
     _adt_file(tmp_path / "adt_20260331.nc", d1)
-    field = ADTBlender(cfg, tmp_path)._regrid_esmf(
+    field = ADTBlender(cfg, tmp_path, ops_numerics=True)._regrid_esmf(
         [tmp_path / "adt_20260401.nc", tmp_path / "adt_20260331.nc"], _ssh1(tmp_path / "SSH_1.nc"))
     assert field.dtype == np.float32
     f32 = np.float32

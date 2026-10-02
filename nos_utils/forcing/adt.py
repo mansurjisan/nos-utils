@@ -59,15 +59,20 @@ ADT_PAD = 1.0
 # Ops holds ADT-missing cells as the CMEMS int fill carried through float32. MJ (10/02/26)
 ADT_OPS_FILL = -2147483647.0
 ADT_MISSING_BELOW = -1.0e4
+ADT_OPS_NAME = "adt_aft_cvtz_cln.nc"
 ADT_COORD_TOL = 1e-3
 ADT_DST_TOL = 1e-2
+
+
+class ADTUnavailableError(RuntimeError):
+    """No ADT file and no archived ADT field: ops aborts here (non_adjust.sh:536)."""
 
 
 class ADTBlender:
     """Blend CMEMS ADT satellite SSH with RTOFS SSH."""
 
     def __init__(self, config: ForcingConfig, input_path: Path, keep: bool = False,
-                 archive_path: Optional[Path] = None, prev_dirs=()):
+                 archive_path: Optional[Path] = None, prev_dirs=(), ops_numerics: bool = False):
         """
         Args:
             config: ForcingConfig with ADT settings
@@ -75,12 +80,15 @@ class ADTBlender:
             keep: also write adt_on_rtofs.nc (the ops adt_aft_cvtz_cln.nc analogue)
             archive_path: write the ADT field here each cycle for the next cycle's fallback
             prev_dirs: previous-cycle directories searched for the archived field
+            ops_numerics: ops-exact float32 blend, ADT archive, previous-field fallback and
+                warnings (obc_ops_timeline); off keeps the earlier float64 numerics
         """
         self.config = config
         self.input_path = input_path
         self.keep = keep
-        self.archive_path = Path(archive_path) if archive_path else None
-        self.prev_dirs = [Path(d) for d in prev_dirs]
+        self.ops_numerics = ops_numerics
+        self.archive_path = Path(archive_path) if archive_path and ops_numerics else None
+        self.prev_dirs = [Path(d) for d in prev_dirs] if ops_numerics else []
         self.regrid = None  # "esmf" | "bilinear" once blend_ssh has run
         self.warnings = []
 
@@ -106,12 +114,13 @@ class ADTBlender:
         )
         self.regrid = None
         self.warnings = []
+        if not adt_files and not self.ops_numerics:
+            log.warning("No ADT satellite data available — using RTOFS-only SSH")
+            return None
         if not adt_files:
             prev = self._load_previous(ssh_path)
             if prev is None:
-                log.warning("No ADT satellite data and no archived previous field — "
-                            "using RTOFS-only SSH")
-                return None
+                raise ADTUnavailableError(self._no_adt_message())
             self.regrid = "previous"
             return self._apply_adt_blend(ssh_path, None, work_dir, adt_dst=prev)
         try:
@@ -200,8 +209,8 @@ class ADTBlender:
             return None
         wt = Path(wt)
         if not wt.is_file():
-            self._warn(f"ADT weight file {wt} not found — bilinear ADT regrid, result is "
-                       f"not ops-exact")
+            self._warn(f"ADT weight file {wt} not found — bilinear ADT regrid"
+                       + (", result is not ops-exact" if self.ops_numerics else ""))
             return None
         return wt
 
@@ -272,7 +281,7 @@ class ADTBlender:
         """
         wt = self._weight_file()
         if wt is None:
-            if not self.warnings:
+            if self.ops_numerics and not self.warnings:
                 self._warn("ADT: no ESMF map configured — bilinear ADT regrid, result is "
                            "not ops-exact")
             return None
@@ -311,17 +320,23 @@ class ADTBlender:
                         or np.abs(yca - LA.ravel()).max() > ADT_COORD_TOL):
                     raise ValueError("ADT ROI coordinates do not match map xc_a/yc_a")
                 out = self._apply_esmf_map(S, row, col, n_b, a.ravel())
-                days.append((out - 0.45).astype(np.float32))
-            stack = np.stack(days)
-            ok = np.isfinite(stack)
-            cnt = ok.sum(axis=0)
-            tot = np.where(ok, stack, 0.0).astype(np.float64).sum(axis=0)
-            with np.errstate(all="ignore"):
-                field = np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan)
-            field = field.astype(np.float32).reshape(dlon.shape)
+                days.append((out - 0.45).astype(np.float32) if self.ops_numerics else out - 0.45)
+            if self.ops_numerics:
+                stack = np.stack(days)
+                ok = np.isfinite(stack)
+                cnt = ok.sum(axis=0)
+                tot = np.where(ok, stack, 0.0).astype(np.float64).sum(axis=0)
+                with np.errstate(all="ignore"):
+                    field = np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan)
+                field = field.astype(np.float32).reshape(dlon.shape)
+            else:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    field = np.nanmean(np.stack(days), axis=0).reshape(dlon.shape)
         except Exception as e:
-            self._warn(f"ADT ESMF regrid unavailable ({e}) — bilinear ADT regrid, result is "
-                       f"not ops-exact")
+            self._warn(f"ADT ESMF regrid unavailable ({e}) — bilinear ADT regrid"
+                       + (", result is not ops-exact" if self.ops_numerics else ""))
             return None
         log.info(f"ADT: ESMF map {wt.name} applied to {len(days)} day(s), "
                  f"{int(np.isfinite(field).sum())}/{field.size} valid")
@@ -339,22 +354,46 @@ class ADTBlender:
             nc.createDimension("xlon", nx)
             nc.createVariable("lon", "f8", ("ylat", "xlon"))[:] = dst_lon
             nc.createVariable("lat", "f8", ("ylat", "xlon"))[:] = dst_lat
-            v = nc.createVariable("surf_el", "f4", ("time", "ylat", "xlon"),
-                                  fill_value=np.float32(ADT_OPS_FILL))
+            fill = np.float32(ADT_OPS_FILL) if self.ops_numerics else -30000.0
+            v = nc.createVariable("surf_el", "f4", ("time", "ylat", "xlon"), fill_value=fill)
             v.units = "m"
-            v[0] = np.where(np.isfinite(adt_dst), adt_dst, np.float32(ADT_OPS_FILL))
+            v[0] = np.where(np.isfinite(adt_dst), adt_dst, fill)
+
+    def _prev_candidates(self):
+        """Archived-ADT paths tried, per previous-cycle dir: own name, bare ops name, any prefixed."""
+        name = self.archive_path.name if self.archive_path else None
+        cands = []
+        for d in self.prev_dirs:
+            if name:
+                cands.append(d / name)
+            cands.append(d / ADT_OPS_NAME)
+            cands.extend(sorted(d.glob(f"*.{ADT_OPS_NAME}"), reverse=True))
+        return list(dict.fromkeys(cands))
+
+    def _no_adt_message(self) -> str:
+        """Error naming every ADT source tried, as the failed ops cpreq (non_adjust.sh:536)."""
+        base = datetime.strptime(self.config.pdy, "%Y%m%d")
+        root = os.environ.get("COMINadt") or os.environ.get("DCOMROOT", "")
+        tried = []
+        for off in (0, -1):
+            d = (base + timedelta(days=off)).strftime("%Y%m%d")
+            if root:
+                tried.append(str(Path(root) / d / "validation_data/marine/cmems/ssh"
+                                 / f"nrt_global_allsat_phy_l4_{d}_{d}.nc"))
+            for parent in (self.input_path, self.input_path.parent):
+                tried.append(str(parent / f"adt_{d}.nc"))
+        tried += [str(c) for c in self._prev_candidates()]
+        if not self.prev_dirs:
+            tried.append(f"(no previous-cycle dirs; {ADT_OPS_NAME} not searched)")
+        return ("No ADT satellite file and no archived ADT field (ops aborts at "
+                "non_adjust.sh:536); paths tried: " + "; ".join(tried))
 
     def _load_previous(self, ssh_path: Path):
         """Previous cycle's archived ADT field on the SSH_1 grid (NaN = missing), else None.
 
         Ops reuses yesterday's adt_aft_cvtz_cln.nc when no ADT file exists (non_adjust.sh:525-537).
         """
-        name = self.archive_path.name if self.archive_path else None
-        cands = []
-        for d in self.prev_dirs:
-            if name:
-                cands.append(d / name)
-            cands.extend(sorted(d.glob("*.adt_aft_cvtz_cln.nc"), reverse=True))
+        cands = self._prev_candidates()
         try:
             with Dataset(str(ssh_path)) as ds:
                 shape = ds.variables["ssh"].shape[1:]
@@ -466,6 +505,61 @@ class ADTBlender:
         out[miss] = adt[valid][idx]
         return out
 
+    @staticmethod
+    def _blend_float32(ds, ssh, nt, adt_dst):
+        """Ops float32 blend of ssh and the packed surf_el, as ncap2."""
+        f32 = np.float32
+        adt32 = np.asarray(adt_dst, dtype=f32)
+
+        def _raw(t):
+            return np.ma.filled(ssh[t, :, :], fill_value=-30000.0).astype(f32)
+
+        # Land in the reference record is 0, as the ops where(abs>1000) fill. MJ (10/02/26)
+        ssh_t0 = _raw(0)
+        ssh_t0 = np.where(np.abs(ssh_t0) > 1000, f32(0), ssh_t0)
+
+        # float32 as ncap2: float(float(ssh_t - ssh_0) + ADT), surf_el = x * float(1000.). MJ (10/02/26)
+        surf_el = ds.variables.get("surf_el")
+        if surf_el is not None:
+            surf_el.set_auto_maskandscale(False)
+        for t in range(nt):
+            ssh_t = _raw(t)
+            corrected = ((ssh_t - ssh_t0).astype(f32) + adt32).astype(f32)
+            bad = ~np.isfinite(corrected) | (np.abs(ssh_t) > 1000) | (np.abs(corrected) > 1000)
+            ssh[t, :, :] = np.where(bad, f32(-30000.0), corrected)
+            if surf_el is not None:
+                surf_el[t, :, :] = np.where(bad, f32(-30000.0), (corrected * f32(1000)).astype(f32))
+
+    @staticmethod
+    def _blend_float64(ds, ssh, nt, adt_dst):
+        """Earlier float64 blend, repacking surf_el with its declared scale (non-ops configs)."""
+        from .rtofs import _pack_for_fortran
+
+        def _raw(t):
+            return np.ma.filled(ssh[t, :, :], fill_value=-30000.0).astype(np.float64)
+
+        # Fill extreme values with 0 (matching NCO: where(abs>1000) = 0)
+        ssh_t0 = _raw(0)
+        ssh_t0 = np.where(np.abs(ssh_t0) > 1000, 0.0, ssh_t0)
+
+        for t in range(nt):
+            ssh_t = _raw(t)
+            corrected = ssh_t - ssh_t0 + adt_dst
+            bad = ~np.isfinite(corrected) | (np.abs(ssh_t) > 1000) | (np.abs(corrected) > 1000)
+            ssh[t, :, :] = np.where(bad, -30000.0, corrected)
+
+        # Pack surf_el manually: auto-maskandscale would re-apply scale_factor (double-pack).
+        if "surf_el" in ds.variables:
+            surf_el = ds.variables["surf_el"]
+            surf_el.set_auto_maskandscale(False)
+            fill = getattr(surf_el, "missing_value", -30000)
+            for t in range(nt):
+                real = np.ma.filled(ssh[t, :, :], -30000.0).astype(np.float32)
+                ds.variables["surf_el"][t, :, :] = _pack_for_fortran(
+                    real, surf_el.scale_factor, surf_el.add_offset,
+                    fill, fill_mask=np.abs(real) >= 10000,
+                )
+
     def _apply_adt_blend(self, ssh_path: Path, adt_field, work_dir: Path,
                          adt_dst=None) -> Optional[Path]:
         """Apply the ops ADT blend to SSH_1.nc.
@@ -508,27 +602,10 @@ class ADTBlender:
             log.info(f"ADT blend: {self.regrid or 'bilinear'} regrid -> {ny}x{nx} "
                      f"({n_ok}/{ny * nx} valid), mean(ADT)={np.nanmean(adt_dst):.4f}m")
 
-            f32 = np.float32
-            adt32 = np.asarray(adt_dst, dtype=f32)
-
-            def _raw(t):
-                return np.ma.filled(ssh[t, :, :], fill_value=-30000.0).astype(f32)
-
-            # Land in the reference record is 0, as the ops where(abs>1000) fill. MJ (10/02/26)
-            ssh_t0 = _raw(0)
-            ssh_t0 = np.where(np.abs(ssh_t0) > 1000, f32(0), ssh_t0)
-
-            # float32 as ncap2: float(float(ssh_t - ssh_0) + ADT), surf_el = x * float(1000.). MJ (10/02/26)
-            surf_el = ds.variables.get("surf_el")
-            if surf_el is not None:
-                surf_el.set_auto_maskandscale(False)
-            for t in range(nt):
-                ssh_t = _raw(t)
-                corrected = ((ssh_t - ssh_t0).astype(f32) + adt32).astype(f32)
-                bad = ~np.isfinite(corrected) | (np.abs(ssh_t) > 1000) | (np.abs(corrected) > 1000)
-                ssh[t, :, :] = np.where(bad, f32(-30000.0), corrected)
-                if surf_el is not None:
-                    surf_el[t, :, :] = np.where(bad, f32(-30000.0), (corrected * f32(1000)).astype(f32))
+            if self.ops_numerics:
+                self._blend_float32(ds, ssh, nt, adt_dst)
+            else:
+                self._blend_float64(ds, ssh, nt, adt_dst)
 
             ds.close()
             log.info(f"ADT blending applied to {output.name}")
