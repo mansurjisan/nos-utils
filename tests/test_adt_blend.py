@@ -346,3 +346,60 @@ def test_default_removes_work_dir(setup, monkeypatch):
     res, data, seen = _stofs_run(setup, monkeypatch, keep=False)
     assert list(data.iterdir()) == []
     assert not seen["p"].parent.exists()
+
+
+def _stub_exe(tmp, monkeypatch):
+    exe_dir = tmp / "exec"
+    exe_dir.mkdir()
+    exe = exe_dir / "stofs_3d_atl_gen_3Dth_from_hycom"
+    exe.write_text("#!/bin/sh\nls -1 > seen.txt\nexit 0\n")
+    exe.chmod(0o755)
+    for v in ("EXECstofs3d", "EXECofs", "FIXstofs3d", "FIXofs", "RUN"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("EXECnos", str(exe_dir))
+
+
+def test_fortran_inputs_found_with_port_names_and_logged(setup, monkeypatch, caplog):
+    cfg, proc, files, ssh_1, work, tmp = setup
+    _stub_exe(tmp, monkeypatch)
+    fix = tmp / "fix"
+    fix.mkdir()
+    for n in ("hgrid.gr3", "hgrid.ll", "vgrid.in", "obc_3dth_nc.in"):
+        (fix / f"stofs_3d_atl_ufs.{n}").write_text("x")
+    (fix / "stofs_3d_atl_estuary.gr3").write_text("x")  # ops name still found
+    monkeypatch.setenv("FIXstofs3d", str(fix))
+    proc.grid_file = None
+    with caplog.at_level("INFO"):
+        proc._call_fortran_gen_3dth(work, ssh_1, None)
+    seen = set((work / "seen.txt").read_text().split())
+    assert {"hgrid.gr3", "hgrid.ll", "vgrid.in", "gen_3Dth_from_nc.in", "estuary.gr3"} <= seen
+    assert "gen_3Dth input: hgrid.gr3 ->" in caplog.text
+    assert not [r for r in caplog.records if r.levelname == "WARNING"
+                and "hgrid" in r.message]
+
+
+def test_fortran_config_path_wins_and_missing_required_warns(setup, monkeypatch, caplog):
+    cfg, proc, files, ssh_1, work, tmp = setup
+    _stub_exe(tmp, monkeypatch)
+    fix = tmp / "fix"
+    fix.mkdir()
+    (fix / "stofs_3d_atl_ufs.hgrid.ll").write_text("fix")
+    monkeypatch.setenv("FIXstofs3d", str(fix))
+    gl = tmp / "mine.ll"
+    gl.write_text("cfg")
+    proc.grid_file = gl
+    with caplog.at_level("WARNING"):
+        proc._call_fortran_gen_3dth(work, ssh_1, None)
+    assert (work / "hgrid.ll").resolve() == gl.resolve()
+    for n in ("hgrid.gr3", "vgrid.in", "gen_3Dth_from_nc.in"):
+        assert f"gen_3Dth input {n} not found" in caplog.text
+    assert "hgrid.ll not found" not in caplog.text
+
+
+def test_fortran_keeps_raw_ssh_when_linking_adt(setup, monkeypatch):
+    cfg, proc, files, ssh_1, work, tmp = setup
+    _stub_exe(tmp, monkeypatch)
+    blended = _blend(cfg, tmp, ssh_1, work, lambda lo, la: np.full_like(lo, 0.90))
+    proc._call_fortran_gen_3dth(work, blended, None)
+    assert (work / "SSH_1.nc").resolve() == blended.resolve()
+    assert (work / "SSH_1_raw.nc").is_file()

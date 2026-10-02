@@ -1091,49 +1091,36 @@ class RTOFSProcessor(ForcingProcessor):
             log.debug("No Fortran gen_3Dth_from_hycom executable found")
             return False
 
-        # Symlink required input files into work_dir
-        fix_dir = os.environ.get("FIXstofs3d", "")
         required_links = {
             "SSH_1.nc": ssh_path,
             "TS_1.nc": tsuv_path,
             "UV_1.nc": tsuv_path,
         }
-
-        # Grid files from FIX
-        fix_files = {
-            "hgrid.ll": "stofs_3d_atl_hgrid.ll",
-            "hgrid.gr3": "stofs_3d_atl_hgrid.gr3",
-            "vgrid.in": "stofs_3d_atl_vgrid.in",
-            "estuary.gr3": "stofs_3d_atl_estuary.gr3",
-            "TEM_nudge.gr3": "stofs_3d_atl_tem_nudge.gr3",
-            "gen_3Dth_from_nc.in": "stofs_3d_atl_obc_3dth_nc.in",
-        }
-
         for link_name, source in required_links.items():
             if source and source.exists():
                 target = work_dir / link_name
-                # SSH_1.nc already holds the raw SSH when ADT went to SSH_1_adt.nc;
-                # point the exe at this run's input. MJ (10/01/26)
+                # SSH_1.nc holds the raw SSH when ADT went to SSH_1_adt.nc; point the exe at
+                # this run's input but keep the raw file as SSH_1_raw.nc. MJ (10/02/26)
                 if target.exists() or target.is_symlink():
                     if target.exists() and os.path.samefile(target, source):
                         continue
-                    target.unlink()
+                    if target.is_symlink():
+                        target.unlink()
+                    else:
+                        target.rename(work_dir / f"{target.stem}_raw{target.suffix}")
                 target.symlink_to(source)
+                log.info(f"gen_3Dth input: {link_name} -> {source}")
 
-        if fix_dir:
-            for link_name, fix_name in fix_files.items():
-                src = Path(fix_dir) / fix_name
-                if src.exists():
-                    target = work_dir / link_name
-                    if not target.exists():
-                        target.symlink_to(src)
-
-        # Also try grid_file from config
-        if self.grid_file and Path(self.grid_file).exists():
-            for name in ["hgrid.ll"]:
-                target = work_dir / name
-                if not target.exists():
-                    target.symlink_to(self.grid_file)
+        for link_name, (src, required) in self._fortran_fix_inputs().items():
+            if src is None:
+                (log.warning if required else log.info)(
+                    f"gen_3Dth input {link_name} not found"
+                    f"{' — the exe will likely fail' if required else ''}")
+                continue
+            target = work_dir / link_name
+            if not target.exists():
+                target.symlink_to(src)
+                log.info(f"gen_3Dth input: {link_name} -> {src}")
 
         try:
             result = subprocess.run(
@@ -1172,6 +1159,34 @@ class RTOFSProcessor(ForcingProcessor):
         except Exception as e:
             log.warning(f"Error calling Fortran gen_3Dth: {e}")
             return False
+
+    def _fortran_fix_inputs(self) -> dict:
+        """{link name: (path or None, required)} for the gen_3Dth fix inputs.
+
+        Per file: the configured path, then <prefix>.<name> (the port's fix naming), then the
+        ops name, searched in FIXstofs3d then FIXofs. MJ (10/02/26)
+        """
+        dirs = [Path(os.environ[v]) for v in ("FIXstofs3d", "FIXofs") if os.environ.get(v)]
+        prefixes = []
+        if self.grid_file and ".hgrid" in Path(self.grid_file).name:
+            prefixes.append(Path(self.grid_file).name.split(".hgrid")[0])
+        prefixes += [p for p in (os.environ.get("RUN"), "stofs_3d_atl_ufs") if p]
+        prefixes = list(dict.fromkeys(prefixes))
+        table = {
+            "hgrid.ll": (self.grid_file, "hgrid.ll", "stofs_3d_atl_hgrid.ll", True),
+            "hgrid.gr3": (None, "hgrid.gr3", "stofs_3d_atl_hgrid.gr3", True),
+            "vgrid.in": (self.vgrid_file, "vgrid.in", "stofs_3d_atl_vgrid.in", True),
+            "gen_3Dth_from_nc.in": (None, "obc_3dth_nc.in", "stofs_3d_atl_obc_3dth_nc.in", True),
+            "estuary.gr3": (None, "estuary.gr3", "stofs_3d_atl_estuary.gr3", False),
+            "TEM_nudge.gr3": (None, "tem_nudge.gr3", "stofs_3d_atl_tem_nudge.gr3", False),
+        }
+        out = {}
+        for link, (cfg_path, bare, ops_name, required) in table.items():
+            cands = [Path(cfg_path)] if cfg_path else []
+            cands += [d / f"{pf}.{bare}" for d in dirs for pf in prefixes]
+            cands += [d / ops_name for d in dirs]
+            out[link] = (next((c for c in cands if c.is_file()), None), required)
+        return out
 
     @staticmethod
     def _hold_first_record(elev_path: Path) -> None:
