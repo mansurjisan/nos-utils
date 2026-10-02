@@ -435,6 +435,7 @@ class NudgingProcessor(ForcingProcessor):
             # Transfer the cycle date for valid-time calculation
             if hasattr(rtofs_proc_nophase, '_rtofs_cycle_date'):
                 rtofs_proc._rtofs_cycle_date = rtofs_proc_nophase._rtofs_cycle_date
+            rtofs_proc._valid_times = rtofs_proc_nophase._valid_times
 
         if not files_3d:
             return ForcingResult(
@@ -473,13 +474,6 @@ class NudgingProcessor(ForcingProcessor):
         # or after sim_start depending on availability).
         sim_start, sim_end, sim_duration = self._get_output_window()
 
-        # RTOFS cycle date drives the per-file valid-time calculation.
-        # Falls back to PDY when find_input_files_by_type didn't run
-        # (e.g., synthetic test data with no naming pattern that matches).
-        rtofs_cycle = getattr(rtofs_proc, '_rtofs_cycle_date', None)
-        if rtofs_cycle is None:
-            rtofs_cycle = datetime.strptime(self.config.pdy, "%Y%m%d")
-
         all_temp = []
         all_salt = []
         # Seconds-from-sim_start for each appended timestep. Files
@@ -516,10 +510,7 @@ class NudgingProcessor(ForcingProcessor):
 
                 # File valid time relative to sim_start (model t=0).
                 # Parses the f### or n### tag from the filename.
-                file_hour, _ = RTOFSProcessor._parse_rtofs_hour(f)
-                file_t0 = (
-                    rtofs_cycle + timedelta(hours=file_hour) - sim_start
-                ).total_seconds()
+                file_t0 = (rtofs_proc.valid_time(f) - sim_start).total_seconds()
 
                 # Validate precomputed weights grid on first file
                 if use_precomputed and not grid_validated:

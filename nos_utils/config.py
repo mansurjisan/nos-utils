@@ -192,6 +192,11 @@ class ForcingConfig:
     # Ops STOFS-3D-ATL holds elev2D at its first record (non_adjust.sh, after the +0.04); PAC keeps it
     # time-varying, so only the ATL presets/yaml turn this on. STOFS mode only. MJ (10/02/26)
     obc_ssh_hold_first_record: bool = False
+    # Ops RTOFS timeline (STOFS-3D-ATL): same-day RTOFS cycle first with the previous cycle only
+    # filling missing 6-hourly slots, n-files dated cycle-24h+HHH, 6-hourly (21600 s) OBC records
+    # sliced per phase, non-zero uv3D. Off keeps the previous-cycle search, 3-hourly T/S and zero
+    # uv3D that SECOFS, Pacific and Alaska use. MJ (10/02/26)
+    obc_ops_timeline: bool = False
     # T,S for boundary nodes outside the RTOFS grid (stofs_3d_atl_obc_3dth_nc.in). MJ (10/01/26)
     obc_tem_outside: float = 20.0
     obc_sal_outside: float = 33.0
@@ -515,6 +520,7 @@ class ForcingConfig:
             adt_enabled=True,
             adt_weight_file=Path("stofs_3d_atl_ufs.adt_weight.nc"),
             obc_ssh_hold_first_record=True,
+            obc_ops_timeline=True,
             # Nudging
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
@@ -568,6 +574,7 @@ class ForcingConfig:
             adt_enabled=True,
             adt_weight_file=Path("stofs_3d_atl_ufs.adt_weight.nc"),
             obc_ssh_hold_first_record=True,
+            obc_ops_timeline=True,
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
             nwm_product="medium_range_mem1",
@@ -801,6 +808,9 @@ class ForcingConfig:
         _sys = data.get("system", {}) if isinstance(data.get("system"), dict) else {}
         _hold = _strict_bool(_hold, "obc.ssh_hold_first_record",
                              str(_sys.get("name", "")).startswith("stofs_3d_atl"))
+        _ops_tl = obc.get("ops_timeline") if isinstance(obc, dict) else None
+        _ops_tl = _strict_bool(_ops_tl, "obc.ops_timeline",
+                               str(_sys.get("name", "")).startswith("stofs_3d_atl"))
         if obc_elev_segments is not None:
             obc_elev_segments = [int(i) for i in obc_elev_segments]
 
@@ -863,6 +873,7 @@ class ForcingConfig:
                 "obc.use_fortran_gen3dth", False),
             obc_interp_mode=_interp_mode,
             obc_ssh_hold_first_record=_hold,
+            obc_ops_timeline=_ops_tl,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
             adt_weight_file=_adt_wt,
             nwm_product=nwm_product,

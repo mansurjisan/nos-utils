@@ -62,6 +62,12 @@ except ImportError:
     HAS_NETCDF4 = False
 
 
+# Ops OBC record spacing (stofs_3d_atl_obc_3dth_nc.in dtout) and the ops record count: 23 6-hourly
+# records from the nowcast start, n012 to f120. MJ (10/02/26)
+OPS_OBC_DT = 21600.0
+OPS_MIN_SLOTS = 23
+
+
 def _pack_for_fortran(real, scale, offset, fill, fill_mask=None):
     """
     Pack a float field to float exactly as the Fortran gen_*_hycom expects.
@@ -167,6 +173,8 @@ class RTOFSProcessor(ForcingProcessor):
                 config, "obc_buffer_hours", self.DEFAULT_BUFFER_HOURS,
             )
         self.buffer_hours = int(buffer_hours)
+        self._valid_times = {}  # path -> valid time, set by the ops file selection
+        self._select_notes = []
         self._grid = None
         self._bnd_lons = None
         self._bnd_lats = None
@@ -460,6 +468,24 @@ class RTOFSProcessor(ForcingProcessor):
         """True if using STOFS-style ROI-based processing."""
         return self.config.obc_roi_2d is not None
 
+    @property
+    def _ops_timeline(self) -> bool:
+        """True for the ATL ops timeline (same-day cycle first, 6-hourly records)."""
+        return self.is_stofs_mode and bool(self.config.obc_ops_timeline)
+
+    def valid_time(self, path: Path) -> datetime:
+        """Valid time of an RTOFS file: the selection's own date, else cycle date + hour tag.
+
+        In the ops timeline an nHHH file is valid at cycle - 24 h + HHH. MJ (10/02/26)
+        """
+        vt = self._valid_times.get(Path(path))
+        if vt is not None:
+            return vt
+        hour, is_n = self._parse_rtofs_hour(path)
+        cycle = getattr(self, "_rtofs_cycle_date", None) or datetime.strptime(
+            self.config.pdy, "%Y%m%d")
+        return cycle + timedelta(hours=hour - (24 if is_n and self._ops_timeline else 0))
+
     def process(self) -> ForcingResult:
         if not HAS_NETCDF4:
             return ForcingResult(
@@ -646,7 +672,7 @@ class RTOFSProcessor(ForcingProcessor):
         keep = os.environ.get("KEEPDATA", "").strip().upper() == "YES"
         work_dir = self._stofs_work_dir(keep)
         log.info(f"STOFS OBC work dir: {work_dir} ({'kept' if keep else 'removed on exit'})")
-        self._ops_warnings = []
+        self._ops_warnings = list(self._select_notes)
         self._ops_reasons = {"elev2D": [], "T/S": []}
         self._ts_mask_fallback = False
         self._elev2d_interp = self._ts_interp = None
@@ -1282,7 +1308,8 @@ class RTOFSProcessor(ForcingProcessor):
         file_info = []
         for f in files:
             hour, is_nowcast = self._parse_rtofs_hour(f)
-            valid_time = cycle_date + timedelta(hours=hour)
+            back = 24 if (is_nowcast and self._ops_timeline) else 0
+            valid_time = cycle_date + timedelta(hours=hour - back)
             file_info.append((valid_time, is_nowcast, f))
 
         # Sort by valid time; for ties, forecast first (is_nowcast=False < True)
@@ -1318,7 +1345,13 @@ class RTOFSProcessor(ForcingProcessor):
         shared date for both variables, so picking 2D from one date and 3D
         from another would silently misdate whichever type didn't match
         that date -- a corrupted time axis, not a missing-file error.
+
+        The ops timeline (config.obc_ops_timeline) instead picks the same-day cycle
+        first and fills missing 6-hourly slots from the previous cycle, see
+        _find_ops_files.
         """
+        if self._ops_timeline:
+            return self._find_ops_files()
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
         # Ops stages "alaska", "US_east" and "US_west" 3dz tiles side by
         # side for every valid time, with no region distinction in the old
@@ -1495,6 +1528,90 @@ class RTOFSProcessor(ForcingProcessor):
             files_3d = self._sort_and_dedup(files_3d, rtofs_cycle_date)
 
         return files_2d, files_3d
+
+    def _ops_slot_times(self) -> List[datetime]:
+        """6-hourly slots from the nowcast start, at least the 23 ops records, long enough for the run."""
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+        t0 = cycle_dt - timedelta(hours=int(self.config.nowcast_hours))
+        span = (cycle_dt - t0).total_seconds() + (
+            int(self.config.forecast_hours) + self.buffer_hours) * 3600.0
+        n = max(OPS_MIN_SLOTS, int(np.ceil(span / OPS_OBC_DT)) + 1)
+        return [t0 + timedelta(seconds=OPS_OBC_DT * k) for k in range(n)]
+
+    def _ops_candidates(self, date: datetime, kind: str):
+        """[(valid time, is_nowcast, path)] of the size-valid 2D or 3D files of one RTOFS cycle date."""
+        date_str = date.strftime("%Y%m%d")
+        region = self.config.rtofs_3d_region
+        if kind == "2d":
+            globs, floor = ["rtofs_glo_2ds_*_diag.nc"], self.MIN_FILE_SIZE_2D
+        else:
+            tag = region if region else "*"
+            globs = [f"rtofs_glo_3dz_*_6hrly_hvr_{tag}.nc", f"rtofs_glo_3dz_*_6hrly_hvr_{tag}.nc4"]
+            floor = self._minimum_3d_file_size()
+        for d in (self.input_path / f"rtofs.{date_str}", self.input_path / date_str, self.input_path):
+            if not d.exists():
+                continue
+            found = sorted(f for g in globs for f in d.glob(g))
+            if not found:
+                continue
+            out = []
+            for f in found:
+                if kind == "3d":
+                    try:
+                        self._matched_3d_sizes[f] = f.stat().st_size
+                    except OSError:
+                        self._matched_3d_sizes[f] = -1
+                if not self.validate_file_size(f, floor):
+                    continue
+                if kind == "3d":
+                    self._accepted_3d_paths.add(f)
+                hour, is_n = self._parse_rtofs_hour(f)
+                out.append((date + timedelta(hours=hour - (24 if is_n else 0)), is_n, f))
+            return out
+        return []
+
+    def _find_ops_files(self) -> Tuple[List[Path], List[Path]]:
+        """Ops route 1 then route 2 per slot: the same-day cycle's files, the previous cycle's only to fill gaps.
+
+        Slots are 6-hourly from the nowcast start. Ops route 1 is 2ds n012, n018, f000..f120
+        and 3dz n012, n018, n024, f006..f120 of rtofs.PDY; route 2 is rtofs.PDY-1 f012..f144.
+        Forecast files win over nowcast files at the same valid time.
+        """
+        base = datetime.strptime(self.config.pdy, "%Y%m%d")
+        slots = self._ops_slot_times()
+        want = set(slots)
+        self._matched_3d_sizes, self._accepted_3d_paths, self._invalid_3d_files = {}, set(), {}
+        self._valid_times = {}
+        self._select_notes = []
+        picked = {"2d": {}, "3d": {}}
+        n_prev = {"2d": 0, "3d": 0}
+        for date in (base, base - timedelta(days=1)):
+            for kind in ("2d", "3d"):
+                for vt, is_n, f in sorted(self._ops_candidates(date, kind),
+                                          key=lambda c: (c[0], c[1])):
+                    if vt in want and vt not in picked[kind]:
+                        picked[kind][vt] = f
+                        self._valid_times[f] = vt
+                        n_prev[kind] += date != base
+        self._rtofs_cycle_date = base
+        out = {}
+        for kind in ("2d", "3d"):
+            have = [vt for vt in slots if vt in picked[kind]]
+            out[kind] = [picked[kind][vt] for vt in have]
+            if have and n_prev[kind]:
+                self._select_notes.append(
+                    f"RTOFS {kind}: {n_prev[kind]} of {len(have)} slots filled from the previous cycle")
+            miss = [vt for vt in slots[:OPS_MIN_SLOTS] if vt not in picked[kind]] if have else []
+            if miss:
+                self._select_notes.append(
+                    f"RTOFS {kind}: {len(miss)} of the first {OPS_MIN_SLOTS} 6-hourly slots missing "
+                    f"in both cycles (first {miss[0]:%Y-%m-%d %Hz})")
+        for m in self._select_notes:
+            log.warning(m)
+        log.info(f"RTOFS ops selection: {len(out['2d'])} 2D, {len(out['3d'])} 3D files "
+                 f"over {len(slots)} slots")
+        return out["2d"], out["3d"]
 
     def _interpolate_2d_to_boundary(
         self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray, rtofs_data: np.ndarray,
@@ -1932,11 +2049,6 @@ class RTOFSProcessor(ForcingProcessor):
             # matching production-COMF semantics where the model clock
             # starts at the run origin (param.nml start_year/start_hour
             # already anchored to that point).
-            file_hours = []
-            for f in files_2d:
-                hour, _ = self._parse_rtofs_hour(f)
-                file_hours.append(hour)
-
             # Phase-aware output window: nowcast emits the 6h leg + buffer,
             # forecast emits the 48h leg + buffer (buffer_hours past sim_end
             # for SCHISM time_series interpolation headroom). None gives the
@@ -1946,12 +2058,8 @@ class RTOFSProcessor(ForcingProcessor):
             # Compute time of each file relative to model_t0.
             # Files at the nowcast origin have time=0; files before it
             # have negative times (ignored by interp clipping below).
-            rtofs_cycle = getattr(self, '_rtofs_cycle_date', None)
-            if rtofs_cycle is None:
-                rtofs_cycle = datetime.strptime(self.config.pdy, "%Y%m%d")
             rtofs_times = np.array(
-                [(rtofs_cycle + timedelta(hours=h) - model_t0).total_seconds()
-                 for h in file_hours],
+                [(self.valid_time(f) - model_t0).total_seconds() for f in files_2d],
                 dtype=np.float64,
             )
             if hold and ops_ssh is not None and self._ssh_blended_used:
@@ -2529,13 +2637,8 @@ class RTOFSProcessor(ForcingProcessor):
             # starting at t=0 — which silently labelled the first 3D file
             # as model_t0 regardless of its true valid time. With Route B
             # the anchor must be explicit.
-            file_hours_3d = [self._parse_rtofs_hour(f)[0] for f in files_3d]
-            rtofs_cycle = getattr(self, '_rtofs_cycle_date', None)
-            if rtofs_cycle is None:
-                rtofs_cycle = datetime.strptime(self.config.pdy, "%Y%m%d")
             rtofs_times_3d = np.array(
-                [(rtofs_cycle + timedelta(hours=h) - model_t0).total_seconds()
-                 for h in file_hours_3d],
+                [(self.valid_time(f) - model_t0).total_seconds() for f in files_3d],
                 dtype=np.float64,
             )
 
