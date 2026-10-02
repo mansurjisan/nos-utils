@@ -353,8 +353,17 @@ class ForcingConfig:
     )
     # Pre-computed bctides.in template
     bctides_template: Optional[Path] = None
+    # Nodal-factor reference: "phase" evaluates (f, u) at each phase's own
+    # midpoint; "cycle" at the cycle midpoint in both phases (ops one-run
+    # tide_fac input). MJ (10/02/26)
+    tide_nodal_reference: str = "phase"
 
     def __post_init__(self):
+        if self.tide_nodal_reference not in ("phase", "cycle"):
+            raise ValueError(
+                f"tide_nodal_reference must be 'phase' or 'cycle', "
+                f"got {self.tide_nodal_reference!r}"
+            )
         if self.lon_min >= self.lon_max:
             raise ValueError(f"lon_min ({self.lon_min}) must be < lon_max ({self.lon_max})")
         if self.lat_min >= self.lat_max:
@@ -501,6 +510,7 @@ class ForcingConfig:
             dynamic_adjust_enabled=True,
             # OBC dim QC threshold (operational N_dim_cr_max).
             obc_min_timesteps=21,
+            tide_nodal_reference="cycle",
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -557,6 +567,7 @@ class ForcingConfig:
             ufs_total_tasks=1200,
             ufs_nhours_fcst=132,
             ufs_dt_atmos=720,
+            tide_nodal_reference="cycle",
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -1052,6 +1063,9 @@ class ForcingConfig:
             kwargs["river_clim_file"] = Path(clim_file)
         if bctides_template:
             kwargs["bctides_template"] = Path(bctides_template)
+        nodal_ref = tidal.get("nodal_reference") if isinstance(tidal, dict) else None
+        if nodal_ref is not None:
+            kwargs["tide_nodal_reference"] = nodal_ref
         if grid_file:
             kwargs["grid_file"] = Path(grid_file)
 
