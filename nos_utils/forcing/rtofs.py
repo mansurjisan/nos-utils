@@ -1066,8 +1066,13 @@ class RTOFSProcessor(ForcingProcessor):
         for link_name, source in required_links.items():
             if source and source.exists():
                 target = work_dir / link_name
-                if not target.exists():
-                    target.symlink_to(source)
+                # SSH_1.nc already holds the raw SSH when ADT went to SSH_1_adt.nc;
+                # point the exe at this run's input. MJ (10/01/26)
+                if target.exists() or target.is_symlink():
+                    if target.exists() and os.path.samefile(target, source):
+                        continue
+                    target.unlink()
+                target.symlink_to(source)
 
         if fix_dir:
             for link_name, fix_name in fix_files.items():
