@@ -1801,6 +1801,9 @@ class RTOFSProcessor(ForcingProcessor):
                 return None
 
             ssh_array = np.stack(all_ssh, axis=0)
+            if self.is_stofs_mode and self.config.obc_ssh_hold_first_record:
+                ssh_array = np.repeat(ssh_array[:1], ssh_array.shape[0], axis=0)
+                log.info("elev2D: held at the first record (ops non_adjust)")
 
             # Fill NaN nodes (e.g., nodes 0-3 that fall outside RTOFS domain)
             # by propagating from nearest valid boundary node
@@ -2031,7 +2034,7 @@ class RTOFSProcessor(ForcingProcessor):
             z[n] = np.concatenate([np.full(nvrt - len(col), col[0]), col])
         return z
 
-    def _ops_ts_profiles(self, tsuv_path, n_files):
+    def _ops_ts_profiles(self, tsuv_path, n_files, ssh_path=None):
         """(all_temp, all_salt) lists of (n_bnd, nvrt) per record from TSUV_1.nc, gen_3Dth rules; None to fall back."""
         nvrt = self._vgrid.nvrt if self._vgrid else None
         z = self._ops_node_z(nvrt) if nvrt else None
@@ -2058,6 +2061,15 @@ class RTOFSProcessor(ForcingProcessor):
                 cj, ci = corner_cells(ix, iy)
                 raw0 = np.ma.filled(ds.variables["temperature"][0, 0], -30000.0)
                 wet = np.asarray(raw0, np.float64) * 1e-3 + 20.0 > RJUNK + JUNK_EPS
+                # ops decides dry from SSH_1 on the first record (f90:488); surface T is the fallback. MJ (10/02/26)
+                if ssh_path:
+                    try:
+                        with Dataset(str(ssh_path)) as sd:
+                            s0 = np.ma.filled(sd.variables["ssh"][0], -30000.0).astype(np.float64)
+                        if s0.shape == wet.shape:
+                            wet = np.where(np.isfinite(s0), s0, -30000.0) >= DRY_SSH
+                    except Exception as e:
+                        log.warning(f"SSH_1 dry mask unavailable ({e}) — using surface T")
                 ll_dry = ~wet[cj[0], ci[0]]
                 pj, pi, n_dry = dry_parents(wet, cj, ci)
                 cells, inv = np.unique(pj * wet.shape[1] + pi, return_inverse=True)
@@ -2184,7 +2196,7 @@ class RTOFSProcessor(ForcingProcessor):
             all_temp = []
             all_salt = []
             # Ops-equivalent T/S from TSUV_1.nc; the per-file loop below is the fallback. MJ (10/01/26)
-            ops_ts = (self._ops_ts_profiles(self._tsuv1_path, len(files_3d))
+            ops_ts = (self._ops_ts_profiles(self._tsuv1_path, len(files_3d), self._ssh1_path)
                       if self.is_stofs_mode and self._tsuv1_path else None)
             if ops_ts is not None:
                 all_temp, all_salt = ops_ts

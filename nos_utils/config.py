@@ -170,8 +170,11 @@ class ForcingConfig:
     # EXECnos/EXECstofs3d. Off by default so installing the exe cannot silently
     # switch algorithms away from the Python ops-equivalent. MJ (10/01/26)
     obc_use_fortran_gen3dth: bool = False
-    # gen_3Dth interp_mode: 0 = bilinear, 1 = diagonal-split triangles. MJ (10/01/26)
-    obc_interp_mode: int = 0
+    # gen_3Dth interp_mode: 0 = bilinear, 1 = diagonal-split triangles (what ops runs,
+    # since SSH_1 xlon is 2-D: f90:349). MJ (10/02/26)
+    obc_interp_mode: int = 1
+    # Ops holds elev2D at its first record (non_adjust.sh, after the +0.04); STOFS mode only. MJ (10/02/26)
+    obc_ssh_hold_first_record: bool = True
     # T,S for boundary nodes outside the RTOFS grid (stofs_3d_atl_obc_3dth_nc.in). MJ (10/01/26)
     obc_tem_outside: float = 20.0
     obc_sal_outside: float = 33.0
@@ -818,7 +821,8 @@ class ForcingConfig:
             obc_ssh_offset=obc_ssh_offset,
             obc_elev_segments=obc_elev_segments,
             obc_use_fortran_gen3dth=bool(obc.get("use_fortran_gen3dth", False)) if isinstance(obc, dict) else False,
-            obc_interp_mode=int(obc.get("interp_mode", 0)) if isinstance(obc, dict) else 0,
+            obc_interp_mode=int(obc.get("interp_mode", 1)) if isinstance(obc, dict) else 1,
+            obc_ssh_hold_first_record=bool(obc.get("ssh_hold_first_record", True)) if isinstance(obc, dict) else True,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
             nwm_product=nwm_product,
         )

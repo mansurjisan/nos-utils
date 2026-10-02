@@ -43,16 +43,57 @@ def parent_weights(xax, yax, x, y, mode=0):
         w[..., 2] = xr * yr
         w[..., 3] = (1 - xr) * yr
     else:
-        # f90:726-749; triangle (1,2,3) is accepted up to 0.025 past the diagonal
-        tri1 = (yr - xr) < 0.025
-        w1 = np.clip(1 - xr, 0, 1)
-        w2 = np.clip(np.abs(xr - yr), 0, 1)
-        w[..., 0] = np.where(tri1, w1, np.clip(1 - yr, 0, 1))
-        w[..., 1] = np.where(tri1, w2, 0.0)
-        w[..., 2] = np.where(tri1, np.clip(1 - w1 - w2, 0, 1), np.clip(xr, 0, 1))
-        w[..., 3] = np.where(tri1, 0.0, np.clip(1 - (1 - yr) - xr, 0, 1))
+        return _mode1(xax, yax, x, y)
     w[~inside] = 0.0
     return ix, iy, w, inside
+
+
+def _area(x0, y0, x1, y1, x2, y2):
+    return np.abs(0.5 * ((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)))
+
+
+def _mode1(xax, yax, x, y, small1=1e-2):
+    """ops interp_mode=1 (f90:709-760): area-tolerance cell search, then diagonal-split triangle weights."""
+    n = x.size
+    ix0 = np.clip(np.searchsorted(xax, x, side="left") - 1, 0, xax.size - 2)
+    iy0 = np.clip(np.searchsorted(yax, y, side="left") - 1, 0, yax.size - 2)
+    ix = np.zeros(n, int)
+    iy = np.zeros(n, int)
+    found = np.zeros(n, bool)
+    # the ops loop takes the first accepted cell in ix-major order; only neighbours of the
+    # containing cell can pass the 1% area test. MJ (10/02/26)
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            cx, cy = ix0 + di, iy0 + dj
+            ok = (cx >= 0) & (cx < xax.size - 1) & (cy >= 0) & (cy < yax.size - 1) & ~found
+            cx, cy = np.clip(cx, 0, xax.size - 2), np.clip(cy, 0, yax.size - 2)
+            x1, x2, y1, y2 = xax[cx], xax[cx + 1], yax[cy], yax[cy + 1]
+            a = (_area(x, y, x1, y1, x2, y1) + _area(x, y, x2, y1, x2, y2)
+                 + _area(x, y, x2, y2, x1, y2) + _area(x, y, x1, y2, x1, y1))
+            b = (x2 - x1) * (y2 - y1)
+            acc = ok & (np.abs(a - b) / b < small1)
+            ix = np.where(acc, cx, ix)
+            iy = np.where(acc, cy, iy)
+            found |= acc
+    x1, x2, y1, y2 = xax[ix], xax[ix + 1], yax[iy], yax[iy + 1]
+    bb = 0.5 * (x2 - x1) * (y2 - y1)
+    a1 = _area(x, y, x1, y1, x2, y1)
+    a2 = _area(x, y, x2, y1, x2, y2)
+    a3 = _area(x, y, x2, y2, x1, y2)
+    a4 = _area(x, y, x1, y2, x1, y1)
+    ap = _area(x, y, x1, y1, x2, y2)
+    tri1 = np.abs(a1 + a2 + ap - bb) / bb < 5 * small1
+    tri2 = np.abs(a3 + a4 + ap - bb) / bb < 5 * small1
+    if (found & ~tri1 & ~tri2).any():
+        raise ValueError("cannot find a triangle")
+    c = lambda v: np.clip(v, 0.0, 1.0)  # noqa: E731
+    w = np.zeros((n, 4))
+    w[:, 0] = np.where(tri1, c(a2 / bb), c(a3 / bb))
+    w[:, 1] = np.where(tri1, c(ap / bb), 0.0)
+    w[:, 2] = np.where(tri1, c(1 - w[:, 0] - w[:, 1]), c(a4 / bb))
+    w[:, 3] = np.where(tri1, 0.0, c(1 - w[:, 0] - w[:, 2]))
+    w[~found] = 0.0
+    return ix, iy, w, found
 
 
 def corner_cells(ix, iy):

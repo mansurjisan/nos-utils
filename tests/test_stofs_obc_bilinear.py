@@ -24,6 +24,7 @@ YAX = np.array([0.0, 2.0, 4.0])
 
 def _proc(tmp_path, lons, lats, depths=None, **cfg_kw):
     cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+    cfg.obc_interp_mode = 0
     for k, v in cfg_kw.items():
         setattr(cfg, k, v)
     p = RTOFSProcessor(cfg, tmp_path, tmp_path)
@@ -81,6 +82,16 @@ class TestWeights:
         # xr=0.75 > yr=0.25 -> triangle (1,2,3): (1-xr, xr-yr, yr, 0)
         _, _, w2, _ = oi.parent_weights(XAX, YAX, [0.75], [0.5], mode=1)
         np.testing.assert_allclose(w2[0], [0.25, 0.5, 0.25, 0.0])
+
+    def test_mode1_point_just_outside_edge_accepted_by_tolerance(self):
+        # x=1.005 lies in cell 1, but the ops scan reaches cell 0 first and its 1% area test passes
+        ix, iy, w, inside = oi.parent_weights(XAX, YAX, [1.005], [1.0], mode=1)
+        assert inside[0] and ix[0] == 0 and iy[0] == 0
+        np.testing.assert_allclose(w[0], [0.005, 0.505, 0.49, 0.0], atol=1e-9)
+
+    def test_mode1_beyond_tolerance_is_outside(self):
+        _, _, w, inside = oi.parent_weights(XAX, YAX, [2.05], [1.0], mode=1)
+        assert not inside[0] and (w == 0).all()
 
     def test_rect_axes_from_separable_2d_and_rejects_curvilinear(self):
         LO, LA = np.meshgrid(XAX, YAX)
@@ -242,6 +253,18 @@ class TestTS:
         # bottom-first column [18, 15, 18, 13] at z=[-50,-20,-10,0]; SCHISM z=[-40,-20,-10,0]
         np.testing.assert_allclose(temp[0][0], [17.0, 15.0, 18.0, 13.0], atol=1e-4)
 
+    def test_dry_in_ssh_but_valid_in_ts_is_dry(self, tmp_path):
+        p, path, nt = _tsuv_proc(tmp_path, [-59.5], [30.5], [40.0], SIGMA)
+        f = np.zeros((3, 3))
+        f[0, 0] = -30000.0
+        ssh = _write_ssh1(tmp_path / "s.nc", np.array([-60.0, -59.0, -58.0]),
+                          np.array([30.0, 31.0, 32.0]), [f])
+        with_t = p._ops_ts_profiles(path, nt)[0][0]
+        with_ssh = p._ops_ts_profiles(path, nt, ssh)[0][0]
+        # T valid everywhere: without SSH_1 the LL column is its own (surface 10); dry -> parent (11)
+        np.testing.assert_allclose(with_t[0, -1], (10.0 + 12.0 + 13.0 + 11.0) / 4, atol=1e-4)
+        np.testing.assert_allclose(with_ssh[0], (11.0 + 12.0 + 13.0 + 11.0) / 4, atol=1e-4)
+
     def test_mode1_uses_triangle_split(self, tmp_path):
         p, path, nt = _tsuv_proc(tmp_path, [-59.75], [30.75], [40.0], SIGMA)
         p.config.obc_interp_mode = 1
@@ -338,6 +361,30 @@ class TestWiring:
         proc._tsuv1_path = tmp_path / "TSUV_1.nc"
         np.testing.assert_array_equal(self._elev(proc._process_2d(files)), ref)
 
+    def test_hold_first_record_flag(self, tmp_path):
+        cfg, proc, files, ssh_1, work = self._setup(tmp_path)
+        proc._ssh1_path = ssh_1
+        held = self._elev(proc._process_2d(files))
+        assert held.shape[0] > 1 and (held == held[0]).all()
+        np.testing.assert_allclose(held[0], 0.04, atol=1e-5)
+        cfg.obc_ssh_hold_first_record = False
+        free = self._elev(proc._process_2d(files))
+        assert free.shape == held.shape and np.ptp(free[:, 0]) > 0.1
+        np.testing.assert_array_equal(free[0], held[0])
+
+    def test_hold_first_record_ignored_in_secofs(self, tmp_path):
+        cfg = ForcingConfig.for_secofs(pdy="20260401", cyc=12)
+        assert cfg.obc_ssh_hold_first_record is True
+        out = tmp_path / "out"
+        out.mkdir()
+        proc = RTOFSProcessor(cfg, tmp_path, out)
+        proc._bnd_lons = np.linspace(-80.0, -79.0, 5)
+        proc._bnd_lats = np.linspace(30.0, 31.0, 5)
+        proc._rtofs_cycle_date = datetime.strptime(cfg.pdy, "%Y%m%d")
+        files = _write_2d(tmp_path, cfg, proc._bnd_lons, proc._bnd_lats)
+        got = self._elev(proc._process_2d(files))
+        assert np.ptp(got[:, 0]) > 0.1
+
     @pytest.mark.parametrize("opt_in", [False, True])
     def test_fortran_exe_only_called_when_opted_in(self, tmp_path, monkeypatch, opt_in):
         cfg, proc, files, ssh_1, work = self._setup(tmp_path)
@@ -358,7 +405,8 @@ class TestWiring:
 def test_defaults_keep_fortran_off_and_ops_constants():
     cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
     assert cfg.obc_use_fortran_gen3dth is False
-    assert (cfg.obc_tem_outside, cfg.obc_sal_outside, cfg.obc_interp_mode) == (20.0, 33.0, 0)
+    assert (cfg.obc_tem_outside, cfg.obc_sal_outside, cfg.obc_interp_mode) == (20.0, 33.0, 1)
+    assert cfg.obc_ssh_hold_first_record is True
 
 
 def test_160k_nodes_interpolate_in_seconds(tmp_path):
