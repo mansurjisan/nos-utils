@@ -50,7 +50,7 @@ from ..io.schism_grid import SchismGrid
 from .base import ForcingProcessor, ForcingResult
 from .obc_ops_interp import (
     DRY_SSH, JUNK_EPS, RJUNK, corner_cells, dry_parents, fill_columns, fix_ssh,
-    parent_weights, rect_axes, vertical_index,
+    parent_weights, parent_weights_2d, rect_axes, vertical_index,
 )
 
 log = logging.getLogger(__name__)
@@ -172,6 +172,9 @@ class RTOFSProcessor(ForcingProcessor):
         self._3d_roi = None     # Cached ROI indices (j_start, j_end, i_start, i_end) for 3D subsetting
         self._wl_bias_info = None   # Outcome of the WL bias correction (see _apply_wl_bias)
         self._ssh_blended_used = False
+        self._ops_warnings = []
+        self._elev2d_interp = None  # "ops" | "delaunay" | "raw", for the ForcingResult metadata
+        self._ts_interp = None
         self._ssh1_path = None  # SSH_1.nc (ADT-blended when available) for the ops-equivalent elev2D
         self._tsuv1_path = None  # TSUV_1.nc for the ops-equivalent T/S
         # Discovery diagnostics, reset by find_input_files_by_type(). Values
@@ -623,6 +626,8 @@ class RTOFSProcessor(ForcingProcessor):
 
         import tempfile
         work_dir = Path(tempfile.mkdtemp(prefix="rtofs_stofs_"))
+        self._ops_warnings = []
+        self._elev2d_interp = self._ts_interp = None
 
         try:
             output_files = []
@@ -676,18 +681,20 @@ class RTOFSProcessor(ForcingProcessor):
 
             if fortran_ok:
                 # Copy Fortran outputs to final output directory.
-                # NOTE: do NOT apply obc_ssh_offset here — the Fortran exe
-                # (nos_ofs_create_forcing_obc_schism / gen_3Dth_from_hycom)
-                # already adds the geoid-to-MSL offset internally. See the
-                # note at _call_fortran_gen_3dth and commit ca16ad5 which
-                # removed a double-offset bug. The Python fallback path
-                # (_interpolate_2d) does apply it inline, but only because
-                # that path doesn't call the Fortran.
+                # The gen_3Dth f90 has no datum offset (it only scales ssh by 1e-3), so the
+                # +0.04 and the first-record hold are applied to elev2D below, as in
+                # non_adjust.sh:609-611. MJ (10/02/26)
                 for fname in ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]:
                     src = work_dir / fname
                     if src.exists():
                         dst = self.output_path / fname
                         shutil.copy2(src, dst)
+                        if fname == "elev2D.th.nc":
+                            # The f90 adds no offset; non_adjust.sh adds +0.04 and holds record 0
+                            # (lines 609-611). MJ (10/02/26)
+                            self._apply_ssh_offset(dst, self.config.obc_ssh_offset)
+                            if self.config.obc_ssh_hold_first_record:
+                                self._hold_first_record(dst)
                         output_files.append(dst)
                 # Track elev2d_ok/obc3d_ok from the names actually copied,
                 # not "was anything copied" -- the Fortran exe (like
@@ -752,12 +759,22 @@ class RTOFSProcessor(ForcingProcessor):
                     warnings=warnings,
                 )
 
+            if not fortran_ok:
+                reasons = "; ".join(self._ops_warnings) or "SSH_1/TSUV_1 unavailable"
+                for label, used in (("elev2D", self._elev2d_interp), ("T/S", self._ts_interp)):
+                    if used not in (None, "ops"):
+                        warnings.append(f"{label}: fell back from the ops-equivalent path to "
+                                        f"{used} ({reasons})")
+                warnings.extend(m for m in dict.fromkeys(self._ops_warnings)
+                                if not any(m in w for w in warnings))
             return ForcingResult(
                 success=len(output_files) > 0,
                 source=self.SOURCE_NAME,
                 output_files=output_files,
                 warnings=warnings,
                 metadata={
+                    "elev2d_interp": "fortran" if fortran_ok else self._elev2d_interp,
+                    "ts_interp": "fortran" if fortran_ok else self._ts_interp,
                     "n_2d_files": len(files_2d),
                     "n_3d_files": len(files_3d),
                     "stofs_mode": True,
@@ -1114,10 +1131,8 @@ class RTOFSProcessor(ForcingProcessor):
                 log.warning(f"gen_3Dth returned {result.returncode}: {result.stderr[:300]}")
                 return False
 
-            # NOTE: Do NOT apply SSH offset here — the Fortran executable
-            # (nos_ofs_create_forcing_obc_schism / gen_3Dth_from_hycom)
-            # already applies the offset internally (WL += 1.25 at line ~3133).
-            # Applying it again would double the offset to +2.5m.
+            # The offset (+0.04) and the first-record hold are applied by the caller after the
+            # copy; the gen_3Dth f90 adds no offset. MJ (10/02/26)
 
             # Verify outputs exist. A bare count (`len(found) >= 3`) treated
             # any three of the four files as good enough, which accepts
@@ -1140,6 +1155,14 @@ class RTOFSProcessor(ForcingProcessor):
         except Exception as e:
             log.warning(f"Error calling Fortran gen_3Dth: {e}")
             return False
+
+    @staticmethod
+    def _hold_first_record(elev_path: Path) -> None:
+        """Set every elev2D record to record 0 (ops non_adjust.sh:611)."""
+        ds = Dataset(str(elev_path), "r+")
+        ts = ds.variables["time_series"]
+        ts[:] = np.repeat(ts[0:1], ts.shape[0], axis=0)
+        ds.close()
 
     @staticmethod
     def _apply_ssh_offset(elev_path: Path, offset: float) -> None:
@@ -1759,6 +1782,8 @@ class RTOFSProcessor(ForcingProcessor):
         if ops_ssh is None and ssh_source:
             blended = self._load_blended_ssh(ssh_source, files_2d)
         self._ssh_blended_used = bool(ssh_source) and (ops_ssh is not None or blended is not None)
+        self._elev2d_interp = "ops" if ops_ssh is not None else (
+            "delaunay" if blended is not None else "raw")
         if ops_ssh is None:
             if blended is not None:
                 log.info("elev2D: SSH taken from the ADT-blended SSH_1 file")
@@ -1976,15 +2001,33 @@ class RTOFSProcessor(ForcingProcessor):
             log.error(traceback.format_exc())
             return None
 
-    def _ops_weights(self, xax, yax):
-        """Ops parent cell/weights for the boundary nodes on a rectilinear grid."""
-        lon = np.asarray(self._bnd_lons, np.float64)
-        lon = lon % 360.0 if xax.max() > 180.0 else np.where(lon > 180.0, lon - 360.0, lon)
-        return parent_weights(xax, yax, lon, np.asarray(self._bnd_lats, np.float64),
-                              mode=int(self.config.obc_interp_mode))
+    def _ops_note(self, msg):
+        log.warning(msg)
+        self._ops_warnings.append(msg)
+
+    def _ops_weights(self, lon, lat):
+        """Ops parent cell/weights for the boundary nodes; raises ValueError with the reason."""
+        mode = self.config.obc_interp_mode
+        if mode not in (0, 1):
+            raise ValueError(f"obc_interp_mode must be 0 or 1, got {mode!r}")
+        lon = np.ma.filled(lon, np.nan).astype(np.float64)
+        lat = np.ma.filled(lat, np.nan).astype(np.float64)
+        if not (np.isfinite(lon).all() and np.isfinite(lat).all()):
+            raise ValueError("non-finite lon/lat on the background grid")
+        nlon = np.asarray(self._bnd_lons, np.float64)
+        nlon = nlon % 360.0 if lon.max() > 180.0 else np.where(nlon > 180.0, nlon - 360.0, nlon)
+        nlat = np.asarray(self._bnd_lats, np.float64)
+        if mode == 1:
+            if lon.ndim == 1:
+                lon, lat = np.meshgrid(lon, lat)
+            return parent_weights_2d(lon, lat, nlon, nlat)
+        axes = rect_axes(lon, lat)
+        if axes is None:
+            raise ValueError("grid is not rectilinear, which interp_mode 0 needs")
+        return parent_weights(*axes, nlon, nlat, mode=0)
 
     def _ops_label(self):
-        return "ops bilinear" if int(self.config.obc_interp_mode) == 0 else "ops interp_mode=1"
+        return "ops bilinear" if self.config.obc_interp_mode == 0 else "ops interp_mode=1"
 
     def _ops_ssh_boundary(self, ssh_path, n_files) -> Optional[np.ndarray]:
         """Boundary SSH (nt, n_bnd) in m from SSH_1(_adt).nc, gen_3Dth rules; None to fall back."""
@@ -1993,15 +2036,11 @@ class RTOFSProcessor(ForcingProcessor):
                 ssh = np.ma.filled(ds.variables["ssh"][:], -30000.0).astype(np.float64)
                 lon, lat = ds.variables["xlon"][:], ds.variables["ylat"][:]
             if ssh.shape[0] != n_files:
-                log.warning(f"{Path(ssh_path).name} has {ssh.shape[0]} steps for {n_files} 2D "
-                            f"files — not using the ops-equivalent elev2D")
-                return None
-            axes = rect_axes(lon, lat)
-            if axes is None:
-                log.warning("SSH_1 grid is not rectilinear — not using the ops-equivalent elev2D")
+                self._ops_note(f"{Path(ssh_path).name} has {ssh.shape[0]} steps for {n_files} 2D "
+                               f"files — elev2D not from the ops-equivalent path")
                 return None
             ssh = np.where(np.isfinite(ssh), ssh, -30000.0)
-            ix, iy, w, inside = self._ops_weights(*axes)
+            ix, iy, w, inside = self._ops_weights(lon, lat)
             wet = ssh[0] >= DRY_SSH
             cj, ci = corner_cells(ix, iy)
             cj, ci, n_dry = dry_parents(wet, cj, ci)
@@ -2012,15 +2051,15 @@ class RTOFSProcessor(ForcingProcessor):
                 n_fix += n
                 out[t] = (w * s_t[cj, ci].T).sum(axis=1)
         except Exception as e:
-            log.warning(f"Ops-equivalent elev2D unavailable ({e}) — using the generic interpolation")
+            self._ops_note(f"ops-equivalent elev2D unavailable ({e})")
             return None
         log.info(f"elev2D: {self._ops_label()} (gen_3Dth-equivalent), {len(ix)} nodes, "
                  f"{int((~inside).sum())} outside grid, {n_dry + n_fix} filled")
         return out
 
     def _ops_node_z(self, nvrt) -> Optional[np.ndarray]:
-        """SCHISM z (n_bnd, nvrt), bottom first, max(0.11, depth)*sigma, held at the node bottom below kbp."""
-        hh = np.maximum(np.abs(np.asarray(self._bnd_depths, np.float64)), 0.11)
+        """SCHISM z (n_bnd, nvrt), bottom first, max(0.11, dp)*sigma, held at the node bottom below kbp."""
+        hh = np.maximum(0.11, np.asarray(self._bnd_depths, np.float64))
         v = self._vgrid
         if v is None:
             return None
@@ -2034,11 +2073,40 @@ class RTOFSProcessor(ForcingProcessor):
             z[n] = np.concatenate([np.full(nvrt - len(col), col[0]), col])
         return z
 
+    @staticmethod
+    def _grid2d(lon, lat):
+        lon = np.ma.filled(lon, np.nan).astype(np.float64)
+        lat = np.ma.filled(lat, np.nan).astype(np.float64)
+        return np.meshgrid(lon, lat) if lon.ndim == 1 else (lon, lat)
+
+    def _ssh_dry_mask(self, ssh_path, lon_t, lat_t):
+        """Wet mask from SSH_1 record 0 on the TSUV grid, or None (with a note) if the grids differ."""
+        try:
+            with Dataset(str(ssh_path)) as sd:
+                s0 = np.ma.filled(sd.variables["ssh"][0], -30000.0).astype(np.float64)
+                lon_s, lat_s = self._grid2d(sd.variables["xlon"][:], sd.variables["ylat"][:])
+        except Exception as e:
+            self._ops_note(f"T/S dry mask fell back to surface T: SSH_1 unreadable ({e})")
+            return None
+        lon_t, lat_t = self._grid2d(lon_t, lat_t)
+        if s0.shape != lon_t.shape:
+            self._ops_note(f"T/S dry mask fell back to surface T: SSH_1 grid {s0.shape} != "
+                           f"TSUV_1 grid {lon_t.shape}")
+            return None
+        dlon = np.abs((lon_s - lon_t + 180.0) % 360.0 - 180.0).max()
+        dlat = np.abs(lat_s - lat_t).max()
+        if dlon > 1e-3 or dlat > 1e-3:
+            self._ops_note(f"T/S dry mask fell back to surface T: SSH_1 and TSUV_1 coordinates "
+                           f"differ (max {dlon:.4f} deg lon, {dlat:.4f} deg lat)")
+            return None
+        return np.where(np.isfinite(s0), s0, -30000.0) >= DRY_SSH
+
     def _ops_ts_profiles(self, tsuv_path, n_files, ssh_path=None):
         """(all_temp, all_salt) lists of (n_bnd, nvrt) per record from TSUV_1.nc, gen_3Dth rules; None to fall back."""
         nvrt = self._vgrid.nvrt if self._vgrid else None
         z = self._ops_node_z(nvrt) if nvrt else None
         if z is None:
+            self._ops_note("no vgrid for the ops-equivalent T/S")
             return None
         try:
             with Dataset(str(tsuv_path)) as ds:
@@ -2047,29 +2115,27 @@ class RTOFSProcessor(ForcingProcessor):
                     ds.variables[nme].set_auto_maskandscale(False)
                 nt = ds.dimensions["time"].size
                 if nt != n_files:
-                    log.warning(f"{Path(tsuv_path).name} has {nt} steps for {n_files} 3D files "
-                                f"— not using the ops-equivalent T/S")
+                    self._ops_note(f"{Path(tsuv_path).name} has {nt} steps for {n_files} 3D files "
+                                   f"— T/S not from the ops-equivalent path")
                     return None
-                axes = rect_axes(ds.variables["xlon"][:], ds.variables["ylat"][:])
+                lon_t, lat_t = ds.variables["xlon"][:], ds.variables["ylat"][:]
                 depth = np.asarray(ds.variables["depth"][:], np.float64)
-                if axes is None or not np.all(np.diff(depth) > 0):
-                    log.warning("TSUV_1 grid/depth not usable — not using the ops-equivalent T/S")
+                if not np.all(np.diff(depth) > 0):
+                    self._ops_note("TSUV_1 depth is not increasing — T/S not from the ops-equivalent path")
                     return None
                 zm = -depth[::-1]
-                ix, iy, w, inside = self._ops_weights(*axes)
+                ix, iy, w, inside = self._ops_weights(lon_t, lat_t)
                 n = len(ix)
                 cj, ci = corner_cells(ix, iy)
                 raw0 = np.ma.filled(ds.variables["temperature"][0, 0], -30000.0)
                 wet = np.asarray(raw0, np.float64) * 1e-3 + 20.0 > RJUNK + JUNK_EPS
                 # ops decides dry from SSH_1 on the first record (f90:488); surface T is the fallback. MJ (10/02/26)
                 if ssh_path:
-                    try:
-                        with Dataset(str(ssh_path)) as sd:
-                            s0 = np.ma.filled(sd.variables["ssh"][0], -30000.0).astype(np.float64)
-                        if s0.shape == wet.shape:
-                            wet = np.where(np.isfinite(s0), s0, -30000.0) >= DRY_SSH
-                    except Exception as e:
-                        log.warning(f"SSH_1 dry mask unavailable ({e}) — using surface T")
+                    m = self._ssh_dry_mask(ssh_path, lon_t, lat_t)
+                    if m is not None and m.shape == wet.shape:
+                        wet = m
+                else:
+                    self._ops_note("T/S dry mask from surface T: no SSH_1 in this run")
                 ll_dry = ~wet[cj[0], ci[0]]
                 pj, pi, n_dry = dry_parents(wet, cj, ci)
                 cells, inv = np.unique(pj * wet.shape[1] + pi, return_inverse=True)
@@ -2106,7 +2172,7 @@ class RTOFSProcessor(ForcingProcessor):
                     all_temp.append(row[0])
                     all_salt.append(row[1])
         except Exception as e:
-            log.warning(f"Ops-equivalent T/S unavailable ({e}) — using the generic interpolation")
+            self._ops_note(f"ops-equivalent T/S unavailable ({e})")
             return None
         log.info(f"T/S: {self._ops_label()} (gen_3Dth-equivalent), {n} nodes, "
                  f"{int((~inside).sum())} outside grid, {n_dry + n_mid} filled")
@@ -2200,6 +2266,8 @@ class RTOFSProcessor(ForcingProcessor):
                       if self.is_stofs_mode and self._tsuv1_path else None)
             if ops_ts is not None:
                 all_temp, all_salt = ops_ts
+            self._ts_interp = "ops" if ops_ts is not None else (
+                "raw" if (weights_3d or ssh_weights) else "delaunay")
             for f in (files_3d if ops_ts is None else []):
                 ds = Dataset(str(f))
 

@@ -89,6 +89,20 @@ class TestWeights:
         assert inside[0] and ix[0] == 0 and iy[0] == 0
         np.testing.assert_allclose(w[0], [0.005, 0.505, 0.49, 0.0], atol=1e-9)
 
+    def test_mode1_y_edge_band_hand_values(self):
+        # y=2.01 is just above cell 0 (y 0..2): accepted by the 1% test, triangle (1,3,4)
+        ix, iy, w, inside = oi.parent_weights(XAX, YAX, [0.5], [2.01], mode=1)
+        assert inside[0] and ix[0] == 0 and iy[0] == 0
+        np.testing.assert_allclose(w[0], [0.005, 0.0, 0.5, 0.495], atol=1e-9)
+
+    def test_mode1_diagonal_band_hand_values(self):
+        # yr-xr = 0.01 < 0.025 stays on triangle (1,2,3) with clamped weights ...
+        _, _, w, _ = oi.parent_weights(XAX, YAX, [0.5], [1.02], mode=1)
+        np.testing.assert_allclose(w[0], [0.5, 0.01, 0.49, 0.0], atol=1e-9)
+        # ... and 0.03 is past the 5% test, so triangle (1,3,4)
+        _, _, w2, _ = oi.parent_weights(XAX, YAX, [0.5], [1.06], mode=1)
+        np.testing.assert_allclose(w2[0], [0.47, 0.0, 0.5, 0.03], atol=1e-9)
+
     def test_mode1_beyond_tolerance_is_outside(self):
         _, _, w, inside = oi.parent_weights(XAX, YAX, [2.05], [1.0], mode=1)
         assert not inside[0] and (w == 0).all()
@@ -99,6 +113,80 @@ class TestWeights:
         np.testing.assert_array_equal(ax[0], XAX)
         np.testing.assert_array_equal(ax[1], YAX)
         assert oi.rect_axes(LO + 0.1 * LA, LA) is None
+
+
+def _ref_mode1(lon, lat, xl, yl, small1=1e-2):
+    """Full-scan loop copy of f90:709-760 (ix outer, iy inner), one point at a time."""
+    def sg(x1, x2, x3, y1, y2, y3):
+        return abs(((x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)) / 2)
+
+    ny, nx = lon.shape
+    res = []
+    for x, y in zip(xl, yl):
+        hit = None
+        for ix in range(nx - 1):
+            for iy in range(ny - 1):
+                x1, x2, x3, x4 = lon[iy, ix], lon[iy, ix + 1], lon[iy + 1, ix + 1], lon[iy + 1, ix]
+                y1, y2, y3, y4 = lat[iy, ix], lat[iy, ix + 1], lat[iy + 1, ix + 1], lat[iy + 1, ix]
+                a1, a2, a3, a4 = sg(x, x1, x2, y, y1, y2), sg(x, x2, x3, y, y2, y3), \
+                    sg(x, x3, x4, y, y3, y4), sg(x, x4, x1, y, y4, y1)
+                b1, b2 = sg(x1, x2, x3, y1, y2, y3), sg(x1, x3, x4, y1, y3, y4)
+                if abs(a1 + a2 + a3 + a4 - b1 - b2) / (b1 + b2) < small1:
+                    hit = (ix, iy, x1, x2, x3, x4, y1, y2, y3, y4, a1, a2, a3, a4)
+                    break
+            if hit:
+                break
+        if not hit:
+            res.append((0, 0, np.zeros(4), False))
+            continue
+        ix, iy, x1, x2, x3, x4, y1, y2, y3, y4, a1, a2, a3, a4 = hit
+        ap = sg(x, x1, x3, y, y1, y3)
+        c = lambda v: max(0.0, min(1.0, v))  # noqa: E731
+        bb = sg(x1, x2, x3, y1, y2, y3)
+        if abs(a1 + a2 + ap - bb) / bb < small1 * 5:
+            w0, w1 = c(a2 / bb), c(ap / bb)
+            wt = np.array([w0, w1, c(1 - w0 - w1), 0.0])
+        else:
+            bb = sg(x1, x3, x4, y1, y3, y4)
+            w0, w2 = c(a3 / bb), c(a4 / bb)
+            wt = np.array([w0, 0.0, w2, c(1 - w0 - w2)])
+        res.append((ix, iy, wt, True))
+    return res
+
+
+def _curvi(ny=14, nx=11):
+    j, i = np.mgrid[0:ny, 0:nx]
+    return -60.0 + 0.1 * i + 0.04 * j + 0.002 * i * j, 30.0 + 0.1 * j + 0.03 * i - 0.001 * i * i
+
+
+class TestCurvilinear:
+    def test_matches_full_scan_reference_node_by_node(self):
+        lon, lat = _curvi()
+        rng = np.random.default_rng(3)
+        j = rng.integers(0, lon.shape[0] - 1, 300)
+        i = rng.integers(0, lon.shape[1] - 1, 300)
+        u = rng.uniform(-0.04, 1.04, (2, 300))
+        px = (lon[j, i] * (1 - u[0]) * (1 - u[1]) + lon[j, i + 1] * u[0] * (1 - u[1])
+              + lon[j + 1, i + 1] * u[0] * u[1] + lon[j + 1, i] * (1 - u[0]) * u[1])
+        py = (lat[j, i] * (1 - u[0]) * (1 - u[1]) + lat[j, i + 1] * u[0] * (1 - u[1])
+              + lat[j + 1, i + 1] * u[0] * u[1] + lat[j + 1, i] * (1 - u[0]) * u[1])
+        px = np.concatenate([px, rng.uniform(-62, -57, 40)])
+        py = np.concatenate([py, rng.uniform(28, 33, 40)])
+        ix, iy, w, found = oi.parent_weights_2d(lon, lat, px, py)
+        ref = _ref_mode1(lon, lat, px, py)
+        assert found.sum() > 250 and (~found).sum() > 0  # includes outside-grid points
+        for k, (rx, ry, rw, rf) in enumerate(ref):
+            assert found[k] == rf
+            if rf:
+                assert (ix[k], iy[k]) == (rx, ry)
+                np.testing.assert_allclose(w[k], rw, atol=1e-12)
+            else:
+                assert (w[k] == 0).all()
+
+    def test_rejects_non_monotonic_grid(self):
+        lon, lat = _curvi()
+        with pytest.raises(ValueError):
+            oi.parent_weights_2d(lon[:, ::-1], lat, [-59.0], [30.5])
 
 
 class TestSshFill:
@@ -374,7 +462,8 @@ class TestWiring:
 
     def test_hold_first_record_ignored_in_secofs(self, tmp_path):
         cfg = ForcingConfig.for_secofs(pdy="20260401", cyc=12)
-        assert cfg.obc_ssh_hold_first_record is True
+        assert cfg.obc_ssh_hold_first_record is False
+        cfg.obc_ssh_hold_first_record = True
         out = tmp_path / "out"
         out.mkdir()
         proc = RTOFSProcessor(cfg, tmp_path, out)
@@ -406,7 +495,13 @@ def test_defaults_keep_fortran_off_and_ops_constants():
     cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
     assert cfg.obc_use_fortran_gen3dth is False
     assert (cfg.obc_tem_outside, cfg.obc_sal_outside, cfg.obc_interp_mode) == (20.0, 33.0, 1)
-    assert cfg.obc_ssh_hold_first_record is True
+    assert cfg.obc_ssh_hold_first_record is True  # ATL preset
+    assert ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260401", cyc=12).obc_ssh_hold_first_record is True
+    pac = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
+    assert pac.obc_ssh_hold_first_record is False
+    generic = ForcingConfig(lon_min=-98.5, lon_max=-52.5, lat_min=7.3, lat_max=52.6,
+                            pdy="20260401", cyc=12, obc_roi_2d={"x1": 0, "x2": 1, "y1": 0, "y2": 1})
+    assert generic.obc_ssh_hold_first_record is False
 
 
 def test_160k_nodes_interpolate_in_seconds(tmp_path):
@@ -421,3 +516,26 @@ def test_160k_nodes_interpolate_in_seconds(tmp_path):
     out = p._ops_ssh_boundary(path, 4)
     assert out.shape == (4, n)
     assert time.perf_counter() - t0 < 5.0
+
+
+def _yaml_cfg(tmp_path, name, obc_extra=""):
+    pytest.importorskip("yaml")
+    y = tmp_path / f"{name}.yaml"
+    y.write_text(
+        f"system:\n  name: {name}\ngrid:\n  domain: {{lon_min: -98.5, lon_max: -52.5, lat_min: 7.3, lat_max: 52.6}}\n"
+        "forcing:\n  ocean:\n    obc:\n      roi_2ds: {x1: 0, x2: 1, y1: 0, y2: 1}\n" + obc_extra)
+    return ForcingConfig.from_yaml(y, pdy="20260401", cyc=12)
+
+
+def test_yaml_hold_default_by_system_and_override(tmp_path):
+    assert _yaml_cfg(tmp_path, "stofs_3d_atl_ufs").obc_ssh_hold_first_record is True
+    assert _yaml_cfg(tmp_path, "stofs_3d_pac_ufs").obc_ssh_hold_first_record is False
+    off = _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", "      ssh_hold_first_record: false\n")
+    assert off.obc_ssh_hold_first_record is False
+
+
+def test_yaml_interp_mode_null_defaults_and_invalid_rejected(tmp_path):
+    assert _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", "      interp_mode: null\n").obc_interp_mode == 1
+    assert _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", "      interp_mode: 0\n").obc_interp_mode == 0
+    with pytest.raises(ValueError):
+        _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", "      interp_mode: 2\n")

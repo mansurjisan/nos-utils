@@ -192,6 +192,9 @@ def fix_ssh(s, wet):
 def fill_columns(T, S, U, V):
     """Bottom-first (n, nz) columns: bottom extension and junk-in-middle fill (f90:493-558); returns T, S, klev0, n_mid."""
     nz = T.shape[1]
+    # Deliberate deviation: in float32 the -30000 fill unpacks to exactly RJUNK, so the f90's
+    # `< rjunk` mid-column test never fires and ops would abort at its sanity stop; here such
+    # levels are filled with the bottom value instead. MJ (10/02/26)
     thr = RJUNK + JUNK_EPS
     valid = [a > thr for a in (T, S, U, V)]
     first = np.stack([np.where(v.any(1), v.argmax(1), -1) for v in valid])

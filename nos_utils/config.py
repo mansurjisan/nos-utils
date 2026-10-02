@@ -173,8 +173,9 @@ class ForcingConfig:
     # gen_3Dth interp_mode: 0 = bilinear, 1 = diagonal-split triangles (what ops runs,
     # since SSH_1 xlon is 2-D: f90:349). MJ (10/02/26)
     obc_interp_mode: int = 1
-    # Ops holds elev2D at its first record (non_adjust.sh, after the +0.04); STOFS mode only. MJ (10/02/26)
-    obc_ssh_hold_first_record: bool = True
+    # Ops STOFS-3D-ATL holds elev2D at its first record (non_adjust.sh, after the +0.04); PAC keeps it
+    # time-varying, so only the ATL presets/yaml turn this on. STOFS mode only. MJ (10/02/26)
+    obc_ssh_hold_first_record: bool = False
     # T,S for boundary nodes outside the RTOFS grid (stofs_3d_atl_obc_3dth_nc.in). MJ (10/01/26)
     obc_tem_outside: float = 20.0
     obc_sal_outside: float = 33.0
@@ -493,6 +494,7 @@ class ForcingConfig:
             # carry only the 778 elevation nodes SCHISM expects.
             obc_elev_segments=[0, 1],
             adt_enabled=True,
+            obc_ssh_hold_first_record=True,
             # Nudging
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
@@ -544,6 +546,7 @@ class ForcingConfig:
             # carry only the 778 elevation nodes SCHISM expects.
             obc_elev_segments=[0, 1],
             adt_enabled=True,
+            obc_ssh_hold_first_record=True,
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
             nwm_product="medium_range_mem1",
@@ -768,6 +771,14 @@ class ForcingConfig:
         # these segments (excludes flow-only iettype-0 segments). See the
         # ``obc_elev_segments`` field docstring on ForcingConfig.
         obc_elev_segments = obc.get("elev_segments") if isinstance(obc, dict) else None
+        _interp_mode = obc.get("interp_mode") if isinstance(obc, dict) else None
+        _interp_mode = 1 if _interp_mode is None else int(_interp_mode)
+        if _interp_mode not in (0, 1):
+            raise ValueError(f"obc.interp_mode must be 0 or 1, got {_interp_mode!r}")
+        # Only the ATL ops chain holds elev2D at its first record. MJ (10/02/26)
+        _hold = obc.get("ssh_hold_first_record") if isinstance(obc, dict) else None
+        _sys = data.get("system", {}) if isinstance(data.get("system"), dict) else {}
+        _hold = str(_sys.get("name", "")).startswith("stofs_3d_atl") if _hold is None else bool(_hold)
         if obc_elev_segments is not None:
             obc_elev_segments = [int(i) for i in obc_elev_segments]
 
@@ -821,8 +832,8 @@ class ForcingConfig:
             obc_ssh_offset=obc_ssh_offset,
             obc_elev_segments=obc_elev_segments,
             obc_use_fortran_gen3dth=bool(obc.get("use_fortran_gen3dth", False)) if isinstance(obc, dict) else False,
-            obc_interp_mode=int(obc.get("interp_mode", 1)) if isinstance(obc, dict) else 1,
-            obc_ssh_hold_first_record=bool(obc.get("ssh_hold_first_record", True)) if isinstance(obc, dict) else True,
+            obc_interp_mode=_interp_mode,
+            obc_ssh_hold_first_record=_hold,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
             nwm_product=nwm_product,
         )
