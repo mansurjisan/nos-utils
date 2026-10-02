@@ -238,6 +238,35 @@ def fill_columns(T, S, U, V):
     return out[0], out[1], klev0, n_mid
 
 
+def fill_uv(U, V, klev0):
+    """Bottom-first u, v columns as the f90 (f90:525-532, 554-557): junk from klev0 up -> 0, below klev0 copy klev0."""
+    k = np.arange(U.shape[1])[None, :]
+    row = np.arange(U.shape[0])
+    thr = RJUNK + JUNK_EPS
+    out = []
+    for a in (U, V):
+        a = np.where((k >= klev0[:, None]) & ~(a > thr), 0.0, a)
+        out.append(np.where(k < klev0[:, None], a[row, klev0][:, None], a))
+    return out
+
+
+def resample_records(a, times, dt, n):
+    """a[nt, ...] at `times` (s) -> n records at 0, dt, 2dt, ... linear in time, end records held.
+
+    Records that fall on a source time are exact copies.
+    """
+    times = np.asarray(times, np.float64)
+    order = np.argsort(times)
+    times, a = times[order], np.asarray(a)[order]
+    if len(times) == 1:
+        return np.repeat(a[:1], n, axis=0)
+    tgt = np.arange(n) * float(dt)
+    i = np.clip(np.searchsorted(times, tgt, side="right") - 1, 0, len(times) - 2)
+    f = np.clip((tgt - times[i]) / (times[i + 1] - times[i]), 0.0, 1.0)
+    f = f.reshape((-1,) + (1,) * (a.ndim - 1))
+    return (a[i].astype(np.float64) * (1.0 - f) + a[i + 1].astype(np.float64) * f).astype(a.dtype)
+
+
 def vertical_index(z, zm, kbp0, dry):
     """Lower level and ratio per node/level from the lower-left corner only (f90:932-964)."""
     nz = zm.size

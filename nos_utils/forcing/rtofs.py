@@ -49,8 +49,8 @@ from ..coords import normalize_lon, lon_convention
 from ..io.schism_grid import SchismGrid
 from .base import ForcingProcessor, ForcingResult
 from .obc_ops_interp import (
-    DRY_SSH, JUNK_EPS, RJUNK, corner_cells, dry_parents, fill_columns, fix_ssh,
-    interpolate4, parent_weights, parent_weights_2d, rect_axes, vertical_index,
+    DRY_SSH, JUNK_EPS, RJUNK, corner_cells, dry_parents, fill_columns, fill_uv, fix_ssh,
+    interpolate4, parent_weights, parent_weights_2d, rect_axes, resample_records, vertical_index,
 )
 
 log = logging.getLogger(__name__)
@@ -173,7 +173,7 @@ class RTOFSProcessor(ForcingProcessor):
                 config, "obc_buffer_hours", self.DEFAULT_BUFFER_HOURS,
             )
         self.buffer_hours = int(buffer_hours)
-        self._valid_times = {}  # path -> valid time, set by the ops file selection
+        self._valid_times = {}  # path -> valid time from the ops file selection. MJ (10/02/26)
         self._select_notes = []
         self._grid = None
         self._bnd_lons = None
@@ -833,6 +833,7 @@ class RTOFSProcessor(ForcingProcessor):
                     "ts_interp": "fortran" if fortran_ok else self._ts_interp,
                     "n_2d_files": len(files_2d),
                     "n_3d_files": len(files_3d),
+                    "n_source_records": {"2d": len(files_2d), "3d": len(files_3d)},
                     "stofs_mode": True,
                     "fortran_used": fortran_ok,
                     "adt_blended": adt_blended,
@@ -1962,7 +1963,6 @@ class RTOFSProcessor(ForcingProcessor):
           * ``wl_bias_obs_dir`` (path) — station files for the ``"file"``
             provider.
         """
-        output_file = self.output_path / "elev2D.th.nc"
         n_bnd = len(self._bnd_lons)
         model_dt = float(getattr(self.config, "model_dt", 120.0))  # SCHISM model timestep (seconds)
 
@@ -1974,13 +1974,16 @@ class RTOFSProcessor(ForcingProcessor):
         # Ops-equivalent horizontal step on the SSH_1 grid (blended when given). MJ (10/01/26)
         src = ssh_source or (self._ssh1_path if self.is_stofs_mode else None)
         hold = self.is_stofs_mode and self.config.obc_ssh_hold_first_record
-        ops_ssh = self._ops_ssh_boundary(src, len(files_2d)) if src else None
+        first_only = {"first_only": True} if (self._ops_timeline and hold) else {}
+        ops_ssh = self._ops_ssh_boundary(src, len(files_2d), **first_only) if src else None
         blended = None
         if ops_ssh is None and ssh_source:
             blended = self._load_blended_ssh(ssh_source, files_2d)
         self._ssh_blended_used = bool(ssh_source) and (ops_ssh is not None or blended is not None)
         self._elev2d_interp = "ops" if ops_ssh is not None else (
             "delaunay" if blended is not None else ("precomputed" if ssh_weights else "raw"))
+        if ops_ssh is not None and self._ops_timeline:
+            return self._write_elev2d_ops(files_2d, ops_ssh, hold)
         if ops_ssh is None:
             if blended is not None:
                 log.info("elev2D: SSH taken from the ADT-blended SSH_1 file")
@@ -2144,51 +2147,75 @@ class RTOFSProcessor(ForcingProcessor):
                 ssh_array, time_axis, model_t0,
             )
 
-            # Write SCHISM format. NETCDF4_CLASSIC (not NETCDF4): SCHISM's
-            # NUOPC cap opens these via collective parallel-NetCDF at 2794-rank
-            # scale; HDF5-flavored files segfault during MPI-IO collective open
-            # *before* partition_hgrid runs. Production v3.9 writes classic.
-            nc = Dataset(str(output_file), "w", format="NETCDF4_CLASSIC")
-
-            # Dimension declaration order matches v3.9 production header layout
-            # (nComponents *before* nOpenBndNodes). Parallel pnetcdf readers can
-            # consult dim records by header offset, so the order matters even
-            # though variables reference dims by name.
-            nc.createDimension("time", nt)
-            nc.createDimension("nComponents", 1)
-            nc.createDimension("nOpenBndNodes", n_bnd)
-            nc.createDimension("nLevels", 1)
-            nc.createDimension("one", 1)
-
-            # Production elev2D uses time as f4 (not f8). Match for byte-format
-            # parity with v3.9 production output.
-            time_var = nc.createVariable("time", "f4", ("time",))
-            time_var[:] = time_axis
-
-            # SCHISM-required scalar for `nc dt1` consistency check.
-            # Without this variable, model init aborts with `MISC: nc dt1`.
-            ts_step = nc.createVariable("time_step", "f4", ("one",))
-            ts_step[0] = float(dt_out)
-
-            # Production omits _FillValue on time_series (no fill cells exist
-            # because all RTOFS-interpolated boundary points are valid). Match
-            # production by not setting fill_value here.
-            # Last dim is `one` (not `nComponents`) for elev2D — matches
-            # production. Both dims are size 1 so shape is unchanged but the
-            # binding name affects file layout.
-            ts = nc.createVariable("time_series", "f4",
-                                   ("time", "nOpenBndNodes", "nLevels", "one"))
-            ts[:, :, 0, 0] = ssh_array
-
-            nc.close()
-            log.info(f"Created elev2D.th.nc: ({nt}, {n_bnd}) boundary nodes, "
-                     f"time_step={dt_out}s")
-            return output_file
+            return self._write_elev2d(ssh_array, time_axis, dt_out)
 
         except Exception as e:
             log.error(f"Failed to process RTOFS 2D: {e}")
             import traceback
             log.error(traceback.format_exc())
+            return None
+
+    def _write_elev2d(self, ssh_array: np.ndarray, time_axis: np.ndarray, dt_out: float) -> Path:
+        """Write elev2D.th.nc (SCHISM time_series layout) for ssh_array (nt, n_bnd) at time_axis (s)."""
+        output_file = self.output_path / "elev2D.th.nc"
+        nt, n_bnd = ssh_array.shape
+        # Write SCHISM format. NETCDF4_CLASSIC (not NETCDF4): SCHISM's
+        # NUOPC cap opens these via collective parallel-NetCDF at 2794-rank
+        # scale; HDF5-flavored files segfault during MPI-IO collective open
+        # *before* partition_hgrid runs. Production v3.9 writes classic.
+        nc = Dataset(str(output_file), "w", format="NETCDF4_CLASSIC")
+
+        # Dimension declaration order matches v3.9 production header layout
+        # (nComponents *before* nOpenBndNodes). Parallel pnetcdf readers can
+        # consult dim records by header offset, so the order matters even
+        # though variables reference dims by name.
+        nc.createDimension("time", nt)
+        nc.createDimension("nComponents", 1)
+        nc.createDimension("nOpenBndNodes", n_bnd)
+        nc.createDimension("nLevels", 1)
+        nc.createDimension("one", 1)
+
+        # Production elev2D uses time as f4 (not f8). Match for byte-format
+        # parity with v3.9 production output.
+        time_var = nc.createVariable("time", "f4", ("time",))
+        time_var[:] = time_axis
+
+        # SCHISM-required scalar for `nc dt1` consistency check.
+        # Without this variable, model init aborts with `MISC: nc dt1`.
+        ts_step = nc.createVariable("time_step", "f4", ("one",))
+        ts_step[0] = float(dt_out)
+
+        # Production omits _FillValue on time_series (no fill cells exist
+        # because all RTOFS-interpolated boundary points are valid). Match
+        # production by not setting fill_value here.
+        # Last dim is `one` (not `nComponents`) for elev2D — matches
+        # production. Both dims are size 1 so shape is unchanged but the
+        # binding name affects file layout.
+        ts = nc.createVariable("time_series", "f4",
+                               ("time", "nOpenBndNodes", "nLevels", "one"))
+        ts[:, :, 0, 0] = ssh_array
+
+        nc.close()
+        log.info(f"Created elev2D.th.nc: ({nt}, {n_bnd}) boundary nodes, "
+                 f"time_step={dt_out}s")
+        return output_file
+
+    def _write_elev2d_ops(self, files_2d: List[Path], ops_ssh: np.ndarray, hold: bool) -> Optional[Path]:
+        """Ops elev2D: 6-hourly records for this phase, constant when held (record 0 + 0.04, non_adjust.sh:609-611)."""
+        try:
+            off = np.float32(self.config.obc_ssh_offset)
+            model_t0, _, dur = self._get_output_window(self.phase)
+            n = int(np.ceil(dur / OPS_OBC_DT)) + 1
+            if hold:
+                rows = np.repeat(ops_ssh[:1] + off, n, axis=0)
+            else:
+                times = [(self.valid_time(f) - model_t0).total_seconds() for f in files_2d]
+                rows = resample_records(ops_ssh + off, times, OPS_OBC_DT, n)
+            time_axis = np.arange(n, dtype=np.float64) * OPS_OBC_DT
+            rows, self._wl_bias_info = self._apply_wl_bias(rows, time_axis, model_t0)
+            return self._write_elev2d(rows, time_axis, OPS_OBC_DT)
+        except Exception as e:
+            log.error(f"Failed to write ops elev2D: {e}")
             return None
 
     def _ops_note(self, msg, kind=None):
@@ -2316,8 +2343,12 @@ class RTOFSProcessor(ForcingProcessor):
             return None
         return np.where(np.isfinite(s0), s0, -30000.0) >= DRY_SSH
 
-    def _ops_ts_profiles(self, tsuv_path, n_files, ssh_path=None):
-        """(all_temp, all_salt) lists of (n_bnd, nvrt) per record from TSUV_1.nc, gen_3Dth rules; None to fall back."""
+    def _ops_ts_profiles(self, tsuv_path, n_files, ssh_path=None, uv=False):
+        """(all_temp, all_salt) lists of (n_bnd, nvrt) per record from TSUV_1.nc, gen_3Dth rules; None to fall back.
+
+        uv=True returns (all_temp, all_salt, all_u, all_v); u, v use the same parents, vertical
+        rules and weights with no clamp and 0 outside the grid (f90:975-987).
+        """
         nvrt = self._vgrid.nvrt if self._vgrid else None
         z = self._ops_node_z(nvrt) if nvrt else None
         if z is None:
@@ -2366,30 +2397,40 @@ class RTOFSProcessor(ForcingProcessor):
                     for nme, off in zip(names, (20.0, 20.0, 0.0, 0.0)):
                         a = np.asarray(ds.variables[nme][t][:, gj, gi], np.float64)
                         cols.append((a * 1e-3 + off)[::-1].T)
-                    return fill_columns(*cols)
+                    T, S, k0, nm = fill_columns(*cols)
+                    U, V = fill_uv(cols[2], cols[3], k0) if uv else (None, None)
+                    return T, S, U, V, k0, nm
 
-                T0, S0, kbp0, n_mid = read(0)
+                T0, S0, U0, V0, kbp0, n_mid = read(0)
                 lev, vrat = vertical_index(z, zm, kbp0[pos[0]], ll_dry)
-                all_temp, all_salt = [], []
+                all_temp, all_salt, all_u, all_v = [], [], [], []
                 for t in range(nt):
                     if t == 0:
-                        T, S = T0, S0
+                        T, S, U, V = T0, S0, U0, V0
                     else:
-                        T, S, _, nm = read(t)
+                        T, S, U, V, _, nm = read(t)
                         n_mid += nm
                     row = []
-                    for F, lo, hi, fill in ((T, 0.0, None, self.config.obc_tem_outside),
-                                            (S, None, 40.0, self.config.obc_sal_outside)):
+                    # T floored at 0 and S capped at 40 as the ops (f90:1015-1016); u, v unclamped. MJ (10/02/26)
+                    fields = [(T, 0.0, None, self.config.obc_tem_outside),
+                              (S, None, 40.0, self.config.obc_sal_outside)]
+                    if uv:
+                        fields += [(U, None, None, 0.0), (V, None, None, 0.0)]
+                    for F, lo, hi, fill in fields:
                         prof = np.zeros((n, nvrt))
                         for c in range(4):
                             col = F[pos[c][:, None], lev]
                             col1 = F[pos[c][:, None], lev + 1]
                             prof += w[:, c, None] * (col * (1 - vrat) + col1 * vrat)
-                        prof = np.clip(prof, lo, hi)
+                        if lo is not None or hi is not None:
+                            prof = np.clip(prof, lo, hi)
                         prof[~inside] = fill
                         row.append(prof.astype(np.float32))
                     all_temp.append(row[0])
                     all_salt.append(row[1])
+                    if uv:
+                        all_u.append(row[2])
+                        all_v.append(row[3])
         except Exception as e:
             self._ops_note(f"ops-equivalent T/S unavailable ({e})", "T/S")
             return None
@@ -2400,7 +2441,7 @@ class RTOFSProcessor(ForcingProcessor):
                            f"{self.config.obc_sal_outside:g} psu, as ops)")
         log.info(f"T/S: {self._ops_label()} (gen_3Dth-equivalent), {n} nodes, "
                  f"{n_out} outside grid, {n_dry + n_mid} filled")
-        return all_temp, all_salt
+        return (all_temp, all_salt, all_u, all_v) if uv else (all_temp, all_salt)
 
     def _compute_3d_roi(self, ds) -> Optional[Tuple[int, int, int, int]]:
         """Compute ROI (Region of Interest) indices for 3D RTOFS file subsetting.
@@ -2486,8 +2527,12 @@ class RTOFSProcessor(ForcingProcessor):
             all_temp = []
             all_salt = []
             # Ops-equivalent T/S from TSUV_1.nc; the per-file loop below is the fallback. MJ (10/01/26)
-            ops_ts = (self._ops_ts_profiles(self._tsuv1_path, len(files_3d), self._ssh1_path)
+            ops_ts = (self._ops_ts_profiles(self._tsuv1_path, len(files_3d), self._ssh1_path,
+                                            uv=self._ops_timeline)
                       if self.is_stofs_mode and self._tsuv1_path else None)
+            if ops_ts is not None and self._ops_timeline:
+                self._ts_interp = "ops+surfT-mask" if self._ts_mask_fallback else "ops"
+                return self._write_3d_ops(files_3d, *ops_ts)
             if ops_ts is not None:
                 all_temp, all_salt = ops_ts
             self._ts_interp = (
@@ -2718,6 +2763,31 @@ class RTOFSProcessor(ForcingProcessor):
             log.error(traceback.format_exc())
 
         return output_files
+
+    def _write_3d_ops(self, files_3d, all_temp, all_salt, all_u, all_v) -> List[Path]:
+        """Ops TEM_3D, SAL_3D and uv3D: this phase's slice of the 6-hourly series, time 0 at the phase start."""
+        model_t0, _, dur = self._get_output_window(self.phase)
+        n = int(np.ceil(dur / OPS_OBC_DT)) + 1
+        times = [(self.valid_time(f) - model_t0).total_seconds() for f in files_3d]
+        if n > 1 and max(times) < (n - 1) * OPS_OBC_DT:
+            self._ops_note(f"T/S/uv: the RTOFS series ends {(n - 1) * OPS_OBC_DT / 3600 - max(times) / 3600:g} h "
+                           f"before the {n}-record phase window; the last record is held")
+        n_bnd = len(self._bnd_lons)
+        out = []
+        series = {}
+        for name, lst in (("t", all_temp), ("s", all_salt), ("u", all_u), ("v", all_v)):
+            series[name] = resample_records(np.stack(lst), times, OPS_OBC_DT, n)
+        for fname, key, var, units in (("TEM_3D.th.nc", "t", "temperature", "degC"),
+                                       ("SAL_3D.th.nc", "s", "salinity", "PSU")):
+            path = self.output_path / fname
+            self._write_3d_th(path, series[key], var, units, OPS_OBC_DT, n_bnd)
+            out.append(path)
+            log.info(f"Created {fname}: {series[key].shape} at dt={OPS_OBC_DT:g}s")
+        path = self.output_path / "uv3D.th.nc"
+        self._write_uv3d_th(path, series["u"], series["v"], OPS_OBC_DT, n_bnd)
+        out.append(path)
+        log.info(f"Created uv3D.th.nc: {series['u'].shape} at dt={OPS_OBC_DT:g}s from RTOFS u/v")
+        return out
 
     def _interpolate_vertical(
         self, bnd_profile: np.ndarray, rtofs_depths: np.ndarray,

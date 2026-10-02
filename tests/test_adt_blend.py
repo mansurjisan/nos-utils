@@ -21,6 +21,7 @@ HOURS = [0, 6, 12, 18, 24]
 def _cfg():
     cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
     cfg.obc_roi_2d = {"x1": 0, "x2": 29, "y1": 0, "y2": 29}
+    cfg.obc_ops_timeline = False  # these tests cover the model-dt time axis of the other STOFS systems
     return cfg
 
 

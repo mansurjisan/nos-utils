@@ -274,14 +274,16 @@ class PrepOrchestrator:
 
         # RTOFS OBC: heavy NetCDF I/O + Delaunay interpolation
         if "rtofs" in self.paths and (self.is_stofs or not self.skip_legacy):
-            results.append(self._run_rtofs(output_dir, phase, time_hotstart))
+            rtofs_result = self._run_rtofs(output_dir, phase, time_hotstart)
+            results.append(rtofs_result)
 
             # After RTOFS runs, QC the OBC file time dimensions. If any file
             # has fewer than obc_min_timesteps records, fall back to the
             # previous cycle's archive. This guards against partial RTOFS
             # coverage at cycle boundaries.
             if self.config.obc_min_timesteps > 0:
-                qc_result = self._qc_obc_dimensions(output_dir)
+                qc_result = self._qc_obc_dimensions(
+                    output_dir, (rtofs_result.metadata or {}).get("n_source_records"))
                 if qc_result is not None:
                     results.append(qc_result)
         elif self.skip_legacy:
@@ -607,8 +609,13 @@ class PrepOrchestrator:
         "uv3D.th.nc": "uv3dth",
     }
 
-    def _qc_obc_dimensions(self, output_dir: Path) -> Optional[ForcingResult]:
+    def _qc_obc_dimensions(self, output_dir: Path,
+                           source_counts: Optional[Dict[str, int]] = None) -> Optional[ForcingResult]:
         """Validate OBC time dims and fall back to COMOUT_PREV on short files.
+
+        With the ops timeline the phase files are slices of the 6-hourly series, so the
+        count checked is the number of RTOFS source records (source_counts "2d"/"3d"), the
+        quantity ops checks against N_dim_cr_max.
 
         Returns None (no QC event) when every file satisfies the minimum,
         otherwise a ForcingResult describing the fallback outcome.
@@ -643,6 +650,8 @@ class PrepOrchestrator:
                         n_t = int(ds.variables["time"].shape[0])
                     else:
                         continue
+                if source_counts and self.config.obc_ops_timeline:
+                    n_t = int(source_counts["2d" if name == "elev2D.th.nc" else "3d"])
                 file_dims[name] = n_t
                 if n_t < min_t:
                     short_files.append(name)

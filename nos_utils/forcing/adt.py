@@ -518,7 +518,7 @@ class ADTBlender:
             ssh_t0 = _raw(0)
             ssh_t0 = np.where(np.abs(ssh_t0) > 1000, f32(0), ssh_t0)
 
-            # float32 as ncap2: float(float(ssh_t - ssh_0) + ADT), surf_el = x * float(1000.)
+            # float32 as ncap2: float(float(ssh_t - ssh_0) + ADT), surf_el = x * float(1000.). MJ (10/02/26)
             surf_el = ds.variables.get("surf_el")
             if surf_el is not None:
                 surf_el.set_auto_maskandscale(False)

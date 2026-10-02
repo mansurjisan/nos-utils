@@ -507,6 +507,45 @@ def compute_bias(
 # NetCDF SSH adjustment
 # =============================================================================
 
+def densify_hourly(elev_nc: Path) -> bool:
+    """Resample a coarser-than-hourly elev2D to hourly, linear in time (ops `cdo inttime,1hour`).
+
+    Ops runs the ramp on the hourly file, so the 6-hourly non-adjusted series is densified
+    first. Files with hourly or finer records, or no time axis, are left alone. Returns True
+    if the file was rewritten.
+    """
+    from netCDF4 import Dataset
+
+    from .obc_ops_interp import resample_records
+
+    with Dataset(str(elev_nc)) as src:
+        if "time" not in src.variables or src.dimensions["time"].size < 2:
+            return False
+        t = np.asarray(src.variables["time"][:], dtype=np.float64)
+        if np.diff(t).min() <= 3600.0 + 1e-6:
+            return False
+        n = int(np.ceil((t[-1] - t[0]) / 3600.0 - 1e-9)) + 1
+        tmp = elev_nc.with_name(elev_nc.name + ".hourly")
+        with Dataset(str(tmp), "w", format=src.data_model) as dst:
+            for name, dim in src.dimensions.items():
+                dst.createDimension(name, n if name == "time" else dim.size)
+            for name, v in src.variables.items():
+                out = dst.createVariable(name, v.dtype, v.dimensions)
+                out.setncatts({k: v.getncattr(k) for k in v.ncattrs() if k != "_FillValue"})
+                a = np.ma.filled(v[:], np.nan) if v.dimensions[:1] == ("time",) else v[:]
+                if name == "time":
+                    out[:] = t[0] + np.arange(n) * 3600.0
+                elif v.dimensions[:1] == ("time",):
+                    out[:] = resample_records(a, t - t[0], 3600.0, n)
+                elif name == "time_step":
+                    out[:] = 3600.0
+                else:
+                    out[:] = a
+    tmp.replace(elev_nc)
+    log.info(f"Resampled {elev_nc.name} to hourly records ({n}), as ops inttime before the ramp")
+    return True
+
+
 def apply_ssh_time_varying_adjust(
     elev_nc: Path,
     adj0: float,
@@ -526,6 +565,12 @@ def apply_ssh_time_varying_adjust(
         raise RuntimeError("netCDF4 is required for SSH adjustment")
     if not elev_nc.exists():
         log.error(f"Cannot apply SSH adjust: {elev_nc} not found")
+        return False
+
+    try:
+        densify_hourly(elev_nc)
+    except Exception as exc:
+        log.error(f"Failed to resample {elev_nc} to hourly: {exc}")
         return False
 
     adj0_f = 0.0 if (adj0 is None or math.isnan(adj0)) else float(adj0)
