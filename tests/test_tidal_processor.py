@@ -203,3 +203,26 @@ class TestFortranTideFacTwoPhase:
         assert res.success
         assert res.metadata["mode"] == "fortran_tide_fac"
         assert (work / "bctides.in").read_text() == "ONLY\n"
+
+    def test_manifest_records_selected_template(self, mock_config, tmp_path, monkeypatch):
+        from nos_utils.forcing._log import (
+            drain_input_capture, reset_input_capture, start_input_capture,
+        )
+        self._stub_exe(tmp_path, monkeypatch)
+        fix = tmp_path / "fix"
+        fix.mkdir()
+        (fix / "sys.bctides.in_template").write_text("PRISTINE\n")
+        work = tmp_path / "work"
+        work.mkdir()
+        mock_config.bctides_template = Path("bctides.in_template")
+        monkeypatch.chdir(work)
+        self._run(mock_config, fix, work, "nowcast")
+        reset_input_capture()
+        start_input_capture()
+        try:
+            self._run(mock_config, fix, work, "forecast")
+            entries = {(e["category"], e["source"]): e for e in drain_input_capture()}
+        finally:
+            reset_input_capture()
+        assert entries[("tidal", "TIDAL")]["files"] == [
+            str((fix / "sys.bctides.in_template").resolve())]

@@ -92,19 +92,21 @@ class TidalProcessor(ForcingProcessor):
         log.info(f"Tidal processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z")
         self.create_output_dir()
 
-        from ._log import log_input_files
-        log_input_files(
-            self.SOURCE_NAME, self.find_input_files(),
-            source="TIDAL", category="tidal",
-            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d}",
-        )
-
         output_file = self.output_path / "bctides.in"
 
         # Find template (needed for both Fortran and template modes)
         template = self._select_template(output_file.parent)
         if template:
             log.info(f"bctides template: {template}")
+
+        # Record the template actually consumed, not a stale work copy. MJ (10/01/26)
+        from ._log import log_input_files
+        log_input_files(
+            self.SOURCE_NAME,
+            [Path(template).resolve()] if template else self.find_input_files(),
+            source="TIDAL", category="tidal",
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d}",
+        )
 
         # Mode 0: Fortran tide_fac executable (production, most accurate)
         if template and Path(template).exists():
