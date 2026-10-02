@@ -92,22 +92,21 @@ class TidalProcessor(ForcingProcessor):
         log.info(f"Tidal processor: pdy={self.config.pdy} cyc={self.config.cyc:02d}z")
         self.create_output_dir()
 
-        from ._log import log_input_files
-        log_input_files(
-            self.SOURCE_NAME, self.find_input_files(),
-            source="TIDAL", category="tidal",
-            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d}",
-        )
-
         output_file = self.output_path / "bctides.in"
 
         # Find template (needed for both Fortran and template modes)
-        template = self.config.bctides_template
-        if not template or not Path(template).exists():
-            for f in sorted(self.input_path.glob("*bctides*template*")):
-                template = f
-                log.info(f"Auto-discovered bctides template: {f.name}")
-                break
+        template = self._select_template(output_file.parent)
+        if template:
+            log.info(f"bctides template: {template}")
+
+        # Record the template actually consumed, not a stale work copy. MJ (10/01/26)
+        from ._log import log_input_files
+        log_input_files(
+            self.SOURCE_NAME,
+            [Path(template).resolve()] if template else self.find_input_files(),
+            source="TIDAL", category="tidal",
+            note=f"pdy={self.config.pdy} cyc={self.config.cyc:02d}",
+        )
 
         # Mode 0: Fortran tide_fac executable (production, most accurate)
         if template and Path(template).exists():
@@ -159,6 +158,37 @@ class TidalProcessor(ForcingProcessor):
             output_files=[output_file] if output_file.exists() else [],
             metadata={"mode": "python_native"},
         )
+
+    def _select_template(self, work_dir: Path) -> Optional[Path]:
+        """Pick the pristine system template, never the per-phase working copy.
+
+        _call_fortran_tide_fac stages the template as work_dir/bctides.in_template,
+        so a bare config name (or glob hit) resolving to that file in a later phase
+        would be copied onto itself. MJ (10/01/26)
+        """
+        work_copy = Path(work_dir) / "bctides.in_template"
+
+        def is_work_copy(p) -> bool:
+            try:
+                return work_copy.exists() and os.path.samefile(p, work_copy)
+            except OSError:
+                return False
+
+        cfg = self.config.bctides_template
+        if cfg and Path(cfg).exists() and not is_work_copy(cfg):
+            return Path(cfg)
+        for f in sorted(self.input_path.glob("*bctides*template*")):
+            if f.name != "bctides.in_template" and not is_work_copy(f):
+                log.info(f"Auto-discovered bctides template: {f.name}")
+                return f
+        for f in sorted(self.input_path.glob("*bctides*template*")):
+            if not is_work_copy(f):
+                log.info(f"Auto-discovered bctides template: {f.name}")
+                return f
+        if cfg and Path(cfg).exists():
+            return Path(cfg)
+        # FIXofs unset: input dir is the work dir, keep its copy. MJ (10/01/26)
+        return work_copy if work_copy.exists() else None
 
     def find_input_files(self) -> List[Path]:
         """Find bctides template or static files."""
@@ -240,7 +270,8 @@ class TidalProcessor(ForcingProcessor):
 
         try:
             work_template = output_path.parent / "bctides.in_template"
-            shutil.copy2(template_path, work_template)
+            if not (work_template.exists() and os.path.samefile(template_path, work_template)):
+                shutil.copy2(template_path, work_template)
 
             # Fortran input: N_days, hh,dd,mm,yyyy, y (confirmation)
             # Production uses `bc scale=4` (4 decimals); match that format exactly.

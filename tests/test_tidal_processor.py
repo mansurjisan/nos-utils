@@ -140,3 +140,89 @@ class TestConstituentData:
     def test_s2_frequency(self):
         """S2 frequency should be exactly 30.0 deg/hr."""
         assert TIDAL_CONSTITUENTS["S2"]["omega"] == 30.0
+
+
+class TestFortranTideFacTwoPhase:
+    """Nowcast then forecast in one work dir must both take the Fortran path."""
+
+    def _stub_exe(self, tmp_path, monkeypatch):
+        exe_dir = tmp_path / "exec"
+        exe_dir.mkdir()
+        exe = exe_dir / "nos_ofs_create_tide_fac_schism"
+        exe.write_text(
+            "#!/bin/sh\ncat > /dev/null\ncp bctides.in_template bctides.in\n"
+        )
+        exe.chmod(0o755)
+        monkeypatch.setenv("EXECnos", str(exe_dir))
+
+    def _run(self, cfg, fix, work, phase):
+        proc = TidalProcessor(cfg, fix, work, phase=phase)
+        return proc.process()
+
+    def test_two_phases_use_fortran(self, mock_config, tmp_path, monkeypatch):
+        self._stub_exe(tmp_path, monkeypatch)
+        fix = tmp_path / "fix"
+        fix.mkdir()
+        (fix / "sys.bctides.in_template").write_text("PRISTINE\n")
+        work = tmp_path / "work"
+        work.mkdir()
+        # bare relative name, as in the ATL yaml; resolves via cwd in phase 2
+        mock_config.bctides_template = Path("bctides.in_template")
+        monkeypatch.chdir(work)
+        for phase in ("nowcast", "forecast"):
+            res = self._run(mock_config, fix, work, phase)
+            assert res.success
+            assert res.metadata["mode"] == "fortran_tide_fac"
+        assert (work / "bctides.in_template").read_text() == "PRISTINE\n"
+
+    def test_discovery_prefers_prefixed_over_work_copy(self, mock_config, tmp_path):
+        fix = tmp_path / "fix"
+        fix.mkdir()
+        (fix / "bctides.in_template").write_text("STALE\n")
+        (fix / "zz.bctides.in_template").write_text("PRISTINE\n")
+        proc = TidalProcessor(mock_config, fix, tmp_path / "out")
+        assert proc._select_template(tmp_path / "out").name == "zz.bctides.in_template"
+
+    def test_same_file_copy_does_not_raise(self, mock_config, tmp_path, monkeypatch):
+        self._stub_exe(tmp_path, monkeypatch)
+        work = tmp_path / "work"
+        work.mkdir()
+        t = work / "bctides.in_template"
+        t.write_text("X\n")
+        proc = TidalProcessor(mock_config, work, work)
+        assert proc._call_fortran_tide_fac(t, work / "bctides.in")
+
+    def test_work_dir_only_template_is_used(self, mock_config, tmp_path, monkeypatch):
+        """No FIXofs: the work copy is the only template and still drives Fortran."""
+        self._stub_exe(tmp_path, monkeypatch)
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "bctides.in_template").write_text("ONLY\n")
+        mock_config.bctides_template = None
+        res = self._run(mock_config, work, work, "forecast")
+        assert res.success
+        assert res.metadata["mode"] == "fortran_tide_fac"
+        assert (work / "bctides.in").read_text() == "ONLY\n"
+
+    def test_manifest_records_selected_template(self, mock_config, tmp_path, monkeypatch):
+        from nos_utils.forcing._log import (
+            drain_input_capture, reset_input_capture, start_input_capture,
+        )
+        self._stub_exe(tmp_path, monkeypatch)
+        fix = tmp_path / "fix"
+        fix.mkdir()
+        (fix / "sys.bctides.in_template").write_text("PRISTINE\n")
+        work = tmp_path / "work"
+        work.mkdir()
+        mock_config.bctides_template = Path("bctides.in_template")
+        monkeypatch.chdir(work)
+        self._run(mock_config, fix, work, "nowcast")
+        reset_input_capture()
+        start_input_capture()
+        try:
+            self._run(mock_config, fix, work, "forecast")
+            entries = {(e["category"], e["source"]): e for e in drain_input_capture()}
+        finally:
+            reset_input_capture()
+        assert entries[("tidal", "TIDAL")]["files"] == [
+            str((fix / "sys.bctides.in_template").resolve())]
