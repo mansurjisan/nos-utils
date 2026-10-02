@@ -35,7 +35,6 @@ from typing import Optional
 import numpy as np
 
 from ..config import ForcingConfig
-from ..coords import normalize_lon, lon_convention
 from .rtofs import _pack_for_fortran
 
 log = logging.getLogger(__name__)
@@ -46,13 +45,13 @@ try:
 except ImportError:
     HAS_NETCDF4 = False
 
-# ADT subset domain — computed from config at runtime, not hardcoded here.
-# Atlantic defaults kept as module-level fallbacks for callers that do not
-# pass a config (e.g. legacy shell tests).
-ADT_LON_MIN_DEFAULT = -62.5
-ADT_LON_MAX_DEFAULT = -51.5
+# Ops ADT subset ROI, used only when the SSH_1 destination grid cannot be read.
+# MJ (10/01/26)
+ADT_LON_MIN = -62.5
+ADT_LON_MAX = -51.5
 ADT_LAT_MIN = 7.0
 ADT_LAT_MAX = 54.0
+ADT_PAD = 1.0
 
 
 class ADTBlender:
@@ -66,24 +65,6 @@ class ADTBlender:
         """
         self.config = config
         self.input_path = input_path
-
-        # ADT subset domain: derive from the config's lon/lat extent.
-        # Pacific (0-360) needs the domain bounds converted to the ADT
-        # product convention (-180/+180) for subsetting the CMEMS NetCDF.
-        self._adt_lon_min = ADT_LON_MIN_DEFAULT
-        self._adt_lon_max = ADT_LON_MAX_DEFAULT
-        if hasattr(config, "lon_min") and hasattr(config, "lon_max"):
-            _conv = lon_convention(config)
-            if _conv == "0360":
-                # Pacific: convert the domain lon_min/max from 0-360 to -180/180
-                # so we can subset the CMEMS global ADT file (which uses -180/180)
-                self._adt_lon_min = float(normalize_lon(
-                    np.array([config.lon_min]), "pm180")[0])
-                self._adt_lon_max = float(normalize_lon(
-                    np.array([config.lon_max]), "pm180")[0])
-            else:
-                self._adt_lon_min = float(config.lon_min)
-                self._adt_lon_max = float(config.lon_max)
 
     def blend_ssh(self, ssh_path: Path, work_dir: Path) -> Optional[Path]:
         """Blend ADT into RTOFS SSH_1.nc.
@@ -101,11 +82,12 @@ class ADTBlender:
 
         adt_files = self._find_adt_files()
         if not adt_files:
-            log.info("No ADT satellite data available — using RTOFS-only SSH")
+            log.warning("No ADT satellite data available — using RTOFS-only SSH")
             return None
 
         try:
-            fields = [self._read_adt(f) for f in adt_files]
+            bounds = self._dest_bounds(ssh_path)
+            fields = [self._read_adt(f, bounds) for f in adt_files]
             fields = [f for f in fields if f is not None]
             if not fields:
                 return None
@@ -121,6 +103,21 @@ class ADTBlender:
         except Exception as e:
             log.warning(f"ADT blending failed: {e}")
             return None
+
+    @staticmethod
+    def _dest_bounds(ssh_path: Path):
+        """ADT subset (lon_min, lon_max, lat_min, lat_max): SSH_1 grid extent padded
+        by ADT_PAD (same -180/180 convention as ADT), else the ops ROI. MJ (10/01/26)
+        """
+        try:
+            with Dataset(str(ssh_path)) as ds:
+                lon = np.array(ds.variables["xlon"][:], dtype=np.float64)
+                lat = np.array(ds.variables["ylat"][:], dtype=np.float64)
+            return (float(np.nanmin(lon)) - ADT_PAD, float(np.nanmax(lon)) + ADT_PAD,
+                    float(np.nanmin(lat)) - ADT_PAD, float(np.nanmax(lat)) + ADT_PAD)
+        except Exception as e:
+            log.warning(f"Cannot read SSH_1 grid extent ({e}) — using ops ADT ROI")
+            return ADT_LON_MIN, ADT_LON_MAX, ADT_LAT_MIN, ADT_LAT_MAX
 
     def _find_adt_data(self) -> Optional[Path]:
         """Newest available CMEMS ADT file (valid day, else previous day)."""
@@ -171,50 +168,46 @@ class ADTBlender:
                 return wt
         return None
 
-    def _read_adt(self, adt_path: Path):
-        """Read and subset ADT to the domain, offset by -0.45 m.
+    def _read_adt(self, adt_path: Path, bounds=None):
+        """Read and subset ADT to bounds, offset by -0.45 m.
 
-        Returns (adt[lat, lon], lons, lats) or None. Fill values become NaN.
+        bounds is (lon_min, lon_max, lat_min, lat_max) in -180/180; default is the
+        ops ROI. Returns (adt[lat, lon], lons, lats) or None. Fill values become NaN.
         """
+        lon_min, lon_max, lat_min, lat_max = bounds or (
+            ADT_LON_MIN, ADT_LON_MAX, ADT_LAT_MIN, ADT_LAT_MAX)
         try:
             ds = Dataset(str(adt_path))
+            try:
+                lon_name = "longitude" if "longitude" in ds.variables else "lon"
+                lat_name = "latitude" if "latitude" in ds.variables else "lat"
 
-            lon_name = "longitude" if "longitude" in ds.variables else "lon"
-            lat_name = "latitude" if "latitude" in ds.variables else "lat"
+                lons = np.array(ds.variables[lon_name][:], dtype=np.float64)
+                lats = np.array(ds.variables[lat_name][:], dtype=np.float64)
 
-            lons = np.array(ds.variables[lon_name][:], dtype=np.float64)
-            lats = np.array(ds.variables[lat_name][:], dtype=np.float64)
+                lon_idx = np.where((lons >= lon_min) & (lons <= lon_max))[0]
+                lat_idx = np.where((lats >= lat_min) & (lats <= lat_max))[0]
 
-            # Subset to ADT domain using per-instance bounds (config-derived)
-            # self._adt_lon_min/max are always in -180/+180 to match CMEMS files
-            lon_mask = (lons >= self._adt_lon_min) & (lons <= self._adt_lon_max)
-            lat_mask = (lats >= ADT_LAT_MIN) & (lats <= ADT_LAT_MAX)
+                if len(lon_idx) == 0 or len(lat_idx) == 0:
+                    log.warning("ADT data doesn't cover target domain")
+                    return None
 
-            lon_idx = np.where(lon_mask)[0]
-            lat_idx = np.where(lat_mask)[0]
-
-            if len(lon_idx) == 0 or len(lat_idx) == 0:
+                adt_var = "adt" if "adt" in ds.variables else "surf_el"
+                # 0.45 from NCO file
+                # TODO: Should be different for different systems, e.g. PAC
+                adt_data = ds.variables[adt_var][...] - 0.45
+                sl_y = slice(lat_idx[0], lat_idx[-1] + 1)
+                sl_x = slice(lon_idx[0], lon_idx[-1] + 1)
+                if adt_data.ndim == 3:
+                    subset = np.ma.filled(adt_data[:, sl_y, sl_x], fill_value=np.nan)
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        adt_2d = np.nanmean(subset, axis=0)
+                else:
+                    adt_2d = np.ma.filled(adt_data[sl_y, sl_x], fill_value=np.nan)
+            finally:
                 ds.close()
-                log.warning("ADT data doesn't cover target domain")
-                return None
-
-            # Read ADT variable
-            adt_var = "adt" if "adt" in ds.variables else "surf_el"
-            # 0.45 from NCO file
-            # TODO: Should be different for different systems, e.g. PAC
-            adt_data = ds.variables[adt_var][...] - 0.45
-            sl_y = slice(lat_idx[0], lat_idx[-1] + 1)
-            sl_x = slice(lon_idx[0], lon_idx[-1] + 1)
-            if adt_data.ndim == 3:
-                subset = np.ma.filled(adt_data[:, sl_y, sl_x], fill_value=np.nan)
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)
-                    adt_2d = np.nanmean(subset, axis=0)
-            else:
-                adt_2d = np.ma.filled(adt_data[sl_y, sl_x], fill_value=np.nan)
-
-            ds.close()
             adt_2d = np.asarray(adt_2d, dtype=np.float64)
             adt_2d[np.abs(adt_2d) > 1000] = np.nan
             log.info(f"Read ADT {adt_path.name}: shape={adt_2d.shape}, "
@@ -243,6 +236,23 @@ class ADTBlender:
             out = np.where(den > 1e-6, num / den, np.nan)
         return out.reshape(dst_lon.shape)
 
+    @staticmethod
+    def _fill_nearest(adt, adt_lons, adt_lats, dst_lon, dst_lat, adt_dst, need):
+        """Fill adt_dst where `need` and still NaN with the nearest valid source cell
+        (ESMF nearest-source for unmapped points; plain lon/lat distance). MJ (10/01/26)
+        """
+        from scipy.spatial import cKDTree
+        miss = need & ~np.isfinite(adt_dst)
+        valid = np.isfinite(adt)
+        if not miss.any() or not valid.any():
+            return adt_dst
+        LA, LO = np.meshgrid(adt_lats, adt_lons, indexing="ij")
+        tree = cKDTree(np.column_stack([LO[valid], LA[valid]]))
+        _, idx = tree.query(np.column_stack([dst_lon[miss], dst_lat[miss]]))
+        out = adt_dst.copy()
+        out[miss] = adt[valid][idx]
+        return out
+
     def _apply_adt_blend(self, ssh_path: Path, adt_field, work_dir: Path) -> Optional[Path]:
         """Apply the ops ADT blend to SSH_1.nc.
 
@@ -265,10 +275,13 @@ class ADTBlender:
             dst_lat = np.array(ds.variables["ylat"][:], dtype=np.float64)
             if dst_lon.ndim == 1:
                 dst_lon, dst_lat = np.meshgrid(dst_lon, dst_lat)
-            # SSH_1 keeps the RTOFS (0-360) longitudes; ADT is -180/180
-            dst_lon_adt = np.where(dst_lon > 180.0, dst_lon - 360.0, dst_lon)
+            # SSH_1 longitudes are RTOFS lon-360 (_stofs_prepare_ssh), same as ADT. MJ (10/01/26)
+            dst_lon_adt = dst_lon
 
             adt_dst = self._regrid_bilinear(adt, adt_lons, adt_lats, dst_lon_adt, dst_lat)
+            rtofs_wet = np.abs(np.ma.filled(ssh[0, :, :], fill_value=-30000.0)) < 1000
+            adt_dst = self._fill_nearest(adt, adt_lons, adt_lats, dst_lon_adt, dst_lat,
+                                         adt_dst, rtofs_wet)
             n_ok = int(np.isfinite(adt_dst).sum())
             if n_ok == 0:
                 ds.close()

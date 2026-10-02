@@ -167,6 +167,7 @@ class RTOFSProcessor(ForcingProcessor):
         self._struct_interp = {}  # Cached StructuredGridInterpolator per grid shape
         self._3d_roi = None     # Cached ROI indices (j_start, j_end, i_start, i_end) for 3D subsetting
         self._wl_bias_info = None   # Outcome of the WL bias correction (see _apply_wl_bias)
+        self._ssh_blended_used = False
         # Discovery diagnostics, reset by find_input_files_by_type(). Values
         # are exact glob matches before size/pairing/window filtering.
         self._matched_3d_sizes = {}
@@ -697,6 +698,10 @@ class RTOFSProcessor(ForcingProcessor):
                     if files_2d:
                         f = (self._process_2d(files_2d, ssh_source=ssh_source)
                              if ssh_source else self._process_2d(files_2d))
+                        if ssh_source and not self._ssh_blended_used:
+                            adt_blended = False
+                            warnings.append("ADT blend requested but raw RTOFS SSH was "
+                                            "used for elev2D")
                         if f:
                             output_files.append(f)
                             elev2d_ok = True
@@ -1732,6 +1737,20 @@ class RTOFSProcessor(ForcingProcessor):
             log.info("Using precomputed REMESH weights for SSH (Fortran-equivalent)")
 
         blended = self._load_blended_ssh(ssh_source, files_2d) if ssh_source else None
+        if blended is not None and ssh_weights:
+            # NaN at a weight source index would poison the corner mean. MJ (10/01/26)
+            roi = self.config.obc_roi_2d
+            with Dataset(str(files_2d[0])) as d0:
+                fs = d0.variables["ssh"].shape[-2:]
+            ny, nx = blended[2].shape[1:]
+            emb = np.full((blended[2].shape[0],) + tuple(fs), np.nan)
+            emb[:, roi["y1"]:roi["y1"] + ny, roi["x1"]:roi["x1"] + nx] = blended[2]
+            src = np.asarray(ssh_weights["source_data_flat_idx"])
+            if np.isnan(emb.reshape(emb.shape[0], -1)[:, src]).any():
+                log.warning("Blended SSH has NaN at precomputed-weight source points "
+                            "— using raw RTOFS SSH")
+                blended = None
+        self._ssh_blended_used = blended is not None
         if blended is not None:
             log.info("elev2D: SSH taken from the ADT-blended SSH_1 file")
         else:
