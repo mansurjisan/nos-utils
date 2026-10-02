@@ -40,6 +40,10 @@ from .base import ForcingProcessor, ForcingResult
 
 log = logging.getLogger(__name__)
 
+# Ops St. Lawrence row spans: obs flux.th start..start+6 d, clim 6 rows. MJ (10/02/26)
+OPS_FLUX_SPAN_DAYS = 6
+OPS_CLIM_ROWS = 6
+
 try:
     import pandas as pd
     HAS_PANDAS = True
@@ -356,9 +360,8 @@ class StLawrenceProcessor(ForcingProcessor):
 
         Values are written as ``%.3f`` of the file value with no sign change
         (the clim file already stores negative inflow). Ops writes a fixed 6
-        rows (0..120 h), which ends 12 h short of a 24 h + 108 h run and SCHISM
-        aborts at the missing record; write one row per entry of
-        ``datevectors_full``, the same span the observation path covers. MJ (09/28/26)
+        rows (0..120 h); keep 6 unless the run is longer, so SCHISM never
+        reads past the last record. MJ (10/02/26)
         """
         if self.clim_file is None or not self.clim_file.is_file():
             raise FileNotFoundError("climatology file not found")
@@ -371,7 +374,10 @@ class StLawrenceProcessor(ForcingProcessor):
                 except ValueError:
                     continue
         base = datetime(start.year, start.month, start.day)
-        n_rows = len(datevectors_full)
+        total_hours = self.config.nowcast_hours + self.config.forecast_hours
+        n_rows = min(len(datevectors_full),
+                     max(OPS_CLIM_ROWS, int(np.ceil(total_hours / 24.0)) + 1))
+        datevectors_full = datevectors_full[:n_rows]
         lines: List[str] = []
         for i in range(n_rows):
             doy = (base + timedelta(days=i)).timetuple().tm_yday
@@ -711,13 +717,12 @@ class StLawrenceProcessor(ForcingProcessor):
     def _n_days_total(self) -> int:
         """Span (in days) covered by the output, for use with _daily_range.
 
-        Operational STOFS configures nowcast=24h + forecast=108h = 5.5 days,
-        producing a 7-row flux.th (days 0..6 inclusive). _daily_range
-        takes the span and adds one entry, so we pass the ceiling span.
-        With nowcast=24h/forecast=108h this returns 6 (span) → 7 rows.
+        Ops gen_fluxth_st_lawrence_riv.py always spans start..start+6 days
+        (7 rows), whatever the run length; keep that span unless the run is
+        longer. _daily_range adds one entry to the span. MJ (10/02/26)
         """
         total_hours = self.config.nowcast_hours + self.config.forecast_hours
-        return int(np.ceil(total_hours / 24.0))
+        return max(OPS_FLUX_SPAN_DAYS, int(np.ceil(total_hours / 24.0)))
 
     @staticmethod
     def _daily_range(start: datetime, days: int):
