@@ -23,8 +23,8 @@ VAR_DEFS = {
     "elev": {
         "staout_fname": "staout_1",
         "name": "zeta",
-        "long_name": "water surface elevation above navd88",
-        "stardard_name": "sea_surface_height_above_navd88",
+        "long_name": "water surface elevation above msl",
+        "stardard_name": "sea_surface_height_above_msl",
         "units": "m",
     },
     "temperature": {
@@ -119,7 +119,7 @@ def test_full_product(tmp_path):
             )
             assert np.allclose(v[:], expect)
 
-        assert ds["zeta"].standard_name == "sea_surface_height_above_navd88"
+        assert ds["zeta"].standard_name == "sea_surface_height_above_msl"
         assert ds["zeta"].units == "m"
         assert ds["u"].standard_name == "eastward_surface_velocity"
 

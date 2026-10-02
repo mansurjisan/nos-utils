@@ -254,13 +254,13 @@ class PrepOrchestrator:
         # ---- Phase 2: Heavy and dependent steps (sequential) ----
 
         # St. Lawrence River (STOFS only): needs GFS rad.nc from Phase 1.
-        if self.config.st_lawrence_enabled and "law" in self.paths:
+        if self.config.st_lawrence_enabled:
+            if "law" not in self.paths:
+                log.warning(
+                    "st_lawrence_enabled but 'law' path not provided — "
+                    "trying climatology / previous-cycle archive only"
+                )
             results.append(self._run_st_lawrence(output_dir))
-        elif self.config.st_lawrence_enabled:
-            log.info(
-                "st_lawrence_enabled but 'law' path not provided — skipping "
-                "St. Lawrence River forcing"
-            )
 
         # GFS-Wave boundary spectra (WW3 nest.ww3): independent of
         # GFS/HRRR/NWM/RTOFS, only needs its own COMINgfswave tree.
@@ -362,6 +362,12 @@ class PrepOrchestrator:
             )
             if not any(r.source in critical_sources for r in results):
                 success = any(r.success for r in results)
+
+        # A missing St. Lawrence flux.th kills pschism at open (flow-only
+        # boundary), so it is always critical when enabled.  MJ (09/28/26)
+        if getattr(self.config, "st_lawrence_enabled", False) and "ST_LAWRENCE" in failed:
+            log.error("Critical prep source ST_LAWRENCE FAILED: no flux.th produced")
+            success = False
 
         prep_result = PrepResult(
             success=success, phase=phase,
@@ -486,15 +492,19 @@ class PrepOrchestrator:
                 break
 
         prev_rerun = self.paths.get("prev_rerun")
+        clim_file = None
+        if "fix" in self.paths:
+            clim_file = Path(self.paths["fix"]) / self.config.st_lawrence_clim_name
         proc = StLawrenceProcessor(
             self.config,
-            self.paths["law"],
+            self.paths.get("law", output_dir / "_no_law"),
             output_dir,
             csv_name=self.config.st_lawrence_csv_name,
             subdir=self.config.st_lawrence_subdir,
             sflux_rad_file=sflux_rad,
             prev_rerun_dir=prev_rerun,
             archive_prefix=archive_prefix,
+            clim_file=clim_file,
         )
         return proc.process()
 

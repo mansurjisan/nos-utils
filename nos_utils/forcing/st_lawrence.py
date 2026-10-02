@@ -1,22 +1,28 @@
 """
 St. Lawrence River forcing processor (STOFS-3D-ATL).
 
-Generates the two climatology-free river files for the St. Lawrence:
+Generates the two St. Lawrence river files for the flow-only open boundary:
 
-  - ``flux.th``  — daily discharge (m^3/s, negative = inflow) read from the
-    discharge column of the wide ECCC hydrometric CSV
-    (``QC_02OA016_hourly_hydrometric.csv`` under
-    ``$DCOMROOT/<yyyymmdd>/canadian_water/``).
-  - ``TEM_1.th`` — daily water temperature derived from GFS air temperature
-    at the river mouth via a linear regression ``T_water = 0.83 * T_air + 2.817``
-    (negative values clamped to 0). The hydrometric CSV carries discharge
-    only, so when a GFS sflux radiation file is not available a -9999
-    sentinel is written for temperature, matching the operational default.
+  - ``flux.th``  — daily discharge (m^3/s, negative = inflow). Sources, in the
+    ops v3.1 order (``stofs_3d_atl_create_river_st_lawrence.sh``):
+      1. the first gauge CSV that exists, today's then yesterday's, under
+         ``$COMINlaw/<yyyymmdd>/<subdir>/``. Two layouts are read, chosen by
+         the file's contents: the v3.1 parameter-coded table
+         (``can_streamgauge/02OA016_hydrometric.csv``, discharge = parameter
+         47) and the v2.1 wide export
+         (``canadian_water/QC_02OA016_hourly_hydrometric.csv``, discharge in
+         column 6);
+      2. the day-of-year climatology (``stofs_3d_atl_StLawrence_clim.txt``),
+         one row per run day;
+      3. the previous cycle's archived ``flux.th``, copied unchanged.
+  - ``TEM_1.th`` — daily water temperature from GFS air temperature at the
+    river mouth, ``T_water = 0.83 * T_air + 2.817`` (negative values clamped
+    to 0), built from the current sflux radiation file whatever the flux
+    source. Without it the previous cycle's archive is used, else a -9999
+    sentinel.
 
-The operational ex-script sources
-``gen_fluxth_st_lawrence_riv.py`` and ``gen_temp_1_st_lawrence_riv.py`` with a
-previous-day CSV fallback and a previous-cycle archive fallback (re-shifted in
-time). This module ports both algorithms plus both fallbacks.
+Ports ``gen_fluxth_st_lawrence_riv.py`` and ``gen_temp_1_st_lawrence_riv.py``
+plus the ex-script's fallbacks. MJ (09/28/26)
 """
 
 from __future__ import annotations
@@ -33,6 +39,10 @@ from ..config import ForcingConfig
 from .base import ForcingProcessor, ForcingResult
 
 log = logging.getLogger(__name__)
+
+# Ops St. Lawrence row spans: obs flux.th start..start+6 d, clim 6 rows. MJ (10/02/26)
+OPS_FLUX_SPAN_DAYS = 6
+OPS_CLIM_ROWS = 6
 
 try:
     import pandas as pd
@@ -62,6 +72,12 @@ DEFAULT_CSV_NAME = "02OA016_hydrometric.csv"
 # Legacy default; operational WCOSS2 uses "canadian_water".
 DEFAULT_SUBDIR = "can_streamgauge"
 
+# Day-of-year climatology (fix file) used when no observation file yields data.  MJ (09/28/26)
+DEFAULT_CLIM_NAME = "stofs_3d_atl_StLawrence_clim.txt"
+
+# v3.1 long-format parameter codes (gen_fluxth_st_lawrence_riv.py).  MJ (09/28/26)
+PARAM_DISCHARGE = 47
+
 
 @dataclass
 class _StLawrenceSeries:
@@ -70,23 +86,21 @@ class _StLawrenceSeries:
     seconds_from_start: List[int]
     flow_cms: List[float]
     temp_c: List[float]
+    # Pre-formatted flux.th rows (climatology path); None = derive from flow_cms.  MJ (09/28/26)
+    flux_lines: Optional[List[str]] = None
+    temp_from_sflux: bool = False
 
 
 class StLawrenceProcessor(ForcingProcessor):
     """Produce flux.th and TEM_1.th for the St. Lawrence River.
 
-    The processor expects a Canadian hydrometric CSV at
-    ``<input_path>/<pdy>/can_streamgauge/<csv_name>`` (mirroring
-    ``$COMINlaw``). If that file is missing, it falls back to the previous
-    day's directory. If both are missing, the caller can provide
-    ``prev_rerun_dir`` to reuse yesterday's archived
-    ``<run>.<cycle>.riv.obs.flux.th`` and ``...tem_1.th``.
-
-    The GFS sflux radiation file (``stofs_3d_atl.tHHz.gfs.rad.nc``) is read
-    for temperature if available (the air-temp regression). The wide ECCC
-    hydrometric export carries discharge only — no temperature column — so
-    when no rad file is present a constant -9999 sentinel is written for
-    temperature, matching the operational default.
+    Flux source order: the first gauge CSV found at
+    ``<input_path>/<pdy>/<subdir>/<csv_name>`` (today, else yesterday), then
+    ``clim_file``, then ``prev_rerun_dir``'s archived
+    ``<run>.<cycle>.riv.obs.flux.th``. See the module docstring for the two
+    CSV layouts. Temperature comes from ``sflux_rad_file`` when present,
+    otherwise the archived ``...tem_1.th``, otherwise a -9999 sentinel.
+    Returns ``success=False`` when no flux.th can be produced. MJ (09/28/26)
     """
 
     SOURCE_NAME = "ST_LAWRENCE"
@@ -102,6 +116,7 @@ class StLawrenceProcessor(ForcingProcessor):
         sflux_rad_file: Optional[Path] = None,
         prev_rerun_dir: Optional[Path] = None,
         archive_prefix: Optional[str] = None,
+        clim_file: Optional[Path] = None,
     ) -> None:
         super().__init__(config, input_path, output_path)
         self.csv_name = csv_name
@@ -113,6 +128,7 @@ class StLawrenceProcessor(ForcingProcessor):
         # Archive prefix like "stofs_3d_atl.t12z" — determines the fallback
         # archive filenames (…riv.obs.flux.th / …riv.obs.tem_1.th).
         self.archive_prefix = archive_prefix
+        self.clim_file = Path(clim_file) if clim_file else None
 
     # ------------------------------------------------------------------ API
 
@@ -144,8 +160,12 @@ class StLawrenceProcessor(ForcingProcessor):
         warnings: List[str] = []
         output_files: List[Path] = []
 
+        # Ops v3.1 picks the FIRST existing obs file (today, then yesterday)
+        # and, if it yields no usable data, goes straight to climatology.  MJ (09/28/26)
         csv_path = self._find_csv(pdy_dt)
         series: Optional[_StLawrenceSeries] = None
+        tried: List[str] = []
+        source_used = None
 
         if csv_path is not None:
             log.info(f"St. Lawrence CSV: {csv_path}")
@@ -153,59 +173,103 @@ class StLawrenceProcessor(ForcingProcessor):
                 series = self._read_hydrometric_csv(
                     csv_path, datevectors_hindcast, datevectors_full
                 )
+                source_used = f"obs file {csv_path}"
             except Exception as exc:
                 warnings.append(f"Failed to parse CSV {csv_path}: {exc}")
+                tried.append(f"obs {csv_path}: {exc}")
                 series = None
+        else:
+            tried.append(
+                "obs: no file at "
+                + " or ".join(str(self._csv_path_for(pdy_dt - timedelta(days=d)))
+                              for d in (0, 1))
+            )
 
-        # If we have series data, overwrite temperature with the sflux-based
-        # regression when a rad file is available (matches operational flow:
-        # `rm -f TEM_1.th` between the flux script and the temp script).
-        if series is not None and self.sflux_rad_file and self.sflux_rad_file.exists():
+        if series is None:
+            try:
+                series = self._read_climatology(start, datevectors_full)
+                source_used = f"climatology {self.clim_file}"
+                warnings.append(
+                    "St. Lawrence obs unavailable; using climatology "
+                    f"{self.clim_file}"
+                )
+            except Exception as exc:
+                tried.append(f"climatology {self.clim_file}: {exc}")
+
+        # Temperature is built from the current sflux rad file whatever the flux
+        # source was, as ops runs gen_temp_1 separately from the flux step
+        # (`rm -f TEM_1.th` in between). MJ (09/28/26)
+        temp_from_sflux: Optional[List[float]] = None
+        if self.sflux_rad_file and self.sflux_rad_file.exists():
             try:
                 temp_from_sflux = self._temp_from_sflux(
                     self.sflux_rad_file, datevectors_full
                 )
-                if temp_from_sflux is not None:
-                    series.temp_c = temp_from_sflux
             except Exception as exc:
                 warnings.append(f"Failed to read sflux rad {self.sflux_rad_file}: {exc}")
+        if series is not None and temp_from_sflux is not None:
+            series.temp_c = temp_from_sflux
+            series.temp_from_sflux = True
 
         if series is not None:
             flux_path = self._write_flux_th(series)
-            temp_path = self._write_tem_1_th(series)
             if flux_path:
                 output_files.append(flux_path)
-            if temp_path:
-                output_files.append(temp_path)
-
-        # Fallback: previous cycle's archive if either file is missing.
-        if len(output_files) < 2 and self.prev_rerun_dir is not None:
-            missing = {"flux.th", "TEM_1.th"} - {p.name for p in output_files}
-            for name in sorted(missing):
-                archived = self._fallback_from_archive(name)
+            # No sflux temperature: ops reuses the previous cycle's TEM_1.th.  MJ (09/28/26)
+            if not series.temp_from_sflux and self.prev_rerun_dir is not None:
+                archived = self._fallback_from_archive("TEM_1.th")
                 if archived is not None:
                     output_files.append(archived)
-                    warnings.append(
-                        f"Using previous-cycle archive for {name}"
-                    )
+                    warnings.append("Using previous-cycle archive for TEM_1.th")
+            if not any(p.name == "TEM_1.th" for p in output_files):
+                temp_path = self._write_tem_1_th(series)
+                if temp_path:
+                    output_files.append(temp_path)
+        else:
+            # Last resort: previous cycle's archive (ops copies it unchanged).  MJ (09/28/26)
+            tried.append(f"previous-cycle archive in {self.prev_rerun_dir}")
+            archived = self._fallback_from_archive("flux.th")
+            if archived is not None:
+                output_files.append(archived)
+                warnings.append("Using previous-cycle archive for flux.th")
+            if temp_from_sflux is not None:
+                secs = [int((dt - datevectors_full[0]).total_seconds())
+                        for dt in datevectors_full]
+                temp_path = self._write_tem_1_th(_StLawrenceSeries(
+                    seconds_from_start=secs, flow_cms=[0.0] * len(secs),
+                    temp_c=temp_from_sflux, temp_from_sflux=True,
+                ))
+                if temp_path:
+                    output_files.append(temp_path)
+            else:
+                archived = self._fallback_from_archive("TEM_1.th")
+                if archived is not None:
+                    output_files.append(archived)
+                    warnings.append("Using previous-cycle archive for TEM_1.th")
+            if any(p.name == "flux.th" for p in output_files):
+                source_used = f"previous-cycle archive {self.prev_rerun_dir}"
 
-        if not output_files:
+        if not any(p.name == "flux.th" for p in output_files):
+            msg = (
+                "No St. Lawrence flux.th could be produced; paths tried: "
+                + "; ".join(tried)
+            )
+            log.error(msg)
             return ForcingResult(
                 success=False, source=self.SOURCE_NAME,
-                errors=[
-                    "No St. Lawrence data available: CSV missing and no "
-                    "previous-cycle archive found",
-                ],
-                warnings=warnings,
+                errors=[msg], warnings=warnings,
             )
 
+        log.info(f"St. Lawrence flux.th source: {source_used}")
         return ForcingResult(
-            success=len(output_files) >= 1,
+            success=True,
             source=self.SOURCE_NAME,
             output_files=output_files,
             warnings=warnings,
             metadata={
-                "csv_used": str(csv_path) if csv_path else None,
+                "flux_source": source_used,
+                "csv_used": str(csv_path) if csv_path and source_used
+                and source_used.startswith("obs") else None,
                 "sflux_used": str(self.sflux_rad_file) if self.sflux_rad_file else None,
                 "n_timesteps": len(series.seconds_from_start) if series else 0,
             },
@@ -224,6 +288,115 @@ class StLawrenceProcessor(ForcingProcessor):
 
     # -------------------------------------------------------------- CSV read
 
+    def _load_flow_frame(self, csv_path: Path):
+        """Return a UTC-indexed frame with a ``flow`` column.
+
+        The layout is chosen from the content: the v3.1 long file has 9
+        columns with a small set of integer parameter codes in column 2;
+        anything else is treated as the v2.1 wide export.
+        """
+        df = pd.read_csv(csv_path, sep=",", na_values="")
+        if self._is_long_layout(df):
+            log.info("St. Lawrence CSV layout: v3.1 long (parameter-coded)")
+            return self._flow_frame_long(df)
+        log.info("St. Lawrence CSV layout: v2.1 wide")
+        return self._flow_frame_wide(df, csv_path)
+
+    @staticmethod
+    def _is_long_layout(df) -> bool:
+        if df.shape[1] != 9:
+            return False
+        code = pd.to_numeric(df.iloc[:, 2], errors="coerce")
+        if code.isna().all():
+            return False
+        vals = code.dropna()
+        return bool((vals == vals.round()).all() and vals.nunique() <= 20)
+
+    @staticmethod
+    def _to_utc_index(frame, date_col: str):
+        ts = pd.to_datetime(frame[date_col], errors="coerce")
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize("UTC")
+        else:
+            ts = ts.dt.tz_convert("UTC")
+        frame = frame.assign(date_utc=ts).dropna(subset=["date_utc"])
+        frame = frame[~frame["date_utc"].duplicated(keep="first")]
+        return frame.set_index("date_utc")
+
+    def _flow_frame_long(self, df):
+        """Ops v3.1: drop cols [0,4..8]; rows with parameter == 47 are discharge."""
+        sub = pd.DataFrame(
+            {
+                "date_local": df.iloc[:, 1].values,
+                "parameter": pd.to_numeric(df.iloc[:, 2], errors="coerce").values,
+                "flow": pd.to_numeric(df.iloc[:, 3], errors="coerce").values,
+            }
+        )
+        sub = sub[sub["parameter"] == PARAM_DISCHARGE]
+        if sub.empty:
+            raise ValueError(f"no parameter {PARAM_DISCHARGE} (discharge) rows")
+        return self._to_utc_index(sub[["date_local", "flow"]], "date_local")
+
+    def _flow_frame_wide(self, df, csv_path: Path):
+        DATE_COL = 1
+        FLOW_COL = 6
+        if df.shape[1] <= FLOW_COL:
+            raise ValueError(
+                f"St. Lawrence CSV {csv_path} has only {df.shape[1]} columns; "
+                f"expected the wide ECCC hydrometric layout with discharge at "
+                f"column {FLOW_COL} (>= {FLOW_COL + 1} columns), or the v3.1 "
+                "9-column parameter-coded layout."
+            )
+        sub = pd.DataFrame(
+            {
+                "date_local": df.iloc[:, DATE_COL].values,
+                "flow": pd.to_numeric(df.iloc[:, FLOW_COL], errors="coerce").values,
+            }
+        )
+        return self._to_utc_index(sub, "date_local")
+
+    def _read_climatology(self, start: datetime, datevectors_full) -> _StLawrenceSeries:
+        """Ops v3.1 clim fallback: one day-of-year row per day from model_t0.
+
+        Values are written as ``%.3f`` of the file value with no sign change
+        (the clim file already stores negative inflow). Ops writes a fixed 6
+        rows (0..120 h); keep 6 unless the run is longer, so SCHISM never
+        reads past the last record. MJ (10/02/26)
+        """
+        if self.clim_file is None or not self.clim_file.is_file():
+            raise FileNotFoundError("climatology file not found")
+        by_doy = {}
+        for line in self.clim_file.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    by_doy.setdefault(int(float(parts[0])), float(parts[1]))
+                except ValueError:
+                    continue
+        base = datetime(start.year, start.month, start.day)
+        total_hours = self.config.nowcast_hours + self.config.forecast_hours
+        n_rows = min(len(datevectors_full),
+                     max(OPS_CLIM_ROWS, int(np.ceil(total_hours / 24.0)) + 1))
+        datevectors_full = datevectors_full[:n_rows]
+        lines: List[str] = []
+        for i in range(n_rows):
+            doy = (base + timedelta(days=i)).timetuple().tm_yday
+            if doy in by_doy:
+                lines.append(f"{i * 86400} {by_doy[doy]:.3f}")
+        if len(lines) < n_rows:
+            raise ValueError(
+                f"climatology {self.clim_file} lacks day-of-year rows "
+                f"(got {len(lines)} of {n_rows})"
+            )
+        secs = [int((dt - datevectors_full[0]).total_seconds())
+                for dt in datevectors_full]
+        return _StLawrenceSeries(
+            seconds_from_start=secs,
+            flow_cms=[0.0] * len(secs),
+            temp_c=[-9999.0] * len(secs),
+            flux_lines=lines,
+        )
+
     def _read_hydrometric_csv(
         self,
         csv_path: Path,
@@ -232,78 +405,42 @@ class StLawrenceProcessor(ForcingProcessor):
     ) -> _StLawrenceSeries:
         """Return a _StLawrenceSeries with daily flow & temperature.
 
-        Mirrors the operational ``gen_fluxth_st_lawrence_riv.py`` reader
-        (``get_river_discharge``): the NCO dcom Canadian gauge file
-        (``QC_02OA016_hourly_hydrometric.csv`` under
-        ``$DCOMROOT/<PDY>/canadian_water/``) is a **wide** ECCC hydrometric
-        export, *not* a parameter-coded ("long") table. Its columns are::
+        Reads either gauge layout via ``_load_flow_frame``, which picks the
+        layout from the file's contents and reads columns by position (the
+        real header is bilingual):
 
-            0: ID
-            1: Date (local, e.g. "...-05:00")
-            2: Water Level / Niveau d'eau (m)
-            3-5: water-level grade / symbol / approval
-            6: Discharge / Débit (m^3/s)
-            7-9: discharge grade / symbol / approval
+          * v3.1 ``can_streamgauge/02OA016_hydrometric.csv``: parameter-coded
+            rows ``ID, Date (UTC, trailing Z), Parameter, Value, ...``;
+            discharge is ``Parameter == 47`` (46 is water level), as in ops
+            v3.1 ``gen_fluxth_st_lawrence_riv.py``.
+          * v2.1 ``canadian_water/QC_02OA016_hourly_hydrometric.csv``: wide
+            export with the date in column 1 (local offset) and discharge in
+            column 6.
 
-        The operational script does ``df.drop(df.columns[[0,2,3,4,5,7,8,9]])``,
-        keeping column 1 (Date) and column 6 (Discharge), converts the
-        timezone-aware local timestamps with ``.dt.tz_convert('UTC')``, and
-        reads discharge straight from the flow column — there is **no**
-        ``parameter == 47`` row filtering. We read positionally (``.iloc``)
-        so the parser is robust to the bilingual header text in the real
-        file.
+        Values are looked up at exact timestamps (the nowcast start and each
+        following day), not averaged. MJ (09/28/26)
 
         Discharge windowing (also from the operational script):
-          * day 0 miss -> raise (caller falls back to the previous-day CSV
-            or the previous-cycle archive);
+          * day 0 miss -> raise (caller falls back to the climatology, then
+            the previous-cycle archive);
           * day >0 miss -> carry forward the previous day's value;
           * forecast days are padded with the last available value.
 
-        The wide export carries **no** river-temperature column, so the
-        temperature series defaults to the -9999 sentinel here; ``process()``
+        Neither layout is used for temperature, so the temperature series defaults to the -9999 sentinel here; ``process()``
         overwrites it with the GFS-sflux air-temp regression
         (``_temp_from_sflux``) when a radiation file is available, matching
         operational ``gen_temp_1_st_lawrence_riv.py`` (which never reads the
         CSV for temperature).
         """
-        df = pd.read_csv(csv_path, sep=",", na_values="")
-        # Wide ECCC layout: keep column 1 (local date) and column 6
-        # (discharge), discarding ID + water-level + the grade/symbol/approval
-        # qualifier columns — exactly the operational
-        # ``df.drop(df.columns[[0,2,3,4,5,7,8,9]])``. Read positionally so the
-        # bilingual header strings don't matter.
-        DATE_COL = 1
-        FLOW_COL = 6
-        if df.shape[1] <= FLOW_COL:
-            raise ValueError(
-                f"St. Lawrence CSV {csv_path} has only {df.shape[1]} columns; "
-                f"expected the wide ECCC hydrometric layout with discharge at "
-                f"column {FLOW_COL} (>= {FLOW_COL + 1} columns). This looks "
-                "like a water-level-only or unexpected export."
-            )
-        df_flow = pd.DataFrame(
-            {
-                "date_local": df.iloc[:, DATE_COL].values,
-                "flow": pd.to_numeric(df.iloc[:, FLOW_COL], errors="coerce").values,
-            }
-        )
-        # Local timestamps carry a UTC offset (e.g. "-05:00"); convert to UTC
-        # so the index aligns with the tz-aware UTC lookup keys. Operational:
-        # ``pd.to_datetime(date_local).dt.tz_convert('UTC')``. Localize naive
-        # timestamps to UTC as a defensive fallback (real dcom is offset-aware).
-        ts = pd.to_datetime(df_flow["date_local"], errors="coerce")
-        if getattr(ts.dt, "tz", None) is None:
-            ts = ts.dt.tz_localize("UTC")
-        else:
-            ts = ts.dt.tz_convert("UTC")
-        df_flow["date_utc"] = ts
-        df_flow = df_flow.dropna(subset=["date_utc"]).set_index("date_utc")
+        df_flow = self._load_flow_frame(csv_path)
 
         data_flow: List[float] = []
         last_flow_idx = -1
         for i, dt in enumerate(datevectors_hindcast):
             try:
                 value = float(df_flow.loc[dt]["flow"])
+                if np.isnan(value):
+                    raise KeyError(dt)
                 data_flow.append(round(value, 3))
                 last_flow_idx = i
             except KeyError:
@@ -457,6 +594,9 @@ class StLawrenceProcessor(ForcingProcessor):
     def _write_flux_th(self, series: _StLawrenceSeries) -> Optional[Path]:
         output_file = self.output_path / "flux.th"
         try:
+            if series.flux_lines is not None:
+                output_file.write_text("\n".join(series.flux_lines) + "\n")
+                return output_file
             data = np.array(
                 [
                     [t, -flow]  # negative sign = inflow in SCHISM convention
@@ -537,6 +677,9 @@ class StLawrenceProcessor(ForcingProcessor):
                 # Last row keeps the second-to-last new value (matches
                 # the idx_2 = (N-2)*2+3 branch in the shell).
                 shifted_vals[-1] = raw[-1, 1]
+            if kind == "flux":
+                # Ops copies the previous flux.th unchanged.  MJ (09/28/26)
+                shifted_vals = raw[:, 1].copy()
             out = np.column_stack([shifted_times.astype(int), shifted_vals])
             output_file = self.output_path / output_name
             np.savetxt(output_file, out, fmt=["%d", "%.3f"])
@@ -574,13 +717,12 @@ class StLawrenceProcessor(ForcingProcessor):
     def _n_days_total(self) -> int:
         """Span (in days) covered by the output, for use with _daily_range.
 
-        Operational STOFS configures nowcast=24h + forecast=108h = 5.5 days,
-        producing a 7-row flux.th (days 0..6 inclusive). _daily_range
-        takes the span and adds one entry, so we pass the ceiling span.
-        With nowcast=24h/forecast=108h this returns 6 (span) → 7 rows.
+        Ops gen_fluxth_st_lawrence_riv.py always spans start..start+6 days
+        (7 rows), whatever the run length; keep that span unless the run is
+        longer. _daily_range adds one entry to the span. MJ (10/02/26)
         """
         total_hours = self.config.nowcast_hours + self.config.forecast_hours
-        return int(np.ceil(total_hours / 24.0))
+        return max(OPS_FLUX_SPAN_DAYS, int(np.ceil(total_hours / 24.0)))
 
     @staticmethod
     def _daily_range(start: datetime, days: int):
