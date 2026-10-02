@@ -25,7 +25,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -575,8 +575,26 @@ class PrepOrchestrator:
             vgrid_file=vgrid,
             phase=phase,
             time_hotstart=time_hotstart,
+            adt_archive_name=(self._adt_archive_name() if self.is_stofs else None),
+            adt_prev_dirs=(self._prev_cycle_dirs() if self.is_stofs else ()),
         )
         return proc.process()
+
+    def _adt_archive_name(self) -> str:
+        """Archive name of the ADT field, the ops adt_aft_cvtz_cln.nc analogue."""
+        return f"{self.run_name}.t{self.config.cyc:02d}z.adt_aft_cvtz_cln.nc"
+
+    def _prev_cycle_dirs(self, max_days: int = 3) -> List[Path]:
+        """Previous-cycle archive dirs: COMINrerun, then {run}.{PDY-k} under the restart/COMOUT roots."""
+        dirs = [Path(self.paths["prev_rerun"])] if self.paths.get("prev_rerun") else []
+        roots = [Path(self.paths[k]) for k in ("restart", "comout") if self.paths.get(k)]
+        roots += [r.parent for r in list(roots)]
+        base = datetime.strptime(self.config.pdy, "%Y%m%d")
+        for k in range(1, max_days + 1):
+            day = (base - timedelta(days=k)).strftime("%Y%m%d")
+            for r in roots:
+                dirs += [r / f"{self.run_name}.{day}", r / day]
+        return list(dict.fromkeys(dirs))
 
     # Mapping from the active OBC filename (what SCHISM reads) to the
     # standard archive basename under $COMOUT_PREV/rerun/ (see
@@ -1142,6 +1160,17 @@ class PrepOrchestrator:
                     f"  Copied St. Lawrence {src_name} -> {dst_name}"
                 )
 
+    def _archive_adt_field(self, work_dir: Path, comout: Path, archived: List[Path]) -> None:
+        """Copy the ADT field to $COMOUT for the next cycle's ADT fallback (STOFS only)."""
+        import shutil
+
+        src = work_dir / self._adt_archive_name()
+        if src.exists():
+            dst = comout / src.name
+            shutil.copy2(src, dst)
+            archived.append(dst)
+            log.info(f"  Archived ADT field -> {dst.name}")
+
     def _archive_obc_qc_artifacts(
         self, work_dir: Path, comout: Path, archived: List[Path],
     ) -> None:
@@ -1260,6 +1289,8 @@ class PrepOrchestrator:
                     log.info(f"  Archived HRRR sflux -> {tar_name}")
                 except (subprocess.CalledProcessError, FileNotFoundError) as e:
                     log.warning(f"  Failed to tar HRRR sflux: {e}")
+
+        self._archive_adt_field(work_dir, comout, archived)
 
         if manifest_on:
             # --- Declarative manifest path (opt-in) ---

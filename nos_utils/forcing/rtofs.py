@@ -129,6 +129,8 @@ class RTOFSProcessor(ForcingProcessor):
         phase: Optional[str] = None,
         time_hotstart: Optional[datetime] = None,
         buffer_hours: Optional[int] = None,
+        adt_archive_name: Optional[str] = None,
+        adt_prev_dirs=(),
     ):
         """
         Args:
@@ -147,8 +149,14 @@ class RTOFSProcessor(ForcingProcessor):
                 ``DEFAULT_BUFFER_HOURS`` (3h, matching legacy COMF). The
                 buffer only applies to phase != None — the backward-compat
                 combined ``phase=None`` window is unchanged.
+            adt_archive_name: file name under ``output_path`` that receives the ADT field
+                each cycle (the ops adt_aft_cvtz_cln.nc archive); None disables it
+            adt_prev_dirs: previous-cycle directories searched for that archive when no
+                ADT file exists
         """
         super().__init__(config, input_path, output_path)
+        self.adt_archive_name = adt_archive_name
+        self.adt_prev_dirs = list(adt_prev_dirs)
         self.grid_file = grid_file or config.grid_file
         self.obc_ctl_file = obc_ctl_file
         self.vgrid_file = vgrid_file
@@ -672,7 +680,11 @@ class RTOFSProcessor(ForcingProcessor):
             adt_regrid = None
             if ssh_path and self.config.adt_enabled:
                 from .adt import ADTBlender
-                blender = ADTBlender(self.config, self.input_path, keep=keep)
+                blender = ADTBlender(
+                    self.config, self.input_path, keep=keep,
+                    archive_path=(self.output_path / self.adt_archive_name
+                                  if self.adt_archive_name else None),
+                    prev_dirs=self.adt_prev_dirs)
                 blended = blender.blend_ssh(ssh_path, work_dir)
                 adt_regrid = blender.regrid if blended else None
                 warnings.extend(blender.warnings)

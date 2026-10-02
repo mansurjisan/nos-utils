@@ -25,7 +25,9 @@ Input:
 Output:
   - SSH_1.nc updated with ADT-blended surf_el values
 
-Graceful fallback: returns None if ADT data is unavailable (RTOFS-only SSH used).
+Fallback as ops (non_adjust.sh:525-537): with no ADT file, the previous cycle's archived
+adt_aft_cvtz_cln.nc is reused with a warning. Only when that is missing too does
+blend_ssh return None (RTOFS-only SSH).
 """
 
 import logging
@@ -55,6 +57,9 @@ ADT_LAT_MIN = 7.0
 ADT_LAT_MAX = 54.0
 ADT_PAD = 1.0
 
+# Ops holds ADT-missing cells as the CMEMS int fill carried through float32. MJ (10/02/26)
+ADT_OPS_FILL = -2147483647.0
+ADT_MISSING_BELOW = -1.0e4
 ADT_COORD_TOL = 1e-3
 ADT_DST_TOL = 1e-2
 
@@ -62,16 +67,21 @@ ADT_DST_TOL = 1e-2
 class ADTBlender:
     """Blend CMEMS ADT satellite SSH with RTOFS SSH."""
 
-    def __init__(self, config: ForcingConfig, input_path: Path, keep: bool = False):
+    def __init__(self, config: ForcingConfig, input_path: Path, keep: bool = False,
+                 archive_path: Optional[Path] = None, prev_dirs=()):
         """
         Args:
             config: ForcingConfig with ADT settings
             input_path: Root data path (COMINrtofs parent or COMINadt)
             keep: also write adt_on_rtofs.nc (the ops adt_aft_cvtz_cln.nc analogue)
+            archive_path: write the ADT field here each cycle for the next cycle's fallback
+            prev_dirs: previous-cycle directories searched for the archived field
         """
         self.config = config
         self.input_path = input_path
         self.keep = keep
+        self.archive_path = Path(archive_path) if archive_path else None
+        self.prev_dirs = [Path(d) for d in prev_dirs]
         self.regrid = None  # "esmf" | "bilinear" once blend_ssh has run
         self.warnings = []
 
@@ -95,12 +105,16 @@ class ADTBlender:
             "ADT", adt_files, source="ADT", category="ocean",
             note=f"pdy={self.config.pdy} n={len(adt_files)}",
         )
-        if not adt_files:
-            log.warning("No ADT satellite data available — using RTOFS-only SSH")
-            return None
-
         self.regrid = None
         self.warnings = []
+        if not adt_files:
+            prev = self._load_previous(ssh_path)
+            if prev is None:
+                log.warning("No ADT satellite data and no archived previous field — "
+                            "using RTOFS-only SSH")
+                return None
+            self.regrid = "previous"
+            return self._apply_adt_blend(ssh_path, None, work_dir, adt_dst=prev)
         try:
             adt_dst = self._regrid_esmf(adt_files, ssh_path)
             if adt_dst is not None:
@@ -315,7 +329,10 @@ class ADTBlender:
         return field
 
     def _write_adt_on_rtofs(self, adt_dst, dst_lon, dst_lat, out: Path):
-        """adt_aft_cvtz_cln.nc analogue: surf_el(time=1, ylat, xlon) in m after -0.45, plus lon/lat."""
+        """adt_aft_cvtz_cln.nc analogue: float32 surf_el(time=1, ylat, xlon) in m after -0.45.
+
+        Missing cells carry the ops fill (the CMEMS int fill held as float32).
+        """
         ny, nx = adt_dst.shape
         with Dataset(str(out), "w", format="NETCDF4") as nc:
             nc.createDimension("time", 1)
@@ -323,9 +340,47 @@ class ADTBlender:
             nc.createDimension("xlon", nx)
             nc.createVariable("lon", "f8", ("ylat", "xlon"))[:] = dst_lon
             nc.createVariable("lat", "f8", ("ylat", "xlon"))[:] = dst_lat
-            v = nc.createVariable("surf_el", "f4", ("time", "ylat", "xlon"), fill_value=-30000.0)
+            v = nc.createVariable("surf_el", "f4", ("time", "ylat", "xlon"),
+                                  fill_value=np.float32(ADT_OPS_FILL))
             v.units = "m"
-            v[0] = np.where(np.isfinite(adt_dst), adt_dst, -30000.0)
+            v[0] = np.where(np.isfinite(adt_dst), adt_dst, np.float32(ADT_OPS_FILL))
+
+    def _load_previous(self, ssh_path: Path):
+        """Previous cycle's archived ADT field on the SSH_1 grid (NaN = missing), else None.
+
+        Ops reuses yesterday's adt_aft_cvtz_cln.nc when no ADT file exists (non_adjust.sh:525-537).
+        """
+        name = self.archive_path.name if self.archive_path else None
+        cands = []
+        for d in self.prev_dirs:
+            if name:
+                cands.append(d / name)
+            cands.extend(sorted(d.glob("*.adt_aft_cvtz_cln.nc"), reverse=True))
+        try:
+            with Dataset(str(ssh_path)) as ds:
+                shape = ds.variables["ssh"].shape[1:]
+        except Exception as e:
+            log.warning(f"Cannot read SSH_1 grid for the archived ADT fallback ({e})")
+            return None
+        for c in dict.fromkeys(cands):
+            if not c.is_file():
+                continue
+            try:
+                with Dataset(str(c)) as ds:
+                    v = ds.variables["surf_el"]
+                    v.set_auto_maskandscale(False)
+                    f = np.asarray(v[0], dtype=np.float32)
+            except Exception as e:
+                log.warning(f"Cannot read archived ADT {c}: {e}")
+                continue
+            if f.shape != tuple(shape):
+                log.warning(f"Archived ADT {c} has shape {f.shape}, SSH_1 is {tuple(shape)} — skipped")
+                continue
+            f = np.where(f < ADT_MISSING_BELOW, np.float32(np.nan), f)
+            self._warn(f"No ADT satellite data — reusing the previous cycle's ADT field {c}, "
+                       f"as ops does")
+            return f
+        return None
 
     def _read_adt(self, adt_path: Path, bounds=None):
         """Read and subset ADT to bounds, offset by -0.45 m.
@@ -450,6 +505,8 @@ class ADTBlender:
                 return None
             if self.keep:
                 self._write_adt_on_rtofs(adt_dst, dst_lon, dst_lat, work_dir / "adt_on_rtofs.nc")
+            if self.archive_path:
+                self._write_adt_on_rtofs(adt_dst, dst_lon, dst_lat, self.archive_path)
             log.info(f"ADT blend: {self.regrid or 'bilinear'} regrid -> {ny}x{nx} "
                      f"({n_ok}/{ny * nx} valid), mean(ADT)={np.nanmean(adt_dst):.4f}m")
 
