@@ -113,3 +113,30 @@ class TestOBCQC:
         result = orch._qc_obc_dimensions(output_dir)
         assert result is not None
         assert result.success
+
+
+class TestOpsTimelineQC:
+    def _files(self, out, nt=6):
+        for name in ("elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"):
+            _write_obc_file(out / name, nt=nt, is_3d=name != "elev2D.th.nc")
+
+    def test_phase_slices_pass_when_the_source_series_is_complete(self, tmp_path):
+        out = tmp_path / "out"
+        self._files(out)
+        orch = _make_orchestrator(tmp_path)
+        assert orch._qc_obc_dimensions(out, {"2d": 23, "3d": 23}) is None
+
+    def test_short_source_series_triggers_the_previous_cycle_fallback(self, tmp_path):
+        out = tmp_path / "out"
+        self._files(out)
+        orch = _make_orchestrator(tmp_path)
+        result = orch._qc_obc_dimensions(out, {"2d": 23, "3d": 12})
+        assert result is not None and "TEM_3D.th.nc" in result.metadata["short_files"]
+        assert "elev2D.th.nc" not in result.metadata["short_files"]
+
+    def test_source_counts_are_ignored_without_the_ops_timeline(self, tmp_path):
+        out = tmp_path / "out"
+        self._files(out, nt=25)
+        orch = _make_orchestrator(tmp_path)
+        orch.config.obc_ops_timeline = False
+        assert orch._qc_obc_dimensions(out, {"2d": 3, "3d": 3}) is None

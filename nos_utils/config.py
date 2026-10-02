@@ -38,6 +38,22 @@ def _nudging_timescale_seconds(nudge) -> float:
     return _DEFAULT_NUDGING_TIMESCALE_S
 
 
+def _strict_bool(val, key, default):
+    """true/false, yes/no, 1/0 (case-insensitive) or a bool; None gives default; else ValueError."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int) and val in (0, 1):
+        return bool(val)
+    t = str(val).strip().lower()
+    if t in ("true", "yes", "1"):
+        return True
+    if t in ("false", "no", "0"):
+        return False
+    raise ValueError(f"{key} must be true/false, yes/no or 1/0, got {val!r}")
+
+
 @dataclass
 class ForcingConfig:
     """
@@ -166,8 +182,29 @@ class ForcingConfig:
     # leaves this None (no-op). STOFS-3D-ATL v2.1 mesh: [0, 1] (B0=756,
     # B1=22 are iettype 5; B2=3 is the iettype-0 St-Lawrence flow boundary).
     obc_elev_segments: Optional[List[int]] = None
+    # Run the compiled stofs_3d_atl_gen_3Dth_from_hycom when it is found in
+    # EXECnos/EXECstofs3d. Off by default so installing the exe cannot silently
+    # switch algorithms away from the Python ops-equivalent. MJ (10/01/26)
+    obc_use_fortran_gen3dth: bool = False
+    # gen_3Dth interp_mode: 0 = bilinear, 1 = diagonal-split triangles (what ops runs,
+    # since SSH_1 xlon is 2-D: f90:349). MJ (10/02/26)
+    obc_interp_mode: int = 1
+    # Ops STOFS-3D-ATL holds elev2D at its first record (non_adjust.sh, after the +0.04); PAC keeps it
+    # time-varying, so only the ATL presets/yaml turn this on. STOFS mode only. MJ (10/02/26)
+    obc_ssh_hold_first_record: bool = False
+    # Ops RTOFS timeline (STOFS-3D-ATL): same-day RTOFS cycle first with the previous cycle only
+    # filling missing 6-hourly slots, n-files dated cycle-24h+HHH, 6-hourly (21600 s) OBC records
+    # sliced per phase, non-zero uv3D. Off keeps the previous-cycle search, 3-hourly T/S and zero
+    # uv3D that SECOFS, Pacific and Alaska use. MJ (10/02/26)
+    obc_ops_timeline: bool = False
+    # T,S for boundary nodes outside the RTOFS grid (stofs_3d_atl_obc_3dth_nc.in). MJ (10/01/26)
+    obc_tem_outside: float = 20.0
+    obc_sal_outside: float = 33.0
     # ADT satellite SSH blending (STOFS-3D-ATL uses CMEMS ADT to correct boundary SSH)
     adt_enabled: bool = False
+    # Ops ESMF map for the ADT regrid (yaml ocean.adt.weight_file); a bare name resolves against
+    # FIXofs. Unset or missing falls back to the bilinear regrid. MJ (10/02/26)
+    adt_weight_file: Optional[Path] = None
     # Nudging enabled and timescale
     nudging_enabled: bool = False
     nudging_timescale_seconds: float = 86400.0
@@ -473,7 +510,7 @@ class ForcingConfig:
             lon_min=-98.5035, lon_max=-52.4867,
             lat_min=7.347, lat_max=52.5904,
             pdy=pdy, cyc=cyc,
-            nowcast_hours=24, forecast_hours=108,
+            nowcast_hours=24, forecast_hours=96,
             gfs_resolution="0p25",
             met_num=2, n_levels=51,
             # STOFS-3D-ATL runs at dt=150 (param.nml dt=150.); elev2D.th.nc
@@ -493,6 +530,9 @@ class ForcingConfig:
             # carry only the 778 elevation nodes SCHISM expects.
             obc_elev_segments=[0, 1],
             adt_enabled=True,
+            adt_weight_file=Path("stofs_3d_atl_ufs.adt_weight.nc"),
+            obc_ssh_hold_first_record=True,
+            obc_ops_timeline=True,
             # Nudging
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
@@ -527,7 +567,7 @@ class ForcingConfig:
             lon_min=-98.5035, lon_max=-52.4867,
             lat_min=7.347, lat_max=52.5904,
             pdy=pdy, cyc=cyc,
-            nowcast_hours=24, forecast_hours=108,
+            nowcast_hours=24, forecast_hours=96,
             gfs_resolution="0p25",
             met_num=2, nws=4, n_levels=51,
             # STOFS-3D-ATL runs at dt=150 (param.nml dt=150.); elev2D.th.nc
@@ -545,6 +585,9 @@ class ForcingConfig:
             # carry only the 778 elevation nodes SCHISM expects.
             obc_elev_segments=[0, 1],
             adt_enabled=True,
+            adt_weight_file=Path("stofs_3d_atl_ufs.adt_weight.nc"),
+            obc_ssh_hold_first_record=True,
+            obc_ops_timeline=True,
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
             nwm_product="medium_range_mem1",
@@ -561,11 +604,11 @@ class ForcingConfig:
             datm_lon_min=-98.0, datm_lon_max=-55.0,
             datm_lat_min=10.0, datm_lat_max=53.0,
             datm_dx=0.025,
-            # UFS-Coastal resource layout (nowcast 24h + forecast 108h = 132h)
+            # UFS-Coastal resource layout (nowcast 24h + forecast 96h = 120h) MJ (10/02/26)
             ufs_datm_tasks=120,
             ufs_schism_tasks=1080,
             ufs_total_tasks=1200,
-            ufs_nhours_fcst=132,
+            ufs_nhours_fcst=120,
             ufs_dt_atmos=720,
             tide_nodal_reference="cycle",
         )
@@ -770,6 +813,18 @@ class ForcingConfig:
         # these segments (excludes flow-only iettype-0 segments). See the
         # ``obc_elev_segments`` field docstring on ForcingConfig.
         obc_elev_segments = obc.get("elev_segments") if isinstance(obc, dict) else None
+        _interp_mode = obc.get("interp_mode") if isinstance(obc, dict) else None
+        _interp_mode = 1 if _interp_mode is None else int(_interp_mode)
+        if _interp_mode not in (0, 1):
+            raise ValueError(f"obc.interp_mode must be 0 or 1, got {_interp_mode!r}")
+        # Only the ATL ops chain holds elev2D at its first record. MJ (10/02/26)
+        _hold = obc.get("ssh_hold_first_record") if isinstance(obc, dict) else None
+        _sys = data.get("system", {}) if isinstance(data.get("system"), dict) else {}
+        _hold = _strict_bool(_hold, "obc.ssh_hold_first_record",
+                             str(_sys.get("name", "")).startswith("stofs_3d_atl"))
+        _ops_tl = obc.get("ops_timeline") if isinstance(obc, dict) else None
+        _ops_tl = _strict_bool(_ops_tl, "obc.ops_timeline",
+                               str(_sys.get("name", "")).startswith("stofs_3d_atl"))
         if obc_elev_segments is not None:
             obc_elev_segments = [int(i) for i in obc_elev_segments]
 
@@ -790,6 +845,11 @@ class ForcingConfig:
 
         # ADT satellite SSH blending
         adt = ocean.get("adt", {}) if isinstance(ocean, dict) else {}
+        _sys = data.get("system", {}) if isinstance(data.get("system"), dict) else {}
+        _adt_wt = adt.get("weight_file") if isinstance(adt, dict) else None
+        if _adt_wt is None and str(_sys.get("name", "")).startswith("stofs_3d_atl"):
+            _adt_wt = "stofs_3d_atl_ufs.adt_weight.nc"
+        _adt_wt = Path(_adt_wt) if _adt_wt else None
 
         # NWM river product and target counts
         river_product = river.get("primary", "nwm") if isinstance(river, dict) else "nwm"
@@ -822,7 +882,14 @@ class ForcingConfig:
             nudging_timescale_seconds=_nudging_timescale_seconds(nudge),
             obc_ssh_offset=obc_ssh_offset,
             obc_elev_segments=obc_elev_segments,
+            obc_use_fortran_gen3dth=_strict_bool(
+                obc.get("use_fortran_gen3dth") if isinstance(obc, dict) else None,
+                "obc.use_fortran_gen3dth", False),
+            obc_interp_mode=_interp_mode,
+            obc_ssh_hold_first_record=_hold,
+            obc_ops_timeline=_ops_tl,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
+            adt_weight_file=_adt_wt,
             nwm_product=nwm_product,
         )
 

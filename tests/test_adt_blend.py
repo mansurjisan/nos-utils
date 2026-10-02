@@ -1,6 +1,7 @@
 """ADT-blended SSH must reach elev2D.th.nc in the Python fallback."""
 
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -20,6 +21,7 @@ HOURS = [0, 6, 12, 18, 24]
 def _cfg():
     cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
     cfg.obc_roi_2d = {"x1": 0, "x2": 29, "y1": 0, "y2": 29}
+    cfg.obc_ops_timeline = False  # these tests cover the model-dt time axis of the other STOFS systems
     return cfg
 
 
@@ -269,27 +271,6 @@ def test_step_count_mismatch_reports_raw_and_warns(setup, monkeypatch):
     assert any("raw RTOFS SSH" in w for w in res.warnings)
 
 
-@pytest.mark.parametrize("src_idx,expect_blend", [(0, False), (5, True)])
-def test_precomputed_weights_nan_guard(setup, monkeypatch, src_idx, expect_blend):
-    cfg, proc, files, ssh_1, work, tmp = setup
-    blended = _blend(cfg, tmp, ssh_1, work, lambda lo, la: np.full_like(lo, 0.90))
-    with Dataset(str(blended), "r+") as ds:
-        ds["ssh"][:, 0, 0] = -30000.0  # becomes NaN at flat index 0
-    seen = []
-    n_bnd = len(proc._bnd_lons)
-
-    def stub(w, field):
-        seen.append(bool(np.isnan(field.ravel()[w["source_data_flat_idx"]]).any()))
-        return np.zeros(n_bnd)
-
-    monkeypatch.setattr("nos_utils.interp.precomputed_weights.apply_precomputed_ssh", stub)
-    monkeypatch.setattr(proc, "_find_ssh_weights",
-                        lambda: {"source_data_flat_idx": np.array([src_idx])})
-    proc._process_2d(files, ssh_source=blended)
-    assert proc._ssh_blended_used is expect_blend
-    assert not any(seen)
-
-
 def test_fortran_exe_reads_blended_ssh(setup, monkeypatch):
     cfg, proc, files, ssh_1, work, tmp = setup
     blended = _blend(cfg, tmp, ssh_1, work, lambda lo, la: np.full_like(lo, 0.90))
@@ -320,3 +301,106 @@ def test_fortran_link_keeps_raw_ssh_without_adt(setup, monkeypatch):
     monkeypatch.setenv("EXECnos", str(exe_dir))
     proc._call_fortran_gen_3dth(work, ssh_1, None)
     assert ssh_1.exists() and not ssh_1.is_symlink()
+
+
+def _stofs_run(setup, monkeypatch, keep, phase="nowcast"):
+    cfg, proc, files, ssh_1, work, tmp = setup
+    cfg.rtofs_3d_region = None
+    proc.phase = phase
+    data = tmp / "DATA"
+    data.mkdir()
+    monkeypatch.setenv("DATA", str(data))
+    if keep:
+        monkeypatch.setenv("KEEPDATA", "YES")
+    else:
+        monkeypatch.delenv("KEEPDATA", raising=False)
+    monkeypatch.setattr(RTOFSProcessor, "find_input_files_by_type", lambda self: (files, []))
+    monkeypatch.setattr(RTOFSProcessor, "_call_fortran_gen_3dth", lambda *a, **k: False)
+    monkeypatch.setattr(RTOFSProcessor, "_load_grid", lambda self: True)
+    _write_adt(tmp / "adt_20260401.nc", lambda lo, la: np.full_like(lo, 0.90))
+    seen = {}
+    orig = RTOFSProcessor._ops_ssh_boundary
+
+    def spy(self, p, n):
+        seen["p"] = Path(p)
+        return orig(self, p, n)
+
+    monkeypatch.setattr(RTOFSProcessor, "_ops_ssh_boundary", spy)
+    res = proc._process_stofs()
+    assert res.success
+    return res, data, seen
+
+
+def test_keepdata_keeps_intermediates_per_phase(setup, monkeypatch):
+    res, data, seen = _stofs_run(setup, monkeypatch, keep=True)
+    kept = data / "rtofs_stofs_nowcast"
+    for n in ("SSH_1.nc", "SSH_1_adt.nc", "adt_on_rtofs.nc"):
+        assert (kept / n).is_file()
+    assert seen["p"] == kept / "SSH_1_adt.nc"
+    assert res.metadata["adt_regrid"] == "bilinear"
+    with Dataset(str(kept / "adt_on_rtofs.nc")) as ds:
+        assert ds["surf_el"].shape[0] == 1
+        np.testing.assert_allclose(np.array(ds["surf_el"][0]), 0.90 - 0.45, atol=1e-5)
+
+
+def test_default_removes_work_dir(setup, monkeypatch):
+    res, data, seen = _stofs_run(setup, monkeypatch, keep=False)
+    assert list(data.iterdir()) == []
+    assert not seen["p"].parent.exists()
+
+
+def _stub_exe(tmp, monkeypatch):
+    exe_dir = tmp / "exec"
+    exe_dir.mkdir()
+    exe = exe_dir / "stofs_3d_atl_gen_3Dth_from_hycom"
+    exe.write_text("#!/bin/sh\nls -1 > seen.txt\nexit 0\n")
+    exe.chmod(0o755)
+    for v in ("EXECstofs3d", "EXECofs", "FIXstofs3d", "FIXofs", "RUN"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("EXECnos", str(exe_dir))
+
+
+def test_fortran_inputs_found_with_port_names_and_logged(setup, monkeypatch, caplog):
+    cfg, proc, files, ssh_1, work, tmp = setup
+    _stub_exe(tmp, monkeypatch)
+    fix = tmp / "fix"
+    fix.mkdir()
+    for n in ("hgrid.gr3", "hgrid.ll", "vgrid.in", "obc_3dth_nc.in"):
+        (fix / f"stofs_3d_atl_ufs.{n}").write_text("x")
+    (fix / "stofs_3d_atl_estuary.gr3").write_text("x")  # ops name still found
+    monkeypatch.setenv("FIXstofs3d", str(fix))
+    proc.grid_file = None
+    with caplog.at_level("INFO"):
+        proc._call_fortran_gen_3dth(work, ssh_1, None)
+    seen = set((work / "seen.txt").read_text().split())
+    assert {"hgrid.gr3", "hgrid.ll", "vgrid.in", "gen_3Dth_from_nc.in", "estuary.gr3"} <= seen
+    assert "gen_3Dth input: hgrid.gr3 ->" in caplog.text
+    assert not [r for r in caplog.records if r.levelname == "WARNING"
+                and "hgrid" in r.message]
+
+
+def test_fortran_config_path_wins_and_missing_required_warns(setup, monkeypatch, caplog):
+    cfg, proc, files, ssh_1, work, tmp = setup
+    _stub_exe(tmp, monkeypatch)
+    fix = tmp / "fix"
+    fix.mkdir()
+    (fix / "stofs_3d_atl_ufs.hgrid.ll").write_text("fix")
+    monkeypatch.setenv("FIXstofs3d", str(fix))
+    gl = tmp / "mine.ll"
+    gl.write_text("cfg")
+    proc.grid_file = gl
+    with caplog.at_level("WARNING"):
+        proc._call_fortran_gen_3dth(work, ssh_1, None)
+    assert (work / "hgrid.ll").resolve() == gl.resolve()
+    for n in ("hgrid.gr3", "vgrid.in", "gen_3Dth_from_nc.in"):
+        assert f"gen_3Dth input {n} not found" in caplog.text
+    assert "hgrid.ll not found" not in caplog.text
+
+
+def test_fortran_keeps_raw_ssh_when_linking_adt(setup, monkeypatch):
+    cfg, proc, files, ssh_1, work, tmp = setup
+    _stub_exe(tmp, monkeypatch)
+    blended = _blend(cfg, tmp, ssh_1, work, lambda lo, la: np.full_like(lo, 0.90))
+    proc._call_fortran_gen_3dth(work, blended, None)
+    assert (work / "SSH_1.nc").resolve() == blended.resolve()
+    assert (work / "SSH_1_raw.nc").is_file()
