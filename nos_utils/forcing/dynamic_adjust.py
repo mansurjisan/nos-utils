@@ -507,13 +507,56 @@ def compute_bias(
 # NetCDF SSH adjustment
 # =============================================================================
 
+def densify_hourly(elev_nc: Path) -> bool:
+    """Resample a coarser-than-hourly elev2D to hourly, linear in time (ops `cdo inttime,1hour`).
+
+    Ops runs the ramp on the hourly file, so the 6-hourly non-adjusted series is densified
+    first. Files with hourly or finer records, or no time axis, are left alone. Returns True
+    if the file was rewritten.
+    """
+    from netCDF4 import Dataset
+
+    from .obc_ops_interp import resample_records
+
+    with Dataset(str(elev_nc)) as src:
+        if "time" not in src.variables or src.dimensions["time"].size < 2:
+            return False
+        t = np.asarray(src.variables["time"][:], dtype=np.float64)
+        if np.diff(t).min() <= 3600.0 + 1e-6:
+            return False
+        n = int(np.ceil((t[-1] - t[0]) / 3600.0 - 1e-9)) + 1
+        tmp = elev_nc.with_name(elev_nc.name + ".hourly")
+        with Dataset(str(tmp), "w", format=src.data_model) as dst:
+            for name, dim in src.dimensions.items():
+                dst.createDimension(name, n if name == "time" else dim.size)
+            for name, v in src.variables.items():
+                out = dst.createVariable(name, v.dtype, v.dimensions)
+                out.setncatts({k: v.getncattr(k) for k in v.ncattrs() if k != "_FillValue"})
+                a = np.ma.filled(v[:], np.nan) if v.dimensions[:1] == ("time",) else v[:]
+                if name == "time":
+                    out[:] = t[0] + np.arange(n) * 3600.0
+                elif v.dimensions[:1] == ("time",):
+                    out[:] = resample_records(a, t - t[0], 3600.0, n)
+                elif name == "time_step":
+                    out[:] = 3600.0
+                else:
+                    out[:] = a
+    tmp.replace(elev_nc)
+    log.info(f"Resampled {elev_nc.name} to hourly records ({n}), as ops inttime before the ramp")
+    return True
+
+
 def apply_ssh_time_varying_adjust(
     elev_nc: Path,
     adj0: float,
     adj1: float,
     var_name: str = "time_series",
+    start_offset_hours: int = 0,
 ) -> bool:
     """Subtract a time-varying bias from ``time_series`` in ``elev_nc``.
+
+    ``start_offset_hours`` is the file's start measured from the nowcast start, so the ramp
+    runs on absolute time (a forecast file starting at 24 h gets adj1 on every record).
 
     The operational ex-script applies:
         * t=0  -> value - adj0
@@ -526,6 +569,12 @@ def apply_ssh_time_varying_adjust(
         raise RuntimeError("netCDF4 is required for SSH adjustment")
     if not elev_nc.exists():
         log.error(f"Cannot apply SSH adjust: {elev_nc} not found")
+        return False
+
+    try:
+        densify_hourly(elev_nc)
+    except Exception as exc:
+        log.error(f"Failed to resample {elev_nc} to hourly: {exc}")
         return False
 
     adj0_f = 0.0 if (adj0 is None or math.isnan(adj0)) else float(adj0)
@@ -547,11 +596,10 @@ def apply_ssh_time_varying_adjust(
             if np.ma.isMaskedArray(data):
                 data = data.filled(np.nan)
             data = np.asarray(data, dtype=np.float64)
-            data[0] = data[0] - adj0_f
-            if n_t > 1:
-                data[1] = data[1] - avg
-            if n_t > 2:
-                data[2:] = data[2:] - adj1_f
+            k = int(start_offset_hours) + np.arange(n_t)
+            data[k <= 0] -= adj0_f
+            data[k == 1] -= avg
+            data[k >= 2] -= adj1_f
             var[:] = data.astype(var.dtype, copy=False)
         log.info(
             f"Applied SSH dynamic adjust to {elev_nc.name}: "
@@ -608,8 +656,10 @@ class DynamicAdjustProcessor(ForcingProcessor):
         station_lats: Sequence[float] = DEFAULT_STATION_LATS,
         bias_window_days: int = 2,
         nan_threshold: float = DEFAULT_NAN_THRESHOLD,
+        start_offset_hours: int = 0,
     ) -> None:
         super().__init__(config, input_path, output_path)
+        self.start_offset_hours = int(start_offset_hours)
         self.obs_dir = (
             Path(obs_dir) if obs_dir
             else self._resolve_obs_dir(config.pdy)
@@ -709,6 +759,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
             self.elev2d_th_nc,
             adj0=adj_prev if adj_prev is not None else float("nan"),
             adj1=adj_today if adj_today is not None else float("nan"),
+            start_offset_hours=self.start_offset_hours,
         )
         if not applied:
             errors.append(f"Failed to apply SSH adjust to {self.elev2d_th_nc}")

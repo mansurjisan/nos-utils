@@ -48,6 +48,10 @@ from ..config import ForcingConfig
 from ..coords import normalize_lon, lon_convention
 from ..io.schism_grid import SchismGrid
 from .base import ForcingProcessor, ForcingResult
+from .obc_ops_interp import (
+    DRY_SSH, JUNK_EPS, RJUNK, corner_cells, dry_parents, fill_columns, fill_uv, fix_ssh,
+    interpolate4, parent_weights, parent_weights_2d, rect_axes, resample_records, vertical_index,
+)
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +60,29 @@ try:
     HAS_NETCDF4 = True
 except ImportError:
     HAS_NETCDF4 = False
+
+
+# Ops OBC record spacing (stofs_3d_atl_obc_3dth_nc.in dtout) and the ops record count: 23 6-hourly
+# records from the nowcast start, n012 to f120. MJ (10/02/26)
+OPS_OBC_DT = 21600.0
+OPS_MIN_SLOTS = 23
+
+
+def _pack_for_fortran(real, scale, offset, fill, fill_mask=None):
+    """
+    Pack a float field to float exactly as the Fortran gen_*_hycom expects.
+    stored = (real - offset) / scale
+
+    Single source of truth for the SSH writer, the TSUV writer, and the ADT
+    blend so the packing convention cannot drift between surf_el and TSUV.
+    """
+    real = np.asarray(real, dtype=np.float32)
+    packed = (real - offset) / scale
+    mask = ~np.isfinite(real)
+    if fill_mask is not None:
+        mask = mask | fill_mask
+    packed = np.where(mask, fill, packed)
+    return packed
 
 
 class RTOFSProcessor(ForcingProcessor):
@@ -108,6 +135,8 @@ class RTOFSProcessor(ForcingProcessor):
         phase: Optional[str] = None,
         time_hotstart: Optional[datetime] = None,
         buffer_hours: Optional[int] = None,
+        adt_archive_name: Optional[str] = None,
+        adt_prev_dirs=(),
     ):
         """
         Args:
@@ -126,8 +155,14 @@ class RTOFSProcessor(ForcingProcessor):
                 ``DEFAULT_BUFFER_HOURS`` (3h, matching legacy COMF). The
                 buffer only applies to phase != None — the backward-compat
                 combined ``phase=None`` window is unchanged.
+            adt_archive_name: file name under ``output_path`` that receives the ADT field
+                each cycle (the ops adt_aft_cvtz_cln.nc archive); None disables it
+            adt_prev_dirs: previous-cycle directories searched for that archive when no
+                ADT file exists
         """
         super().__init__(config, input_path, output_path)
+        self.adt_archive_name = adt_archive_name
+        self.adt_prev_dirs = list(adt_prev_dirs)
         self.grid_file = grid_file or config.grid_file
         self.obc_ctl_file = obc_ctl_file
         self.vgrid_file = vgrid_file
@@ -138,6 +173,8 @@ class RTOFSProcessor(ForcingProcessor):
                 config, "obc_buffer_hours", self.DEFAULT_BUFFER_HOURS,
             )
         self.buffer_hours = int(buffer_hours)
+        self._valid_times = {}  # path -> valid time from the ops file selection. MJ (10/02/26)
+        self._select_notes = []
         self._grid = None
         self._bnd_lons = None
         self._bnd_lats = None
@@ -150,6 +187,23 @@ class RTOFSProcessor(ForcingProcessor):
         self._struct_interp = {}  # Cached StructuredGridInterpolator per grid shape
         self._3d_roi = None     # Cached ROI indices (j_start, j_end, i_start, i_end) for 3D subsetting
         self._wl_bias_info = None   # Outcome of the WL bias correction (see _apply_wl_bias)
+        self._ssh_blended_used = False
+        self._ops_warnings = []
+        self._ops_reasons = {"elev2D": [], "T/S": []}  # fallback reasons kept apart per product
+        # Interpolation labels in the ForcingResult metadata:
+        #   ops         Python gen_3Dth-equivalent from SSH_1(_adt).nc / TSUV_1.nc
+        #   ops+surfT-mask  as ops, but the T/S dry mask came from surface T, not SSH_1
+        #   fortran     output of the gen_3Dth executable
+        #   delaunay    Delaunay interpolation of the ADT-blended SSH_1 (elev2D) or of the raw
+        #               3D files (T/S)
+        #   precomputed REMESH weights applied to the raw RTOFS files
+        #   raw         raw RTOFS 2D files with Delaunay, no ADT (elev2D only)
+        # MJ (10/02/26)
+        self._elev2d_interp = None
+        self._ts_interp = None
+        self._ts_mask_fallback = False
+        self._ssh1_path = None  # SSH_1.nc (ADT-blended when available) for the ops-equivalent elev2D
+        self._tsuv1_path = None  # TSUV_1.nc for the ops-equivalent T/S
         # Discovery diagnostics, reset by find_input_files_by_type(). Values
         # are exact glob matches before size/pairing/window filtering.
         self._matched_3d_sizes = {}
@@ -414,6 +468,24 @@ class RTOFSProcessor(ForcingProcessor):
         """True if using STOFS-style ROI-based processing."""
         return self.config.obc_roi_2d is not None
 
+    @property
+    def _ops_timeline(self) -> bool:
+        """True for the ATL ops timeline (same-day cycle first, 6-hourly records)."""
+        return self.is_stofs_mode and bool(self.config.obc_ops_timeline)
+
+    def valid_time(self, path: Path) -> datetime:
+        """Valid time of an RTOFS file: the selection's own date, else cycle date + hour tag.
+
+        In the ops timeline an nHHH file is valid at cycle - 24 h + HHH. MJ (10/02/26)
+        """
+        vt = self._valid_times.get(Path(path))
+        if vt is not None:
+            return vt
+        hour, is_n = self._parse_rtofs_hour(path)
+        cycle = getattr(self, "_rtofs_cycle_date", None) or datetime.strptime(
+            self.config.pdy, "%Y%m%d")
+        return cycle + timedelta(hours=hour - (24 if is_n and self._ops_timeline else 0))
+
     def process(self) -> ForcingResult:
         if not HAS_NETCDF4:
             return ForcingResult(
@@ -597,8 +669,13 @@ class RTOFSProcessor(ForcingProcessor):
                 errors=[self._missing_region_3d_error(region)],
             )
 
-        import tempfile
-        work_dir = Path(tempfile.mkdtemp(prefix="rtofs_stofs_"))
+        keep = os.environ.get("KEEPDATA", "").strip().upper() == "YES"
+        work_dir = self._stofs_work_dir(keep)
+        log.info(f"STOFS OBC work dir: {work_dir} ({'kept' if keep else 'removed on exit'})")
+        self._ops_warnings = list(self._select_notes)
+        self._ops_reasons = {"elev2D": [], "T/S": []}
+        self._ts_mask_fallback = False
+        self._elev2d_interp = self._ts_interp = None
 
         try:
             output_files = []
@@ -625,36 +702,63 @@ class RTOFSProcessor(ForcingProcessor):
                 )
 
             # Step 3: ADT SSH blending (if enabled and data available)
+            adt_blended = False
+            adt_regrid = None
             if ssh_path and self.config.adt_enabled:
-                from .adt import ADTBlender
-                blender = ADTBlender(self.config, self.input_path)
-                blended = blender.blend_ssh(ssh_path, work_dir)
+                from .adt import ADTBlender, ADTUnavailableError
+                blender = ADTBlender(
+                    self.config, self.input_path, keep=keep,
+                    archive_path=(self.output_path / self.adt_archive_name
+                                  if self.adt_archive_name else None),
+                    prev_dirs=self.adt_prev_dirs, ops_numerics=self._ops_timeline)
+                try:
+                    blended = blender.blend_ssh(ssh_path, work_dir)
+                except ADTUnavailableError as e:
+                    return ForcingResult(success=False, source=self.SOURCE_NAME,
+                                         errors=[str(e)], warnings=warnings)
+                adt_regrid = blender.regrid if blended else None
+                warnings.extend(blender.warnings)
                 if blended:
                     ssh_path = blended
+                    adt_blended = True
                     log.info("ADT SSH blending applied")
                 else:
                     warnings.append("ADT data unavailable, using RTOFS-only SSH")
 
-            # Step 4: Try Fortran gen_3Dth_from_hycom
-            fortran_ok = self._call_fortran_gen_3dth(work_dir, ssh_path, tsuv_path)
+            # Step 4: Fortran gen_3Dth_from_hycom only when opted in; the default is
+            # the Python ops-equivalent. MJ (10/01/26)
+            fortran_ok = False
+            if self.config.obc_use_fortran_gen3dth:
+                fortran_ok = self._call_fortran_gen_3dth(work_dir, ssh_path, tsuv_path)
 
             elev2d_ok = False
             obc3d_ok = False
+            # SSH_1(_adt).nc / TSUV_1.nc feed the Python ops-equivalent. MJ (10/01/26)
+            self._ssh1_path = ssh_path
+            self._tsuv1_path = tsuv_path
+            ssh_source = ssh_path if adt_blended else None
 
             if fortran_ok:
                 # Copy Fortran outputs to final output directory.
-                # NOTE: do NOT apply obc_ssh_offset here — the Fortran exe
-                # (nos_ofs_create_forcing_obc_schism / gen_3Dth_from_hycom)
-                # already adds the geoid-to-MSL offset internally. See the
-                # note at _call_fortran_gen_3dth and commit ca16ad5 which
-                # removed a double-offset bug. The Python fallback path
-                # (_interpolate_2d) does apply it inline, but only because
-                # that path doesn't call the Fortran.
+                # The gen_3Dth f90 has no datum offset (it only scales ssh by 1e-3), so the
+                # +0.04 and the first-record hold are applied to elev2D below, as in
+                # non_adjust.sh:609-611. MJ (10/02/26)
                 for fname in ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"]:
                     src = work_dir / fname
                     if src.exists():
                         dst = self.output_path / fname
                         shutil.copy2(src, dst)
+                        if fname == "elev2D.th.nc":
+                            # The f90 adds no offset; non_adjust.sh adds +0.04 and holds record 0
+                            # (lines 609-611). MJ (10/02/26)
+                            self._apply_ssh_offset(dst, self.config.obc_ssh_offset)
+                            if self.config.obc_ssh_hold_first_record:
+                                self._hold_first_record(dst)
+                        # The exe series starts at the nowcast start; slice after the hold so
+                        # the held record is the nowcast-start one, as the Python ops path.
+                        # MJ (10/02/26)
+                        if self._ops_timeline and self.phase:
+                            self._slice_phase_records(dst)
                         output_files.append(dst)
                 # Track elev2d_ok/obc3d_ok from the names actually copied,
                 # not "was anything copied" -- the Fortran exe (like
@@ -668,12 +772,18 @@ class RTOFSProcessor(ForcingProcessor):
                 elev2d_ok = "elev2D.th.nc" in produced
                 obc3d_ok = set(self.REQUIRED_3D_OBC_FILES).issubset(produced)
             else:
-                warnings.append("Fortran gen_3Dth not available, using Python interpolation")
-                # Fall back to Python Delaunay — load grid and use existing _process_2d/_process_3d
+                if self.config.obc_use_fortran_gen3dth:
+                    warnings.append("Fortran gen_3Dth not available, using Python interpolation")
+                # Python ops-equivalent (Delaunay only if its inputs are unusable)
                 has_grid = self._load_grid()
                 if has_grid:
                     if files_2d:
-                        f = self._process_2d(files_2d)
+                        f = (self._process_2d(files_2d, ssh_source=ssh_source)
+                             if ssh_source else self._process_2d(files_2d))
+                        if ssh_source and not self._ssh_blended_used:
+                            adt_blended = False
+                            warnings.append("ADT blend requested but raw RTOFS SSH was "
+                                            "used for elev2D")
                         if f:
                             output_files.append(f)
                             elev2d_ok = True
@@ -713,27 +823,53 @@ class RTOFSProcessor(ForcingProcessor):
                     warnings=warnings,
                 )
 
+            if not fortran_ok:
+                for label, used in (("elev2D", self._elev2d_interp), ("T/S", self._ts_interp)):
+                    reasons = "; ".join(dict.fromkeys(self._ops_reasons[label])) \
+                        or "SSH_1/TSUV_1 unavailable"
+                    if used is not None and not used.startswith("ops"):
+                        warnings.append(f"{label}: fell back from the ops-equivalent path to "
+                                        f"{used} ({reasons})")
+                warnings.extend(m for m in dict.fromkeys(self._ops_warnings)
+                                if not any(m in w for w in warnings))
             return ForcingResult(
                 success=len(output_files) > 0,
                 source=self.SOURCE_NAME,
                 output_files=output_files,
                 warnings=warnings,
                 metadata={
+                    "elev2d_interp": "fortran" if fortran_ok else self._elev2d_interp,
+                    "ts_interp": "fortran" if fortran_ok else self._ts_interp,
                     "n_2d_files": len(files_2d),
                     "n_3d_files": len(files_3d),
+                    "n_source_records": {"2d": len(files_2d), "3d": len(files_3d)},
                     "stofs_mode": True,
                     "fortran_used": fortran_ok,
-                    "adt_blended": self.config.adt_enabled and not any("ADT" in w for w in warnings),
+                    "adt_blended": adt_blended,
+                    "adt_regrid": adt_regrid if adt_blended else None,
                 },
             )
         finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            if not keep:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            self._ssh1_path = self._tsuv1_path = None
 
     def find_input_files(self) -> List[Path]:
         files_2d, files_3d = self.find_input_files_by_type()
         return files_2d + files_3d
 
     # ---- STOFS data preparation methods ----
+
+    def _stofs_work_dir(self, keep: bool) -> Path:
+        """Scratch dir for the STOFS OBC intermediates; per phase under DATA (else the output dir) when kept."""
+        if not keep:
+            import tempfile
+            return Path(tempfile.mkdtemp(prefix="rtofs_stofs_"))
+        base = Path(os.environ.get("DATA") or self.output_path)
+        work = base / f"rtofs_stofs_{self.phase or 'all'}"
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True, exist_ok=True)
+        return work
 
     def _stofs_subset_roi(self, ds, roi: dict, variables: List[str]) -> dict:
         """Subset RTOFS NetCDF by ROI indices (replaces NCO ncks -d X,x1,x2 -d Y,y1,y2)."""
@@ -818,7 +954,8 @@ class RTOFSProcessor(ForcingProcessor):
             time_var[:] = np.arange(nt) * 21600.0  # 6-hourly default
 
         lon_var = nc.createVariable("xlon", "f4", ("ylat", "xlon"))
-        lon_var[:] = all_lon
+        # TODO: Check validity for pacific
+        lon_var[:] = all_lon - 360
 
         lat_var = nc.createVariable("ylat", "f4", ("ylat", "xlon"))
         lat_var[:] = all_lat
@@ -829,14 +966,23 @@ class RTOFSProcessor(ForcingProcessor):
         for t in range(nt):
             ssh_var[t] = all_ssh[t]
 
-        # Also write surf_el (scaled format expected by Fortran)
-        surf_el = nc.createVariable("surf_el", "f4", ("time", "ylat", "xlon"),
-                                    fill_value=-30000.0)
-        surf_el.scale_factor = 0.001
+        _SSH_FILL = -30000.0
+        surf_el = nc.createVariable(
+            "surf_el", "f4", ("time", "ylat", "xlon"),
+            fill_value=_SSH_FILL,
+        )
+        surf_el.set_auto_maskandscale(False)
+        surf_el.scale_factor = np.float32(0.001)
+        surf_el.add_offset = np.float32(0.0)
+        surf_el.missing_value = _SSH_FILL
         for t in range(nt):
-            data = all_ssh[t].copy()
-            data = np.where(np.abs(data) < 10000, data * 1000.0, -3000.0)
-            surf_el[t] = data
+            real = np.asarray(all_ssh[t], dtype=np.float32)
+            # Extreme cells (|SSH| >= 10000 m) map to fill; _pack_for_fortran also
+            # sends non-finite cells there
+            surf_el[t] = _pack_for_fortran(
+                real, surf_el.scale_factor, surf_el.add_offset,
+                _SSH_FILL, fill_mask=np.abs(real) >= 10000,
+            )
 
         nc.close()
         log.info(f"Created SSH_1.nc: {nt} times, {ny}x{nx} grid")
@@ -881,8 +1027,9 @@ class RTOFSProcessor(ForcingProcessor):
                 for t in range(subset["temperature"].shape[0]):
                     all_temp.append(np.ma.filled(subset["temperature"][t], fill_value=-30000.0))
                     all_salt.append(np.ma.filled(subset["salinity"][t], fill_value=-30000.0))
-                    all_u.append(np.ma.filled(subset["u"][t], fill_value=0.0))
-                    all_v.append(np.ma.filled(subset["v"][t], fill_value=0.0))
+                    # Missing u/v -> -30000 (ops cvtUV.nco change_miss(-30000)),
+                    all_u.append(np.ma.filled(subset["u"][t], fill_value=-30000.0))
+                    all_v.append(np.ma.filled(subset["v"][t], fill_value=-30000.0))
 
                 if all_lon is None:
                     all_lon = np.array(subset["Longitude"])
@@ -898,6 +1045,28 @@ class RTOFSProcessor(ForcingProcessor):
             return None
 
         # Write TSUV_1.nc (matching Fortran input format)
+        return self._write_tsuv_nc(
+            work_dir, all_temp, all_salt, all_u, all_v,
+            all_lon, all_lat, all_depth,
+        )
+
+    def _write_tsuv_nc(
+        self, work_dir: Path,
+        all_temp: List[np.ndarray], all_salt: List[np.ndarray],
+        all_u: List[np.ndarray], all_v: List[np.ndarray],
+        all_lon: np.ndarray, all_lat: np.ndarray,
+        all_depth: Optional[np.ndarray] = None,
+    ) -> Optional[Path]:
+        """Write TSUV_1.nc with T/S/U/V explicitly packed
+
+        Split out of _stofs_prepare_tsuv so the packing is unit-testable.
+        Each list holds one (nz, ny, nx) array per time step; all_lon/all_lat
+        are (ny, nx); all_depth is the (nz,) level depths. Cells equal to the
+        -30000 real-space sentinel (from ma.filled in the caller) are stored.
+        """
+        if not all_temp:
+            return None
+
         output = work_dir / "TSUV_1.nc"
         nc = Dataset(str(output), "w", format="NETCDF4")
 
@@ -913,19 +1082,43 @@ class RTOFSProcessor(ForcingProcessor):
         time_var[:] = np.arange(nt) * 21600.0
 
         if all_depth is not None:
-            lev_var = nc.createVariable("lev", "f4", ("lev",))
-            lev_var[:] = all_depth
+            dep_var = nc.createVariable("depth", "f4", ("lev",))
+            dep_var[:] = all_depth
 
         lon_var = nc.createVariable("xlon", "f4", ("ylat", "xlon"))
         lon_var[:] = all_lon
         lat_var = nc.createVariable("ylat", "f4", ("ylat", "xlon"))
         lat_var[:] = all_lat
 
-        for name, data_list in [("temperature", all_temp), ("salinity", all_salt),
-                                ("water_u", all_u), ("water_v", all_v)]:
-            var = nc.createVariable(name, "f4", ("time", "lev", "ylat", "xlon"))
+        # Pack T/S/U/V explicitly, matching operational NCO converters
+        # set_auto_maskandscale(False) prevents netCDF4 re-applying scale_factor
+        # on write (double-pack).
+        _TSUV_FILL = -30000.0
+        _pack_spec = [
+            # (varname,   data_list,  add_offset, scale_factor, unpacked_fill)
+            ("temperature", all_temp, 20.0,  0.001, -30000.0),
+            ("salinity",    all_salt, 20.0,  0.001, -30000.0),
+            ("water_u",     all_u,     0.0,  0.001, -30000.0),
+            ("water_v",     all_v,     0.0,  0.001, -30000.0),
+        ]
+        for vname, data_list, add_offset, scale_factor, fill_real in _pack_spec:
+            var = nc.createVariable(
+                vname, "f4", ("time", "lev", "ylat", "xlon"),
+                fill_value=_TSUV_FILL,
+            )
+            var.set_auto_maskandscale(False)
+            var.scale_factor = np.float32(scale_factor)
+            var.add_offset = np.float32(add_offset)
+            var.missing_value = _TSUV_FILL
             for t in range(nt):
-                var[t] = data_list[t]
+                real = np.asarray(data_list[t], dtype=np.float32)
+                # Cells equal to the real-space sentinel (fill_real from
+                # ma.filled in the caller) map to fill; _pack_for_fortran also sends
+                # non-finite cells there
+                var[t] = _pack_for_fortran(
+                    real, var.scale_factor, var.add_offset,
+                    _TSUV_FILL, fill_mask=np.abs(real - fill_real) < 1e-3,
+                )
 
         nc.close()
         log.info(f"Created TSUV_1.nc: {nt} times, {nz} levels, {ny}x{nx} grid")
@@ -960,44 +1153,36 @@ class RTOFSProcessor(ForcingProcessor):
             log.debug("No Fortran gen_3Dth_from_hycom executable found")
             return False
 
-        # Symlink required input files into work_dir
-        fix_dir = os.environ.get("FIXstofs3d", "")
         required_links = {
             "SSH_1.nc": ssh_path,
             "TS_1.nc": tsuv_path,
             "UV_1.nc": tsuv_path,
         }
-
-        # Grid files from FIX
-        fix_files = {
-            "hgrid.ll": "stofs_3d_atl_hgrid.ll",
-            "hgrid.gr3": "stofs_3d_atl_hgrid.gr3",
-            "vgrid.in": "stofs_3d_atl_vgrid.in",
-            "estuary.gr3": "stofs_3d_atl_estuary.gr3",
-            "TEM_nudge.gr3": "stofs_3d_atl_tem_nudge.gr3",
-            "gen_3Dth_from_nc.in": "stofs_3d_atl_obc_3dth_nc.in",
-        }
-
         for link_name, source in required_links.items():
             if source and source.exists():
                 target = work_dir / link_name
-                if not target.exists():
-                    target.symlink_to(source)
+                # SSH_1.nc holds the raw SSH when ADT went to SSH_1_adt.nc; point the exe at
+                # this run's input but keep the raw file as SSH_1_raw.nc. MJ (10/02/26)
+                if target.exists() or target.is_symlink():
+                    if target.exists() and os.path.samefile(target, source):
+                        continue
+                    if target.is_symlink():
+                        target.unlink()
+                    else:
+                        target.rename(work_dir / f"{target.stem}_raw{target.suffix}")
+                target.symlink_to(source)
+                log.info(f"gen_3Dth input: {link_name} -> {source}")
 
-        if fix_dir:
-            for link_name, fix_name in fix_files.items():
-                src = Path(fix_dir) / fix_name
-                if src.exists():
-                    target = work_dir / link_name
-                    if not target.exists():
-                        target.symlink_to(src)
-
-        # Also try grid_file from config
-        if self.grid_file and Path(self.grid_file).exists():
-            for name in ["hgrid.ll"]:
-                target = work_dir / name
-                if not target.exists():
-                    target.symlink_to(self.grid_file)
+        for link_name, (src, required) in self._fortran_fix_inputs().items():
+            if src is None:
+                (log.warning if required else log.info)(
+                    f"gen_3Dth input {link_name} not found"
+                    f"{' — the exe will likely fail' if required else ''}")
+                continue
+            target = work_dir / link_name
+            if not target.exists():
+                target.symlink_to(src)
+                log.info(f"gen_3Dth input: {link_name} -> {src}")
 
         try:
             result = subprocess.run(
@@ -1012,10 +1197,8 @@ class RTOFSProcessor(ForcingProcessor):
                 log.warning(f"gen_3Dth returned {result.returncode}: {result.stderr[:300]}")
                 return False
 
-            # NOTE: Do NOT apply SSH offset here — the Fortran executable
-            # (nos_ofs_create_forcing_obc_schism / gen_3Dth_from_hycom)
-            # already applies the offset internally (WL += 1.25 at line ~3133).
-            # Applying it again would double the offset to +2.5m.
+            # The offset (+0.04) and the first-record hold are applied by the caller after the
+            # copy; the gen_3Dth f90 adds no offset. MJ (10/02/26)
 
             # Verify outputs exist. A bare count (`len(found) >= 3`) treated
             # any three of the four files as good enough, which accepts
@@ -1038,6 +1221,95 @@ class RTOFSProcessor(ForcingProcessor):
         except Exception as e:
             log.warning(f"Error calling Fortran gen_3Dth: {e}")
             return False
+
+    def _fortran_fix_inputs(self) -> dict:
+        """{link name: (path or None, required)} for the gen_3Dth fix inputs.
+
+        Per file: the configured path, then <prefix>.<name> (the port's fix naming), then the
+        ops name, searched in FIXstofs3d then FIXofs. MJ (10/02/26)
+        """
+        dirs = [Path(os.environ[v]) for v in ("FIXstofs3d", "FIXofs") if os.environ.get(v)]
+        prefixes = []
+        if self.grid_file and ".hgrid" in Path(self.grid_file).name:
+            prefixes.append(Path(self.grid_file).name.split(".hgrid")[0])
+        prefixes += [p for p in (os.environ.get("RUN"), "stofs_3d_atl_ufs") if p]
+        prefixes = list(dict.fromkeys(prefixes))
+        table = {
+            "hgrid.ll": (self.grid_file, "hgrid.ll", "stofs_3d_atl_hgrid.ll", True),
+            "hgrid.gr3": (None, "hgrid.gr3", "stofs_3d_atl_hgrid.gr3", True),
+            "vgrid.in": (self.vgrid_file, "vgrid.in", "stofs_3d_atl_vgrid.in", True),
+            "gen_3Dth_from_nc.in": (None, "obc_3dth_nc.in", "stofs_3d_atl_obc_3dth_nc.in", True),
+            "estuary.gr3": (None, "estuary.gr3", "stofs_3d_atl_estuary.gr3", False),
+            "TEM_nudge.gr3": (None, "tem_nudge.gr3", "stofs_3d_atl_tem_nudge.gr3", False),
+        }
+        out = {}
+        for link, (cfg_path, bare, ops_name, required) in table.items():
+            cands = [Path(cfg_path)] if cfg_path else []
+            cands += [d / f"{pf}.{bare}" for d in dirs for pf in prefixes]
+            cands += [d / ops_name for d in dirs]
+            out[link] = (next((c for c in cands if c.is_file()), None), required)
+        return out
+
+    def _hold_at_nowcast_start(self, ssh_array, rtofs_times, model_t0):
+        """Hold elev2D at its value at the nowcast start, as ops holds record 0 (n012) for the run.
+
+        rtofs_times are seconds from model_t0. When the nowcast start is outside the file window
+        (usually in the forecast phase) record 0 is held and a warning is recorded. MJ (10/02/26)
+        """
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + timedelta(hours=self.config.cyc)
+        ref = (cycle_dt - timedelta(hours=self.config.nowcast_hours) - model_t0).total_seconds()
+        order = np.argsort(rtofs_times)
+        t, a = rtofs_times[order], ssh_array[order]
+        if t[0] <= ref <= t[-1]:
+            i = int(np.clip(np.searchsorted(t, ref, side="right") - 1, 0, max(len(t) - 2, 0)))
+            f = 0.0 if len(t) == 1 or t[i + 1] == t[i] else (ref - t[i]) / (t[i + 1] - t[i])
+            row = a[i] * (1 - f) + a[min(i + 1, len(t) - 1)] * f
+            log.info("elev2D: held at the nowcast-start value (ops non_adjust)")
+        else:
+            row = ssh_array[0]
+            self._ops_note("elev2D hold reference differs from ops: the nowcast start is outside "
+                           "the RTOFS window, so the first file is held (only matters without ADT)")
+        return np.repeat(row[None, :], ssh_array.shape[0], axis=0)
+
+    @staticmethod
+    def _hold_first_record(elev_path: Path) -> None:
+        """Set every elev2D record to record 0 (ops non_adjust.sh:611)."""
+        ds = Dataset(str(elev_path), "r+")
+        ts = ds.variables["time_series"]
+        ts[:] = np.repeat(ts[0:1], ts.shape[0], axis=0)
+        ds.close()
+
+    def _slice_phase_records(self, path: Path) -> None:
+        """Cut a series that starts at the nowcast start down to this phase's window, time 0 at its start.
+
+        Records are picked by their time, the last record is held past the end of the series.
+        """
+        model_t0, _, dur = self._get_output_window(self.phase)
+        cycle = datetime.strptime(self.config.pdy, "%Y%m%d") + timedelta(hours=self.config.cyc)
+        start = (model_t0 - (cycle - timedelta(hours=self.config.nowcast_hours))).total_seconds()
+        n = int(np.ceil(dur / OPS_OBC_DT)) + 1
+        tmp = path.with_name(path.name + ".phase")
+        with Dataset(str(path)) as src:
+            t = np.asarray(src.variables["time"][:], dtype=np.float64)
+            dt = float(np.diff(t).min()) if len(t) > 1 else OPS_OBC_DT
+            idx = np.clip(np.rint(start / dt).astype(int) + np.arange(n), 0, len(t) - 1)
+            if start / dt + n - 1 > len(t) - 1:
+                self._ops_note(f"{path.name}: the exe series ends before the {n}-record "
+                               f"{self.phase} window; the last record is held")
+            with Dataset(str(tmp), "w", format=src.data_model) as dst:
+                for name, dim in src.dimensions.items():
+                    dst.createDimension(name, n if name == "time" else dim.size)
+                for name, v in src.variables.items():
+                    out = dst.createVariable(name, v.dtype, v.dimensions)
+                    out.setncatts({k: v.getncattr(k) for k in v.ncattrs() if k != "_FillValue"})
+                    if name == "time":
+                        out[:] = np.arange(n) * dt
+                    elif v.dimensions[:1] == ("time",):
+                        out[:] = v[:][idx]
+                    else:
+                        out[:] = v[:]
+        tmp.replace(path)
+        log.info(f"Sliced {path.name} to the {self.phase} window: {n} records from +{start / 3600:g} h")
 
     @staticmethod
     def _apply_ssh_offset(elev_path: Path, offset: float) -> None:
@@ -1114,7 +1386,13 @@ class RTOFSProcessor(ForcingProcessor):
         shared date for both variables, so picking 2D from one date and 3D
         from another would silently misdate whichever type didn't match
         that date -- a corrupted time axis, not a missing-file error.
+
+        The ops timeline (config.obc_ops_timeline) instead picks the same-day cycle
+        first and fills missing 6-hourly slots from the previous cycle, see
+        _find_ops_files.
         """
+        if self._ops_timeline:
+            return self._find_ops_files()
         base_date = datetime.strptime(self.config.pdy, "%Y%m%d")
         # Ops stages "alaska", "US_east" and "US_west" 3dz tiles side by
         # side for every valid time, with no region distinction in the old
@@ -1292,6 +1570,90 @@ class RTOFSProcessor(ForcingProcessor):
 
         return files_2d, files_3d
 
+    def _ops_slot_times(self) -> List[datetime]:
+        """6-hourly slots from the nowcast start, at least the 23 ops records, long enough for the run."""
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+                   timedelta(hours=self.config.cyc)
+        t0 = cycle_dt - timedelta(hours=int(self.config.nowcast_hours))
+        span = (cycle_dt - t0).total_seconds() + (
+            int(self.config.forecast_hours) + self.buffer_hours) * 3600.0
+        n = max(OPS_MIN_SLOTS, int(np.ceil(span / OPS_OBC_DT)) + 1)
+        return [t0 + timedelta(seconds=OPS_OBC_DT * k) for k in range(n)]
+
+    def _ops_candidates(self, date: datetime, kind: str):
+        """[(valid time, is_nowcast, path)] of the size-valid 2D or 3D files of one RTOFS cycle date."""
+        date_str = date.strftime("%Y%m%d")
+        region = self.config.rtofs_3d_region
+        if kind == "2d":
+            globs, floor = ["rtofs_glo_2ds_*_diag.nc"], self.MIN_FILE_SIZE_2D
+        else:
+            tag = region if region else "*"
+            globs = [f"rtofs_glo_3dz_*_6hrly_hvr_{tag}.nc", f"rtofs_glo_3dz_*_6hrly_hvr_{tag}.nc4"]
+            floor = self._minimum_3d_file_size()
+        for d in (self.input_path / f"rtofs.{date_str}", self.input_path / date_str, self.input_path):
+            if not d.exists():
+                continue
+            found = sorted(f for g in globs for f in d.glob(g))
+            if not found:
+                continue
+            out = []
+            for f in found:
+                if kind == "3d":
+                    try:
+                        self._matched_3d_sizes[f] = f.stat().st_size
+                    except OSError:
+                        self._matched_3d_sizes[f] = -1
+                if not self.validate_file_size(f, floor):
+                    continue
+                if kind == "3d":
+                    self._accepted_3d_paths.add(f)
+                hour, is_n = self._parse_rtofs_hour(f)
+                out.append((date + timedelta(hours=hour - (24 if is_n else 0)), is_n, f))
+            return out
+        return []
+
+    def _find_ops_files(self) -> Tuple[List[Path], List[Path]]:
+        """Ops route 1 then route 2 per slot: the same-day cycle's files, the previous cycle's only to fill gaps.
+
+        Slots are 6-hourly from the nowcast start. Ops route 1 is 2ds n012, n018, f000..f120
+        and 3dz n012, n018, n024, f006..f120 of rtofs.PDY; route 2 is rtofs.PDY-1 f012..f144.
+        Forecast files win over nowcast files at the same valid time.
+        """
+        base = datetime.strptime(self.config.pdy, "%Y%m%d")
+        slots = self._ops_slot_times()
+        want = set(slots)
+        self._matched_3d_sizes, self._accepted_3d_paths, self._invalid_3d_files = {}, set(), {}
+        self._valid_times = {}
+        self._select_notes = []
+        picked = {"2d": {}, "3d": {}}
+        n_prev = {"2d": 0, "3d": 0}
+        for date in (base, base - timedelta(days=1)):
+            for kind in ("2d", "3d"):
+                for vt, is_n, f in sorted(self._ops_candidates(date, kind),
+                                          key=lambda c: (c[0], c[1])):
+                    if vt in want and vt not in picked[kind]:
+                        picked[kind][vt] = f
+                        self._valid_times[f] = vt
+                        n_prev[kind] += date != base
+        self._rtofs_cycle_date = base
+        out = {}
+        for kind in ("2d", "3d"):
+            have = [vt for vt in slots if vt in picked[kind]]
+            out[kind] = [picked[kind][vt] for vt in have]
+            if have and n_prev[kind]:
+                self._select_notes.append(
+                    f"RTOFS {kind}: {n_prev[kind]} of {len(have)} slots filled from the previous cycle")
+            miss = [vt for vt in slots[:OPS_MIN_SLOTS] if vt not in picked[kind]] if have else []
+            if miss:
+                self._select_notes.append(
+                    f"RTOFS {kind}: {len(miss)} of the first {OPS_MIN_SLOTS} 6-hourly slots missing "
+                    f"in both cycles (first {miss[0]:%Y-%m-%d %Hz})")
+        for m in self._select_notes:
+            log.warning(m)
+        log.info(f"RTOFS ops selection: {len(out['2d'])} 2D, {len(out['3d'])} 3D files "
+                 f"over {len(slots)} slots")
+        return out["2d"], out["3d"]
+
     def _interpolate_2d_to_boundary(
         self, rtofs_lon: np.ndarray, rtofs_lat: np.ndarray, rtofs_data: np.ndarray,
     ) -> np.ndarray:
@@ -1311,7 +1673,6 @@ class RTOFSProcessor(ForcingProcessor):
         n_bnd = len(self._bnd_lons)
 
         # Delaunay interpolation with corner points (matching Fortran INTERP_REMESH)
-        # target_pts uses the mesh boundary convention (same as self._bnd_lons)
         target_pts = np.column_stack([self._bnd_lons, self._bnd_lats])
 
         # Flatten RTOFS grid
@@ -1598,7 +1959,29 @@ class RTOFSProcessor(ForcingProcessor):
             log.warning(f"WL bias correction unavailable ({e}) — SSH left uncorrected")
             return ssh_array, {"applied": False, "reason": f"error: {e}"}
 
-    def _process_2d(self, files_2d: List[Path]) -> Optional[Path]:
+    def _load_blended_ssh(self, ssh_source: Path, files_2d: List[Path]):
+        """Read the ADT-blended SSH_1 file as (lon, lat, ssh[nt, ny, nx] in m, NaN fill).
+
+        Returns None unless it has exactly one step per RTOFS 2D file, so the
+        time axis derived from the file names stays valid.
+        """
+        try:
+            ds = Dataset(str(ssh_source))
+            ssh = np.ma.filled(ds.variables["ssh"][:], fill_value=np.nan).astype(np.float64)
+            lon = np.array(ds.variables["xlon"][:])
+            lat = np.array(ds.variables["ylat"][:])
+            ds.close()
+        except Exception as e:
+            log.warning(f"Cannot read blended SSH {ssh_source}: {e} — using raw RTOFS SSH")
+            return None
+        if ssh.shape[0] != len(files_2d):
+            log.warning(f"Blended SSH has {ssh.shape[0]} steps for {len(files_2d)} 2D files "
+                        f"— using raw RTOFS SSH")
+            return None
+        ssh[np.abs(ssh) > 1000] = np.nan
+        return lon, lat, ssh
+
+    def _process_2d(self, files_2d: List[Path], ssh_source: Optional[Path] = None) -> Optional[Path]:
         """Extract SSH from RTOFS 2D files, interpolate to boundary nodes.
 
         After temporal interpolation the operational water-level bias
@@ -1620,7 +2003,6 @@ class RTOFSProcessor(ForcingProcessor):
           * ``wl_bias_obs_dir`` (path) — station files for the ``"file"``
             provider.
         """
-        output_file = self.output_path / "elev2D.th.nc"
         n_bnd = len(self._bnd_lons)
         model_dt = float(getattr(self.config, "model_dt", 120.0))  # SCHISM model timestep (seconds)
 
@@ -1628,28 +2010,57 @@ class RTOFSProcessor(ForcingProcessor):
         ssh_weights = self._find_ssh_weights()
         if ssh_weights:
             from ..interp.precomputed_weights import apply_precomputed_ssh
-            log.info("Using precomputed REMESH weights for SSH (Fortran-equivalent)")
+
+        # Ops-equivalent horizontal step on the SSH_1 grid (blended when given). MJ (10/01/26)
+        src = ssh_source or (self._ssh1_path if self.is_stofs_mode else None)
+        hold = self.is_stofs_mode and self.config.obc_ssh_hold_first_record
+        first_only = {"first_only": True} if (self._ops_timeline and hold) else {}
+        ops_ssh = self._ops_ssh_boundary(src, len(files_2d), **first_only) if src else None
+        blended = None
+        if ops_ssh is None and ssh_source:
+            blended = self._load_blended_ssh(ssh_source, files_2d)
+        self._ssh_blended_used = bool(ssh_source) and (ops_ssh is not None or blended is not None)
+        self._elev2d_interp = "ops" if ops_ssh is not None else (
+            "delaunay" if blended is not None else ("precomputed" if ssh_weights else "raw"))
+        if ops_ssh is not None and self._ops_timeline:
+            return self._write_elev2d_ops(files_2d, ops_ssh, hold)
+        if ops_ssh is None:
+            if blended is not None:
+                log.info("elev2D: SSH taken from the ADT-blended SSH_1 file")
+            else:
+                log.info("elev2D: SSH taken from the raw RTOFS 2D files")
 
         try:
             all_ssh = []
 
-            for f in files_2d:
-                ds = Dataset(str(f))
-                ssh_raw = ds.variables["ssh"][:]
-                lon = ds.variables["Longitude"][:]
-                lat = ds.variables["Latitude"][:]
-
-                ssh_raw = np.ma.filled(ssh_raw, fill_value=np.nan)
-
-                for t in range(ssh_raw.shape[0]):
-                    if ssh_weights:
-                        ssh_bnd = apply_precomputed_ssh(ssh_weights, ssh_raw[t])
-                    else:
-                        ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
+            if ops_ssh is not None:
+                all_ssh = [row + np.float32(self.config.obc_ssh_offset) for row in ops_ssh]
+            elif blended is not None:
+                b_lon, b_lat, b_ssh = blended
+                for t in range(b_ssh.shape[0]):
+                    ssh_bnd = self._interpolate_2d_to_boundary(b_lon, b_lat, b_ssh[t])
                     ssh_bnd += self.config.obc_ssh_offset
                     all_ssh.append(ssh_bnd)
+            else:
+                if ssh_weights:
+                    log.info("Using precomputed REMESH weights for SSH (Fortran-equivalent)")
+                for f in files_2d:
+                    ds = Dataset(str(f))
+                    ssh_raw = ds.variables["ssh"][:]
+                    lon = ds.variables["Longitude"][:]
+                    lat = ds.variables["Latitude"][:]
 
-                ds.close()
+                    ssh_raw = np.ma.filled(ssh_raw, fill_value=np.nan)
+
+                    for t in range(ssh_raw.shape[0]):
+                        if ssh_weights:
+                            ssh_bnd = apply_precomputed_ssh(ssh_weights, ssh_raw[t])
+                        else:
+                            ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
+                        ssh_bnd += self.config.obc_ssh_offset
+                        all_ssh.append(ssh_bnd)
+
+                    ds.close()
 
             if not all_ssh:
                 return None
@@ -1681,11 +2092,6 @@ class RTOFSProcessor(ForcingProcessor):
             # matching production-COMF semantics where the model clock
             # starts at the run origin (param.nml start_year/start_hour
             # already anchored to that point).
-            file_hours = []
-            for f in files_2d:
-                hour, _ = self._parse_rtofs_hour(f)
-                file_hours.append(hour)
-
             # Phase-aware output window: nowcast emits the 6h leg + buffer,
             # forecast emits the 48h leg + buffer (buffer_hours past sim_end
             # for SCHISM time_series interpolation headroom). None gives the
@@ -1695,14 +2101,15 @@ class RTOFSProcessor(ForcingProcessor):
             # Compute time of each file relative to model_t0.
             # Files at the nowcast origin have time=0; files before it
             # have negative times (ignored by interp clipping below).
-            rtofs_cycle = getattr(self, '_rtofs_cycle_date', None)
-            if rtofs_cycle is None:
-                rtofs_cycle = datetime.strptime(self.config.pdy, "%Y%m%d")
             rtofs_times = np.array(
-                [(rtofs_cycle + timedelta(hours=h) - model_t0).total_seconds()
-                 for h in file_hours],
+                [(self.valid_time(f) - model_t0).total_seconds() for f in files_2d],
                 dtype=np.float64,
             )
+            if hold and ops_ssh is not None and self._ssh_blended_used:
+                # Record 0 of the ADT blend is the ADT field alone, which ops holds. MJ (10/02/26)
+                ssh_array = np.repeat(ssh_array[:1], ssh_array.shape[0], axis=0)
+            elif hold:
+                ssh_array = self._hold_at_nowcast_start(ssh_array, rtofs_times, model_t0)
 
             # Route B coverage strategy (backfill, not previous-cycle reload):
             #   - Output must span [0, sim_duration] at model_dt intervals.
@@ -1780,52 +2187,306 @@ class RTOFSProcessor(ForcingProcessor):
                 ssh_array, time_axis, model_t0,
             )
 
-            # Write SCHISM format. NETCDF4_CLASSIC (not NETCDF4): SCHISM's
-            # NUOPC cap opens these via collective parallel-NetCDF at 2794-rank
-            # scale; HDF5-flavored files segfault during MPI-IO collective open
-            # *before* partition_hgrid runs. Production v3.9 writes classic.
-            nc = Dataset(str(output_file), "w", format="NETCDF4_CLASSIC")
-
-            # Dimension declaration order matches v3.9 production header layout
-            # (nComponents *before* nOpenBndNodes). Parallel pnetcdf readers can
-            # consult dim records by header offset, so the order matters even
-            # though variables reference dims by name.
-            nc.createDimension("time", nt)
-            nc.createDimension("nComponents", 1)
-            nc.createDimension("nOpenBndNodes", n_bnd)
-            nc.createDimension("nLevels", 1)
-            nc.createDimension("one", 1)
-
-            # Production elev2D uses time as f4 (not f8). Match for byte-format
-            # parity with v3.9 production output.
-            time_var = nc.createVariable("time", "f4", ("time",))
-            time_var[:] = time_axis
-
-            # SCHISM-required scalar for `nc dt1` consistency check.
-            # Without this variable, model init aborts with `MISC: nc dt1`.
-            ts_step = nc.createVariable("time_step", "f4", ("one",))
-            ts_step[0] = float(dt_out)
-
-            # Production omits _FillValue on time_series (no fill cells exist
-            # because all RTOFS-interpolated boundary points are valid). Match
-            # production by not setting fill_value here.
-            # Last dim is `one` (not `nComponents`) for elev2D — matches
-            # production. Both dims are size 1 so shape is unchanged but the
-            # binding name affects file layout.
-            ts = nc.createVariable("time_series", "f4",
-                                   ("time", "nOpenBndNodes", "nLevels", "one"))
-            ts[:, :, 0, 0] = ssh_array
-
-            nc.close()
-            log.info(f"Created elev2D.th.nc: ({nt}, {n_bnd}) boundary nodes, "
-                     f"time_step={dt_out}s")
-            return output_file
+            return self._write_elev2d(ssh_array, time_axis, dt_out)
 
         except Exception as e:
             log.error(f"Failed to process RTOFS 2D: {e}")
             import traceback
             log.error(traceback.format_exc())
             return None
+
+    def _write_elev2d(self, ssh_array: np.ndarray, time_axis: np.ndarray, dt_out: float) -> Path:
+        """Write elev2D.th.nc (SCHISM time_series layout) for ssh_array (nt, n_bnd) at time_axis (s)."""
+        output_file = self.output_path / "elev2D.th.nc"
+        nt, n_bnd = ssh_array.shape
+        # Write SCHISM format. NETCDF4_CLASSIC (not NETCDF4): SCHISM's
+        # NUOPC cap opens these via collective parallel-NetCDF at 2794-rank
+        # scale; HDF5-flavored files segfault during MPI-IO collective open
+        # *before* partition_hgrid runs. Production v3.9 writes classic.
+        nc = Dataset(str(output_file), "w", format="NETCDF4_CLASSIC")
+
+        # Dimension declaration order matches v3.9 production header layout
+        # (nComponents *before* nOpenBndNodes). Parallel pnetcdf readers can
+        # consult dim records by header offset, so the order matters even
+        # though variables reference dims by name.
+        nc.createDimension("time", nt)
+        nc.createDimension("nComponents", 1)
+        nc.createDimension("nOpenBndNodes", n_bnd)
+        nc.createDimension("nLevels", 1)
+        nc.createDimension("one", 1)
+
+        # Production elev2D uses time as f4 (not f8). Match for byte-format
+        # parity with v3.9 production output.
+        time_var = nc.createVariable("time", "f4", ("time",))
+        time_var[:] = time_axis
+
+        # SCHISM-required scalar for `nc dt1` consistency check.
+        # Without this variable, model init aborts with `MISC: nc dt1`.
+        ts_step = nc.createVariable("time_step", "f4", ("one",))
+        ts_step[0] = float(dt_out)
+
+        # Production omits _FillValue on time_series (no fill cells exist
+        # because all RTOFS-interpolated boundary points are valid). Match
+        # production by not setting fill_value here.
+        # Last dim is `one` (not `nComponents`) for elev2D — matches
+        # production. Both dims are size 1 so shape is unchanged but the
+        # binding name affects file layout.
+        ts = nc.createVariable("time_series", "f4",
+                               ("time", "nOpenBndNodes", "nLevels", "one"))
+        ts[:, :, 0, 0] = ssh_array
+
+        nc.close()
+        log.info(f"Created elev2D.th.nc: ({nt}, {n_bnd}) boundary nodes, "
+                 f"time_step={dt_out}s")
+        return output_file
+
+    def _write_elev2d_ops(self, files_2d: List[Path], ops_ssh: np.ndarray, hold: bool) -> Optional[Path]:
+        """Ops elev2D: 6-hourly records for this phase, constant when held (record 0 + 0.04, non_adjust.sh:609-611)."""
+        try:
+            off = np.float32(self.config.obc_ssh_offset)
+            model_t0, _, dur = self._get_output_window(self.phase)
+            n = int(np.ceil(dur / OPS_OBC_DT)) + 1
+            if hold:
+                rows = np.repeat(ops_ssh[:1] + off, n, axis=0)
+            else:
+                times = [(self.valid_time(f) - model_t0).total_seconds() for f in files_2d]
+                rows = resample_records(ops_ssh + off, times, OPS_OBC_DT, n)
+            time_axis = np.arange(n, dtype=np.float64) * OPS_OBC_DT
+            rows, self._wl_bias_info = self._apply_wl_bias(rows, time_axis, model_t0)
+            return self._write_elev2d(rows, time_axis, OPS_OBC_DT)
+        except Exception as e:
+            log.error(f"Failed to write ops elev2D: {e}")
+            return None
+
+    def _ops_note(self, msg, kind=None):
+        """Record a warning; kind ("elev2D" or "T/S") files it under that product's fallback reason."""
+        log.warning(msg)
+        self._ops_warnings.append(msg)
+        if kind:
+            self._ops_reasons[kind].append(msg)
+
+    def _ops_weights(self, lon, lat, single=False):
+        """Ops parent cell/weights for the boundary nodes; raises ValueError with the reason.
+
+        single=True evaluates mode 1 in float32 as the f90's real*4 (mode 0 stays float64).
+        """
+        mode = self.config.obc_interp_mode
+        if mode not in (0, 1):
+            raise ValueError(f"obc_interp_mode must be 0 or 1, got {mode!r}")
+        lon = np.ma.filled(lon, np.nan).astype(np.float64)
+        lat = np.ma.filled(lat, np.nan).astype(np.float64)
+        if not (np.isfinite(lon).all() and np.isfinite(lat).all()):
+            raise ValueError("non-finite lon/lat on the background grid")
+        nlon = np.asarray(self._bnd_lons, np.float64)
+        nlon = nlon % 360.0 if lon.max() > 180.0 else np.where(nlon > 180.0, nlon - 360.0, nlon)
+        nlat = np.asarray(self._bnd_lats, np.float64)
+        if mode == 1:
+            if lon.ndim == 1:
+                lon, lat = np.meshgrid(lon, lat)
+            return parent_weights_2d(lon, lat, nlon, nlat, single=single)
+        axes = rect_axes(lon, lat)
+        if axes is None:
+            raise ValueError("grid is not rectilinear, which interp_mode 0 needs")
+        return parent_weights(*axes, nlon, nlat, mode=0)
+
+    def _ops_label(self):
+        return "ops bilinear" if self.config.obc_interp_mode == 0 else "ops interp_mode=1"
+
+    def _ops_ssh_boundary(self, ssh_path, n_files, first_only=False) -> Optional[np.ndarray]:
+        """Boundary SSH (nt, n_bnd) float32 in m from SSH_1(_adt).nc, gen_3Dth rules; None to fall back.
+
+        Under the ops timeline, as the f90 (real*4): ssh = surf_el * 1e-3 from the packed
+        variable, float32 weights and sums. Other configs keep the float64 path on the ssh
+        variable. first_only reads record 0 only (the held ops elev2D).
+        """
+        ops = self._ops_timeline
+        f32 = np.float32 if ops else np.float64
+        try:
+            with Dataset(str(ssh_path)) as ds:
+                nt = ds.dimensions["time"].size
+                if nt != n_files:
+                    self._ops_note(f"{Path(ssh_path).name} has {nt} steps for {n_files} 2D "
+                                   f"files — elev2D not from the ops-equivalent path", "elev2D")
+                    return None
+                sl = slice(0, 1) if first_only else slice(None)
+                if ops and "surf_el" in ds.variables:
+                    v = ds.variables["surf_el"]
+                    v.set_auto_maskandscale(False)
+                    ssh = np.asarray(v[sl], f32) * f32(1e-3)
+                else:
+                    ssh = np.ma.filled(ds.variables["ssh"][sl], -30000.0).astype(f32)
+                lon, lat = ds.variables["xlon"][:], ds.variables["ylat"][:]
+            ssh = np.where(np.isfinite(ssh), ssh, f32(-30.0 if ops else -30000.0)).astype(f32)
+            ix, iy, w, inside = self._ops_weights(lon, lat, single=ops)
+            wet = ssh[0] >= f32(DRY_SSH)
+            cj, ci = corner_cells(ix, iy)
+            cj, ci, n_dry = dry_parents(wet, cj, ci)
+            out = np.zeros((ssh.shape[0], len(ix)), f32)
+            n_fix = 0
+            for t in range(ssh.shape[0]):
+                s_t, n = fix_ssh(ssh[t], wet)
+                n_fix += n
+                if ops:
+                    acc = interpolate4(np.asarray(s_t, f32)[cj, ci].T, w.astype(f32))
+                    out[t] = np.where(inside, acc, f32(0))
+                else:
+                    out[t] = (w * s_t[cj, ci].T).sum(axis=1)
+        except Exception as e:
+            self._ops_note(f"ops-equivalent elev2D unavailable ({e})", "elev2D")
+            return None
+        n_out = int((~inside).sum())
+        if n_out:
+            self._ops_note(f"elev2D: {n_out} of {len(ix)} boundary nodes are outside the RTOFS "
+                           f"grid (set to 0 m before the offset, as ops)")
+        log.info(f"elev2D: {self._ops_label()} (gen_3Dth-equivalent), {len(ix)} nodes, "
+                 f"{n_out} outside grid, {n_dry + n_fix} filled")
+        return out
+
+    def _ops_node_z(self, nvrt) -> Optional[np.ndarray]:
+        """SCHISM z (n_bnd, nvrt), bottom first, max(0.11, dp)*sigma, held at the node bottom below kbp."""
+        hh = np.maximum(0.11, np.asarray(self._bnd_depths, np.float64))
+        v = self._vgrid
+        if v is None:
+            return None
+        if v.node_sigma is not None and v.node_sigma.shape[1] == len(hh):
+            z = hh[None, :] * v.node_sigma
+            idx = np.maximum(np.arange(nvrt)[:, None], np.asarray(v.node_kbp)[None, :] - 1)
+            return np.take_along_axis(z, idx, axis=0).T
+        z = np.empty((len(hh), nvrt))
+        for n, h in enumerate(hh):
+            col = np.sort(v.get_depths(h))[-nvrt:]
+            z[n] = np.concatenate([np.full(nvrt - len(col), col[0]), col])
+        return z
+
+    @staticmethod
+    def _grid2d(lon, lat):
+        lon = np.ma.filled(lon, np.nan).astype(np.float64)
+        lat = np.ma.filled(lat, np.nan).astype(np.float64)
+        return np.meshgrid(lon, lat) if lon.ndim == 1 else (lon, lat)
+
+    def _ssh_dry_mask(self, ssh_path, lon_t, lat_t):
+        """Wet mask from SSH_1 record 0 on the TSUV grid, or None (with a note) if the grids differ."""
+        try:
+            with Dataset(str(ssh_path)) as sd:
+                s0 = np.ma.filled(sd.variables["ssh"][0], -30000.0).astype(np.float64)
+                lon_s, lat_s = self._grid2d(sd.variables["xlon"][:], sd.variables["ylat"][:])
+        except Exception as e:
+            self._ops_note(f"T/S dry mask fell back to surface T: SSH_1 unreadable ({e}); "
+                           f"the T/S result may differ from ops", "T/S")
+            return None
+        lon_t, lat_t = self._grid2d(lon_t, lat_t)
+        if s0.shape != lon_t.shape:
+            self._ops_note(f"T/S dry mask fell back to surface T: SSH_1 grid {s0.shape} != "
+                           f"TSUV_1 grid {lon_t.shape}; the T/S result may differ from ops", "T/S")
+            return None
+        dlon = np.abs((lon_s - lon_t + 180.0) % 360.0 - 180.0).max()
+        dlat = np.abs(lat_s - lat_t).max()
+        if dlon > 1e-3 or dlat > 1e-3:
+            self._ops_note(f"T/S dry mask fell back to surface T: SSH_1 and TSUV_1 coordinates "
+                           f"differ (max {dlon:.4f} deg lon, {dlat:.4f} deg lat); "
+                           f"the T/S result may differ from ops", "T/S")
+            return None
+        return np.where(np.isfinite(s0), s0, -30000.0) >= DRY_SSH
+
+    def _ops_ts_profiles(self, tsuv_path, n_files, ssh_path=None, uv=False):
+        """(all_temp, all_salt) lists of (n_bnd, nvrt) per record from TSUV_1.nc, gen_3Dth rules; None to fall back.
+
+        uv=True returns (all_temp, all_salt, all_u, all_v); u, v use the same parents, vertical
+        rules and weights with no clamp and 0 outside the grid (f90:975-987).
+        """
+        nvrt = self._vgrid.nvrt if self._vgrid else None
+        z = self._ops_node_z(nvrt) if nvrt else None
+        if z is None:
+            self._ops_note("no vgrid for the ops-equivalent T/S", "T/S")
+            return None
+        try:
+            with Dataset(str(tsuv_path)) as ds:
+                names = ("temperature", "salinity", "water_u", "water_v")
+                for nme in names:
+                    ds.variables[nme].set_auto_maskandscale(False)
+                nt = ds.dimensions["time"].size
+                if nt != n_files:
+                    self._ops_note(f"{Path(tsuv_path).name} has {nt} steps for {n_files} 3D files "
+                                   f"— T/S not from the ops-equivalent path", "T/S")
+                    return None
+                lon_t, lat_t = ds.variables["xlon"][:], ds.variables["ylat"][:]
+                depth = np.asarray(ds.variables["depth"][:], np.float64)
+                if not np.all(np.diff(depth) > 0):
+                    self._ops_note("TSUV_1 depth is not increasing — T/S not from the ops-equivalent path", "T/S")
+                    return None
+                zm = -depth[::-1]
+                ix, iy, w, inside = self._ops_weights(lon_t, lat_t)
+                n = len(ix)
+                cj, ci = corner_cells(ix, iy)
+                raw0 = np.ma.filled(ds.variables["temperature"][0, 0], -30000.0)
+                wet = np.asarray(raw0, np.float64) * 1e-3 + 20.0 > RJUNK + JUNK_EPS
+                # ops decides dry from SSH_1 on the first record (f90:488); surface T is the fallback. MJ (10/02/26)
+                if ssh_path:
+                    m = self._ssh_dry_mask(ssh_path, lon_t, lat_t)
+                    if m is not None and m.shape == wet.shape:
+                        wet = m
+                    else:
+                        self._ts_mask_fallback = True
+                else:
+                    self._ops_note("T/S dry mask from surface T: no SSH_1 in this run; "
+                                   "the T/S result may differ from ops", "T/S")
+                    self._ts_mask_fallback = True
+                ll_dry = ~wet[cj[0], ci[0]]
+                pj, pi, n_dry = dry_parents(wet, cj, ci)
+                cells, inv = np.unique(pj * wet.shape[1] + pi, return_inverse=True)
+                pos = inv.reshape(4, n)
+                gj, gi = cells // wet.shape[1], cells % wet.shape[1]
+
+                def read(t):
+                    cols = []
+                    for nme, off in zip(names, (20.0, 20.0, 0.0, 0.0)):
+                        a = np.asarray(ds.variables[nme][t][:, gj, gi], np.float64)
+                        cols.append((a * 1e-3 + off)[::-1].T)
+                    T, S, k0, nm = fill_columns(*cols)
+                    U, V = fill_uv(cols[2], cols[3], k0) if uv else (None, None)
+                    return T, S, U, V, k0, nm
+
+                T0, S0, U0, V0, kbp0, n_mid = read(0)
+                lev, vrat = vertical_index(z, zm, kbp0[pos[0]], ll_dry)
+                all_temp, all_salt, all_u, all_v = [], [], [], []
+                for t in range(nt):
+                    if t == 0:
+                        T, S, U, V = T0, S0, U0, V0
+                    else:
+                        T, S, U, V, _, nm = read(t)
+                        n_mid += nm
+                    row = []
+                    # T floored at 0 and S capped at 40 as the ops (f90:1015-1016); u, v unclamped. MJ (10/02/26)
+                    fields = [(T, 0.0, None, self.config.obc_tem_outside),
+                              (S, None, 40.0, self.config.obc_sal_outside)]
+                    if uv:
+                        fields += [(U, None, None, 0.0), (V, None, None, 0.0)]
+                    for F, lo, hi, fill in fields:
+                        prof = np.zeros((n, nvrt))
+                        for c in range(4):
+                            col = F[pos[c][:, None], lev]
+                            col1 = F[pos[c][:, None], lev + 1]
+                            prof += w[:, c, None] * (col * (1 - vrat) + col1 * vrat)
+                        if lo is not None or hi is not None:
+                            prof = np.clip(prof, lo, hi)
+                        prof[~inside] = fill
+                        row.append(prof.astype(np.float32))
+                    all_temp.append(row[0])
+                    all_salt.append(row[1])
+                    if uv:
+                        all_u.append(row[2])
+                        all_v.append(row[3])
+        except Exception as e:
+            self._ops_note(f"ops-equivalent T/S unavailable ({e})", "T/S")
+            return None
+        n_out = int((~inside).sum())
+        if n_out:
+            self._ops_note(f"T/S: {n_out} of {n} boundary nodes are outside the RTOFS grid "
+                           f"(set to {self.config.obc_tem_outside:g} C / "
+                           f"{self.config.obc_sal_outside:g} psu, as ops)")
+        log.info(f"T/S: {self._ops_label()} (gen_3Dth-equivalent), {n} nodes, "
+                 f"{n_out} outside grid, {n_dry + n_mid} filled")
+        return (all_temp, all_salt, all_u, all_v) if uv else (all_temp, all_salt)
 
     def _compute_3d_roi(self, ds) -> Optional[Tuple[int, int, int, int]]:
         """Compute ROI (Region of Interest) indices for 3D RTOFS file subsetting.
@@ -1910,7 +2571,19 @@ class RTOFSProcessor(ForcingProcessor):
         try:
             all_temp = []
             all_salt = []
-            for f in files_3d:
+            # Ops-equivalent T/S from TSUV_1.nc; the per-file loop below is the fallback. MJ (10/01/26)
+            ops_ts = (self._ops_ts_profiles(self._tsuv1_path, len(files_3d), self._ssh1_path,
+                                            uv=self._ops_timeline)
+                      if self.is_stofs_mode and self._tsuv1_path else None)
+            if ops_ts is not None and self._ops_timeline:
+                self._ts_interp = "ops+surfT-mask" if self._ts_mask_fallback else "ops"
+                return self._write_3d_ops(files_3d, *ops_ts)
+            if ops_ts is not None:
+                all_temp, all_salt = ops_ts
+            self._ts_interp = (
+                "ops+surfT-mask" if self._ts_mask_fallback else "ops") if ops_ts is not None else (
+                "precomputed" if (weights_3d or ssh_weights) else "delaunay")
+            for f in (files_3d if ops_ts is None else []):
                 ds = Dataset(str(f))
 
                 lon_var = ds.variables.get("Longitude") or ds.variables.get("lon")
@@ -2054,13 +2727,8 @@ class RTOFSProcessor(ForcingProcessor):
             # starting at t=0 — which silently labelled the first 3D file
             # as model_t0 regardless of its true valid time. With Route B
             # the anchor must be explicit.
-            file_hours_3d = [self._parse_rtofs_hour(f)[0] for f in files_3d]
-            rtofs_cycle = getattr(self, '_rtofs_cycle_date', None)
-            if rtofs_cycle is None:
-                rtofs_cycle = datetime.strptime(self.config.pdy, "%Y%m%d")
             rtofs_times_3d = np.array(
-                [(rtofs_cycle + timedelta(hours=h) - model_t0).total_seconds()
-                 for h in file_hours_3d],
+                [(self.valid_time(f) - model_t0).total_seconds() for f in files_3d],
                 dtype=np.float64,
             )
 
@@ -2140,6 +2808,31 @@ class RTOFSProcessor(ForcingProcessor):
             log.error(traceback.format_exc())
 
         return output_files
+
+    def _write_3d_ops(self, files_3d, all_temp, all_salt, all_u, all_v) -> List[Path]:
+        """Ops TEM_3D, SAL_3D and uv3D: this phase's slice of the 6-hourly series, time 0 at the phase start."""
+        model_t0, _, dur = self._get_output_window(self.phase)
+        n = int(np.ceil(dur / OPS_OBC_DT)) + 1
+        times = [(self.valid_time(f) - model_t0).total_seconds() for f in files_3d]
+        if n > 1 and max(times) < (n - 1) * OPS_OBC_DT:
+            self._ops_note(f"T/S/uv: the RTOFS series ends {(n - 1) * OPS_OBC_DT / 3600 - max(times) / 3600:g} h "
+                           f"before the {n}-record phase window; the last record is held")
+        n_bnd = len(self._bnd_lons)
+        out = []
+        series = {}
+        for name, lst in (("t", all_temp), ("s", all_salt), ("u", all_u), ("v", all_v)):
+            series[name] = resample_records(np.stack(lst), times, OPS_OBC_DT, n)
+        for fname, key, var, units in (("TEM_3D.th.nc", "t", "temperature", "degC"),
+                                       ("SAL_3D.th.nc", "s", "salinity", "PSU")):
+            path = self.output_path / fname
+            self._write_3d_th(path, series[key], var, units, OPS_OBC_DT, n_bnd)
+            out.append(path)
+            log.info(f"Created {fname}: {series[key].shape} at dt={OPS_OBC_DT:g}s")
+        path = self.output_path / "uv3D.th.nc"
+        self._write_uv3d_th(path, series["u"], series["v"], OPS_OBC_DT, n_bnd)
+        out.append(path)
+        log.info(f"Created uv3D.th.nc: {series['u'].shape} at dt={OPS_OBC_DT:g}s from RTOFS u/v")
+        return out
 
     def _interpolate_vertical(
         self, bnd_profile: np.ndarray, rtofs_depths: np.ndarray,

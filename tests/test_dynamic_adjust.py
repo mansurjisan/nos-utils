@@ -14,6 +14,7 @@ from nos_utils.config import ForcingConfig  # noqa: E402
 from nos_utils.forcing.dynamic_adjust import (  # noqa: E402
     DynamicAdjustProcessor,
     apply_ssh_time_varying_adjust,
+    densify_hourly,
     compute_bias,
     load_observations,
     parse_noaa_xml,
@@ -59,6 +60,23 @@ class TestApplyAdjust:
         assert np.allclose(vals[1], 0.85, atol=1e-5)
         # t>=2 -> 1.0 - 0.20 = 0.80
         assert np.allclose(vals[2:], 0.80, atol=1e-5)
+
+    def test_forecast_offset_is_adj1_everywhere(self, tmp_path):
+        nc = tmp_path / "elev2D.th.nc"
+        _write_fake_elev(nc, nt=5, n_bnd=3, init_val=1.0)
+        assert apply_ssh_time_varying_adjust(nc, adj0=0.10, adj1=0.20, start_offset_hours=24)
+        with nc_mod.Dataset(str(nc)) as ds:
+            vals = ds.variables["time_series"][:]
+        assert np.allclose(vals, 0.80, atol=1e-5)
+
+    def test_offset_one_starts_at_average(self, tmp_path):
+        nc = tmp_path / "elev2D.th.nc"
+        _write_fake_elev(nc, nt=3, n_bnd=2, init_val=1.0)
+        assert apply_ssh_time_varying_adjust(nc, adj0=0.10, adj1=0.20, start_offset_hours=1)
+        with nc_mod.Dataset(str(nc)) as ds:
+            vals = ds.variables["time_series"][:]
+        assert np.allclose(vals[0], 0.85, atol=1e-5)
+        assert np.allclose(vals[1:], 0.80, atol=1e-5)
 
     def test_nan_treated_as_zero(self, tmp_path):
         nc = tmp_path / "elev2D.th.nc"
@@ -298,3 +316,34 @@ class TestObsDirResolution:
             obs_dir=explicit,
         )
         assert proc.obs_dir == explicit
+
+
+class TestDensifyHourly:
+    def _six_hourly(self, path, vals):
+        with nc_mod.Dataset(str(path), "w", format="NETCDF4_CLASSIC") as ds:
+            ds.createDimension("time", len(vals))
+            ds.createDimension("nOpenBndNodes", 2)
+            ds.createDimension("nLevels", 1)
+            ds.createDimension("one", 1)
+            ds.createVariable("time", "f4", ("time",))[:] = np.arange(len(vals)) * 21600.0
+            ds.createVariable("time_step", "f4", ("one",))[0] = 21600.0
+            ds.createVariable("time_series", "f4", ("time", "nOpenBndNodes", "nLevels", "one"))[:] = \
+                np.asarray(vals, np.float32)[:, None, None, None]
+
+    def test_six_hourly_file_is_resampled_then_ramped_as_ops(self, tmp_path):
+        nc = tmp_path / "elev2D.th.nc"
+        self._six_hourly(nc, [1.0, 1.0, 1.0])
+        assert apply_ssh_time_varying_adjust(nc, adj0=0.10, adj1=0.20)
+        with nc_mod.Dataset(str(nc)) as ds:
+            t, ts, dt = ds["time"][:], ds["time_series"][:, 0, 0, 0], ds["time_step"][0]
+        assert len(t) == 13 and dt == 3600.0 and t[1] - t[0] == 3600.0
+        np.testing.assert_allclose(ts[:3], [0.90, 0.85, 0.80], atol=1e-5)
+        np.testing.assert_allclose(ts[3:], 0.80, atol=1e-5)
+
+    def test_linear_in_time_and_hourly_files_untouched(self, tmp_path):
+        nc = tmp_path / "e.nc"
+        self._six_hourly(nc, [0.0, 6.0])
+        assert densify_hourly(nc)
+        with nc_mod.Dataset(str(nc)) as ds:
+            np.testing.assert_allclose(ds["time_series"][:, 0, 0, 0], np.arange(7), atol=1e-6)
+        assert not densify_hourly(nc)

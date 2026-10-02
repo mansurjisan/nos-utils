@@ -25,7 +25,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -274,14 +274,16 @@ class PrepOrchestrator:
 
         # RTOFS OBC: heavy NetCDF I/O + Delaunay interpolation
         if "rtofs" in self.paths and (self.is_stofs or not self.skip_legacy):
-            results.append(self._run_rtofs(output_dir, phase, time_hotstart))
+            rtofs_result = self._run_rtofs(output_dir, phase, time_hotstart)
+            results.append(rtofs_result)
 
             # After RTOFS runs, QC the OBC file time dimensions. If any file
             # has fewer than obc_min_timesteps records, fall back to the
             # previous cycle's archive. This guards against partial RTOFS
             # coverage at cycle boundaries.
             if self.config.obc_min_timesteps > 0:
-                qc_result = self._qc_obc_dimensions(output_dir)
+                qc_result = self._qc_obc_dimensions(
+                    output_dir, (rtofs_result.metadata or {}).get("n_source_records"))
                 if qc_result is not None:
                     results.append(qc_result)
         elif self.skip_legacy:
@@ -290,7 +292,7 @@ class PrepOrchestrator:
         # Dynamic SSH adjust: NOAA tide-gauge bias correction on elev2D.th.nc.
         # Must run after RTOFS has produced the non-adjusted file.
         if self.config.dynamic_adjust_enabled:
-            results.append(self._run_dynamic_adjust(output_dir))
+            results.append(self._run_dynamic_adjust(output_dir, phase))
 
         # Nudging needs RTOFS to have completed
         if self.config.nudging_enabled and "rtofs" in self.paths:
@@ -585,8 +587,26 @@ class PrepOrchestrator:
             vgrid_file=vgrid,
             phase=phase,
             time_hotstart=time_hotstart,
+            adt_archive_name=(self._adt_archive_name() if self.is_stofs else None),
+            adt_prev_dirs=(self._prev_cycle_dirs() if self.is_stofs else ()),
         )
         return proc.process()
+
+    def _adt_archive_name(self) -> str:
+        """Archive name of the ADT field, the ops adt_aft_cvtz_cln.nc analogue."""
+        return f"{self.run_name}.t{self.config.cyc:02d}z.adt_aft_cvtz_cln.nc"
+
+    def _prev_cycle_dirs(self, max_days: int = 3) -> List[Path]:
+        """Previous-cycle archive dirs: COMINrerun, then {run}.{PDY-k} under the restart/COMOUT roots."""
+        dirs = [Path(self.paths["prev_rerun"])] if self.paths.get("prev_rerun") else []
+        roots = [Path(self.paths[k]) for k in ("restart", "comout") if self.paths.get(k)]
+        roots += [r.parent for r in list(roots)]
+        base = datetime.strptime(self.config.pdy, "%Y%m%d")
+        for k in range(1, max_days + 1):
+            day = (base - timedelta(days=k)).strftime("%Y%m%d")
+            for r in roots:
+                dirs += [r / f"{self.run_name}.{day}", r / day]
+        return list(dict.fromkeys(dirs))
 
     # Mapping from the active OBC filename (what SCHISM reads) to the
     # standard archive basename under $COMOUT_PREV/rerun/ (see
@@ -599,8 +619,13 @@ class PrepOrchestrator:
         "uv3D.th.nc": "uv3dth",
     }
 
-    def _qc_obc_dimensions(self, output_dir: Path) -> Optional[ForcingResult]:
+    def _qc_obc_dimensions(self, output_dir: Path,
+                           source_counts: Optional[Dict[str, int]] = None) -> Optional[ForcingResult]:
         """Validate OBC time dims and fall back to COMOUT_PREV on short files.
+
+        With the ops timeline the phase files are slices of the 6-hourly series, so the
+        count checked is the number of RTOFS source records (source_counts "2d"/"3d"), the
+        quantity ops checks against N_dim_cr_max.
 
         Returns None (no QC event) when every file satisfies the minimum,
         otherwise a ForcingResult describing the fallback outcome.
@@ -635,6 +660,8 @@ class PrepOrchestrator:
                         n_t = int(ds.variables["time"].shape[0])
                     else:
                         continue
+                if source_counts and self.config.obc_ops_timeline:
+                    n_t = int(source_counts["2d" if name == "elev2D.th.nc" else "3d"])
                 file_dims[name] = n_t
                 if n_t < min_t:
                     short_files.append(name)
@@ -711,7 +738,7 @@ class PrepOrchestrator:
             },
         )
 
-    def _run_dynamic_adjust(self, output_dir: Path) -> ForcingResult:
+    def _run_dynamic_adjust(self, output_dir: Path, phase: str = "nowcast") -> ForcingResult:
         """Apply NOAA tide-gauge bias correction to elev2D.th.nc.
 
         Resolves the several supporting paths required by the operational
@@ -773,6 +800,10 @@ class PrepOrchestrator:
                     prev_avg_bias = ab
                     break
 
+        # Ops ramps from the nowcast start; the forecast file starts nowcast_hours later. MJ (10/02/26)
+        offset = (int(self.config.nowcast_hours)
+                  if phase == "forecast" and self.config.obc_ops_timeline else 0)
+
         proc = DynamicAdjustProcessor(
             self.config,
             input_path=output_dir,
@@ -785,6 +816,7 @@ class PrepOrchestrator:
             prev_avg_bias_file=prev_avg_bias,
             elev2d_th_nc=output_dir / "elev2D.th.nc",
             bias_window_days=self.config.dynamic_adjust_window_days,
+            start_offset_hours=offset,
         )
         return proc.process()
 
@@ -1152,6 +1184,17 @@ class PrepOrchestrator:
                     f"  Copied St. Lawrence {src_name} -> {dst_name}"
                 )
 
+    def _archive_adt_field(self, work_dir: Path, comout: Path, archived: List[Path]) -> None:
+        """Copy the ADT field to $COMOUT for the next cycle's ADT fallback (STOFS only)."""
+        import shutil
+
+        src = work_dir / self._adt_archive_name()
+        if src.exists():
+            dst = comout / src.name
+            shutil.copy2(src, dst)
+            archived.append(dst)
+            log.info(f"  Archived ADT field -> {dst.name}")
+
     def _archive_obc_qc_artifacts(
         self, work_dir: Path, comout: Path, archived: List[Path],
     ) -> None:
@@ -1270,6 +1313,8 @@ class PrepOrchestrator:
                     log.info(f"  Archived HRRR sflux -> {tar_name}")
                 except (subprocess.CalledProcessError, FileNotFoundError) as e:
                     log.warning(f"  Failed to tar HRRR sflux: {e}")
+
+        self._archive_adt_field(work_dir, comout, archived)
 
         if manifest_on:
             # --- Declarative manifest path (opt-in) ---

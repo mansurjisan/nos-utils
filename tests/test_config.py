@@ -32,7 +32,7 @@ class TestForcingConfig:
         cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
         assert cfg.lon_min == pytest.approx(-98.5035)
         assert cfg.nowcast_hours == 24
-        assert cfg.forecast_hours == 108
+        assert cfg.forecast_hours == 96
 
     def test_factory_overrides(self):
         cfg = ForcingConfig.for_secofs(pdy="20260401", cyc=12, forecast_hours=120)

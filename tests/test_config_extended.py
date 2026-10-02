@@ -10,7 +10,7 @@ class TestSTOFSConfig:
         assert cfg.lon_min == pytest.approx(-98.5035)
         assert cfg.lon_max == pytest.approx(-52.4867)
         assert cfg.nowcast_hours == 24
-        assert cfg.forecast_hours == 108
+        assert cfg.forecast_hours == 96
         assert cfg.met_num == 2
         assert cfg.n_levels == 51
         assert cfg.nudging_enabled is True
@@ -67,7 +67,7 @@ class TestFromYAML:
 
         assert cfg.lon_min == pytest.approx(-98.5035)
         assert cfg.nowcast_hours == 24
-        assert cfg.forecast_hours == 108
+        assert cfg.forecast_hours == 96
 
     def test_yaml_override(self):
         yaml_path = "/mnt/d/NOS-Workflow-Project/nos_ofs_complete_package/nos_ofs/parm/systems/secofs.yaml"

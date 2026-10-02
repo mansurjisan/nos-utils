@@ -480,11 +480,11 @@ def test_time_hotstart_override(tmp_path):
 
 
 def test_stofs_ufs_nhours_covers_full_run(tmp_path):
-    """STOFS-UFS factory (132 = 24+108) anchors at model_t0 too.
+    """STOFS-UFS factory (120 = 24+96) anchors at model_t0 too.
 
     Verifies that the long-window STOFS-3D-ATL UFS layout (nowcast=24,
-    forecast=108) keeps producing nhours_fcst=132 with the new anchor;
-    132 already covers the full coupled run from model_t0 so the explicit
+    forecast=96) keeps producing nhours_fcst=120 with the new anchor;
+    120 already covers the full coupled run from model_t0 so the explicit
     factory value passes through unchanged.
     """
     fix = tmp_path / "fix"
@@ -502,8 +502,8 @@ def test_stofs_ufs_nhours_covers_full_run(tmp_path):
     assert "start_month:             05" in mc
     assert "start_day:               09" in mc
     assert "start_hour:              12" in mc
-    # STOFS-UFS factory sets ufs_nhours_fcst=132 (= 24 + 108).
-    assert "nhours_fcst:             132" in mc
+    # STOFS-UFS factory sets ufs_nhours_fcst=120 (= 24 + 96).
+    assert "nhours_fcst:             120" in mc
 
 
 def test_nhours_fcst_bumped_when_factory_value_too_short(tmp_path):
@@ -697,10 +697,10 @@ class TestRoutePhaseUFSConfig:
         assert "start_hour:              12" in mc
         # NHOURS = 24 (NOT 132)
         assert "nhours_fcst:             24" in mc
-        assert "nhours_fcst:             132" not in mc
+        assert "nhours_fcst:             120" not in mc
 
-    def test_stofs_ufs_phase_forecast_108h(self, tmp_path):
-        """STOFS-3D-ATL-UFS forecast phase = 108h."""
+    def test_stofs_ufs_phase_forecast_96h(self, tmp_path):
+        """STOFS-3D-ATL-UFS forecast phase = 96h."""
         fix = tmp_path / "fix"
         out = tmp_path / "out"
         _write_full_fix(fix)
@@ -714,8 +714,8 @@ class TestRoutePhaseUFSConfig:
         # forecast: start = cycle itself
         assert "start_day:               10" in mc
         assert "start_hour:              12" in mc
-        assert "nhours_fcst:             108" in mc
-        assert "nhours_fcst:             132" not in mc
+        assert "nhours_fcst:             96" in mc
+        assert "nhours_fcst:             120" not in mc
 
 
 def test_nx_ny_from_datm(ufs_config, tmp_path):
