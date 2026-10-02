@@ -114,8 +114,8 @@ class TestStLawrenceFluxTh:
         flux_path = out_dir / "flux.th"
         assert flux_path.exists()
         data = np.loadtxt(flux_path)
-        # 5 days + 1 -> 6 rows (120h/24 = 5, +1 = 6)
-        assert data.shape == (6, 2)
+        # Ops span start..start+6 d -> 7 rows, whatever the run length
+        assert data.shape == (7, 2)
         # Time column starts at 0 (= model_t0 = cycle - nowcast_hours) and
         # steps by 86400 seconds.
         assert data[0, 0] == 0
@@ -535,7 +535,7 @@ class TestStLawrenceV31Long:
         res = StLawrenceProcessor(_cfg(), tmp_path / "in", out).process()
         assert res.success, res.errors
         rows = (out / "flux.th").read_text().split("\n")[:-1]
-        assert len(rows) == 6
+        assert len(rows) == 7
         # t0 = 2026-09-26 12:00Z is 1.5 days into the file  MJ (09/28/26)
         assert rows[0] == "0 -8015.000"
         assert rows[1] == "86400 -8025.000"
