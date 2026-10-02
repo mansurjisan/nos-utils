@@ -226,3 +226,95 @@ class TestFortranTideFacTwoPhase:
             reset_input_capture()
         assert entries[("tidal", "TIDAL")]["files"] == [
             str((fix / "sys.bctides.in_template").resolve())]
+
+
+class TestNodalReference:
+    """tide_nodal_reference: 'cycle' reproduces the ops one-run tide_fac input."""
+
+    def _stub(self, tmp_path, monkeypatch):
+        exe_dir = tmp_path / "exec"
+        exe_dir.mkdir(exist_ok=True)
+        exe = exe_dir / "nos_ofs_create_tide_fac_schism"
+        exe.write_text(
+            "#!/bin/sh\ncat > stdin.rec\ncp bctides.in_template bctides.in\n"
+        )
+        exe.chmod(0o755)
+        monkeypatch.setenv("EXECnos", str(exe_dir))
+
+    def _stdin(self, cfg, tmp_path, monkeypatch, phase):
+        self._stub(tmp_path, monkeypatch)
+        fix = tmp_path / "fix"
+        fix.mkdir(exist_ok=True)
+        (fix / "sys.bctides.in_template").write_text("T\n")
+        work = tmp_path / f"work_{phase}"
+        work.mkdir(exist_ok=True)
+        res = TidalProcessor(cfg, fix, work, phase=phase).process()
+        assert res.metadata["mode"] == "fortran_tide_fac"
+        return (work / "stdin.rec").read_text()
+
+    def _atl(self, **kw):
+        return ForcingConfig.for_stofs_3d_atl(
+            "20260927", 12, nowcast_hours=24, forecast_hours=96, **kw
+        )
+
+    def test_cycle_stdin(self, tmp_path, monkeypatch):
+        cfg = self._atl()
+        assert self._stdin(cfg, tmp_path, monkeypatch, "nowcast") == \
+            "5.0000\n12,26,09,2026\ny\n"
+        assert self._stdin(cfg, tmp_path, monkeypatch, "forecast") == \
+            "3.0000\n12,27,09,2026\ny\n"
+
+    def test_phase_stdin(self, tmp_path, monkeypatch):
+        cfg = self._atl(tide_nodal_reference="phase")
+        assert self._stdin(cfg, tmp_path, monkeypatch, "nowcast") == \
+            "1.0000\n12,26,09,2026\ny\n"
+        assert self._stdin(cfg, tmp_path, monkeypatch, "forecast") == \
+            "4.0000\n12,27,09,2026\ny\n"
+
+    def test_forecast_not_longer_than_nowcast_falls_back(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        cfg = ForcingConfig.for_stofs_3d_atl(
+            "20260927", 12, nowcast_hours=48, forecast_hours=24
+        )
+        with caplog.at_level("WARNING"):
+            text = self._stdin(cfg, tmp_path, monkeypatch, "forecast")
+        assert text == "1.0000\n12,27,09,2026\ny\n"
+        assert "falling back" in caplog.text
+
+    def test_invalid_value_raises(self):
+        with pytest.raises(ValueError):
+            ForcingConfig.for_stofs_3d_atl("20260927", 12, tide_nodal_reference="bogus")
+
+    def test_defaults(self, mock_config):
+        assert ForcingConfig.for_stofs_3d_atl("20260927", 12).tide_nodal_reference == "cycle"
+        assert ForcingConfig.for_stofs_3d_atl_ufs("20260927", 12).tide_nodal_reference == "cycle"
+        assert ForcingConfig.for_secofs("20260927", 12).tide_nodal_reference == "phase"
+        assert mock_config.tide_nodal_reference == "phase"
+
+    def test_yaml_key(self, tmp_path):
+        y = tmp_path / "x.yaml"
+        y.write_text(
+            "system:\n  name: x\nforcing:\n  tidal:\n    nodal_reference: cycle\n"
+        )
+        cfg = ForcingConfig.from_yaml(y, pdy="20260927", cyc=12)
+        assert cfg.tide_nodal_reference == "cycle"
+
+    def test_python_path_gets_same_run_days(self, tmp_path, monkeypatch):
+        import nos_utils.forcing.tidal as tidal
+        monkeypatch.delenv("EXECnos", raising=False)
+        monkeypatch.delenv("EXECofs", raising=False)
+        monkeypatch.delenv("EXECstofs3d", raising=False)
+        seen = []
+        real = tidal.compute_nodal_corrections
+
+        def spy(start, consts, run_days=0.25):
+            seen.append(run_days)
+            return real(start, consts, run_days=run_days)
+
+        monkeypatch.setattr(tidal, "compute_nodal_corrections", spy)
+        cfg = self._atl()
+        for phase in ("nowcast", "forecast"):
+            out = tmp_path / phase
+            TidalProcessor(cfg, tmp_path / "none", out, phase=phase).process()
+        assert seen == [pytest.approx(5.0), pytest.approx(3.0)]
