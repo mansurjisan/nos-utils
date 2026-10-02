@@ -702,3 +702,26 @@ def test_archive_flux_still_uses_current_sflux_for_temperature(tmp_path):
     temps = np.loadtxt(out / "TEM_1.th")[:, 1]
     expected = AIR_TO_WATER_SLOPE * 10.0 + AIR_TO_WATER_INTERCEPT
     assert np.allclose(temps, expected, atol=0.01)
+
+
+class TestStLawrenceOpsRowCounts:
+    """Ops writes 7 obs rows and 6 clim rows whatever the run length."""
+
+    def _rows(self, tmp_path, fcst_hours, with_47=True):
+        _write_long_csv(_long_path(tmp_path / "in", "20260927"), with_47=with_47)
+        cfg = _cfg()
+        cfg.forecast_hours = fcst_hours
+        out = tmp_path / "out"
+        res = StLawrenceProcessor(cfg, tmp_path / "in", out, clim_file=CLIM).process()
+        assert res.success, res.errors
+        return [r.split()[0] for r in (out / "flux.th").read_text().split("\n")[:-1]]
+
+    def test_obs_96h_keeps_ops_seven_rows(self, tmp_path):
+        assert self._rows(tmp_path, 96) == [str(i * 86400) for i in range(7)]
+
+    def test_clim_96h_is_ops_six_rows(self, tmp_path):
+        assert self._rows(tmp_path, 96, with_47=False) == [str(i * 86400) for i in range(6)]
+
+    def test_longer_run_still_covered(self, tmp_path):
+        assert self._rows(tmp_path, 168) == [str(i * 86400) for i in range(9)]
+        assert self._rows(tmp_path / "c", 168, with_47=False) == [str(i * 86400) for i in range(9)]
