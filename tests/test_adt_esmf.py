@@ -118,12 +118,36 @@ def test_esmf_dst_without_valid_source_is_missing(tmp_path, monkeypatch):
     assert np.isnan(_adt_of(out).ravel()[1])
 
 
-def test_esmf_renorm_switch(tmp_path):
+def test_apply_esmf_map_skips_missing_without_renormalization():
     src = np.array([np.nan, 1.0])
-    kw = dict(S=np.array([0.5, 0.5]), row=np.array([0, 0]), col=np.array([0, 1]), n_b=1, src=src)
-    assert ADTBlender._apply_esmf_map(**kw)[0] == pytest.approx(0.5)
-    assert ADTBlender._apply_esmf_map(renorm=0.0, **kw)[0] == pytest.approx(1.0)
-    assert np.isnan(ADTBlender._apply_esmf_map(renorm=0.9, **kw)[0])
+    out = ADTBlender._apply_esmf_map(np.array([0.5, 0.5]), np.array([0, 0]), np.array([0, 1]), 1, src)
+    assert out[0] == pytest.approx(0.5)
+    assert np.isnan(ADTBlender._apply_esmf_map(
+        np.array([1.0]), np.array([0]), np.array([0]), 1, np.array([np.nan]))[0])
+
+
+def test_nearest_map_copies_the_source_cell():
+    src = np.array([0.1234567891, 2.0, 3.0])
+    out = ADTBlender._apply_esmf_map(np.ones(3), np.array([2, 0, 1]), np.array([0, 1, 2]), 3, src)
+    np.testing.assert_array_equal(out, [2.0, 3.0, 0.1234567891])
+
+
+def test_days_are_rounded_to_float32_before_the_mean(tmp_path, monkeypatch):
+    monkeypatch.delenv("COMINadt", raising=False)
+    monkeypatch.delenv("DCOMROOT", raising=False)
+    cfg = _cfg(_map(tmp_path / "wt.nc"))
+    d0 = {(0, 2): 0.3333333333}
+    d1 = {(0, 2): 0.7777777777}
+    _adt_file(tmp_path / "adt_20260401.nc", d0)
+    _adt_file(tmp_path / "adt_20260331.nc", d1)
+    field = ADTBlender(cfg, tmp_path)._regrid_esmf(
+        [tmp_path / "adt_20260401.nc", tmp_path / "adt_20260331.nc"], _ssh1(tmp_path / "SSH_1.nc"))
+    assert field.dtype == np.float32
+    f32 = np.float32
+    a = f32(f32(0.3333333333).astype(np.float64) - 0.45)
+    b = f32(f32(0.7777777777).astype(np.float64) - 0.45)
+    want = f32((float(a) + float(b)) / 2)
+    assert field.ravel()[1] == want
 
 
 @pytest.mark.parametrize("bad", ["n_a", "n_b", "xc_b", "missing"])
@@ -141,15 +165,15 @@ def test_esmf_falls_back_to_bilinear_with_warning(tmp_path, monkeypatch, bad):
     cfg = _cfg(wt)
     b, out, _ = _run(tmp_path, cfg, {})
     assert out is not None and b.regrid == "bilinear"
-    assert any("bilinear" in w for w in b.warnings)
+    assert any("not ops-exact" in w for w in b.warnings)
     np.testing.assert_allclose(_adt_of(out), 0.9 - 0.45, atol=1e-5)
 
 
-def test_unconfigured_weight_is_silent_bilinear(tmp_path, monkeypatch):
+def test_unconfigured_weight_warns_not_ops_exact(tmp_path, monkeypatch):
     monkeypatch.delenv("COMINadt", raising=False)
     monkeypatch.delenv("DCOMROOT", raising=False)
     b, out, _ = _run(tmp_path, _cfg(None), {})
-    assert b.regrid == "bilinear" and not b.warnings
+    assert b.regrid == "bilinear" and any("not ops-exact" in w for w in b.warnings)
 
 
 def test_keep_writes_adt_on_rtofs(tmp_path, monkeypatch):

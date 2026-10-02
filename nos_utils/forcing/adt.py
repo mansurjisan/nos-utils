@@ -7,10 +7,12 @@ boundary condition accuracy for STOFS-3D-ATL.
 The core formula (ops stofs_3d_atl_create_obc_3d_th_non_adjust.sh, SSH_1.nc block):
     SSH_final = SSH_rtofs - SSH_rtofs(t=0) + (ADT - 0.45)
 
-ADT is the mean of the valid-day and previous-day CMEMS files (ncra), regridded
-bilinearly onto the SSH_1 grid (ops: ncremap with stofs_3d_atl_adt_weight.nc,
-ESMF bilinear). The -0.45 m datum offset (stofs_3d_atl_adt_cvtz.nco) is applied
-once, in _read_adt.
+ADT is the mean of the valid-day and previous-day CMEMS files (ncra), mapped onto
+the SSH_1 grid with the ops ESMF map (ncremap with stofs_3d_atl_adt_weight.nc,
+which is a nearest-source map with S=1 despite its "bilinear" global attribute).
+The -0.45 m datum offset (stofs_3d_atl_adt_cvtz.nco) is applied per day and rounded
+to float32 before the mean, as ops does. Without the map, a bilinear regrid is used
+and the result is not ops-exact.
 
 This removes the RTOFS bias at t=0 and replaces it with the satellite-observed
 absolute dynamic topography, preserving RTOFS temporal variability.
@@ -53,12 +55,6 @@ ADT_LAT_MIN = 7.0
 ADT_LAT_MAX = 54.0
 ADT_PAD = 1.0
 
-# Renormalization of the ESMF map application. None reproduces `ncremap -m` with no flags: NCO's
-# default "conservative" weight application sums S*src over valid sources only and leaves cells
-# with no valid source missing (NCO manual, Regridding > Renormalization; ncremap: "ncremap ...
-# # No renormalization/masking"). A float in [0, 1] switches to NCO's --rnr=<thr> behaviour
-# (divide by the valid weight sum, missing if the valid fraction is below thr). MJ (10/02/26)
-ADT_ESMF_RENORM = None
 ADT_COORD_TOL = 1e-3
 ADT_DST_TOL = 1e-2
 
@@ -191,7 +187,8 @@ class ADTBlender:
             return None
         wt = Path(wt)
         if not wt.is_file():
-            self._warn(f"ADT weight file {wt} not found — using bilinear ADT regrid")
+            self._warn(f"ADT weight file {wt} not found — bilinear ADT regrid, result is "
+                       f"not ops-exact")
             return None
         return wt
 
@@ -245,27 +242,26 @@ class ADTBlender:
                     dims[0], dims[1])
 
     @staticmethod
-    def _apply_esmf_map(S, row, col, n_b, src, renorm=None):
-        """dst = sum(S * src) over valid sources, as `ncremap -m` (see ADT_ESMF_RENORM); NaN where none."""
+    def _apply_esmf_map(S, row, col, n_b, src):
+        """dst = sum(S * src) over valid sources, as `ncremap -m`; NaN where none is valid."""
         v = np.isfinite(src[col])
-        w = np.where(v, S, 0.0)
-        num = np.bincount(row, weights=w * np.where(v, src[col], 0.0), minlength=n_b)
+        num = np.bincount(row, weights=np.where(v, S * np.where(v, src[col], 0.0), 0.0),
+                          minlength=n_b)
         tally = np.bincount(row, weights=v.astype(np.float64), minlength=n_b)
-        if renorm is not None:
-            wsum = np.bincount(row, weights=w, minlength=n_b)
-            wall = np.bincount(row, weights=S, minlength=n_b)
-            with np.errstate(all="ignore"):
-                num = num / wsum
-                tally = np.where(wsum / wall >= renorm, tally, 0.0)
         return np.where(tally > 0, num, np.nan)
 
     def _regrid_esmf(self, adt_files, ssh_path: Path):
-        """Ops ADT step with the ESMF map: ROI subset, ncremap, -0.45, per-element two-day mean.
+        """Ops ADT step with the ESMF map: ROI subset, ncremap, float32(adt-0.45), two-day mean.
 
-        Returns the field on the SSH_1 grid, or None after recording a warning.
+        Each day is rounded to float32 after the offset and the valid days are averaged
+        (float64 accumulation, float32 result), as ncap2 and ncra do. Returns the float32
+        field on the SSH_1 grid with NaN for missing cells, or None after recording a warning.
         """
         wt = self._weight_file()
         if wt is None:
+            if not self.warnings:
+                self._warn("ADT: no ESMF map configured — bilinear ADT regrid, result is "
+                           "not ops-exact")
             return None
         try:
             S, row, col, n_a, n_b, xca, yca, xcb, ycb, dst_dims, src_dims = self._read_esmf_map(wt)
@@ -301,14 +297,18 @@ class ADTBlender:
                 if (dlon_diff(xca, LO.ravel()) > ADT_COORD_TOL
                         or np.abs(yca - LA.ravel()).max() > ADT_COORD_TOL):
                     raise ValueError("ADT ROI coordinates do not match map xc_a/yc_a")
-                out = self._apply_esmf_map(S, row, col, n_b, a.ravel(), ADT_ESMF_RENORM)
-                days.append(out - 0.45)
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                field = np.nanmean(np.stack(days), axis=0).reshape(dlon.shape)
+                out = self._apply_esmf_map(S, row, col, n_b, a.ravel())
+                days.append((out - 0.45).astype(np.float32))
+            stack = np.stack(days)
+            ok = np.isfinite(stack)
+            cnt = ok.sum(axis=0)
+            tot = np.where(ok, stack, 0.0).astype(np.float64).sum(axis=0)
+            with np.errstate(all="ignore"):
+                field = np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan)
+            field = field.astype(np.float32).reshape(dlon.shape)
         except Exception as e:
-            self._warn(f"ADT ESMF regrid unavailable ({e}) — using bilinear ADT regrid")
+            self._warn(f"ADT ESMF regrid unavailable ({e}) — bilinear ADT regrid, result is "
+                       f"not ops-exact")
             return None
         log.info(f"ADT: ESMF map {wt.name} applied to {len(days)} day(s), "
                  f"{int(np.isfinite(field).sum())}/{field.size} valid")
@@ -381,9 +381,9 @@ class ADTBlender:
     def _regrid_bilinear(adt, adt_lons, adt_lats, dst_lon, dst_lat) -> np.ndarray:
         """Bilinear regrid of a regular lon/lat field onto 2D destination points.
 
-        Equivalent in intent to the ops ncremap ESMF bilinear weights: source
-        NaNs (land) are excluded and the remaining weights renormalized, and
-        destinations with no valid source stay NaN. MJ (10/01/26)
+        Fallback when the ops ESMF map is unavailable (the ops map is nearest-source, so
+        this is not ops-exact): source NaNs (land) are excluded, the remaining weights
+        renormalized, and destinations with no valid source stay NaN. MJ (10/02/26)
         """
         from scipy.interpolate import RegularGridInterpolator
         valid = np.isfinite(adt)
