@@ -539,3 +539,155 @@ def test_yaml_interp_mode_null_defaults_and_invalid_rejected(tmp_path):
     assert _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", "      interp_mode: 0\n").obc_interp_mode == 0
     with pytest.raises(ValueError):
         _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", "      interp_mode: 2\n")
+
+
+def _write_curvi_ssh1(path, lon, lat, nt):
+    with Dataset(str(path), "w") as ds:
+        ds.createDimension("time", nt)
+        ds.createDimension("ylat", lon.shape[0])
+        ds.createDimension("xlon", lon.shape[1])
+        ds.createVariable("xlon", "f4", ("ylat", "xlon"))[:] = lon
+        ds.createVariable("ylat", "f4", ("ylat", "xlon"))[:] = lat
+        v = ds.createVariable("ssh", "f4", ("time", "ylat", "xlon"), fill_value=-30000.0)
+        for t in range(nt):
+            v[t] = 0.1 + 0.01 * (lon + 60.0) + 0.02 * (lat - 30.0) + 0.001 * t
+
+
+def _curvi_tsuv(proc, work, nt):
+    lon, lat = _curvi()
+    depth = np.array([0.0, 10.0, 20.0, 50.0])
+    T = (10.0 + 2.0 * (lon + 60.0) + (lat - 30.0))[None] + 0.1 * depth[:, None, None]
+    S = (30.0 + 0.5 * (lon + 60.0))[None] + 0 * depth[:, None, None]
+    Z = np.zeros_like(T)
+    return proc._write_tsuv_nc(work, [T] * nt, [S] * nt, [Z] * nt, [Z] * nt, lon, lat, depth)
+
+
+class TestStofsResult:
+    def _run(self, tmp_path, monkeypatch, curvi_ssh=True, mode=1, ssh_nt=5):
+        cfg = _cfg()
+        cfg.rtofs_3d_region = None
+        cfg.adt_enabled = False
+        cfg.obc_interp_mode = mode
+        out = tmp_path / "out"
+        out.mkdir()
+        proc = RTOFSProcessor(cfg, tmp_path, out)
+        lon, lat = _curvi()
+        proc._bnd_lons = np.array([-59.2, -59.0])
+        proc._bnd_lats = np.array([30.9, 31.2])
+        proc._bnd_depths = np.array([40.0, 40.0])
+        proc._rtofs_cycle_date = datetime.strptime(cfg.pdy, "%Y%m%d")
+        sig = np.array(SIGMA)
+        proc._vgrid = SchismVgrid(nvrt=4, kz=0, h_s=100.0, z_levels=np.array([]),
+                                  sigma_levels=np.linspace(-1, 0, 4),
+                                  node_sigma=np.tile(sig[:, None], (1, 2)), node_kbp=np.ones(2, int))
+        files2 = _write_2d(tmp_path, cfg, proc._bnd_lons, proc._bnd_lats)
+        files3 = [tmp_path / f"rtofs_glo_3dz_f{h:03d}_6hrly_hvr_US_east.nc" for h in (0, 6, 12, 18, 24)]
+        work = tmp_path / "w"
+        work.mkdir()
+        ssh1 = work / "SSH_1.nc"
+        if curvi_ssh:
+            _write_curvi_ssh1(ssh1, lon, lat, ssh_nt)
+        else:
+            _write_ssh1(ssh1, np.array([-60.0, -59.0, -58.0]), np.array([30.0, 31.0, 32.0]),
+                        [np.zeros((3, 3))] * 5)
+        tsuv = _curvi_tsuv(proc, work, 5)
+        monkeypatch.setattr(RTOFSProcessor, "find_input_files_by_type", lambda self: (files2, files3))
+        monkeypatch.setattr(RTOFSProcessor, "_load_grid", lambda self: True)
+        monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_ssh", lambda self, f, w: ssh1)
+        monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_tsuv", lambda self, f, w: tsuv)
+        return proc, proc._process_stofs()
+
+    def test_curvilinear_grid_runs_ops_for_both(self, tmp_path, monkeypatch):
+        proc, res = self._run(tmp_path, monkeypatch)
+        assert res.success
+        assert res.metadata["elev2d_interp"] == "ops" and res.metadata["ts_interp"] == "ops"
+        assert not any("fell back" in w for w in res.warnings)
+        with Dataset(str(proc.output_path / "TEM_3D.th.nc")) as ds:
+            t = np.array(ds["time_series"][:])[0, 0, :, 0]
+        lon_n, lat_n = -59.2, 30.9
+        z = np.array([-40.0, -20.0, -10.0, 0.0])
+        np.testing.assert_allclose(t, 10.0 + 2.0 * (lon_n + 60) + (lat_n - 30.0) - 0.1 * z, atol=1e-3)
+
+    def test_mode0_on_curvilinear_falls_back_with_warning(self, tmp_path, monkeypatch):
+        proc, res = self._run(tmp_path, monkeypatch, mode=0)
+        assert res.success
+        assert res.metadata["elev2d_interp"] != "ops" and res.metadata["ts_interp"] != "ops"
+        joined = " ".join(res.warnings)
+        assert "elev2D: fell back" in joined and "T/S: fell back" in joined
+        assert "not rectilinear" in joined
+
+    def test_ssh_tsuv_grid_mismatch_is_reported(self, tmp_path, monkeypatch):
+        proc, res = self._run(tmp_path, monkeypatch, curvi_ssh=False)
+        assert res.metadata["ts_interp"] == "ops"
+        assert any("dry mask fell back to surface T" in w for w in res.warnings)
+
+    def test_step_count_mismatch_is_reported(self, tmp_path, monkeypatch):
+        proc, res = self._run(tmp_path, monkeypatch, ssh_nt=4)
+        assert res.metadata["elev2d_interp"] != "ops" and res.metadata["ts_interp"] == "ops"
+        assert any("elev2D: fell back" in w and "4 steps for 5" in w for w in res.warnings)
+
+
+def test_node_depth_floor_is_0_11(tmp_path):
+    p, path, nt = _tsuv_proc(tmp_path, [-59.5], [30.5], [0.0], SIGMA)
+    z = p._ops_node_z(4)
+    np.testing.assert_allclose(z[0], 0.11 * np.array(SIGMA))
+
+
+def test_missing_ssh1_noted_for_dry_mask(tmp_path):
+    p, path, nt = _tsuv_proc(tmp_path, [-59.5], [30.5], [40.0], SIGMA)
+    p._ops_warnings = []
+    p._ops_ts_profiles(path, nt)
+    assert any("no SSH_1" in m for m in p._ops_warnings)
+
+
+def test_fortran_opt_in_gets_offset_and_hold(tmp_path, monkeypatch):
+    import stat
+    cfg = _cfg()
+    cfg.rtofs_3d_region = None
+    cfg.adt_enabled = False
+    cfg.obc_use_fortran_gen3dth = True
+    cfg.obc_ssh_hold_first_record = True
+    out = tmp_path / "out"
+    out.mkdir()
+    proc = RTOFSProcessor(cfg, tmp_path, out)
+    exe_dir = tmp_path / "exec"
+    exe_dir.mkdir()
+    exe = exe_dir / "stofs_3d_atl_gen_3Dth_from_hycom"
+    exe.write_text(
+        "#!/usr/bin/env python3\n"
+        "import numpy as np\nfrom netCDF4 import Dataset\n"
+        "for n, nlev in (('elev2D', 1), ('TEM_3D', 3), ('SAL_3D', 3), ('uv3D', 3)):\n"
+        "    ds = Dataset(n + '.th.nc', 'w')\n"
+        "    ds.createDimension('time', 3); ds.createDimension('nOpenBndNodes', 2)\n"
+        "    ds.createDimension('nLevels', nlev); ds.createDimension('one', 1)\n"
+        "    v = ds.createVariable('time_series', 'f4', ('time', 'nOpenBndNodes', 'nLevels', 'one'))\n"
+        "    v[:] = np.arange(3, dtype='f4')[:, None, None, None] + np.zeros((3, 2, nlev, 1), 'f4')\n"
+        "    ds.close()\n")
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    for v in ("EXECstofs3d", "EXECofs", "FIXstofs3d"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("EXECnos", str(exe_dir))
+    files2 = [tmp_path / "a_f000.nc"]
+    monkeypatch.setattr(RTOFSProcessor, "find_input_files_by_type", lambda self: (files2, files2))
+    monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_ssh", lambda self, f, w: w / "SSH_1.nc")
+    monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_tsuv", lambda self, f, w: w / "TSUV_1.nc")
+    res = proc._process_stofs()
+    assert res.metadata["fortran_used"] is True and res.metadata["elev2d_interp"] == "fortran"
+    with Dataset(str(out / "elev2D.th.nc")) as ds:
+        ts = np.array(ds["time_series"][:])
+    np.testing.assert_allclose(ts, 0.04, atol=1e-6)  # record 0 (= 0) + 0.04, held for all records
+
+
+def test_160k_nodes_mode1_curvilinear_in_seconds():
+    lon, lat = _curvi(120, 160)
+    rng = np.random.default_rng(1)
+    n = 160_000
+    j = rng.integers(0, 119, n)
+    i = rng.integers(0, 159, n)
+    u = rng.uniform(0, 1, (2, n))
+    px = lon[j, i] * (1 - u[0]) + lon[j, i + 1] * u[0]
+    py = lat[j, i] * (1 - u[1]) + lat[j + 1, i] * u[1]
+    t0 = time.perf_counter()
+    _, _, w, found = oi.parent_weights_2d(lon, lat, px, py)
+    assert found.mean() > 0.99 and np.allclose(w[found].sum(1), 1.0)
+    assert time.perf_counter() - t0 < 20.0
