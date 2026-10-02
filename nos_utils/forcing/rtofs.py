@@ -58,6 +58,23 @@ except ImportError:
     HAS_NETCDF4 = False
 
 
+def _pack_for_fortran(real, scale, offset, fill, fill_mask=None):
+    """
+    Pack a float field to float exactly as the Fortran gen_*_hycom expects.
+    stored = (real - offset) / scale
+
+    Single source of truth for the SSH writer, the TSUV writer, and the ADT
+    blend so the packing convention cannot drift between surf_el and TSUV.
+    """
+    real = np.asarray(real, dtype=np.float32)
+    packed = (real - offset) / scale
+    mask = ~np.isfinite(real)
+    if fill_mask is not None:
+        mask = mask | fill_mask
+    packed = np.where(mask, fill, packed)
+    return packed
+
+
 class RTOFSProcessor(ForcingProcessor):
     """
     RTOFS ocean boundary condition processor for SCHISM.
@@ -150,6 +167,7 @@ class RTOFSProcessor(ForcingProcessor):
         self._struct_interp = {}  # Cached StructuredGridInterpolator per grid shape
         self._3d_roi = None     # Cached ROI indices (j_start, j_end, i_start, i_end) for 3D subsetting
         self._wl_bias_info = None   # Outcome of the WL bias correction (see _apply_wl_bias)
+        self._ssh_blended_used = False
         # Discovery diagnostics, reset by find_input_files_by_type(). Values
         # are exact glob matches before size/pairing/window filtering.
         self._matched_3d_sizes = {}
@@ -625,12 +643,14 @@ class RTOFSProcessor(ForcingProcessor):
                 )
 
             # Step 3: ADT SSH blending (if enabled and data available)
+            adt_blended = False
             if ssh_path and self.config.adt_enabled:
                 from .adt import ADTBlender
                 blender = ADTBlender(self.config, self.input_path)
                 blended = blender.blend_ssh(ssh_path, work_dir)
                 if blended:
                     ssh_path = blended
+                    adt_blended = True
                     log.info("ADT SSH blending applied")
                 else:
                     warnings.append("ADT data unavailable, using RTOFS-only SSH")
@@ -640,6 +660,9 @@ class RTOFSProcessor(ForcingProcessor):
 
             elev2d_ok = False
             obc3d_ok = False
+            # SSH_1.nc carrying the ADT blend, for the Python fallback (the raw
+            # 2D files would silently discard it). MJ (10/01/26)
+            ssh_source = ssh_path if adt_blended else None
 
             if fortran_ok:
                 # Copy Fortran outputs to final output directory.
@@ -673,7 +696,12 @@ class RTOFSProcessor(ForcingProcessor):
                 has_grid = self._load_grid()
                 if has_grid:
                     if files_2d:
-                        f = self._process_2d(files_2d)
+                        f = (self._process_2d(files_2d, ssh_source=ssh_source)
+                             if ssh_source else self._process_2d(files_2d))
+                        if ssh_source and not self._ssh_blended_used:
+                            adt_blended = False
+                            warnings.append("ADT blend requested but raw RTOFS SSH was "
+                                            "used for elev2D")
                         if f:
                             output_files.append(f)
                             elev2d_ok = True
@@ -723,7 +751,7 @@ class RTOFSProcessor(ForcingProcessor):
                     "n_3d_files": len(files_3d),
                     "stofs_mode": True,
                     "fortran_used": fortran_ok,
-                    "adt_blended": self.config.adt_enabled and not any("ADT" in w for w in warnings),
+                    "adt_blended": adt_blended,
                 },
             )
         finally:
@@ -818,7 +846,8 @@ class RTOFSProcessor(ForcingProcessor):
             time_var[:] = np.arange(nt) * 21600.0  # 6-hourly default
 
         lon_var = nc.createVariable("xlon", "f4", ("ylat", "xlon"))
-        lon_var[:] = all_lon
+        # TODO: Check validity for pacific
+        lon_var[:] = all_lon - 360
 
         lat_var = nc.createVariable("ylat", "f4", ("ylat", "xlon"))
         lat_var[:] = all_lat
@@ -829,14 +858,23 @@ class RTOFSProcessor(ForcingProcessor):
         for t in range(nt):
             ssh_var[t] = all_ssh[t]
 
-        # Also write surf_el (scaled format expected by Fortran)
-        surf_el = nc.createVariable("surf_el", "f4", ("time", "ylat", "xlon"),
-                                    fill_value=-30000.0)
-        surf_el.scale_factor = 0.001
+        _SSH_FILL = -30000.0
+        surf_el = nc.createVariable(
+            "surf_el", "f4", ("time", "ylat", "xlon"),
+            fill_value=_SSH_FILL,
+        )
+        surf_el.set_auto_maskandscale(False)
+        surf_el.scale_factor = np.float32(0.001)
+        surf_el.add_offset = np.float32(0.0)
+        surf_el.missing_value = _SSH_FILL
         for t in range(nt):
-            data = all_ssh[t].copy()
-            data = np.where(np.abs(data) < 10000, data * 1000.0, -3000.0)
-            surf_el[t] = data
+            real = np.asarray(all_ssh[t], dtype=np.float32)
+            # Extreme cells (|SSH| >= 10000 m) map to fill; _pack_for_fortran also
+            # sends non-finite cells there
+            surf_el[t] = _pack_for_fortran(
+                real, surf_el.scale_factor, surf_el.add_offset,
+                _SSH_FILL, fill_mask=np.abs(real) >= 10000,
+            )
 
         nc.close()
         log.info(f"Created SSH_1.nc: {nt} times, {ny}x{nx} grid")
@@ -881,8 +919,9 @@ class RTOFSProcessor(ForcingProcessor):
                 for t in range(subset["temperature"].shape[0]):
                     all_temp.append(np.ma.filled(subset["temperature"][t], fill_value=-30000.0))
                     all_salt.append(np.ma.filled(subset["salinity"][t], fill_value=-30000.0))
-                    all_u.append(np.ma.filled(subset["u"][t], fill_value=0.0))
-                    all_v.append(np.ma.filled(subset["v"][t], fill_value=0.0))
+                    # Missing u/v -> -30000 (ops cvtUV.nco change_miss(-30000)),
+                    all_u.append(np.ma.filled(subset["u"][t], fill_value=-30000.0))
+                    all_v.append(np.ma.filled(subset["v"][t], fill_value=-30000.0))
 
                 if all_lon is None:
                     all_lon = np.array(subset["Longitude"])
@@ -898,6 +937,28 @@ class RTOFSProcessor(ForcingProcessor):
             return None
 
         # Write TSUV_1.nc (matching Fortran input format)
+        return self._write_tsuv_nc(
+            work_dir, all_temp, all_salt, all_u, all_v,
+            all_lon, all_lat, all_depth,
+        )
+
+    def _write_tsuv_nc(
+        self, work_dir: Path,
+        all_temp: List[np.ndarray], all_salt: List[np.ndarray],
+        all_u: List[np.ndarray], all_v: List[np.ndarray],
+        all_lon: np.ndarray, all_lat: np.ndarray,
+        all_depth: Optional[np.ndarray] = None,
+    ) -> Optional[Path]:
+        """Write TSUV_1.nc with T/S/U/V explicitly packed
+
+        Split out of _stofs_prepare_tsuv so the packing is unit-testable.
+        Each list holds one (nz, ny, nx) array per time step; all_lon/all_lat
+        are (ny, nx); all_depth is the (nz,) level depths. Cells equal to the
+        -30000 real-space sentinel (from ma.filled in the caller) are stored.
+        """
+        if not all_temp:
+            return None
+
         output = work_dir / "TSUV_1.nc"
         nc = Dataset(str(output), "w", format="NETCDF4")
 
@@ -913,19 +974,43 @@ class RTOFSProcessor(ForcingProcessor):
         time_var[:] = np.arange(nt) * 21600.0
 
         if all_depth is not None:
-            lev_var = nc.createVariable("lev", "f4", ("lev",))
-            lev_var[:] = all_depth
+            dep_var = nc.createVariable("depth", "f4", ("lev",))
+            dep_var[:] = all_depth
 
         lon_var = nc.createVariable("xlon", "f4", ("ylat", "xlon"))
         lon_var[:] = all_lon
         lat_var = nc.createVariable("ylat", "f4", ("ylat", "xlon"))
         lat_var[:] = all_lat
 
-        for name, data_list in [("temperature", all_temp), ("salinity", all_salt),
-                                ("water_u", all_u), ("water_v", all_v)]:
-            var = nc.createVariable(name, "f4", ("time", "lev", "ylat", "xlon"))
+        # Pack T/S/U/V explicitly, matching operational NCO converters
+        # set_auto_maskandscale(False) prevents netCDF4 re-applying scale_factor
+        # on write (double-pack).
+        _TSUV_FILL = -30000.0
+        _pack_spec = [
+            # (varname,   data_list,  add_offset, scale_factor, unpacked_fill)
+            ("temperature", all_temp, 20.0,  0.001, -30000.0),
+            ("salinity",    all_salt, 20.0,  0.001, -30000.0),
+            ("water_u",     all_u,     0.0,  0.001, -30000.0),
+            ("water_v",     all_v,     0.0,  0.001, -30000.0),
+        ]
+        for vname, data_list, add_offset, scale_factor, fill_real in _pack_spec:
+            var = nc.createVariable(
+                vname, "f4", ("time", "lev", "ylat", "xlon"),
+                fill_value=_TSUV_FILL,
+            )
+            var.set_auto_maskandscale(False)
+            var.scale_factor = np.float32(scale_factor)
+            var.add_offset = np.float32(add_offset)
+            var.missing_value = _TSUV_FILL
             for t in range(nt):
-                var[t] = data_list[t]
+                real = np.asarray(data_list[t], dtype=np.float32)
+                # Cells equal to the real-space sentinel (fill_real from
+                # ma.filled in the caller) map to fill; _pack_for_fortran also sends
+                # non-finite cells there
+                var[t] = _pack_for_fortran(
+                    real, var.scale_factor, var.add_offset,
+                    _TSUV_FILL, fill_mask=np.abs(real - fill_real) < 1e-3,
+                )
 
         nc.close()
         log.info(f"Created TSUV_1.nc: {nt} times, {nz} levels, {ny}x{nx} grid")
@@ -1311,7 +1396,6 @@ class RTOFSProcessor(ForcingProcessor):
         n_bnd = len(self._bnd_lons)
 
         # Delaunay interpolation with corner points (matching Fortran INTERP_REMESH)
-        # target_pts uses the mesh boundary convention (same as self._bnd_lons)
         target_pts = np.column_stack([self._bnd_lons, self._bnd_lats])
 
         # Flatten RTOFS grid
@@ -1598,7 +1682,29 @@ class RTOFSProcessor(ForcingProcessor):
             log.warning(f"WL bias correction unavailable ({e}) — SSH left uncorrected")
             return ssh_array, {"applied": False, "reason": f"error: {e}"}
 
-    def _process_2d(self, files_2d: List[Path]) -> Optional[Path]:
+    def _load_blended_ssh(self, ssh_source: Path, files_2d: List[Path]):
+        """Read the ADT-blended SSH_1 file as (lon, lat, ssh[nt, ny, nx] in m, NaN fill).
+
+        Returns None unless it has exactly one step per RTOFS 2D file, so the
+        time axis derived from the file names stays valid.
+        """
+        try:
+            ds = Dataset(str(ssh_source))
+            ssh = np.ma.filled(ds.variables["ssh"][:], fill_value=np.nan).astype(np.float64)
+            lon = np.array(ds.variables["xlon"][:])
+            lat = np.array(ds.variables["ylat"][:])
+            ds.close()
+        except Exception as e:
+            log.warning(f"Cannot read blended SSH {ssh_source}: {e} — using raw RTOFS SSH")
+            return None
+        if ssh.shape[0] != len(files_2d):
+            log.warning(f"Blended SSH has {ssh.shape[0]} steps for {len(files_2d)} 2D files "
+                        f"— using raw RTOFS SSH")
+            return None
+        ssh[np.abs(ssh) > 1000] = np.nan
+        return lon, lat, ssh
+
+    def _process_2d(self, files_2d: List[Path], ssh_source: Optional[Path] = None) -> Optional[Path]:
         """Extract SSH from RTOFS 2D files, interpolate to boundary nodes.
 
         After temporal interpolation the operational water-level bias
@@ -1630,26 +1736,66 @@ class RTOFSProcessor(ForcingProcessor):
             from ..interp.precomputed_weights import apply_precomputed_ssh
             log.info("Using precomputed REMESH weights for SSH (Fortran-equivalent)")
 
+        blended = self._load_blended_ssh(ssh_source, files_2d) if ssh_source else None
+        if blended is not None and ssh_weights:
+            # NaN at a weight source index would poison the corner mean. MJ (10/01/26)
+            roi = self.config.obc_roi_2d
+            with Dataset(str(files_2d[0])) as d0:
+                fs = d0.variables["ssh"].shape[-2:]
+            ny, nx = blended[2].shape[1:]
+            emb = np.full((blended[2].shape[0],) + tuple(fs), np.nan)
+            emb[:, roi["y1"]:roi["y1"] + ny, roi["x1"]:roi["x1"] + nx] = blended[2]
+            src = np.asarray(ssh_weights["source_data_flat_idx"])
+            if np.isnan(emb.reshape(emb.shape[0], -1)[:, src]).any():
+                log.warning("Blended SSH has NaN at precomputed-weight source points "
+                            "— using raw RTOFS SSH")
+                blended = None
+        self._ssh_blended_used = blended is not None
+        if blended is not None:
+            log.info("elev2D: SSH taken from the ADT-blended SSH_1 file")
+        else:
+            log.info("elev2D: SSH taken from the raw RTOFS 2D files")
+
         try:
             all_ssh = []
 
-            for f in files_2d:
-                ds = Dataset(str(f))
-                ssh_raw = ds.variables["ssh"][:]
-                lon = ds.variables["Longitude"][:]
-                lat = ds.variables["Latitude"][:]
-
-                ssh_raw = np.ma.filled(ssh_raw, fill_value=np.nan)
-
-                for t in range(ssh_raw.shape[0]):
+            if blended is not None:
+                b_lon, b_lat, b_ssh = blended
+                full = None
+                if ssh_weights:
+                    # Weights index the full 2D grid: embed the ROI subset back
+                    roi = self.config.obc_roi_2d
+                    with Dataset(str(files_2d[0])) as d0:
+                        full_shape = d0.variables["ssh"].shape[-2:]
+                    full = (full_shape, roi["y1"], roi["x1"])
+                for t in range(b_ssh.shape[0]):
                     if ssh_weights:
-                        ssh_bnd = apply_precomputed_ssh(ssh_weights, ssh_raw[t])
+                        fs, y1, x1 = full
+                        emb = np.full(fs, np.nan)
+                        emb[y1:y1 + b_ssh.shape[1], x1:x1 + b_ssh.shape[2]] = b_ssh[t]
+                        ssh_bnd = apply_precomputed_ssh(ssh_weights, emb)
                     else:
-                        ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
+                        ssh_bnd = self._interpolate_2d_to_boundary(b_lon, b_lat, b_ssh[t])
                     ssh_bnd += self.config.obc_ssh_offset
                     all_ssh.append(ssh_bnd)
+            else:
+                for f in files_2d:
+                    ds = Dataset(str(f))
+                    ssh_raw = ds.variables["ssh"][:]
+                    lon = ds.variables["Longitude"][:]
+                    lat = ds.variables["Latitude"][:]
 
-                ds.close()
+                    ssh_raw = np.ma.filled(ssh_raw, fill_value=np.nan)
+
+                    for t in range(ssh_raw.shape[0]):
+                        if ssh_weights:
+                            ssh_bnd = apply_precomputed_ssh(ssh_weights, ssh_raw[t])
+                        else:
+                            ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
+                        ssh_bnd += self.config.obc_ssh_offset
+                        all_ssh.append(ssh_bnd)
+
+                    ds.close()
 
             if not all_ssh:
                 return None
