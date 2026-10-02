@@ -260,6 +260,22 @@ class TestTS:
         assert temp[0].max() == 0.0
 
 
+class TestProcess3d:
+    def test_process_3d_writes_th_files_from_tsuv(self, tmp_path):
+        from pathlib import Path
+        p, path, nt = _tsuv_proc(tmp_path, [-59.5, -59.2], [30.5, 30.9], [40.0, 40.0], SIGMA)
+        p.output_path = tmp_path / "o"
+        p.output_path.mkdir()
+        p._rtofs_cycle_date = datetime(2026, 4, 1, 12)
+        p._tsuv1_path = path
+        files = [Path(f"rtofs_glo_3dz_f{h:03d}_6hrly_hvr_US_east.nc") for h in (6, 12)]
+        names = {f.name for f in p._process_3d(files)}
+        assert {"TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc"} <= names
+        with Dataset(str(p.output_path / "TEM_3D.th.nc")) as ds:
+            ts = np.array(ds["time_series"][:])
+        assert ts.shape[1:] == (2, 4, 1) and np.isfinite(ts).all()
+
+
 class TestWiring:
     def _setup(self, tmp_path):
         cfg = _cfg()
