@@ -465,7 +465,8 @@ class TestPartialProcessingSuccessBlocked:
         cfg = ForcingConfig(lon_min=-98.5035, lon_max=-52.4867, lat_min=7.347, lat_max=52.5904,
                             pdy="20260730", cyc=0,
                             obc_roi_2d={"x1": 0, "x2": 1, "y1": 0, "y2": 1},
-                            rtofs_3d_region="US_east")
+                            rtofs_3d_region="US_east",
+                            obc_use_fortran_gen3dth=True)
         proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
 
         monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_ssh",
@@ -574,7 +575,8 @@ class TestIncomplete3DArtifactBlocked:
         cfg = ForcingConfig(lon_min=-98.5035, lon_max=-52.4867, lat_min=7.347, lat_max=52.5904,
                             pdy="20260730", cyc=0,
                             obc_roi_2d={"x1": 0, "x2": 1, "y1": 0, "y2": 1},
-                            rtofs_3d_region="US_east")
+                            rtofs_3d_region="US_east",
+                            obc_use_fortran_gen3dth=True)
         proc = _with_fake_grid(RTOFSProcessor(cfg, tmp_path, tmp_path))
 
         monkeypatch.setattr(RTOFSProcessor, "_stofs_prepare_ssh",

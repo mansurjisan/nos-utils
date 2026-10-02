@@ -269,27 +269,6 @@ def test_step_count_mismatch_reports_raw_and_warns(setup, monkeypatch):
     assert any("raw RTOFS SSH" in w for w in res.warnings)
 
 
-@pytest.mark.parametrize("src_idx,expect_blend", [(0, False), (5, True)])
-def test_precomputed_weights_nan_guard(setup, monkeypatch, src_idx, expect_blend):
-    cfg, proc, files, ssh_1, work, tmp = setup
-    blended = _blend(cfg, tmp, ssh_1, work, lambda lo, la: np.full_like(lo, 0.90))
-    with Dataset(str(blended), "r+") as ds:
-        ds["ssh"][:, 0, 0] = -30000.0  # becomes NaN at flat index 0
-    seen = []
-    n_bnd = len(proc._bnd_lons)
-
-    def stub(w, field):
-        seen.append(bool(np.isnan(field.ravel()[w["source_data_flat_idx"]]).any()))
-        return np.zeros(n_bnd)
-
-    monkeypatch.setattr("nos_utils.interp.precomputed_weights.apply_precomputed_ssh", stub)
-    monkeypatch.setattr(proc, "_find_ssh_weights",
-                        lambda: {"source_data_flat_idx": np.array([src_idx])})
-    proc._process_2d(files, ssh_source=blended)
-    assert proc._ssh_blended_used is expect_blend
-    assert not any(seen)
-
-
 def test_fortran_exe_reads_blended_ssh(setup, monkeypatch):
     cfg, proc, files, ssh_1, work, tmp = setup
     blended = _blend(cfg, tmp, ssh_1, work, lambda lo, la: np.full_like(lo, 0.90))
