@@ -624,8 +624,9 @@ class RTOFSProcessor(ForcingProcessor):
                 errors=[self._missing_region_3d_error(region)],
             )
 
-        import tempfile
-        work_dir = Path(tempfile.mkdtemp(prefix="rtofs_stofs_"))
+        keep = os.environ.get("KEEPDATA", "").strip().upper() == "YES"
+        work_dir = self._stofs_work_dir(keep)
+        log.info(f"STOFS OBC work dir: {work_dir} ({'kept' if keep else 'removed on exit'})")
         self._ops_warnings = []
         self._elev2d_interp = self._ts_interp = None
 
@@ -655,10 +656,13 @@ class RTOFSProcessor(ForcingProcessor):
 
             # Step 3: ADT SSH blending (if enabled and data available)
             adt_blended = False
+            adt_regrid = None
             if ssh_path and self.config.adt_enabled:
                 from .adt import ADTBlender
-                blender = ADTBlender(self.config, self.input_path)
+                blender = ADTBlender(self.config, self.input_path, keep=keep)
                 blended = blender.blend_ssh(ssh_path, work_dir)
+                adt_regrid = blender.regrid if blended else None
+                warnings.extend(blender.warnings)
                 if blended:
                     ssh_path = blended
                     adt_blended = True
@@ -780,10 +784,12 @@ class RTOFSProcessor(ForcingProcessor):
                     "stofs_mode": True,
                     "fortran_used": fortran_ok,
                     "adt_blended": adt_blended,
+                    "adt_regrid": adt_regrid if adt_blended else None,
                 },
             )
         finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            if not keep:
+                shutil.rmtree(work_dir, ignore_errors=True)
             self._ssh1_path = self._tsuv1_path = None
 
     def find_input_files(self) -> List[Path]:
@@ -791,6 +797,17 @@ class RTOFSProcessor(ForcingProcessor):
         return files_2d + files_3d
 
     # ---- STOFS data preparation methods ----
+
+    def _stofs_work_dir(self, keep: bool) -> Path:
+        """Scratch dir for the STOFS OBC intermediates; per phase under DATA (else the output dir) when kept."""
+        if not keep:
+            import tempfile
+            return Path(tempfile.mkdtemp(prefix="rtofs_stofs_"))
+        base = Path(os.environ.get("DATA") or self.output_path)
+        work = base / f"rtofs_stofs_{self.phase or 'all'}"
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True, exist_ok=True)
+        return work
 
     def _stofs_subset_roi(self, ds, roi: dict, variables: List[str]) -> dict:
         """Subset RTOFS NetCDF by ROI indices (replaces NCO ncks -d X,x1,x2 -d Y,y1,y2)."""

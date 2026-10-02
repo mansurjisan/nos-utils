@@ -1,6 +1,7 @@
 """ADT-blended SSH must reach elev2D.th.nc in the Python fallback."""
 
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -299,3 +300,49 @@ def test_fortran_link_keeps_raw_ssh_without_adt(setup, monkeypatch):
     monkeypatch.setenv("EXECnos", str(exe_dir))
     proc._call_fortran_gen_3dth(work, ssh_1, None)
     assert ssh_1.exists() and not ssh_1.is_symlink()
+
+
+def _stofs_run(setup, monkeypatch, keep, phase="nowcast"):
+    cfg, proc, files, ssh_1, work, tmp = setup
+    cfg.rtofs_3d_region = None
+    proc.phase = phase
+    data = tmp / "DATA"
+    data.mkdir()
+    monkeypatch.setenv("DATA", str(data))
+    if keep:
+        monkeypatch.setenv("KEEPDATA", "YES")
+    else:
+        monkeypatch.delenv("KEEPDATA", raising=False)
+    monkeypatch.setattr(RTOFSProcessor, "find_input_files_by_type", lambda self: (files, []))
+    monkeypatch.setattr(RTOFSProcessor, "_call_fortran_gen_3dth", lambda *a, **k: False)
+    monkeypatch.setattr(RTOFSProcessor, "_load_grid", lambda self: True)
+    _write_adt(tmp / "adt_20260401.nc", lambda lo, la: np.full_like(lo, 0.90))
+    seen = {}
+    orig = RTOFSProcessor._ops_ssh_boundary
+
+    def spy(self, p, n):
+        seen["p"] = Path(p)
+        return orig(self, p, n)
+
+    monkeypatch.setattr(RTOFSProcessor, "_ops_ssh_boundary", spy)
+    res = proc._process_stofs()
+    assert res.success
+    return res, data, seen
+
+
+def test_keepdata_keeps_intermediates_per_phase(setup, monkeypatch):
+    res, data, seen = _stofs_run(setup, monkeypatch, keep=True)
+    kept = data / "rtofs_stofs_nowcast"
+    for n in ("SSH_1.nc", "SSH_1_adt.nc", "adt_on_rtofs.nc"):
+        assert (kept / n).is_file()
+    assert seen["p"] == kept / "SSH_1_adt.nc"
+    assert res.metadata["adt_regrid"] == "bilinear"
+    with Dataset(str(kept / "adt_on_rtofs.nc")) as ds:
+        assert ds["surf_el"].shape[0] == 1
+        np.testing.assert_allclose(np.array(ds["surf_el"][0]), 0.90 - 0.45, atol=1e-5)
+
+
+def test_default_removes_work_dir(setup, monkeypatch):
+    res, data, seen = _stofs_run(setup, monkeypatch, keep=False)
+    assert list(data.iterdir()) == []
+    assert not seen["p"].parent.exists()
