@@ -166,6 +166,15 @@ class ForcingConfig:
     # leaves this None (no-op). STOFS-3D-ATL v2.1 mesh: [0, 1] (B0=756,
     # B1=22 are iettype 5; B2=3 is the iettype-0 St-Lawrence flow boundary).
     obc_elev_segments: Optional[List[int]] = None
+    # Run the compiled stofs_3d_atl_gen_3Dth_from_hycom when it is found in
+    # EXECnos/EXECstofs3d. Off by default so installing the exe cannot silently
+    # switch algorithms away from the Python ops-equivalent. MJ (10/01/26)
+    obc_use_fortran_gen3dth: bool = False
+    # gen_3Dth interp_mode: 0 = bilinear, 1 = diagonal-split triangles. MJ (10/01/26)
+    obc_interp_mode: int = 0
+    # T,S for boundary nodes outside the RTOFS grid (stofs_3d_atl_obc_3dth_nc.in). MJ (10/01/26)
+    obc_tem_outside: float = 20.0
+    obc_sal_outside: float = 33.0
     # ADT satellite SSH blending (STOFS-3D-ATL uses CMEMS ADT to correct boundary SSH)
     adt_enabled: bool = False
     # Nudging enabled and timescale
@@ -808,6 +817,8 @@ class ForcingConfig:
             nudging_timescale_seconds=_nudging_timescale_seconds(nudge),
             obc_ssh_offset=obc_ssh_offset,
             obc_elev_segments=obc_elev_segments,
+            obc_use_fortran_gen3dth=bool(obc.get("use_fortran_gen3dth", False)) if isinstance(obc, dict) else False,
+            obc_interp_mode=int(obc.get("interp_mode", 0)) if isinstance(obc, dict) else 0,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
             nwm_product=nwm_product,
         )

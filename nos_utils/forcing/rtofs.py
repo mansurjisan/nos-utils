@@ -48,6 +48,10 @@ from ..config import ForcingConfig
 from ..coords import normalize_lon, lon_convention
 from ..io.schism_grid import SchismGrid
 from .base import ForcingProcessor, ForcingResult
+from .obc_ops_interp import (
+    DRY_SSH, JUNK_EPS, RJUNK, corner_cells, dry_parents, fill_columns, fix_ssh,
+    parent_weights, rect_axes, vertical_index,
+)
 
 log = logging.getLogger(__name__)
 
@@ -168,6 +172,8 @@ class RTOFSProcessor(ForcingProcessor):
         self._3d_roi = None     # Cached ROI indices (j_start, j_end, i_start, i_end) for 3D subsetting
         self._wl_bias_info = None   # Outcome of the WL bias correction (see _apply_wl_bias)
         self._ssh_blended_used = False
+        self._ssh1_path = None  # SSH_1.nc (ADT-blended when available) for the ops-equivalent elev2D
+        self._tsuv1_path = None  # TSUV_1.nc for the ops-equivalent T/S
         # Discovery diagnostics, reset by find_input_files_by_type(). Values
         # are exact glob matches before size/pairing/window filtering.
         self._matched_3d_sizes = {}
@@ -655,13 +661,17 @@ class RTOFSProcessor(ForcingProcessor):
                 else:
                     warnings.append("ADT data unavailable, using RTOFS-only SSH")
 
-            # Step 4: Try Fortran gen_3Dth_from_hycom
-            fortran_ok = self._call_fortran_gen_3dth(work_dir, ssh_path, tsuv_path)
+            # Step 4: Fortran gen_3Dth_from_hycom only when opted in; the default is
+            # the Python ops-equivalent. MJ (10/01/26)
+            fortran_ok = False
+            if self.config.obc_use_fortran_gen3dth:
+                fortran_ok = self._call_fortran_gen_3dth(work_dir, ssh_path, tsuv_path)
 
             elev2d_ok = False
             obc3d_ok = False
-            # SSH_1.nc carrying the ADT blend, for the Python fallback (the raw
-            # 2D files would silently discard it). MJ (10/01/26)
+            # SSH_1(_adt).nc / TSUV_1.nc feed the Python ops-equivalent. MJ (10/01/26)
+            self._ssh1_path = ssh_path
+            self._tsuv1_path = tsuv_path
             ssh_source = ssh_path if adt_blended else None
 
             if fortran_ok:
@@ -691,8 +701,9 @@ class RTOFSProcessor(ForcingProcessor):
                 elev2d_ok = "elev2D.th.nc" in produced
                 obc3d_ok = set(self.REQUIRED_3D_OBC_FILES).issubset(produced)
             else:
-                warnings.append("Fortran gen_3Dth not available, using Python interpolation")
-                # Fall back to Python Delaunay — load grid and use existing _process_2d/_process_3d
+                if self.config.obc_use_fortran_gen3dth:
+                    warnings.append("Fortran gen_3Dth not available, using Python interpolation")
+                # Python ops-equivalent (Delaunay only if its inputs are unusable)
                 has_grid = self._load_grid()
                 if has_grid:
                     if files_2d:
@@ -756,6 +767,7 @@ class RTOFSProcessor(ForcingProcessor):
             )
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+            self._ssh1_path = self._tsuv1_path = None
 
     def find_input_files(self) -> List[Path]:
         files_2d, files_3d = self.find_input_files_by_type()
@@ -1739,51 +1751,34 @@ class RTOFSProcessor(ForcingProcessor):
         ssh_weights = self._find_ssh_weights()
         if ssh_weights:
             from ..interp.precomputed_weights import apply_precomputed_ssh
-            log.info("Using precomputed REMESH weights for SSH (Fortran-equivalent)")
 
-        blended = self._load_blended_ssh(ssh_source, files_2d) if ssh_source else None
-        if blended is not None and ssh_weights:
-            # NaN at a weight source index would poison the corner mean. MJ (10/01/26)
-            roi = self.config.obc_roi_2d
-            with Dataset(str(files_2d[0])) as d0:
-                fs = d0.variables["ssh"].shape[-2:]
-            ny, nx = blended[2].shape[1:]
-            emb = np.full((blended[2].shape[0],) + tuple(fs), np.nan)
-            emb[:, roi["y1"]:roi["y1"] + ny, roi["x1"]:roi["x1"] + nx] = blended[2]
-            src = np.asarray(ssh_weights["source_data_flat_idx"])
-            if np.isnan(emb.reshape(emb.shape[0], -1)[:, src]).any():
-                log.warning("Blended SSH has NaN at precomputed-weight source points "
-                            "— using raw RTOFS SSH")
-                blended = None
-        self._ssh_blended_used = blended is not None
-        if blended is not None:
-            log.info("elev2D: SSH taken from the ADT-blended SSH_1 file")
-        else:
-            log.info("elev2D: SSH taken from the raw RTOFS 2D files")
+        # Ops-equivalent horizontal step on the SSH_1 grid (blended when given). MJ (10/01/26)
+        src = ssh_source or (self._ssh1_path if self.is_stofs_mode else None)
+        ops_ssh = self._ops_ssh_boundary(src, len(files_2d)) if src else None
+        blended = None
+        if ops_ssh is None and ssh_source:
+            blended = self._load_blended_ssh(ssh_source, files_2d)
+        self._ssh_blended_used = bool(ssh_source) and (ops_ssh is not None or blended is not None)
+        if ops_ssh is None:
+            if blended is not None:
+                log.info("elev2D: SSH taken from the ADT-blended SSH_1 file")
+            else:
+                log.info("elev2D: SSH taken from the raw RTOFS 2D files")
 
         try:
             all_ssh = []
 
-            if blended is not None:
+            if ops_ssh is not None:
+                all_ssh = [row + self.config.obc_ssh_offset for row in ops_ssh]
+            elif blended is not None:
                 b_lon, b_lat, b_ssh = blended
-                full = None
-                if ssh_weights:
-                    # Weights index the full 2D grid: embed the ROI subset back
-                    roi = self.config.obc_roi_2d
-                    with Dataset(str(files_2d[0])) as d0:
-                        full_shape = d0.variables["ssh"].shape[-2:]
-                    full = (full_shape, roi["y1"], roi["x1"])
                 for t in range(b_ssh.shape[0]):
-                    if ssh_weights:
-                        fs, y1, x1 = full
-                        emb = np.full(fs, np.nan)
-                        emb[y1:y1 + b_ssh.shape[1], x1:x1 + b_ssh.shape[2]] = b_ssh[t]
-                        ssh_bnd = apply_precomputed_ssh(ssh_weights, emb)
-                    else:
-                        ssh_bnd = self._interpolate_2d_to_boundary(b_lon, b_lat, b_ssh[t])
+                    ssh_bnd = self._interpolate_2d_to_boundary(b_lon, b_lat, b_ssh[t])
                     ssh_bnd += self.config.obc_ssh_offset
                     all_ssh.append(ssh_bnd)
             else:
+                if ssh_weights:
+                    log.info("Using precomputed REMESH weights for SSH (Fortran-equivalent)")
                 for f in files_2d:
                     ds = Dataset(str(f))
                     ssh_raw = ds.variables["ssh"][:]
@@ -1978,6 +1973,133 @@ class RTOFSProcessor(ForcingProcessor):
             log.error(traceback.format_exc())
             return None
 
+    def _ops_weights(self, xax, yax):
+        """Ops parent cell/weights for the boundary nodes on a rectilinear grid."""
+        lon = np.asarray(self._bnd_lons, np.float64)
+        lon = lon % 360.0 if xax.max() > 180.0 else np.where(lon > 180.0, lon - 360.0, lon)
+        return parent_weights(xax, yax, lon, np.asarray(self._bnd_lats, np.float64),
+                              mode=int(self.config.obc_interp_mode))
+
+    def _ops_label(self):
+        return "ops bilinear" if int(self.config.obc_interp_mode) == 0 else "ops interp_mode=1"
+
+    def _ops_ssh_boundary(self, ssh_path, n_files) -> Optional[np.ndarray]:
+        """Boundary SSH (nt, n_bnd) in m from SSH_1(_adt).nc, gen_3Dth rules; None to fall back."""
+        try:
+            with Dataset(str(ssh_path)) as ds:
+                ssh = np.ma.filled(ds.variables["ssh"][:], -30000.0).astype(np.float64)
+                lon, lat = ds.variables["xlon"][:], ds.variables["ylat"][:]
+            if ssh.shape[0] != n_files:
+                log.warning(f"{Path(ssh_path).name} has {ssh.shape[0]} steps for {n_files} 2D "
+                            f"files — not using the ops-equivalent elev2D")
+                return None
+            axes = rect_axes(lon, lat)
+            if axes is None:
+                log.warning("SSH_1 grid is not rectilinear — not using the ops-equivalent elev2D")
+                return None
+            ssh = np.where(np.isfinite(ssh), ssh, -30000.0)
+            ix, iy, w, inside = self._ops_weights(*axes)
+            wet = ssh[0] >= DRY_SSH
+            cj, ci = corner_cells(ix, iy)
+            cj, ci, n_dry = dry_parents(wet, cj, ci)
+            out = np.zeros((ssh.shape[0], len(ix)))
+            n_fix = 0
+            for t in range(ssh.shape[0]):
+                s_t, n = fix_ssh(ssh[t], wet)
+                n_fix += n
+                out[t] = (w * s_t[cj, ci].T).sum(axis=1)
+        except Exception as e:
+            log.warning(f"Ops-equivalent elev2D unavailable ({e}) — using the generic interpolation")
+            return None
+        log.info(f"elev2D: {self._ops_label()} (gen_3Dth-equivalent), {len(ix)} nodes, "
+                 f"{int((~inside).sum())} outside grid, {n_dry + n_fix} filled")
+        return out
+
+    def _ops_node_z(self, nvrt) -> Optional[np.ndarray]:
+        """SCHISM z (n_bnd, nvrt), bottom first, max(0.11, depth)*sigma, held at the node bottom below kbp."""
+        hh = np.maximum(np.abs(np.asarray(self._bnd_depths, np.float64)), 0.11)
+        v = self._vgrid
+        if v is None:
+            return None
+        if v.node_sigma is not None and v.node_sigma.shape[1] == len(hh):
+            z = hh[None, :] * v.node_sigma
+            idx = np.maximum(np.arange(nvrt)[:, None], np.asarray(v.node_kbp)[None, :] - 1)
+            return np.take_along_axis(z, idx, axis=0).T
+        z = np.empty((len(hh), nvrt))
+        for n, h in enumerate(hh):
+            col = np.sort(v.get_depths(h))[-nvrt:]
+            z[n] = np.concatenate([np.full(nvrt - len(col), col[0]), col])
+        return z
+
+    def _ops_ts_profiles(self, tsuv_path, n_files):
+        """(all_temp, all_salt) lists of (n_bnd, nvrt) per record from TSUV_1.nc, gen_3Dth rules; None to fall back."""
+        nvrt = self._vgrid.nvrt if self._vgrid else None
+        z = self._ops_node_z(nvrt) if nvrt else None
+        if z is None:
+            return None
+        try:
+            with Dataset(str(tsuv_path)) as ds:
+                names = ("temperature", "salinity", "water_u", "water_v")
+                for nme in names:
+                    ds.variables[nme].set_auto_maskandscale(False)
+                nt = ds.dimensions["time"].size
+                if nt != n_files:
+                    log.warning(f"{Path(tsuv_path).name} has {nt} steps for {n_files} 3D files "
+                                f"— not using the ops-equivalent T/S")
+                    return None
+                axes = rect_axes(ds.variables["xlon"][:], ds.variables["ylat"][:])
+                depth = np.asarray(ds.variables["depth"][:], np.float64)
+                if axes is None or not np.all(np.diff(depth) > 0):
+                    log.warning("TSUV_1 grid/depth not usable — not using the ops-equivalent T/S")
+                    return None
+                zm = -depth[::-1]
+                ix, iy, w, inside = self._ops_weights(*axes)
+                n = len(ix)
+                cj, ci = corner_cells(ix, iy)
+                raw0 = np.ma.filled(ds.variables["temperature"][0, 0], -30000.0)
+                wet = np.asarray(raw0, np.float64) * 1e-3 + 20.0 > RJUNK + JUNK_EPS
+                ll_dry = ~wet[cj[0], ci[0]]
+                pj, pi, n_dry = dry_parents(wet, cj, ci)
+                cells, inv = np.unique(pj * wet.shape[1] + pi, return_inverse=True)
+                pos = inv.reshape(4, n)
+                gj, gi = cells // wet.shape[1], cells % wet.shape[1]
+
+                def read(t):
+                    cols = []
+                    for nme, off in zip(names, (20.0, 20.0, 0.0, 0.0)):
+                        a = np.asarray(ds.variables[nme][t][:, gj, gi], np.float64)
+                        cols.append((a * 1e-3 + off)[::-1].T)
+                    return fill_columns(*cols)
+
+                T0, S0, kbp0, n_mid = read(0)
+                lev, vrat = vertical_index(z, zm, kbp0[pos[0]], ll_dry)
+                all_temp, all_salt = [], []
+                for t in range(nt):
+                    if t == 0:
+                        T, S = T0, S0
+                    else:
+                        T, S, _, nm = read(t)
+                        n_mid += nm
+                    row = []
+                    for F, lo, hi, fill in ((T, 0.0, None, self.config.obc_tem_outside),
+                                            (S, None, 40.0, self.config.obc_sal_outside)):
+                        prof = np.zeros((n, nvrt))
+                        for c in range(4):
+                            col = F[pos[c][:, None], lev]
+                            col1 = F[pos[c][:, None], lev + 1]
+                            prof += w[:, c, None] * (col * (1 - vrat) + col1 * vrat)
+                        prof = np.clip(prof, lo, hi)
+                        prof[~inside] = fill
+                        row.append(prof.astype(np.float32))
+                    all_temp.append(row[0])
+                    all_salt.append(row[1])
+        except Exception as e:
+            log.warning(f"Ops-equivalent T/S unavailable ({e}) — using the generic interpolation")
+            return None
+        log.info(f"T/S: {self._ops_label()} (gen_3Dth-equivalent), {n} nodes, "
+                 f"{int((~inside).sum())} outside grid, {n_dry + n_mid} filled")
+        return all_temp, all_salt
+
     def _compute_3d_roi(self, ds) -> Optional[Tuple[int, int, int, int]]:
         """Compute ROI (Region of Interest) indices for 3D RTOFS file subsetting.
 
@@ -2061,7 +2183,12 @@ class RTOFSProcessor(ForcingProcessor):
         try:
             all_temp = []
             all_salt = []
-            for f in files_3d:
+            # Ops-equivalent T/S from TSUV_1.nc; the per-file loop below is the fallback. MJ (10/01/26)
+            ops_ts = (self._ops_ts_profiles(self._tsuv1_path, len(files_3d))
+                      if self.is_stofs_mode and self._tsuv1_path else None)
+            if ops_ts is not None:
+                all_temp, all_salt = ops_ts
+            for f in (files_3d if ops_ts is None else []):
                 ds = Dataset(str(f))
 
                 lon_var = ds.variables.get("Longitude") or ds.variables.get("lon")
