@@ -196,6 +196,11 @@ def config_from_env(
             if resolved.exists():
                 config.bctides_template = resolved
                 log.info(f"Resolved bctides_template: {resolved}")
+        if config.adt_weight_file and not Path(config.adt_weight_file).is_absolute():
+            resolved = fix_path / config.adt_weight_file
+            if resolved.exists():
+                config.adt_weight_file = resolved
+                log.info(f"Resolved adt_weight_file: {resolved}")
         # Grid file
         if config.grid_file and not Path(config.grid_file).is_absolute():
             resolved = fix_path / config.grid_file

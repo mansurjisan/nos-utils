@@ -53,18 +53,31 @@ ADT_LAT_MIN = 7.0
 ADT_LAT_MAX = 54.0
 ADT_PAD = 1.0
 
+# Renormalization of the ESMF map application. None reproduces `ncremap -m` with no flags: NCO's
+# default "conservative" weight application sums S*src over valid sources only and leaves cells
+# with no valid source missing (NCO manual, Regridding > Renormalization; ncremap: "ncremap ...
+# # No renormalization/masking"). A float in [0, 1] switches to NCO's --rnr=<thr> behaviour
+# (divide by the valid weight sum, missing if the valid fraction is below thr). MJ (10/02/26)
+ADT_ESMF_RENORM = None
+ADT_COORD_TOL = 1e-3
+ADT_DST_TOL = 1e-2
+
 
 class ADTBlender:
     """Blend CMEMS ADT satellite SSH with RTOFS SSH."""
 
-    def __init__(self, config: ForcingConfig, input_path: Path):
+    def __init__(self, config: ForcingConfig, input_path: Path, keep: bool = False):
         """
         Args:
             config: ForcingConfig with ADT settings
             input_path: Root data path (COMINrtofs parent or COMINadt)
+            keep: also write adt_on_rtofs.nc (the ops adt_aft_cvtz_cln.nc analogue)
         """
         self.config = config
         self.input_path = input_path
+        self.keep = keep
+        self.regrid = None  # "esmf" | "bilinear" once blend_ssh has run
+        self.warnings = []
 
     def blend_ssh(self, ssh_path: Path, work_dir: Path) -> Optional[Path]:
         """Blend ADT into RTOFS SSH_1.nc.
@@ -90,7 +103,13 @@ class ADTBlender:
             log.warning("No ADT satellite data available — using RTOFS-only SSH")
             return None
 
+        self.regrid = None
+        self.warnings = []
         try:
+            adt_dst = self._regrid_esmf(adt_files, ssh_path)
+            if adt_dst is not None:
+                self.regrid = "esmf"
+                return self._apply_adt_blend(ssh_path, None, work_dir, adt_dst=adt_dst)
             bounds = self._dest_bounds(ssh_path)
             fields = [self._read_adt(f, bounds) for f in adt_files]
             fields = [f for f in fields if f is not None]
@@ -103,6 +122,7 @@ class ADTBlender:
                 warnings.simplefilter("ignore", RuntimeWarning)
                 adt = np.nanmean(np.stack([f[0] for f in fields]), axis=0)
             log.info(f"ADT: averaged {len(fields)} daily file(s)")
+            self.regrid = "bilinear"
             return self._apply_adt_blend(ssh_path, (adt, lons, lats), work_dir)
 
         except Exception as e:
@@ -164,14 +184,148 @@ class ADTBlender:
                 found.append(hit)
         return found
 
-    def _find_weight_file(self) -> Optional[Path]:
-        """Find ADT regridding weight file."""
-        fix_dir = os.environ.get("FIXstofs3d", "")
-        if fix_dir:
-            wt = Path(fix_dir) / "stofs_3d_atl_adt_weight.nc"
-            if wt.exists():
-                return wt
-        return None
+    def _weight_file(self) -> Optional[Path]:
+        """Configured ADT ESMF map, or None (warns when configured but missing)."""
+        wt = getattr(self.config, "adt_weight_file", None)
+        if not wt:
+            return None
+        wt = Path(wt)
+        if not wt.is_file():
+            self._warn(f"ADT weight file {wt} not found — using bilinear ADT regrid")
+            return None
+        return wt
+
+    def _warn(self, msg):
+        log.warning(msg)
+        self.warnings.append(msg)
+
+    @staticmethod
+    def _subset_ops_roi(adt_path: Path):
+        """ncks -d longitude,-62.5,-51.5 -d latitude,7.0,54.0: inclusive coordinate bounds.
+
+        Returns (adt[lat, lon] in m with NaN for missing, lons, lats, n_time). MJ (10/02/26)
+        """
+        with Dataset(str(adt_path)) as ds:
+            lon_name = "longitude" if "longitude" in ds.variables else "lon"
+            lat_name = "latitude" if "latitude" in ds.variables else "lat"
+            lons = np.array(ds.variables[lon_name][:], dtype=np.float64)
+            lats = np.array(ds.variables[lat_name][:], dtype=np.float64)
+            li = np.where((lons >= ADT_LON_MIN) & (lons <= ADT_LON_MAX))[0]
+            la = np.where((lats >= ADT_LAT_MIN) & (lats <= ADT_LAT_MAX))[0]
+            if li.size == 0 or la.size == 0:
+                raise ValueError("ADT file does not cover the ops ROI")
+            var = ds.variables["adt" if "adt" in ds.variables else "surf_el"]
+            a = np.ma.filled(var[..., la[0]:la[-1] + 1, li[0]:li[-1] + 1], np.nan)
+            a = np.asarray(a, dtype=np.float64)
+            if a.ndim == 3:
+                a = a[0]
+        a[np.abs(a) > 1000] = np.nan
+        return a, lons[li[0]:li[-1] + 1], lats[la[0]:la[-1] + 1]
+
+    @staticmethod
+    def _read_esmf_map(wt: Path):
+        """(S, row0, col0, n_a, n_b, xc_a, yc_a, xc_b, yc_b, dst_dims, src_dims); row/col made 0-based."""
+        with Dataset(str(wt)) as ds:
+            for v in ds.variables.values():
+                v.set_auto_maskandscale(False)
+
+            def deg(name):
+                v = ds.variables[name]
+                x = np.asarray(v[:], dtype=np.float64)
+                return np.rad2deg(x) if "rad" in str(getattr(v, "units", "")).lower() else x
+
+            n_a = ds.dimensions["n_a"].size
+            n_b = ds.dimensions["n_b"].size
+            S = np.asarray(ds.variables["S"][:], dtype=np.float64)
+            row = np.asarray(ds.variables["row"][:], dtype=np.int64) - 1
+            col = np.asarray(ds.variables["col"][:], dtype=np.int64) - 1
+            dims = [np.asarray(ds.variables[k][:]).astype(int).tolist()
+                    if k in ds.variables else None for k in ("dst_grid_dims", "src_grid_dims")]
+            return (S, row, col, n_a, n_b, deg("xc_a"), deg("yc_a"), deg("xc_b"), deg("yc_b"),
+                    dims[0], dims[1])
+
+    @staticmethod
+    def _apply_esmf_map(S, row, col, n_b, src, renorm=None):
+        """dst = sum(S * src) over valid sources, as `ncremap -m` (see ADT_ESMF_RENORM); NaN where none."""
+        v = np.isfinite(src[col])
+        w = np.where(v, S, 0.0)
+        num = np.bincount(row, weights=w * np.where(v, src[col], 0.0), minlength=n_b)
+        tally = np.bincount(row, weights=v.astype(np.float64), minlength=n_b)
+        if renorm is not None:
+            wsum = np.bincount(row, weights=w, minlength=n_b)
+            wall = np.bincount(row, weights=S, minlength=n_b)
+            with np.errstate(all="ignore"):
+                num = num / wsum
+                tally = np.where(wsum / wall >= renorm, tally, 0.0)
+        return np.where(tally > 0, num, np.nan)
+
+    def _regrid_esmf(self, adt_files, ssh_path: Path):
+        """Ops ADT step with the ESMF map: ROI subset, ncremap, -0.45, per-element two-day mean.
+
+        Returns the field on the SSH_1 grid, or None after recording a warning.
+        """
+        wt = self._weight_file()
+        if wt is None:
+            return None
+        try:
+            S, row, col, n_a, n_b, xca, yca, xcb, ycb, dst_dims, src_dims = self._read_esmf_map(wt)
+            with Dataset(str(ssh_path)) as ds:
+                dlon = np.ma.filled(ds.variables["xlon"][:], np.nan).astype(np.float64)
+                dlat = np.ma.filled(ds.variables["ylat"][:], np.nan).astype(np.float64)
+            if dlon.ndim == 1:
+                dlon, dlat = np.meshgrid(dlon, dlat)
+            if dlon.size != n_b:
+                raise ValueError(f"map n_b={n_b} != SSH_1 grid size {dlon.size}")
+            if dst_dims and tuple(dst_dims) != (dlon.shape[1], dlon.shape[0]):
+                raise ValueError(f"map dst_grid_dims {dst_dims} != SSH_1 (nx, ny) "
+                                 f"{(dlon.shape[1], dlon.shape[0])}")
+
+            def dlon_diff(a, b):
+                return np.abs((a - b + 180.0) % 360.0 - 180.0).max()
+
+            if (dlon_diff(xcb, dlon.ravel()) > ADT_DST_TOL
+                    or np.abs(ycb - dlat.ravel()).max() > ADT_DST_TOL):
+                raise ValueError("map xc_b/yc_b do not match the SSH_1 grid")
+            if row.min() < 0 or row.max() >= n_b or col.min() < 0 or col.max() >= n_a:
+                raise ValueError("map row/col out of range")
+
+            days = []
+            for f in adt_files:
+                a, lons, lats = self._subset_ops_roi(f)
+                if a.size != n_a:
+                    raise ValueError(f"ADT ROI subset has {a.size} cells, map n_a={n_a}")
+                if src_dims and tuple(src_dims) != (a.shape[1], a.shape[0]):
+                    raise ValueError(f"map src_grid_dims {src_dims} != ADT (nlon, nlat) "
+                                     f"{(a.shape[1], a.shape[0])}")
+                LO, LA = np.meshgrid(lons, lats)
+                if (dlon_diff(xca, LO.ravel()) > ADT_COORD_TOL
+                        or np.abs(yca - LA.ravel()).max() > ADT_COORD_TOL):
+                    raise ValueError("ADT ROI coordinates do not match map xc_a/yc_a")
+                out = self._apply_esmf_map(S, row, col, n_b, a.ravel(), ADT_ESMF_RENORM)
+                days.append(out - 0.45)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                field = np.nanmean(np.stack(days), axis=0).reshape(dlon.shape)
+        except Exception as e:
+            self._warn(f"ADT ESMF regrid unavailable ({e}) — using bilinear ADT regrid")
+            return None
+        log.info(f"ADT: ESMF map {wt.name} applied to {len(days)} day(s), "
+                 f"{int(np.isfinite(field).sum())}/{field.size} valid")
+        return field
+
+    def _write_adt_on_rtofs(self, adt_dst, dst_lon, dst_lat, out: Path):
+        """adt_aft_cvtz_cln.nc analogue: surf_el(time=1, ylat, xlon) in m after -0.45, plus lon/lat."""
+        ny, nx = adt_dst.shape
+        with Dataset(str(out), "w", format="NETCDF4") as nc:
+            nc.createDimension("time", 1)
+            nc.createDimension("ylat", ny)
+            nc.createDimension("xlon", nx)
+            nc.createVariable("lon", "f8", ("ylat", "xlon"))[:] = dst_lon
+            nc.createVariable("lat", "f8", ("ylat", "xlon"))[:] = dst_lat
+            v = nc.createVariable("surf_el", "f4", ("time", "ylat", "xlon"), fill_value=-30000.0)
+            v.units = "m"
+            v[0] = np.where(np.isfinite(adt_dst), adt_dst, -30000.0)
 
     def _read_adt(self, adt_path: Path, bounds=None):
         """Read and subset ADT to bounds, offset by -0.45 m.
@@ -258,7 +412,8 @@ class ADTBlender:
         out[miss] = adt[valid][idx]
         return out
 
-    def _apply_adt_blend(self, ssh_path: Path, adt_field, work_dir: Path) -> Optional[Path]:
+    def _apply_adt_blend(self, ssh_path: Path, adt_field, work_dir: Path,
+                         adt_dst=None) -> Optional[Path]:
         """Apply the ops ADT blend to SSH_1.nc.
 
         Formula: SSH_final(t) = SSH_rtofs(t) - SSH_rtofs(t=0) + ADT
@@ -268,7 +423,6 @@ class ADTBlender:
         """
         try:
             import shutil
-            adt, adt_lons, adt_lats = adt_field
             output = work_dir / "SSH_1_adt.nc"
             shutil.copy2(ssh_path, output)
 
@@ -283,16 +437,20 @@ class ADTBlender:
             # SSH_1 longitudes are RTOFS lon-360 (_stofs_prepare_ssh), same as ADT. MJ (10/01/26)
             dst_lon_adt = dst_lon
 
-            adt_dst = self._regrid_bilinear(adt, adt_lons, adt_lats, dst_lon_adt, dst_lat)
-            rtofs_wet = np.abs(np.ma.filled(ssh[0, :, :], fill_value=-30000.0)) < 1000
-            adt_dst = self._fill_nearest(adt, adt_lons, adt_lats, dst_lon_adt, dst_lat,
-                                         adt_dst, rtofs_wet)
+            if adt_dst is None:
+                adt, adt_lons, adt_lats = adt_field
+                adt_dst = self._regrid_bilinear(adt, adt_lons, adt_lats, dst_lon_adt, dst_lat)
+                rtofs_wet = np.abs(np.ma.filled(ssh[0, :, :], fill_value=-30000.0)) < 1000
+                adt_dst = self._fill_nearest(adt, adt_lons, adt_lats, dst_lon_adt, dst_lat,
+                                             adt_dst, rtofs_wet)
             n_ok = int(np.isfinite(adt_dst).sum())
             if n_ok == 0:
                 ds.close()
                 log.warning("ADT regrid produced no valid points on the SSH grid — RTOFS-only SSH")
                 return None
-            log.info(f"ADT blend: bilinear regrid {adt.shape} -> {ny}x{nx} "
+            if self.keep:
+                self._write_adt_on_rtofs(adt_dst, dst_lon, dst_lat, work_dir / "adt_on_rtofs.nc")
+            log.info(f"ADT blend: {self.regrid or 'bilinear'} regrid -> {ny}x{nx} "
                      f"({n_ok}/{ny * nx} valid), mean(ADT)={np.nanmean(adt_dst):.4f}m")
 
             def _raw(t):

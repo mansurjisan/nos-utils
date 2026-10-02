@@ -181,6 +181,9 @@ class ForcingConfig:
     obc_sal_outside: float = 33.0
     # ADT satellite SSH blending (STOFS-3D-ATL uses CMEMS ADT to correct boundary SSH)
     adt_enabled: bool = False
+    # Ops ESMF map for the ADT regrid (yaml ocean.adt.weight_file); a bare name resolves against
+    # FIXofs. Unset or missing falls back to the bilinear regrid. MJ (10/02/26)
+    adt_weight_file: Optional[Path] = None
     # Nudging enabled and timescale
     nudging_enabled: bool = False
     nudging_timescale_seconds: float = 86400.0
@@ -494,6 +497,7 @@ class ForcingConfig:
             # carry only the 778 elevation nodes SCHISM expects.
             obc_elev_segments=[0, 1],
             adt_enabled=True,
+            adt_weight_file=Path("stofs_3d_atl_ufs.adt_weight.nc"),
             obc_ssh_hold_first_record=True,
             # Nudging
             nudging_enabled=True,
@@ -546,6 +550,7 @@ class ForcingConfig:
             # carry only the 778 elevation nodes SCHISM expects.
             obc_elev_segments=[0, 1],
             adt_enabled=True,
+            adt_weight_file=Path("stofs_3d_atl_ufs.adt_weight.nc"),
             obc_ssh_hold_first_record=True,
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
@@ -799,6 +804,11 @@ class ForcingConfig:
 
         # ADT satellite SSH blending
         adt = ocean.get("adt", {}) if isinstance(ocean, dict) else {}
+        _sys = data.get("system", {}) if isinstance(data.get("system"), dict) else {}
+        _adt_wt = adt.get("weight_file") if isinstance(adt, dict) else None
+        if _adt_wt is None and str(_sys.get("name", "")).startswith("stofs_3d_atl"):
+            _adt_wt = "stofs_3d_atl_ufs.adt_weight.nc"
+        _adt_wt = Path(_adt_wt) if _adt_wt else None
 
         # NWM river product and target counts
         river_product = river.get("primary", "nwm") if isinstance(river, dict) else "nwm"
@@ -835,6 +845,7 @@ class ForcingConfig:
             obc_interp_mode=_interp_mode,
             obc_ssh_hold_first_record=_hold,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
+            adt_weight_file=_adt_wt,
             nwm_product=nwm_product,
         )
 
