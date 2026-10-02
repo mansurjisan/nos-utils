@@ -63,7 +63,7 @@ def _meta(path):
 
 
 class TestElev2dTimeline:
-    @pytest.mark.parametrize("phase, n", [("nowcast", 6), ("forecast", 20)])
+    @pytest.mark.parametrize("phase, n", [("nowcast", 6), ("forecast", 18)])
     def test_held_record_count_axis_and_dt(self, tmp_path, phase, n):
         cfg, proc, files = _ops_proc(tmp_path, phase)
         out = proc._process_2d(files)
@@ -120,7 +120,7 @@ class TestThreeDTimeline:
         # cycle 12z; files at 06z, 12z, 18z -> forecast record 0 is the 12z file (second record)
         p, names = self._run(tmp_path, "forecast")
         ts, t, dt = self._ts(names["TEM_3D.th.nc"])
-        assert dt == DT and len(t) == 20 and t[1] - t[0] == DT and t[0] == 0
+        assert dt == DT and len(t) == 18 and t[1] - t[0] == DT and t[0] == 0
         base = ts[0, 0, :, 0]
         np.testing.assert_allclose(ts[1, 0, :, 0], base + 1.0, atol=1e-4)  # 18z file
         np.testing.assert_allclose(ts[5, 0, :, 0], base + 1.0, atol=1e-4)  # last record held
@@ -221,3 +221,60 @@ def test_non_ops_timeline_keeps_old_adt_path(tmp_path, monkeypatch):
     proc, seen = _adt_stage_proc(tmp_path, monkeypatch, False)
     proc._process_stofs()
     assert seen["ops"] is False
+
+
+def _fortran_phase_proc(tmp_path, monkeypatch, phase, hold, nt=21):
+    from nos_utils.config import ForcingConfig
+
+    cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+    cfg.rtofs_3d_region = None
+    cfg.adt_enabled = False
+    cfg.obc_use_fortran_gen3dth = True
+    cfg.obc_ssh_hold_first_record = hold
+    out = tmp_path / "out"
+    out.mkdir(exist_ok=True)
+    proc = RTOFSProcessor(cfg, tmp_path, out, phase=phase)
+    proc.find_input_files_by_type = lambda: ([tmp_path / "f.nc"], [tmp_path / "g.nc"])
+    proc._stofs_prepare_ssh = lambda files, work: tmp_path / "ssh.nc"
+    proc._stofs_prepare_tsuv = lambda files, work: tmp_path / "tsuv.nc"
+
+    def stub(work_dir, ssh, tsuv):
+        for name in ("elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc"):
+            with Dataset(str(work_dir / name), "w", format="NETCDF4_CLASSIC") as ds:
+                ds.createDimension("time", nt)
+                ds.createDimension("nOpenBndNodes", 3)
+                ds.createDimension("nLevels", 2)
+                ds.createDimension("one", 1)
+                ds.createVariable("time", "f8", ("time",))[:] = np.arange(nt) * 21600.0
+                ds.createVariable("time_step", "f8", ("one",))[:] = 21600.0
+                v = ds.createVariable("time_series", "f4", ("time", "nOpenBndNodes", "nLevels", "one"))
+                v[:] = np.arange(nt, dtype=np.float32)[:, None, None, None] * np.ones((1, 3, 2, 1))
+        return True
+
+    monkeypatch.setattr(proc, "_call_fortran_gen_3dth", stub)
+    return proc, out
+
+
+def _series(path):
+    with Dataset(str(path)) as ds:
+        return np.array(ds["time"][:]), np.array(ds["time_series"][:, 0, 0, 0])
+
+
+@pytest.mark.parametrize("phase,first,n", [("nowcast", 0, 6), ("forecast", 4, 18)])
+def test_fortran_outputs_are_sliced_by_phase(tmp_path, monkeypatch, phase, first, n):
+    proc, out = _fortran_phase_proc(tmp_path, monkeypatch, phase, hold=False)
+    assert proc._process_stofs().success
+    for name, off in (("elev2D.th.nc", 0.04), ("TEM_3D.th.nc", 0.0), ("SAL_3D.th.nc", 0.0)):
+        t, v = _series(out / name)
+        assert len(t) == n and t[0] == 0 and t[1] == 21600.0
+        want = np.minimum(np.arange(n) + first, 20) + (off if name.startswith("elev") else 0.0)
+        np.testing.assert_allclose(v, want, atol=1e-5)
+
+
+def test_fortran_forecast_hold_is_the_nowcast_start_record(tmp_path, monkeypatch):
+    proc, out = _fortran_phase_proc(tmp_path, monkeypatch, "forecast", hold=True)
+    assert proc._process_stofs().success
+    _, v = _series(out / "elev2D.th.nc")
+    np.testing.assert_allclose(v, 0.04, atol=1e-6)
+    _, tem = _series(out / "TEM_3D.th.nc")
+    assert tem[0] == 4

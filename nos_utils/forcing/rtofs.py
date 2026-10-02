@@ -754,6 +754,11 @@ class RTOFSProcessor(ForcingProcessor):
                             self._apply_ssh_offset(dst, self.config.obc_ssh_offset)
                             if self.config.obc_ssh_hold_first_record:
                                 self._hold_first_record(dst)
+                        # The exe series starts at the nowcast start; slice after the hold so
+                        # the held record is the nowcast-start one, as the Python ops path.
+                        # MJ (10/02/26)
+                        if self._ops_timeline and self.phase:
+                            self._slice_phase_records(dst)
                         output_files.append(dst)
                 # Track elev2d_ok/obc3d_ok from the names actually copied,
                 # not "was anything copied" -- the Fortran exe (like
@@ -1273,6 +1278,38 @@ class RTOFSProcessor(ForcingProcessor):
         ts = ds.variables["time_series"]
         ts[:] = np.repeat(ts[0:1], ts.shape[0], axis=0)
         ds.close()
+
+    def _slice_phase_records(self, path: Path) -> None:
+        """Cut a series that starts at the nowcast start down to this phase's window, time 0 at its start.
+
+        Records are picked by their time, the last record is held past the end of the series.
+        """
+        model_t0, _, dur = self._get_output_window(self.phase)
+        cycle = datetime.strptime(self.config.pdy, "%Y%m%d") + timedelta(hours=self.config.cyc)
+        start = (model_t0 - (cycle - timedelta(hours=self.config.nowcast_hours))).total_seconds()
+        n = int(np.ceil(dur / OPS_OBC_DT)) + 1
+        tmp = path.with_name(path.name + ".phase")
+        with Dataset(str(path)) as src:
+            t = np.asarray(src.variables["time"][:], dtype=np.float64)
+            dt = float(np.diff(t).min()) if len(t) > 1 else OPS_OBC_DT
+            idx = np.clip(np.rint(start / dt).astype(int) + np.arange(n), 0, len(t) - 1)
+            if start / dt + n - 1 > len(t) - 1:
+                self._ops_note(f"{path.name}: the exe series ends before the {n}-record "
+                               f"{self.phase} window; the last record is held")
+            with Dataset(str(tmp), "w", format=src.data_model) as dst:
+                for name, dim in src.dimensions.items():
+                    dst.createDimension(name, n if name == "time" else dim.size)
+                for name, v in src.variables.items():
+                    out = dst.createVariable(name, v.dtype, v.dimensions)
+                    out.setncatts({k: v.getncattr(k) for k in v.ncattrs() if k != "_FillValue"})
+                    if name == "time":
+                        out[:] = np.arange(n) * dt
+                    elif v.dimensions[:1] == ("time",):
+                        out[:] = v[:][idx]
+                    else:
+                        out[:] = v[:]
+        tmp.replace(path)
+        log.info(f"Sliced {path.name} to the {self.phase} window: {n} records from +{start / 3600:g} h")
 
     @staticmethod
     def _apply_ssh_offset(elev_path: Path, offset: float) -> None:
