@@ -418,6 +418,7 @@ class TestNudgingWithSyntheticRTOFS:
         # Check metadata
         assert result.metadata["fortran_used"] is False
         assert result.metadata["n_nudge_nodes"] > 0
+        assert result.metadata["nudge_interp"] == "delaunay"
 
     def test_no_rtofs_returns_failure(self, tmp_path):
         """If no RTOFS files found, should fail gracefully."""

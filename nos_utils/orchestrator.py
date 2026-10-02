@@ -842,7 +842,10 @@ class PrepOrchestrator:
         nudge_weight_file = None
         fix_dir = self.paths.get("fix")
         if fix_dir:
-            for pattern in ["*.nudge.gr3", "*.TEM_nudge.gr3"]:
+            patterns = ["*.nudge.gr3", "*.TEM_nudge.gr3"]
+            if self.config.obc_ops_timeline:
+                patterns.reverse()  # ops reads TEM_nudge.gr3. MJ (10/02/26)
+            for pattern in patterns:
                 matches = sorted(Path(fix_dir).glob(pattern))
                 if matches:
                     nudge_weight_file = matches[0]

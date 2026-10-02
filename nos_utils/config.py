@@ -186,6 +186,9 @@ class ForcingConfig:
     # EXECnos/EXECstofs3d. Off by default so installing the exe cannot silently
     # switch algorithms away from the Python ops-equivalent. MJ (10/01/26)
     obc_use_fortran_gen3dth: bool = False
+    # Same for stofs_3d_atl_gen_nudge_from_hycom, only under obc_ops_timeline: its 23 raw records
+    # go through the ops-effective phase plan. MJ (10/02/26)
+    obc_use_fortran_gen_nudge: bool = False
     # gen_3Dth interp_mode: 0 = bilinear, 1 = diagonal-split triangles (what ops runs,
     # since SSH_1 xlon is 2-D: f90:349). MJ (10/02/26)
     obc_interp_mode: int = 1
@@ -885,6 +888,9 @@ class ForcingConfig:
             obc_use_fortran_gen3dth=_strict_bool(
                 obc.get("use_fortran_gen3dth") if isinstance(obc, dict) else None,
                 "obc.use_fortran_gen3dth", False),
+            obc_use_fortran_gen_nudge=_strict_bool(
+                obc.get("use_fortran_gen_nudge") if isinstance(obc, dict) else None,
+                "obc.use_fortran_gen_nudge", False),
             obc_interp_mode=_interp_mode,
             obc_ssh_hold_first_record=_hold,
             obc_ops_timeline=_ops_tl,
