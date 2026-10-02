@@ -537,8 +537,54 @@ class TestOpsFallbackAndFortranOptIn:
         assert not any("wrong speed" in w for w in res.warnings)
         with Dataset(str(out / "TEM_nu.nc")) as ds:
             t = np.asarray(ds["time"][:], float)
-        assert t[0] == 0.0 and np.allclose(np.diff(t), 21600.0 if t.max() > 1000 else 0.25)
+        assert len(t) == n
+        np.testing.assert_array_equal(t, np.arange(n) * 21600.0)
         assert any("fell back to" in w for w in res.warnings)
+
+    @staticmethod
+    def _fallback(tmp_path, monkeypatch, phase, keep):
+        _stage(tmp_path)
+        d = tmp_path / "rtofs" / f"rtofs.{PDY}"
+        for f in d.glob("*.nc"):
+            if not any(tag in f.name for tag in keep):
+                f.unlink()
+        proc, out = _proc(tmp_path, phase)
+        monkeypatch.setattr(NudgingProcessor, "_process_ops",
+                            lambda self: (_ for _ in ()).throw(ValueError("boom")))
+        monkeypatch.setattr(NudgingProcessor, "_call_fortran_gen_nudge", lambda self, w: False)
+        res = proc._process_stofs()
+        with Dataset(str(out / "TEM_nu.nc")) as ds:
+            t = np.asarray(ds["time"][:], float)
+            tr = np.array(ds["tracer_concentration"][:])
+        return res, t, tr
+
+    @pytest.mark.parametrize("phase, n", [("nowcast", 6), ("forecast", 18)])
+    def test_partial_coverage_holds_the_last_state(self, tmp_path, monkeypatch, phase, n):
+        res, t, tr = self._fallback(tmp_path, monkeypatch, phase, ("n012", "n018"))
+        assert res.success, res.errors
+        assert len(t) == n
+        np.testing.assert_array_equal(t, np.arange(n) * 21600.0)
+        assert any("held" in w for w in res.warnings)
+        np.testing.assert_allclose(tr[-1], tr[-2])
+
+    @pytest.mark.parametrize("phase, n", [("nowcast", 6), ("forecast", 18)])
+    def test_single_file_is_replicated_over_the_full_axis(self, tmp_path, monkeypatch, phase, n):
+        res, t, tr = self._fallback(tmp_path, monkeypatch, phase, ("n024",))
+        assert res.success, res.errors
+        assert len(t) == n
+        np.testing.assert_array_equal(t, np.arange(n) * 21600.0)
+        assert any("held" in w for w in res.warnings)
+        np.testing.assert_allclose(tr[0], tr[-1])
+
+    def test_fortran_path_raises_when_nudge_tsuv_prep_fails(self, tmp_path, monkeypatch):
+        _stage(tmp_path)
+        proc, _ = _proc(tmp_path, "nowcast")
+        monkeypatch.setattr(NudgingProcessor, "_prepare_nudge_tsuv", lambda self, w: None)
+        called = []
+        monkeypatch.setattr(NudgingProcessor, "_call_fortran_gen_nudge", lambda self, w: called.append(1) or True)
+        with pytest.raises(RuntimeError, match="nudge ROI"):
+            proc._process_ops_fortran()
+        assert not called
 
     def test_wrong_dt_is_warned_under_ops_timeline(self, tmp_path):
         proc, _ = _proc(tmp_path, "nowcast")
@@ -559,7 +605,7 @@ class TestOpsFallbackAndFortranOptIn:
         rng = np.random.default_rng(3)
         raw = {n: [rng.normal(size=(5, 4)).astype(np.float32) for _ in range(23)] for n in ("TEM_nu.nc", "SAL_nu.nc")}
 
-        monkeypatch.setattr(NudgingProcessor, "_prepare_nudge_tsuv", lambda self, w: None)
+        monkeypatch.setattr(NudgingProcessor, "_prepare_nudge_tsuv", lambda self, w: w / "TSUV_1.nc")
 
         def fake_exe(self, work):
             for name, recs in raw.items():

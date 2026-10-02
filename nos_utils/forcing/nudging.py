@@ -427,7 +427,9 @@ class NudgingProcessor(ForcingProcessor):
         _, _, (n_out, ratio, off, need, last_j) = self._ops_plan(warnings)
         work_dir = Path(tempfile.mkdtemp(prefix="nudge_ops_f90_"))
         try:
-            self._prepare_nudge_tsuv(work_dir)
+            if self._prepare_nudge_tsuv(work_dir) is None:
+                # Otherwise the exe silently runs on the OBC prep's narrower ROI. MJ (10/02/26)
+                raise RuntimeError("nudge TSUV prep with the nudge ROI failed")
             if not self._call_fortran_gen_nudge(work_dir):
                 raise RuntimeError("Fortran gen_nudge not available or failed")
             recs, ids = [], None
@@ -906,9 +908,11 @@ class NudgingProcessor(ForcingProcessor):
         # the input coverage. If only a single input timestep is loaded
         # (degenerate case), we fall back to the single raw file time.
         output_times: Optional[np.ndarray] = None
+        hold_warnings: List[str] = []
+        ops_tl = bool(self.config.obc_ops_timeline)
 
         for var_list in [all_temp, all_salt]:
-            if len(var_list) > 1:
+            if len(var_list) > 1 or (ops_tl and len(var_list) == 1):
                 n_in = len(var_list)
                 # Defensive: trim/repeat ``rtofs_times_arr`` to match
                 # ``n_in`` (the two variables append the same count, but
@@ -927,6 +931,14 @@ class NudgingProcessor(ForcingProcessor):
                 # Clip target_times to the actual RTOFS coverage so we
                 # never extrapolate past the last file.
                 tt = target_times[target_times <= rt[-1]]
+                if ops_tl:
+                    # SCHISM needs the full record count: write the whole axis, holding the last RTOFS state. MJ (10/02/26)
+                    tt = target_times
+                    if rt[-1] < target_times[-1] and not hold_warnings:
+                        hold_warnings.append(
+                            f"nudging: RTOFS coverage ends at hour {max(rt[-1], 0.0) / 3600:.0f}; last state held "
+                            f"from hour {max(rt[-1], 0.0) / 3600:.0f} to the phase end (hour {target_times[-1] / 3600:.0f})"
+                        )
                 if len(tt) == 0:
                     # Degenerate window: at least keep t=0
                     tt = np.array([0.0], dtype=np.float64)
@@ -1042,6 +1054,7 @@ class NudgingProcessor(ForcingProcessor):
             success=len(output_files) > 0,
             source=self.SOURCE_NAME,
             output_files=output_files,
+            warnings=hold_warnings,
             metadata={
                 "timescale_seconds": self.config.nudging_timescale_seconds,
                 "n_levels": n_levels,
