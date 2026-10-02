@@ -48,52 +48,90 @@ def parent_weights(xax, yax, x, y, mode=0):
     return ix, iy, w, inside
 
 
-def _area(x0, y0, x1, y1, x2, y2):
-    return np.abs(0.5 * ((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)))
+def _signa(x1, x2, x3, y1, y2, y3):
+    return np.abs(((x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)) / 2)
 
 
-def _mode1(xax, yax, x, y, small1=1e-2):
-    """ops interp_mode=1 (f90:709-760): area-tolerance cell search, then diagonal-split triangle weights."""
+def parent_weights_2d(lon, lat, x, y, small1=1e-2, chunk=4000):
+    """ops interp_mode=1 on a general 2-D quad grid (f90:709-760); lon/lat are [j, i].
+
+    Returns ix, iy, w [LL, LR, UR, UL], found. The winner is the first accepted cell in the
+    f90 scan order (ix outer, iy inner); w is clamped as in the f90.
+    """
+    from scipy.spatial import cKDTree
+
+    lon = np.asarray(lon, np.float64)
+    lat = np.asarray(lat, np.float64)
+    x = np.atleast_1d(np.asarray(x, np.float64))
+    y = np.atleast_1d(np.asarray(y, np.float64))
+    if not (np.diff(lon, axis=1) > 0).all() or not (np.diff(lat, axis=0) > 0).all():
+        raise ValueError("lon must increase along i and lat along j")
+    ny, nx = lon.shape
+    X = [lon[:-1, :-1], lon[:-1, 1:], lon[1:, 1:], lon[1:, :-1]]
+    Y = [lat[:-1, :-1], lat[:-1, 1:], lat[1:, 1:], lat[1:, :-1]]
+    ncx = nx - 1
+    X = [a.ravel() for a in X]
+    Y = [a.ravel() for a in Y]
+    diag = np.maximum(np.hypot(X[0] - X[2], Y[0] - Y[2]), np.hypot(X[1] - X[3], Y[1] - Y[3]))
+    cen = np.column_stack([sum(X) / 4, sum(Y) / 4])
+    tree = cKDTree(cen)
+    k = min(25, len(diag))
     n = x.size
-    ix0 = np.clip(np.searchsorted(xax, x, side="left") - 1, 0, xax.size - 2)
-    iy0 = np.clip(np.searchsorted(yax, y, side="left") - 1, 0, yax.size - 2)
-    ix = np.zeros(n, int)
-    iy = np.zeros(n, int)
-    found = np.zeros(n, bool)
-    # the ops loop takes the first accepted cell in ix-major order; only neighbours of the
-    # containing cell can pass the 1% area test. MJ (10/02/26)
-    for di in (-1, 0, 1):
-        for dj in (-1, 0, 1):
-            cx, cy = ix0 + di, iy0 + dj
-            ok = (cx >= 0) & (cx < xax.size - 1) & (cy >= 0) & (cy < yax.size - 1) & ~found
-            cx, cy = np.clip(cx, 0, xax.size - 2), np.clip(cy, 0, yax.size - 2)
-            x1, x2, y1, y2 = xax[cx], xax[cx + 1], yax[cy], yax[cy + 1]
-            a = (_area(x, y, x1, y1, x2, y1) + _area(x, y, x2, y1, x2, y2)
-                 + _area(x, y, x2, y2, x1, y2) + _area(x, y, x1, y2, x1, y1))
-            b = (x2 - x1) * (y2 - y1)
-            acc = ok & (np.abs(a - b) / b < small1)
-            ix = np.where(acc, cx, ix)
-            iy = np.where(acc, cy, iy)
-            found |= acc
-    x1, x2, y1, y2 = xax[ix], xax[ix + 1], yax[iy], yax[iy + 1]
-    bb = 0.5 * (x2 - x1) * (y2 - y1)
-    a1 = _area(x, y, x1, y1, x2, y1)
-    a2 = _area(x, y, x2, y1, x2, y2)
-    a3 = _area(x, y, x2, y2, x1, y2)
-    a4 = _area(x, y, x1, y2, x1, y1)
-    ap = _area(x, y, x1, y1, x2, y2)
-    tri1 = np.abs(a1 + a2 + ap - bb) / bb < 5 * small1
-    tri2 = np.abs(a3 + a4 + ap - bb) / bb < 5 * small1
+    key = np.full(n, np.iinfo(np.int64).max)
+    for s0 in range(0, n, chunk):
+        pts = np.column_stack([x[s0:s0 + chunk], y[s0:s0 + chunk]])
+        # A point passing the 1% area test lies within ~0.02 diag of the cell (area <= diag *
+        # min width), so it is within ~1.02 diag of the centre. The radius is 3x the largest
+        # diagonal among the 25 nearest cells, which covers it with margin. MJ (10/02/26)
+        r = 3.0 * diag[tree.query(pts, k=k)[1].reshape(len(pts), -1)].max(axis=1)
+        lists = tree.query_ball_point(pts, r)
+        lens = np.fromiter((len(a) for a in lists), int, len(lists))
+        if lens.sum() == 0:
+            continue
+        pi = np.repeat(np.arange(len(pts)), lens)
+        ci = np.concatenate([np.asarray(a, int) for a in lists if len(a)])
+        px, py = pts[pi, 0], pts[pi, 1]
+        c = [(X[m][ci], Y[m][ci]) for m in range(4)]
+        a1 = _signa(px, c[0][0], c[1][0], py, c[0][1], c[1][1])
+        a2 = _signa(px, c[1][0], c[2][0], py, c[1][1], c[2][1])
+        a3 = _signa(px, c[2][0], c[3][0], py, c[2][1], c[3][1])
+        a4 = _signa(px, c[3][0], c[0][0], py, c[3][1], c[0][1])
+        b1 = _signa(c[0][0], c[1][0], c[2][0], c[0][1], c[1][1], c[2][1])
+        b2 = _signa(c[0][0], c[2][0], c[3][0], c[0][1], c[2][1], c[3][1])
+        acc = np.abs(a1 + a2 + a3 + a4 - b1 - b2) / (b1 + b2) < small1
+        if acc.any():
+            kk = (ci[acc] % ncx) * (ny - 1) + ci[acc] // ncx
+            np.minimum.at(key, s0 + pi[acc], kk)
+    found = key < np.iinfo(np.int64).max
+    kf = np.where(found, key, 0)
+    ix, iy = kf // (ny - 1), kf % (ny - 1)
+    ci = iy * ncx + ix
+    x1, x2, x3, x4 = (X[m][ci] for m in range(4))
+    y1, y2, y3, y4 = (Y[m][ci] for m in range(4))
+    a1 = _signa(x, x1, x2, y, y1, y2)
+    a2 = _signa(x, x2, x3, y, y2, y3)
+    a3 = _signa(x, x3, x4, y, y3, y4)
+    a4 = _signa(x, x4, x1, y, y4, y1)
+    ap = _signa(x, x1, x3, y, y1, y3)
+    bb1 = _signa(x1, x2, x3, y1, y2, y3)
+    bb2 = _signa(x1, x3, x4, y1, y3, y4)
+    tri1 = np.abs(a1 + a2 + ap - bb1) / bb1 < 5 * small1
+    tri2 = np.abs(a3 + a4 + ap - bb2) / bb2 < 5 * small1
     if (found & ~tri1 & ~tri2).any():
         raise ValueError("cannot find a triangle")
-    c = lambda v: np.clip(v, 0.0, 1.0)  # noqa: E731
+    cl = lambda v: np.clip(v, 0.0, 1.0)  # noqa: E731
     w = np.zeros((n, 4))
-    w[:, 0] = np.where(tri1, c(a2 / bb), c(a3 / bb))
-    w[:, 1] = np.where(tri1, c(ap / bb), 0.0)
-    w[:, 2] = np.where(tri1, c(1 - w[:, 0] - w[:, 1]), c(a4 / bb))
-    w[:, 3] = np.where(tri1, 0.0, c(1 - w[:, 0] - w[:, 2]))
+    w[:, 0] = np.where(tri1, cl(a2 / bb1), cl(a3 / bb2))
+    w[:, 1] = np.where(tri1, cl(ap / bb1), 0.0)
+    w[:, 2] = np.where(tri1, cl(1 - w[:, 0] - w[:, 1]), cl(a4 / bb2))
+    w[:, 3] = np.where(tri1, 0.0, cl(1 - w[:, 0] - w[:, 2]))
     w[~found] = 0.0
     return ix, iy, w, found
+
+
+def _mode1(xax, yax, x, y):
+    LO, LA = np.meshgrid(xax, yax)
+    return parent_weights_2d(LO, LA, x, y)
 
 
 def corner_cells(ix, iy):
