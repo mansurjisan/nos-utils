@@ -49,7 +49,8 @@ def parent_weights(xax, yax, x, y, mode=0):
 
 
 def _signa(x1, x2, x3, y1, y2, y3):
-    return np.abs(((x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)) / 2)
+    two = np.result_type(x1, y1).type(2)
+    return np.abs(((x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)) / two)
 
 
 def _accepted(X, Y, px, py, ci, small1):
@@ -64,18 +65,21 @@ def _accepted(X, Y, px, py, ci, small1):
     return np.abs(a1 + a2 + a3 + a4 - b1 - b2) / (b1 + b2) < small1
 
 
-def parent_weights_2d(lon, lat, x, y, small1=1e-2, chunk=4000):
+def parent_weights_2d(lon, lat, x, y, small1=1e-2, chunk=4000, single=False):
     """ops interp_mode=1 on a general 2-D quad grid (f90:709-760); lon/lat are [j, i].
 
     Returns ix, iy, w [LL, LR, UR, UL], found. The winner is the first accepted cell in the
-    f90 scan order (ix outer, iy inner); w is clamped as in the f90.
+    f90 scan order (ix outer, iy inner); w is clamped as in the f90. single=True evaluates
+    the area tests and weights in float32 on float32 coordinates, as the f90's real*4.
     """
     from scipy.spatial import cKDTree
 
-    lon = np.asarray(lon, np.float64)
-    lat = np.asarray(lat, np.float64)
-    x = np.atleast_1d(np.asarray(x, np.float64))
-    y = np.atleast_1d(np.asarray(y, np.float64))
+    dt = np.float32 if single else np.float64
+    lon = np.asarray(lon, dt)
+    lat = np.asarray(lat, dt)
+    x = np.atleast_1d(np.asarray(x, dt))
+    y = np.atleast_1d(np.asarray(y, dt))
+    small1 = dt(small1)
     if not (np.diff(lon, axis=1) > 0).all() or not (np.diff(lat, axis=0) > 0).all():
         raise ValueError("lon must increase along i and lat along j")
     ny, nx = lon.shape
@@ -129,16 +133,18 @@ def parent_weights_2d(lon, lat, x, y, small1=1e-2, chunk=4000):
     ap = _signa(x, x1, x3, y, y1, y3)
     bb1 = _signa(x1, x2, x3, y1, y2, y3)
     bb2 = _signa(x1, x3, x4, y1, y3, y4)
-    tri1 = np.abs(a1 + a2 + ap - bb1) / bb1 < 5 * small1
-    tri2 = np.abs(a3 + a4 + ap - bb2) / bb2 < 5 * small1
+    five = dt(5)
+    tri1 = np.abs(a1 + a2 + ap - bb1) / bb1 < five * small1
+    tri2 = np.abs(a3 + a4 + ap - bb2) / bb2 < five * small1
     if (found & ~tri1 & ~tri2).any():
         raise ValueError("cannot find a triangle")
-    cl = lambda v: np.clip(v, 0.0, 1.0)  # noqa: E731
-    w = np.zeros((n, 4))
+    zero, one = dt(0), dt(1)
+    cl = lambda v: np.clip(v, zero, one)  # noqa: E731
+    w = np.zeros((n, 4), dt)
     w[:, 0] = np.where(tri1, cl(a2 / bb1), cl(a3 / bb2))
-    w[:, 1] = np.where(tri1, cl(ap / bb1), 0.0)
-    w[:, 2] = np.where(tri1, cl(1 - w[:, 0] - w[:, 1]), cl(a4 / bb2))
-    w[:, 3] = np.where(tri1, 0.0, cl(1 - w[:, 0] - w[:, 2]))
+    w[:, 1] = np.where(tri1, cl(ap / bb1), zero)
+    w[:, 2] = np.where(tri1, cl(one - w[:, 0] - w[:, 1]), cl(a4 / bb2))
+    w[:, 3] = np.where(tri1, zero, cl(one - w[:, 0] - w[:, 2]))
     w[~found] = 0.0
     return ix, iy, w, found
 
@@ -180,6 +186,11 @@ def dry_parents(wet, cj, ci):
             cache[key] = p
         cj.flat[k], ci.flat[k] = cache[key]
     return cj, ci, len(cache)
+
+
+def interpolate4(s, w):
+    """Corner values s (n, 4) combined with weights w (n, 4), summed left to right as the f90's eout."""
+    return ((s[:, 0] * w[:, 0] + s[:, 1] * w[:, 1]) + s[:, 2] * w[:, 2]) + s[:, 3] * w[:, 3]
 
 
 def fix_ssh(s, wet):

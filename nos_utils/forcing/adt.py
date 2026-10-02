@@ -39,7 +39,6 @@ from typing import Optional
 import numpy as np
 
 from ..config import ForcingConfig
-from .rtofs import _pack_for_fortran
 
 log = logging.getLogger(__name__)
 
@@ -472,9 +471,8 @@ class ADTBlender:
         """Apply the ops ADT blend to SSH_1.nc.
 
         Formula: SSH_final(t) = SSH_rtofs(t) - SSH_rtofs(t=0) + ADT
-        (ADT already carries the -0.45 offset) with ADT regridded bilinearly
-        onto the SSH_1 grid. Where either side is invalid the point is left
-        as the -30000 fill.
+        (ADT already carries the -0.45 offset), in float32 as ncap2. Where either
+        side is invalid the point is left as the -30000 fill (dry in gen_3Dth).
         """
         try:
             import shutil
@@ -510,34 +508,27 @@ class ADTBlender:
             log.info(f"ADT blend: {self.regrid or 'bilinear'} regrid -> {ny}x{nx} "
                      f"({n_ok}/{ny * nx} valid), mean(ADT)={np.nanmean(adt_dst):.4f}m")
 
+            f32 = np.float32
+            adt32 = np.asarray(adt_dst, dtype=f32)
+
             def _raw(t):
-                return np.ma.filled(ssh[t, :, :], fill_value=-30000.0).astype(np.float64)
+                return np.ma.filled(ssh[t, :, :], fill_value=-30000.0).astype(f32)
 
-            # Fill extreme values with 0 (matching NCO: where(abs>1000) = 0)
+            # Land in the reference record is 0, as the ops where(abs>1000) fill. MJ (10/02/26)
             ssh_t0 = _raw(0)
-            ssh_t0 = np.where(np.abs(ssh_t0) > 1000, 0.0, ssh_t0)
+            ssh_t0 = np.where(np.abs(ssh_t0) > 1000, f32(0), ssh_t0)
 
+            # float32 as ncap2: float(float(ssh_t - ssh_0) + ADT), surf_el = x * float(1000.)
+            surf_el = ds.variables.get("surf_el")
+            if surf_el is not None:
+                surf_el.set_auto_maskandscale(False)
             for t in range(nt):
                 ssh_t = _raw(t)
-                corrected = ssh_t - ssh_t0 + adt_dst
+                corrected = ((ssh_t - ssh_t0).astype(f32) + adt32).astype(f32)
                 bad = ~np.isfinite(corrected) | (np.abs(ssh_t) > 1000) | (np.abs(corrected) > 1000)
-                ssh[t, :, :] = np.where(bad, -30000.0, corrected)
-
-            # Update surf_el: pack to match _stofs_prepare_ssh.
-            # auto-maskandscale is ON for this r+ handle, so disable it on the
-            # variable and pack manually with its own declared attrs; otherwise
-            # netCDF re-applies scale_factor and double-packs.
-            # Masked/extreme cells use the variable's -30000 fill.
-            if "surf_el" in ds.variables:
-                surf_el = ds.variables["surf_el"]
-                surf_el.set_auto_maskandscale(False)
-                fill = getattr(surf_el, "missing_value", -30000)
-                for t in range(nt):
-                    real = np.ma.filled(ssh[t, :, :], -30000.0).astype(np.float32)
-                    ds.variables["surf_el"][t, :, :] = _pack_for_fortran(
-                        real, surf_el.scale_factor, surf_el.add_offset,
-                        fill, fill_mask=np.abs(real) >= 10000,
-                    )
+                ssh[t, :, :] = np.where(bad, f32(-30000.0), corrected)
+                if surf_el is not None:
+                    surf_el[t, :, :] = np.where(bad, f32(-30000.0), (corrected * f32(1000)).astype(f32))
 
             ds.close()
             log.info(f"ADT blending applied to {output.name}")

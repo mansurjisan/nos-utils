@@ -50,7 +50,7 @@ from ..io.schism_grid import SchismGrid
 from .base import ForcingProcessor, ForcingResult
 from .obc_ops_interp import (
     DRY_SSH, JUNK_EPS, RJUNK, corner_cells, dry_parents, fill_columns, fix_ssh,
-    parent_weights, parent_weights_2d, rect_axes, vertical_index,
+    interpolate4, parent_weights, parent_weights_2d, rect_axes, vertical_index,
 )
 
 log = logging.getLogger(__name__)
@@ -1856,6 +1856,7 @@ class RTOFSProcessor(ForcingProcessor):
 
         # Ops-equivalent horizontal step on the SSH_1 grid (blended when given). MJ (10/01/26)
         src = ssh_source or (self._ssh1_path if self.is_stofs_mode else None)
+        hold = self.is_stofs_mode and self.config.obc_ssh_hold_first_record
         ops_ssh = self._ops_ssh_boundary(src, len(files_2d)) if src else None
         blended = None
         if ops_ssh is None and ssh_source:
@@ -1873,7 +1874,7 @@ class RTOFSProcessor(ForcingProcessor):
             all_ssh = []
 
             if ops_ssh is not None:
-                all_ssh = [row + self.config.obc_ssh_offset for row in ops_ssh]
+                all_ssh = [row + np.float32(self.config.obc_ssh_offset) for row in ops_ssh]
             elif blended is not None:
                 b_lon, b_lat, b_ssh = blended
                 for t in range(b_ssh.shape[0]):
@@ -1953,7 +1954,10 @@ class RTOFSProcessor(ForcingProcessor):
                  for h in file_hours],
                 dtype=np.float64,
             )
-            if self.is_stofs_mode and self.config.obc_ssh_hold_first_record:
+            if hold and ops_ssh is not None and self._ssh_blended_used:
+                # Record 0 of the ADT blend is the ADT field alone, which ops holds. MJ (10/02/26)
+                ssh_array = np.repeat(ssh_array[:1], ssh_array.shape[0], axis=0)
+            elif hold:
                 ssh_array = self._hold_at_nowcast_start(ssh_array, rtofs_times, model_t0)
 
             # Route B coverage strategy (backfill, not previous-cycle reload):
@@ -2086,8 +2090,11 @@ class RTOFSProcessor(ForcingProcessor):
         if kind:
             self._ops_reasons[kind].append(msg)
 
-    def _ops_weights(self, lon, lat):
-        """Ops parent cell/weights for the boundary nodes; raises ValueError with the reason."""
+    def _ops_weights(self, lon, lat, single=False):
+        """Ops parent cell/weights for the boundary nodes; raises ValueError with the reason.
+
+        single=True evaluates mode 1 in float32 as the f90's real*4 (mode 0 stays float64).
+        """
         mode = self.config.obc_interp_mode
         if mode not in (0, 1):
             raise ValueError(f"obc_interp_mode must be 0 or 1, got {mode!r}")
@@ -2101,7 +2108,7 @@ class RTOFSProcessor(ForcingProcessor):
         if mode == 1:
             if lon.ndim == 1:
                 lon, lat = np.meshgrid(lon, lat)
-            return parent_weights_2d(lon, lat, nlon, nlat)
+            return parent_weights_2d(lon, lat, nlon, nlat, single=single)
         axes = rect_axes(lon, lat)
         if axes is None:
             raise ValueError("grid is not rectilinear, which interp_mode 0 needs")
@@ -2110,27 +2117,40 @@ class RTOFSProcessor(ForcingProcessor):
     def _ops_label(self):
         return "ops bilinear" if self.config.obc_interp_mode == 0 else "ops interp_mode=1"
 
-    def _ops_ssh_boundary(self, ssh_path, n_files) -> Optional[np.ndarray]:
-        """Boundary SSH (nt, n_bnd) in m from SSH_1(_adt).nc, gen_3Dth rules; None to fall back."""
+    def _ops_ssh_boundary(self, ssh_path, n_files, first_only=False) -> Optional[np.ndarray]:
+        """Boundary SSH (nt, n_bnd) float32 in m from SSH_1(_adt).nc, gen_3Dth rules; None to fall back.
+
+        As the f90 (real*4): ssh = surf_el * 1e-3 from the packed variable, float32 weights
+        and sums. first_only reads record 0 only (the held ops elev2D).
+        """
+        f32 = np.float32
         try:
             with Dataset(str(ssh_path)) as ds:
-                ssh = np.ma.filled(ds.variables["ssh"][:], -30000.0).astype(np.float64)
+                nt = ds.dimensions["time"].size
+                if nt != n_files:
+                    self._ops_note(f"{Path(ssh_path).name} has {nt} steps for {n_files} 2D "
+                                   f"files — elev2D not from the ops-equivalent path", "elev2D")
+                    return None
+                sl = slice(0, 1) if first_only else slice(None)
+                if "surf_el" in ds.variables:
+                    v = ds.variables["surf_el"]
+                    v.set_auto_maskandscale(False)
+                    ssh = np.asarray(v[sl], f32) * f32(1e-3)
+                else:
+                    ssh = np.ma.filled(ds.variables["ssh"][sl], -30000.0).astype(f32)
                 lon, lat = ds.variables["xlon"][:], ds.variables["ylat"][:]
-            if ssh.shape[0] != n_files:
-                self._ops_note(f"{Path(ssh_path).name} has {ssh.shape[0]} steps for {n_files} 2D "
-                               f"files — elev2D not from the ops-equivalent path", "elev2D")
-                return None
-            ssh = np.where(np.isfinite(ssh), ssh, -30000.0)
-            ix, iy, w, inside = self._ops_weights(lon, lat)
-            wet = ssh[0] >= DRY_SSH
+            ssh = np.where(np.isfinite(ssh), ssh, f32(-30.0)).astype(f32)
+            ix, iy, w, inside = self._ops_weights(lon, lat, single=True)
+            wet = ssh[0] >= f32(DRY_SSH)
             cj, ci = corner_cells(ix, iy)
             cj, ci, n_dry = dry_parents(wet, cj, ci)
-            out = np.zeros((ssh.shape[0], len(ix)))
+            out = np.zeros((ssh.shape[0], len(ix)), f32)
             n_fix = 0
             for t in range(ssh.shape[0]):
                 s_t, n = fix_ssh(ssh[t], wet)
                 n_fix += n
-                out[t] = (w * s_t[cj, ci].T).sum(axis=1)
+                acc = interpolate4(np.asarray(s_t, f32)[cj, ci].T, w.astype(f32))
+                out[t] = np.where(inside, acc, f32(0))
         except Exception as e:
             self._ops_note(f"ops-equivalent elev2D unavailable ({e})", "elev2D")
             return None
