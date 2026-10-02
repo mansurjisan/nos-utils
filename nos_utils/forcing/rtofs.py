@@ -167,6 +167,7 @@ class RTOFSProcessor(ForcingProcessor):
         self._struct_interp = {}  # Cached StructuredGridInterpolator per grid shape
         self._3d_roi = None     # Cached ROI indices (j_start, j_end, i_start, i_end) for 3D subsetting
         self._wl_bias_info = None   # Outcome of the WL bias correction (see _apply_wl_bias)
+        self._ssh_blended_used = False
         # Discovery diagnostics, reset by find_input_files_by_type(). Values
         # are exact glob matches before size/pairing/window filtering.
         self._matched_3d_sizes = {}
@@ -642,12 +643,14 @@ class RTOFSProcessor(ForcingProcessor):
                 )
 
             # Step 3: ADT SSH blending (if enabled and data available)
+            adt_blended = False
             if ssh_path and self.config.adt_enabled:
                 from .adt import ADTBlender
                 blender = ADTBlender(self.config, self.input_path)
                 blended = blender.blend_ssh(ssh_path, work_dir)
                 if blended:
                     ssh_path = blended
+                    adt_blended = True
                     log.info("ADT SSH blending applied")
                 else:
                     warnings.append("ADT data unavailable, using RTOFS-only SSH")
@@ -657,6 +660,9 @@ class RTOFSProcessor(ForcingProcessor):
 
             elev2d_ok = False
             obc3d_ok = False
+            # SSH_1.nc carrying the ADT blend, for the Python fallback (the raw
+            # 2D files would silently discard it). MJ (10/01/26)
+            ssh_source = ssh_path if adt_blended else None
 
             if fortran_ok:
                 # Copy Fortran outputs to final output directory.
@@ -690,7 +696,12 @@ class RTOFSProcessor(ForcingProcessor):
                 has_grid = self._load_grid()
                 if has_grid:
                     if files_2d:
-                        f = self._process_2d(files_2d)
+                        f = (self._process_2d(files_2d, ssh_source=ssh_source)
+                             if ssh_source else self._process_2d(files_2d))
+                        if ssh_source and not self._ssh_blended_used:
+                            adt_blended = False
+                            warnings.append("ADT blend requested but raw RTOFS SSH was "
+                                            "used for elev2D")
                         if f:
                             output_files.append(f)
                             elev2d_ok = True
@@ -740,7 +751,7 @@ class RTOFSProcessor(ForcingProcessor):
                     "n_3d_files": len(files_3d),
                     "stofs_mode": True,
                     "fortran_used": fortran_ok,
-                    "adt_blended": self.config.adt_enabled and not any("ADT" in w for w in warnings),
+                    "adt_blended": adt_blended,
                 },
             )
         finally:
@@ -1055,8 +1066,13 @@ class RTOFSProcessor(ForcingProcessor):
         for link_name, source in required_links.items():
             if source and source.exists():
                 target = work_dir / link_name
-                if not target.exists():
-                    target.symlink_to(source)
+                # SSH_1.nc already holds the raw SSH when ADT went to SSH_1_adt.nc;
+                # point the exe at this run's input. MJ (10/01/26)
+                if target.exists() or target.is_symlink():
+                    if target.exists() and os.path.samefile(target, source):
+                        continue
+                    target.unlink()
+                target.symlink_to(source)
 
         if fix_dir:
             for link_name, fix_name in fix_files.items():
@@ -1671,7 +1687,29 @@ class RTOFSProcessor(ForcingProcessor):
             log.warning(f"WL bias correction unavailable ({e}) — SSH left uncorrected")
             return ssh_array, {"applied": False, "reason": f"error: {e}"}
 
-    def _process_2d(self, files_2d: List[Path]) -> Optional[Path]:
+    def _load_blended_ssh(self, ssh_source: Path, files_2d: List[Path]):
+        """Read the ADT-blended SSH_1 file as (lon, lat, ssh[nt, ny, nx] in m, NaN fill).
+
+        Returns None unless it has exactly one step per RTOFS 2D file, so the
+        time axis derived from the file names stays valid.
+        """
+        try:
+            ds = Dataset(str(ssh_source))
+            ssh = np.ma.filled(ds.variables["ssh"][:], fill_value=np.nan).astype(np.float64)
+            lon = np.array(ds.variables["xlon"][:])
+            lat = np.array(ds.variables["ylat"][:])
+            ds.close()
+        except Exception as e:
+            log.warning(f"Cannot read blended SSH {ssh_source}: {e} — using raw RTOFS SSH")
+            return None
+        if ssh.shape[0] != len(files_2d):
+            log.warning(f"Blended SSH has {ssh.shape[0]} steps for {len(files_2d)} 2D files "
+                        f"— using raw RTOFS SSH")
+            return None
+        ssh[np.abs(ssh) > 1000] = np.nan
+        return lon, lat, ssh
+
+    def _process_2d(self, files_2d: List[Path], ssh_source: Optional[Path] = None) -> Optional[Path]:
         """Extract SSH from RTOFS 2D files, interpolate to boundary nodes.
 
         After temporal interpolation the operational water-level bias
@@ -1703,26 +1741,66 @@ class RTOFSProcessor(ForcingProcessor):
             from ..interp.precomputed_weights import apply_precomputed_ssh
             log.info("Using precomputed REMESH weights for SSH (Fortran-equivalent)")
 
+        blended = self._load_blended_ssh(ssh_source, files_2d) if ssh_source else None
+        if blended is not None and ssh_weights:
+            # NaN at a weight source index would poison the corner mean. MJ (10/01/26)
+            roi = self.config.obc_roi_2d
+            with Dataset(str(files_2d[0])) as d0:
+                fs = d0.variables["ssh"].shape[-2:]
+            ny, nx = blended[2].shape[1:]
+            emb = np.full((blended[2].shape[0],) + tuple(fs), np.nan)
+            emb[:, roi["y1"]:roi["y1"] + ny, roi["x1"]:roi["x1"] + nx] = blended[2]
+            src = np.asarray(ssh_weights["source_data_flat_idx"])
+            if np.isnan(emb.reshape(emb.shape[0], -1)[:, src]).any():
+                log.warning("Blended SSH has NaN at precomputed-weight source points "
+                            "— using raw RTOFS SSH")
+                blended = None
+        self._ssh_blended_used = blended is not None
+        if blended is not None:
+            log.info("elev2D: SSH taken from the ADT-blended SSH_1 file")
+        else:
+            log.info("elev2D: SSH taken from the raw RTOFS 2D files")
+
         try:
             all_ssh = []
 
-            for f in files_2d:
-                ds = Dataset(str(f))
-                ssh_raw = ds.variables["ssh"][:]
-                lon = ds.variables["Longitude"][:]
-                lat = ds.variables["Latitude"][:]
-
-                ssh_raw = np.ma.filled(ssh_raw, fill_value=np.nan)
-
-                for t in range(ssh_raw.shape[0]):
+            if blended is not None:
+                b_lon, b_lat, b_ssh = blended
+                full = None
+                if ssh_weights:
+                    # Weights index the full 2D grid: embed the ROI subset back
+                    roi = self.config.obc_roi_2d
+                    with Dataset(str(files_2d[0])) as d0:
+                        full_shape = d0.variables["ssh"].shape[-2:]
+                    full = (full_shape, roi["y1"], roi["x1"])
+                for t in range(b_ssh.shape[0]):
                     if ssh_weights:
-                        ssh_bnd = apply_precomputed_ssh(ssh_weights, ssh_raw[t])
+                        fs, y1, x1 = full
+                        emb = np.full(fs, np.nan)
+                        emb[y1:y1 + b_ssh.shape[1], x1:x1 + b_ssh.shape[2]] = b_ssh[t]
+                        ssh_bnd = apply_precomputed_ssh(ssh_weights, emb)
                     else:
-                        ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
+                        ssh_bnd = self._interpolate_2d_to_boundary(b_lon, b_lat, b_ssh[t])
                     ssh_bnd += self.config.obc_ssh_offset
                     all_ssh.append(ssh_bnd)
+            else:
+                for f in files_2d:
+                    ds = Dataset(str(f))
+                    ssh_raw = ds.variables["ssh"][:]
+                    lon = ds.variables["Longitude"][:]
+                    lat = ds.variables["Latitude"][:]
 
-                ds.close()
+                    ssh_raw = np.ma.filled(ssh_raw, fill_value=np.nan)
+
+                    for t in range(ssh_raw.shape[0]):
+                        if ssh_weights:
+                            ssh_bnd = apply_precomputed_ssh(ssh_weights, ssh_raw[t])
+                        else:
+                            ssh_bnd = self._interpolate_2d_to_boundary(lon, lat, ssh_raw[t])
+                        ssh_bnd += self.config.obc_ssh_offset
+                        all_ssh.append(ssh_bnd)
+
+                    ds.close()
 
             if not all_ssh:
                 return None
