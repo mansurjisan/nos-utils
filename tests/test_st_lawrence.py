@@ -105,7 +105,7 @@ class TestStLawrenceFluxTh:
 
         out_dir = tmp_path / "out"
         cfg = ForcingConfig.for_stofs_3d_atl(pdy=pdy, cyc=12)
-        # 24h nowcast + 108h forecast = 5.5 days, rounded up to 6 -> 7 rows.
+        # 24h nowcast + 96h forecast = 5 days -> 6 rows.
         proc = StLawrenceProcessor(cfg, input_dir, out_dir)
 
         result = proc.process()
@@ -114,8 +114,8 @@ class TestStLawrenceFluxTh:
         flux_path = out_dir / "flux.th"
         assert flux_path.exists()
         data = np.loadtxt(flux_path)
-        # 6 days forecast + 1 -> 7 rows (132h/24 = 5.5 -> ceil=6, +1 = 7)
-        assert data.shape == (7, 2)
+        # 5 days + 1 -> 6 rows (120h/24 = 5, +1 = 6)
+        assert data.shape == (6, 2)
         # Time column starts at 0 (= model_t0 = cycle - nowcast_hours) and
         # steps by 86400 seconds.
         assert data[0, 0] == 0

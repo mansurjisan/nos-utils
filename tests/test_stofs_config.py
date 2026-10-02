@@ -18,7 +18,7 @@ class TestSTOFSConfigFactory:
     def test_run_window(self):
         cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
         assert cfg.nowcast_hours == 24
-        assert cfg.forecast_hours == 108
+        assert cfg.forecast_hours == 96
 
     def test_gfs_resolution(self):
         cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)

@@ -659,7 +659,7 @@ class TestRoutePhaseRTOFS:
         assert model_t0 == cycle_dt
 
     def test_stofs_24h_nowcast(self, stofs_config, tmp_path):
-        """STOFS-3D-ATL nowcast leg = 24h + 3h buffer, forecast = 108h + 3h.
+        """STOFS-3D-ATL nowcast leg = 24h + 3h buffer, forecast = 96h + 3h.
 
         Verify the helper picks up factory-specific run hours, not just
         the SECOFS defaults.
@@ -670,12 +670,12 @@ class TestRoutePhaseRTOFS:
         _, _, sim_duration = proc._get_output_window("nowcast")
         assert sim_duration == (24 + 3) * 3600.0
 
-    def test_stofs_108h_forecast(self, stofs_config, tmp_path):
+    def test_stofs_96h_forecast(self, stofs_config, tmp_path):
         proc = RTOFSProcessor(
             stofs_config, tmp_path, tmp_path / "out", phase="forecast",
         )
         _, _, sim_duration = proc._get_output_window("forecast")
-        assert sim_duration == (108 + 3) * 3600.0
+        assert sim_duration == (96 + 3) * 3600.0
 
     def test_buffer_extends_past_phase_end(self, mock_config, tmp_path):
         """sim_end for phase != None equals raw phase end + default buffer_hours."""

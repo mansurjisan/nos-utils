@@ -498,7 +498,7 @@ class ForcingConfig:
             lon_min=-98.5035, lon_max=-52.4867,
             lat_min=7.347, lat_max=52.5904,
             pdy=pdy, cyc=cyc,
-            nowcast_hours=24, forecast_hours=108,
+            nowcast_hours=24, forecast_hours=96,
             gfs_resolution="0p25",
             met_num=2, n_levels=51,
             # STOFS-3D-ATL runs at dt=150 (param.nml dt=150.); elev2D.th.nc
@@ -554,7 +554,7 @@ class ForcingConfig:
             lon_min=-98.5035, lon_max=-52.4867,
             lat_min=7.347, lat_max=52.5904,
             pdy=pdy, cyc=cyc,
-            nowcast_hours=24, forecast_hours=108,
+            nowcast_hours=24, forecast_hours=96,
             gfs_resolution="0p25",
             met_num=2, nws=4, n_levels=51,
             # STOFS-3D-ATL runs at dt=150 (param.nml dt=150.); elev2D.th.nc
