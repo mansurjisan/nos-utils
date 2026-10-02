@@ -229,6 +229,28 @@ class TidalProcessor(ForcingProcessor):
             phase_hours = self.config.nowcast_hours
         return phase_hours / 24.0
 
+    def _nodal_run_days(self, start_time: datetime) -> float:
+        """Run days handed to tide_fac / compute_nodal_corrections.
+
+        "cycle" puts the nodal midpoint at nowcast_start + (nowcast+forecast)/2,
+        matching the ops one-run input; "phase" keeps the per-phase value. MJ (10/02/26)
+        """
+        phase_days = self._phase_run_days()
+        if getattr(self.config, "tide_nodal_reference", "phase") != "cycle":
+            return phase_days
+        cfg = self.config
+        cycle_dt = datetime.strptime(cfg.pdy, "%Y%m%d") + timedelta(hours=cfg.cyc)
+        nowcast_start = cycle_dt - timedelta(hours=cfg.nowcast_hours)
+        mid = nowcast_start + timedelta(hours=(cfg.nowcast_hours + cfg.forecast_hours) / 2.0)
+        run_days = 2.0 * (mid - start_time).total_seconds() / 86400.0
+        if run_days <= 0:
+            log.warning(
+                f"tide_nodal_reference=cycle gives run_days={run_days:.4f} <= 0 "
+                f"for phase={self.phase}; falling back to phase run_days={phase_days:.4f}"
+            )
+            return phase_days
+        return run_days
+
     def _call_fortran_tide_fac(self, template_path: Path, output_path: Path) -> bool:
         """
         Call Fortran tide_fac executable for accurate nodal corrections.
@@ -266,7 +288,7 @@ class TidalProcessor(ForcingProcessor):
         # Previous implementation used int((nowcast+forecast)/24), which produced
         # nodal factors evaluated at a midpoint ~1 day off from production and
         # broke byte-parity with the static FIX bctides used in V16 success runs.
-        run_days = self._phase_run_days()
+        run_days = self._nodal_run_days(start_time)
 
         try:
             work_template = output_path.parent / "bctides.in_template"
@@ -282,7 +304,10 @@ class TidalProcessor(ForcingProcessor):
             )
 
             log.info(f"Running Fortran tide_fac: {exe}")
-            log.info(f"  phase={self.phase}, start_time={start_time}, run_days={run_days:.4f}")
+            log.info(
+                f"  phase={self.phase}, nodal_reference={self.config.tide_nodal_reference}, "
+                f"start_time={start_time}, run_days={run_days:.4f}"
+            )
 
             result = subprocess.run(
                 [str(exe)],
@@ -322,6 +347,11 @@ class TidalProcessor(ForcingProcessor):
              in the tidal potential section (lines after constituent names)
         """
         start_time = self._compute_start_time()
+        run_days = self._nodal_run_days(start_time)
+        log.info(
+            f"Python nodal: phase={self.phase}, nodal_reference={self.config.tide_nodal_reference}, "
+            f"start_time={start_time}, run_days={run_days:.4f}"
+        )
 
         try:
             lines = template_path.read_text().splitlines()
@@ -333,7 +363,7 @@ class TidalProcessor(ForcingProcessor):
             nodal = compute_nodal_corrections(
                 start_time,
                 self.config.tidal_constituents,
-                run_days=self._phase_run_days(),
+                run_days=run_days,
             )
             # Constituent names are case-insensitive in SCHISM's Fortran
             # reader. Templates also use mixed conventions in practice: the
@@ -431,10 +461,15 @@ class TidalProcessor(ForcingProcessor):
         start_time = self._compute_start_time()
 
         constituents = self.config.tidal_constituents
+        run_days = self._nodal_run_days(start_time)
+        log.info(
+            f"Python nodal: phase={self.phase}, nodal_reference={self.config.tide_nodal_reference}, "
+            f"start_time={start_time}, run_days={run_days:.4f}"
+        )
         nodal = compute_nodal_corrections(
             start_time,
             constituents,
-            run_days=self._phase_run_days(),
+            run_days=run_days,
         )
 
         with open(output_path, "w") as f:
