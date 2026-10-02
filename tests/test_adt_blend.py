@@ -288,3 +288,35 @@ def test_precomputed_weights_nan_guard(setup, monkeypatch, src_idx, expect_blend
     proc._process_2d(files, ssh_source=blended)
     assert proc._ssh_blended_used is expect_blend
     assert not any(seen)
+
+
+def test_fortran_exe_reads_blended_ssh(setup, monkeypatch):
+    cfg, proc, files, ssh_1, work, tmp = setup
+    blended = _blend(cfg, tmp, ssh_1, work, lambda lo, la: np.full_like(lo, 0.90))
+    assert blended is not None and ssh_1.exists() and not ssh_1.is_symlink()
+    exe_dir = tmp / "exec"
+    exe_dir.mkdir()
+    exe = exe_dir / "stofs_3d_atl_gen_3Dth_from_hycom"
+    exe.write_text("#!/bin/sh\ncp SSH_1.nc seen.nc\n")
+    exe.chmod(0o755)
+    for v in ("EXECstofs3d", "EXECofs", "FIXstofs3d"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("EXECnos", str(exe_dir))
+    proc._call_fortran_gen_3dth(work, blended, None)
+    assert (work / "SSH_1.nc").resolve() == blended.resolve()
+    with Dataset(str(work / "seen.nc")) as a, Dataset(str(blended)) as b:
+        np.testing.assert_array_equal(np.array(a["ssh"][:]), np.array(b["ssh"][:]))
+
+
+def test_fortran_link_keeps_raw_ssh_without_adt(setup, monkeypatch):
+    cfg, proc, files, ssh_1, work, tmp = setup
+    exe_dir = tmp / "exec"
+    exe_dir.mkdir()
+    exe = exe_dir / "stofs_3d_atl_gen_3Dth_from_hycom"
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
+    for v in ("EXECstofs3d", "EXECofs", "FIXstofs3d"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("EXECnos", str(exe_dir))
+    proc._call_fortran_gen_3dth(work, ssh_1, None)
+    assert ssh_1.exists() and not ssh_1.is_symlink()
