@@ -304,15 +304,20 @@ class TestNodeSet:
 class TestPhasePlan:
     @pytest.mark.parametrize("offset, dur, n, need", [(0.0, 27 * 3600.0, 6, 2), (86400.0, 99 * 3600.0, 18, 4)])
     def test_counts_and_needed_records(self, offset, dur, n, need):
-        n_out, ratio, off, aligned, k = no.phase_plan(offset, dur)
+        n_out, ratio, off, aligned, k, _ = no.phase_plan(offset, dur)
         assert (n_out, ratio, aligned, k) == (n, 10, True, need) and off == offset / 21600
+
+    def test_forecast_run_hours_do_not_need_the_buffer_record_r3(self):
+        n_out, ratio, off, aligned, need, last_j = no.phase_plan(86400.0, 99 * 3600.0, run_s=96 * 3600.0)
+        assert (n_out, need, last_j) == (18, 3, 16)
+        assert no.phase_plan(0.0, 27 * 3600.0, run_s=24 * 3600.0)[4:] == (2, 4)
 
     def test_unaligned_offset_is_flagged(self):
         assert not no.phase_plan(3 * 3600.0, 27 * 3600.0)[3]
 
     @pytest.mark.parametrize("offset, dur", [(0.0, 27 * 3600.0), (86400.0, 99 * 3600.0)])
     def test_every_ops_breakpoint_is_a_phase_knot_and_schism_reads_the_ops_field(self, offset, dur):
-        n_out, ratio, off, aligned, need = no.phase_plan(offset, dur)
+        n_out, ratio, off, aligned, need, _ = no.phase_plan(offset, dur)
         rng = np.random.default_rng(0)
         rec = [rng.normal(size=(3, 2)).astype(F) for _ in range(need)]
         for j in range(n_out):
@@ -395,6 +400,7 @@ def _proc(tmp_path, phase, ops_tl=True):
     cfg.grid_file = tmp_path / "hgrid.ll"
     cfg.nudging_enabled = True
     out = tmp_path / f"out_{phase}"
+    out.mkdir(parents=True, exist_ok=True)
     return NudgingProcessor(cfg, tmp_path, out, nudge_weight_file=tmp_path / "nudge.gr3",
                             rtofs_input_path=tmp_path / "rtofs", phase=phase), out
 
@@ -424,7 +430,7 @@ class TestEndToEnd:
         assert tr.shape == (n, 7, 4, 1)
         zc = np.array([-40.0, -20.0, -10.0, 0.0])
         for j in range(n):
-            keff = (off + j) / 10.0
+            keff = (off + min(j, 16 if phase == "forecast" else 4)) / 10.0
             for i in range(7):
                 want = _tfield(nodes[i][0], nodes[i][1], -zc, keff)
                 np.testing.assert_allclose(tr[j, i, :, 0], want, atol=2e-4)
@@ -459,13 +465,137 @@ class TestEndToEnd:
 
     def test_missing_ops_record_falls_back_with_a_reason(self, tmp_path, monkeypatch):
         _stage(tmp_path)
-        (tmp_path / "rtofs" / f"rtofs.{PDY}" / "rtofs_glo_3dz_f006_6hrly_hvr_US_east.nc").unlink()
+        for tag in ("n024", "f006"):
+            (tmp_path / "rtofs" / f"rtofs.{PDY}" / f"rtofs_glo_3dz_{tag}_6hrly_hvr_US_east.nc").unlink()
         proc, out = _proc(tmp_path, "forecast")
         monkeypatch.setattr(NudgingProcessor, "_process_stofs_legacy",
                             lambda self: ForcingResult(True, "NUDGING", metadata={"nudge_interp": "delaunay"}))
         res = proc._process_stofs()
         assert res.metadata["nudge_interp"] == "delaunay"
-        assert any("needs 4 RTOFS 3D files, found 3" in w for w in res.warnings)
+        assert any("RTOFS 3D files, found" in w for w in res.warnings)
+
+    def test_forecast_without_f006_needs_only_three_records_and_holds_the_tail(self, tmp_path):
+        nodes = _stage(tmp_path)
+        (tmp_path / "rtofs" / f"rtofs.{PDY}" / "rtofs_glo_3dz_f006_6hrly_hvr_US_east.nc").unlink()
+        proc, out = _proc(tmp_path, "forecast")
+        res = proc._process_stofs()
+        assert res.metadata["nudge_interp"] == "ops" and res.metadata["ops_records"] == 3, res.warnings
+        with Dataset(str(out / "TEM_nu.nc")) as ds:
+            tr = np.array(ds["tracer_concentration"][:])
+        assert tr.shape[0] == 18
+        np.testing.assert_array_equal(tr[17], tr[16])
+        zc = np.array([-40.0, -20.0, -10.0, 0.0])
+        np.testing.assert_allclose(tr[16, 0, :, 0], _tfield(nodes[0][0], nodes[0][1], -zc, 2.0), atol=2e-4)
+
+    def test_valid_range_does_not_mask_real_values(self, tmp_path):
+        nodes = _stage(tmp_path)
+        for f in (tmp_path / "rtofs" / f"rtofs.{PDY}").glob("*.nc"):
+            with Dataset(str(f), "a") as ds:
+                ds["temperature"].valid_range = np.array([0.0, 1.0], np.float32)
+        proc, out = _proc(tmp_path, "nowcast")
+        res = proc._process_stofs()
+        assert res.metadata["nudge_interp"] == "ops", res.warnings
+        with Dataset(str(out / "TEM_nu.nc")) as ds:
+            tr = np.array(ds["tracer_concentration"][:])
+        zc = np.array([-40.0, -20.0, -10.0, 0.0])
+        np.testing.assert_allclose(tr[0, 0, :, 0], _tfield(nodes[0][0], nodes[0][1], -zc, 0.0), atol=2e-4)
+
+    def test_tem_nudge_gr3_preferred_under_ops_timeline(self, tmp_path, monkeypatch):
+        _stage(tmp_path)
+        fix = tmp_path / "fix"
+        fix.mkdir()
+        for n in ("x.nudge.gr3", "x.TEM_nudge.gr3"):
+            (fix / n).write_text("t\n")
+        monkeypatch.setenv("FIXofs", str(fix))
+        monkeypatch.delenv("FIXstofs3d", raising=False)
+        proc, _ = _proc(tmp_path, "nowcast")
+        proc.nudge_weight_file = None
+        assert proc._nudge_file().name == "x.TEM_nudge.gr3"
+        proc.config.obc_ops_timeline = False
+        assert proc._nudge_file().name == "x.nudge.gr3"
+
+    def test_chosen_gr3_is_in_metadata(self, tmp_path):
+        _stage(tmp_path)
+        proc, _ = _proc(tmp_path, "nowcast")
+        assert proc._process_stofs().metadata["nudge_gr3"] == "nudge.gr3"
+
+
+class TestOpsFallbackAndFortranOptIn:
+    @pytest.mark.parametrize("phase, n", [("nowcast", 6), ("forecast", 18)])
+    def test_legacy_fallback_writes_phase_anchored_21600(self, tmp_path, monkeypatch, phase, n):
+        _stage(tmp_path)
+        proc, out = _proc(tmp_path, phase)
+        monkeypatch.setattr(NudgingProcessor, "_process_ops",
+                            lambda self: (_ for _ in ()).throw(ValueError("boom")))
+        called = []
+        monkeypatch.setattr(NudgingProcessor, "_call_fortran_gen_nudge",
+                            lambda self, w: called.append(1) or False)
+        res = proc._process_stofs()
+        assert not called
+        assert res.success and res.metadata["nudge_interp"] in ("delaunay", "precomputed"), res.warnings
+        assert res.metadata["dt_seconds"] == 21600.0
+        assert not any("wrong speed" in w for w in res.warnings)
+        with Dataset(str(out / "TEM_nu.nc")) as ds:
+            t = np.asarray(ds["time"][:], float)
+        assert t[0] == 0.0 and np.allclose(np.diff(t), 21600.0 if t.max() > 1000 else 0.25)
+        assert any("fell back to" in w for w in res.warnings)
+
+    def test_wrong_dt_is_warned_under_ops_timeline(self, tmp_path):
+        proc, _ = _proc(tmp_path, "nowcast")
+        res = proc._check_ops_dt(ForcingResult(True, "NUDGING", metadata={"dt_seconds": 10800.0}))
+        assert any("wrong speed" in w for w in res.warnings)
+
+    def test_fortran_is_not_used_unless_opted_in(self, tmp_path, monkeypatch):
+        _stage(tmp_path)
+        proc, _ = _proc(tmp_path, "nowcast")
+        called = []
+        monkeypatch.setattr(NudgingProcessor, "_process_ops_fortran", lambda self: called.append(1))
+        assert proc._process_stofs().metadata["nudge_interp"] == "ops" and not called
+
+    def test_fortran_opt_in_records_are_resampled_with_E(self, tmp_path, monkeypatch):
+        nodes = _stage(tmp_path)
+        proc, out = _proc(tmp_path, "forecast")
+        proc.config.obc_use_fortran_gen_nudge = True
+        rng = np.random.default_rng(3)
+        raw = {n: [rng.normal(size=(5, 4)).astype(np.float32) for _ in range(23)] for n in ("TEM_nu.nc", "SAL_nu.nc")}
+
+        monkeypatch.setattr(NudgingProcessor, "_prepare_nudge_tsuv", lambda self, w: None)
+
+        def fake_exe(self, work):
+            for name, recs in raw.items():
+                with Dataset(str(work / name), "w") as ds:
+                    ds.createDimension("node", 5)
+                    ds.createDimension("nLevels", 4)
+                    ds.createDimension("one", 1)
+                    ds.createDimension("time", None)
+                    ds.createVariable("time", "f8", ("time",))[:] = np.arange(23) * 0.25
+                    ds.createVariable("map_to_global_node", "i4", ("node",))[:] = np.arange(1, 6)
+                    v = ds.createVariable("tracer_concentration", "f4", ("time", "node", "nLevels", "one"))
+                    for k, r in enumerate(recs):
+                        v[k, :, :, 0] = r
+            return True
+
+        monkeypatch.setattr(NudgingProcessor, "_call_fortran_gen_nudge", fake_exe)
+        res = proc._process_stofs()
+        assert res.metadata["nudge_interp"] == "fortran_ops", res.warnings
+        assert res.metadata["dt_seconds"] == 21600.0 and res.metadata["n_timesteps"] == 18
+        with Dataset(str(out / "TEM_nu.nc")) as ds:
+            tr = np.array(ds["tracer_concentration"][:])
+        r = raw["TEM_nu.nc"]
+        for j in (0, 3, 6, 16, 17):
+            k, num = divmod(4 + min(j, 16), 10)
+            want = r[k] if num == 0 else (r[k].astype(np.float64) * (1 - num / 10) + r[k + 1].astype(np.float64) * num / 10)
+            np.testing.assert_allclose(tr[j, :, :, 0], want, atol=1e-6)
+
+    def test_non_ops_config_is_unchanged(self, tmp_path, monkeypatch):
+        proc, _ = _proc(tmp_path, "nowcast", ops_tl=False)
+        proc.config.obc_use_fortran_gen_nudge = True
+        called = []
+        monkeypatch.setattr(NudgingProcessor, "_process_ops_fortran", lambda self: called.append(1))
+        monkeypatch.setattr(NudgingProcessor, "_process_stofs_legacy",
+                            lambda self: ForcingResult(True, "NUDGING", metadata={"dt_seconds": 10800.0}))
+        res = proc._process_stofs()
+        assert not called and not res.warnings
 
 
 class TestTiming:

@@ -188,19 +188,39 @@ class NudgingProcessor(ForcingProcessor):
         return self._process_python()
 
     def _process_stofs(self) -> ForcingResult:
-        """STOFS mode: the ops-equivalent port under obc_ops_timeline, else (or on failure) the legacy path."""
-        reason = None
-        if self.config.obc_ops_timeline:
-            try:
-                return self._process_ops()
-            except Exception as e:
-                reason = f"{type(e).__name__}: {e}"
-                log.warning(f"Nudging: ops-equivalent path unavailable ({reason}); using the fallback")
+        """STOFS mode: under obc_ops_timeline the ops-equivalent port (Fortran only as an opt-in), else the legacy path."""
+        ops_tl = self.config.obc_ops_timeline
+        reasons = []
+        if ops_tl:
+            attempts = []
+            if self.config.obc_use_fortran_gen_nudge:
+                attempts.append(("fortran", self._process_ops_fortran))
+            attempts.append(("ops", self._process_ops))
+            for label, fn in attempts:
+                try:
+                    result = fn()
+                except Exception as e:
+                    reasons.append(f"{label}: {type(e).__name__}: {e}")
+                    log.warning(f"Nudging: {label} path unavailable ({reasons[-1]})")
+                    continue
+                result.warnings.extend(f"nudging: {r} unavailable, used {label}" for r in reasons)
+                return self._check_ops_dt(result)
         result = self._process_stofs_legacy()
-        if reason:
+        if reasons:
             result.warnings.append(
                 f"nudging fell back to {result.metadata.get('nudge_interp', 'legacy')}: "
-                f"ops-equivalent path unavailable ({reason}); TEM_nu/SAL_nu will differ from ops")
+                f"ops-equivalent path unavailable ({'; '.join(reasons)}); TEM_nu/SAL_nu will differ from ops")
+        return self._check_ops_dt(result) if ops_tl else result
+
+    def _check_ops_dt(self, result: ForcingResult) -> ForcingResult:
+        """Under the ops timeline the files must be at step_nu_tr = 21600 s; say so loudly when not."""
+        from . import nudge_ops as no
+        dt = result.metadata.get("dt_seconds")
+        if result.success and (dt is None or abs(float(dt) - no.NU_DT) > 1e-6):
+            msg = (f"nudging: wrote dt={dt} s but step_nu_tr is {no.NU_DT:.0f} s under the ops timeline; "
+                   f"SCHISM will play TEM_nu/SAL_nu at the wrong speed")
+            log.error(msg)
+            result.warnings.append(msg)
         return result
 
     def _process_stofs_legacy(self) -> ForcingResult:
@@ -215,11 +235,13 @@ class NudgingProcessor(ForcingProcessor):
 
         try:
             # Prepare TS_1.nc with nudge-specific ROI if we have RTOFS access
-            if self.rtofs_input_path:
+            if self.rtofs_input_path and not self.config.obc_ops_timeline:
                 self._prepare_nudge_tsuv(work_dir)
 
-            # Try Fortran nudge executable
-            fortran_ok = self._call_fortran_gen_nudge(work_dir)
+            # Try Fortran nudge executable; under the ops timeline its raw 6-hourly
+            # records are not what step_nu_tr = 21600 expects, so it is opt-in there
+            # and handled by _process_ops_fortran. MJ (10/02/26)
+            fortran_ok = (not self.config.obc_ops_timeline) and self._call_fortran_gen_nudge(work_dir)
 
             output_files = []
             warnings = []
@@ -273,17 +295,13 @@ class NudgingProcessor(ForcingProcessor):
         )
         if not rtofs_proc._ops_timeline:
             raise ValueError("RTOFS processor is not on the ops timeline")
+        # The port picks files by valid-time slot and fills gaps from the previous cycle; ops picks by
+        # list index and copies the previous rerun file. Identical whenever the first four same-day
+        # files exist. MJ (10/02/26)
         _, files = rtofs_proc.find_input_files_by_type()
         warnings += list(getattr(rtofs_proc, "_select_notes", []))
 
-        sim_start, _, duration = self._get_output_window()
-        nowcast_s = float(self.config.nowcast_hours) * 3600.0
-        offset = nowcast_s if self.phase == "forecast" else 0.0
-        n_out, ratio, off, aligned, need = no.phase_plan(offset, duration)
-        if not aligned:
-            warnings.append(
-                f"nudging: phase offset {offset:.0f} s is not a multiple of {no.NU_DT:.0f} s, so "
-                f"SCHISM's linear read of the file does not reproduce the ops-effective field exactly")
+        sim_start, offset, (n_out, ratio, off, need, last_j) = self._ops_plan(warnings)
         if len(files) < need:
             raise ValueError(f"the ops-effective field needs {need} RTOFS 3D files, found {len(files)}")
         t0 = sim_start - timedelta(seconds=offset)
@@ -302,12 +320,16 @@ class NudgingProcessor(ForcingProcessor):
 
         def read_raw(path):
             with Dataset(str(path)) as ds:
+                # ncap2 honours only _FillValue; netCDF4's auto-mask would also drop values outside
+                # valid_range. MJ (10/02/26)
+                ds.set_auto_mask(False)
                 ys, xs = slice(roi["y1"], roi["y2"] + 1), slice(roi["x1"], roi["x2"] + 1)
                 out = []
                 for nme in ("temperature", "salinity"):
                     v = ds.variables[nme]
-                    out.append(no.pack_ts(v[0, :, ys, xs] if v.ndim == 4 else v[:, ys, xs]))
-                grid = [np.ma.filled(ds.variables[n][ys, xs], np.nan).astype(np.float32)
+                    out.append(no.pack_ts(self._fill_to_nan(v, (0, slice(None), ys, xs) if v.ndim == 4
+                                                            else (slice(None), ys, xs))))
+                grid = [np.asarray(ds.variables[n][ys, xs]).astype(np.float32)
                         for n in ("Longitude", "Latitude")]
                 return out[0], out[1], grid[0], grid[1], np.asarray(ds.variables["Depth"][:], np.float32)
 
@@ -347,7 +369,7 @@ class NudgingProcessor(ForcingProcessor):
         out_files = []
         for name, rec in (("TEM_nu.nc", rec_t), ("SAL_nu.nc", rec_s)):
             path = self.output_path / name
-            self._write_ops_nu(path, rec, state.sel + 1, n_out, off, ratio, no)
+            self._write_ops_nu(path, rec, state.sel + 1, n_out, off, ratio, no, last_j)
             out_files.append(path)
         log.info(f"Nudge ops: wrote {n_out} records at {no.NU_DT:.0f} s in {_time.time() - t_start:.0f} s")
         return ForcingResult(
@@ -360,14 +382,90 @@ class NudgingProcessor(ForcingProcessor):
                 "dt_seconds": no.NU_DT,
                 "step_nu_tr": no.NU_DT,
                 "ops_records": need,
+                "nudge_gr3": Path(nudge_file).name,
                 "fortran_used": False,
                 "precomputed_weights": False,
                 "nudge_interp": "ops",
             },
         )
 
+    def _ops_plan(self, warnings):
+        """(sim_start, phase offset s, (n_out, ratio, off, need, last_j)) of the ops-effective phase file."""
+        from . import nudge_ops as no
+        sim_start, _, duration = self._get_output_window()
+        offset = float(self.config.nowcast_hours) * 3600.0 if self.phase == "forecast" else 0.0
+        run_s = duration - (self.buffer_hours * 3600.0 if self.phase else 0.0)
+        n_out, ratio, off, aligned, need, last_j = no.phase_plan(offset, duration, run_s=run_s)
+        if not aligned:
+            warnings.append(
+                f"nudging: phase offset {offset:.0f} s is not a multiple of {no.NU_DT:.0f} s, so "
+                f"SCHISM's linear read of the file does not reproduce the ops-effective field exactly")
+        return sim_start, offset, (n_out, ratio, off, need, last_j)
+
     @staticmethod
-    def _write_ops_nu(path, records, node_ids, n_out, off, ratio, no):
+    def _fill_to_nan(var, idx):
+        """var[idx] as float with only _FillValue / missing_value (and NaN) masked; auto-mask must be off."""
+        a = np.asarray(var[idx])
+        if a.dtype.kind != "f":
+            a = a.astype(np.float64)
+        sc, ad = getattr(var, "scale_factor", 1.0), getattr(var, "add_offset", 0.0)
+        for attr in ("_FillValue", "missing_value"):
+            fv = getattr(var, attr, None)
+            if fv is not None:
+                a = np.where(np.isclose(a, float(np.ravel(fv)[0]) * sc + ad, rtol=1e-6, atol=0), np.nan, a)
+        return a
+
+    def _process_ops_fortran(self) -> ForcingResult:
+        """Opt-in: the ops Fortran exe on the 23 raw 6-hourly records, resampled through the same ops-effective phase plan."""
+        import tempfile
+        import time as _time
+        from . import nudge_ops as no
+        if not self.rtofs_input_path:
+            raise ValueError("no RTOFS input path for the Fortran gen_nudge")
+        t_start = _time.time()
+        warnings: List[str] = []
+        _, _, (n_out, ratio, off, need, last_j) = self._ops_plan(warnings)
+        work_dir = Path(tempfile.mkdtemp(prefix="nudge_ops_f90_"))
+        try:
+            self._prepare_nudge_tsuv(work_dir)
+            if not self._call_fortran_gen_nudge(work_dir):
+                raise RuntimeError("Fortran gen_nudge not available or failed")
+            recs, ids = [], None
+            for fname in ("TEM_nu.nc", "SAL_nu.nc"):
+                src = work_dir / fname
+                if not src.exists():
+                    raise RuntimeError(f"Fortran gen_nudge wrote no {fname}")
+                with Dataset(str(src)) as ds:
+                    nrec = ds.dimensions["time"].size
+                    if nrec < need:
+                        raise ValueError(f"{fname} has {nrec} records, the ops-effective field needs {need}")
+                    var = ds.variables["tracer_concentration"]
+                    recs.append([np.asarray(var[k, :, :, 0], np.float32) for k in range(need)])
+                    ids = np.asarray(ds.variables["map_to_global_node"][:], np.int32)
+            out_files = []
+            for name, rec in zip(("TEM_nu.nc", "SAL_nu.nc"), recs):
+                path = self.output_path / name
+                self._write_ops_nu(path, rec, ids, n_out, off, ratio, no, last_j)
+                out_files.append(path)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        log.info(f"Nudge ops (Fortran records): wrote {n_out} records in {_time.time() - t_start:.0f} s")
+        return ForcingResult(
+            success=True, source=self.SOURCE_NAME, output_files=out_files, warnings=warnings,
+            metadata={
+                "timescale_seconds": self.config.nudging_timescale_seconds,
+                "n_nudge_nodes": int(len(ids)),
+                "n_timesteps": n_out,
+                "dt_seconds": no.NU_DT,
+                "step_nu_tr": no.NU_DT,
+                "ops_records": need,
+                "fortran_used": True,
+                "nudge_interp": "fortran_ops",
+            },
+        )
+
+    @staticmethod
+    def _write_ops_nu(path, records, node_ids, n_out, off, ratio, no, last_j=None):
         """Ops layout, one record at a time: time (days) double, map_to_global_node, tracer float32."""
         n, nvrt = records[0].shape
         nc = Dataset(str(path), "w", format="NETCDF4_CLASSIC")
@@ -380,7 +478,7 @@ class NudgingProcessor(ForcingProcessor):
         var = nc.createVariable("tracer_concentration", "f4", ("time", "node", "nLevels", "one"))
         mv[:] = np.asarray(node_ids, np.int32)
         for j in range(n_out):
-            k, num = divmod(off + j, ratio)
+            k, num = divmod(off + (j if last_j is None else min(j, last_j)), ratio)
             tv[j] = j * no.NU_DT / 86400.0
             var[j, :, :, 0] = no.effective(records, k, num, ratio)
         nc.close()
@@ -782,12 +880,18 @@ class NudgingProcessor(ForcingProcessor):
         # per-file valid times in ``all_times`` are already relative to
         # the model t=0 anchor (= cycle - nowcast_hours).
         target_dt = 10800.0  # 3-hourly output (matches COMF Fortran)
+        if self.config.obc_ops_timeline:
+            # step_nu_tr = 21600 s: phase-anchored 6-hourly records, time 0 = phase start. MJ (10/02/26)
+            target_dt = 21600.0
 
         # The output time axis covers [0, sim_duration] at ``target_dt``
         # cadence — i.e. 0, 3h, 6h, ..., nowcast+forecast hours from the
         # SCHISM hotstart anchor. For SECOFS (6h nowcast + 48h forecast)
         # this yields 19 samples (0..194400s).
-        n_target = int(sim_duration / target_dt) + 1
+        if self.config.obc_ops_timeline:
+            n_target = int(np.ceil(sim_duration / target_dt - 1e-9)) + 1
+        else:
+            n_target = int(sim_duration / target_dt) + 1
         target_times = (np.arange(n_target) * target_dt).astype(np.float64)
 
         # Sanity-clamp to the input window: if RTOFS files don't reach
@@ -947,6 +1051,7 @@ class NudgingProcessor(ForcingProcessor):
                 "fortran_used": False,
                 "precomputed_weights": use_precomputed,
                 "nudge_interp": "precomputed" if use_precomputed else "delaunay",
+                "nudge_gr3": self._nudge_gr3_name(),
             },
         )
 
@@ -1198,15 +1303,22 @@ class NudgingProcessor(ForcingProcessor):
     _cached_nudge_nodes = None  # (file_path, node_ids, lons, lats, depths)
     _cached_vgrid = None        # (file_path, vgrid_object)
 
+    def _nudge_gr3_name(self) -> Optional[str]:
+        f = self._nudge_file()
+        return Path(f).name if f else None
+
     def _nudge_file(self) -> Optional[Path]:
-        """The configured nudge gr3, else the first *.nudge.gr3 / *.TEM_nudge.gr3 in the FIX dirs."""
+        """The configured nudge gr3, else the first *.nudge.gr3 / *.TEM_nudge.gr3 in the FIX dirs (TEM_nudge first under the ops timeline)."""
         if self.nudge_weight_file is not None:
             return self.nudge_weight_file
+        patterns = ["*.nudge.gr3", "*.TEM_nudge.gr3"]
+        if self.config.obc_ops_timeline:
+            patterns.reverse()
         for env_var in ["FIXofs", "FIXstofs3d"]:
             fix_dir = os.environ.get(env_var)
             if not fix_dir:
                 continue
-            for pattern in ["*.nudge.gr3", "*.TEM_nudge.gr3"]:
+            for pattern in patterns:
                 matches = sorted(Path(fix_dir).glob(pattern))
                 if matches:
                     return matches[0]

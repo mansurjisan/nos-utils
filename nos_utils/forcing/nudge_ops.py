@@ -221,14 +221,19 @@ def effective(rec, n, num, ratio):
     return (rec[n].astype(np.float64) * (1.0 - f) + rec[n + 1].astype(np.float64) * f).astype(F32)
 
 
-def phase_plan(offset_s, duration_s, dt=NU_DT, step=OPS_NU_STEP):
-    """Record plan of one phase file: (n_records, ratio, offset_steps, aligned, n_ops_records_needed).
+def phase_plan(offset_s, duration_s, dt=NU_DT, step=OPS_NU_STEP, run_s=None):
+    """Record plan of one phase file: (n_records, ratio, offset_steps, aligned, n_ops_records_needed, last_j).
 
     Record j sits at offset_s + j*dt of the nowcast clock and holds the ops-effective field there.
+    SCHISM never reads past the run end, so only records up to run_s (default duration_s) need real
+    values (last_j); the trailing buffer records hold the last one and need no extra ops record.
     """
     ratio = int(round(step / dt))
     aligned = abs(ratio * dt - step) < 1e-6 and abs(offset_s / dt - round(offset_s / dt)) < 1e-9
     n_out = int(np.ceil(duration_s / dt - 1e-9)) + 1
     off = int(round(offset_s / dt))
-    last_n, last_num = divmod(off + n_out - 1, ratio)
-    return n_out, ratio, off, aligned, last_n + 1 + (1 if last_num else 0)
+    last_j = n_out - 1
+    if run_s is not None:
+        last_j = min(last_j, int(np.ceil(run_s / dt - 1e-9)))
+    last_n, last_num = divmod(off + last_j, ratio)
+    return n_out, ratio, off, aligned, last_n + 1 + (1 if last_num else 0), last_j

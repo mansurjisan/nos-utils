@@ -737,11 +737,13 @@ def test_fallback_reasons_are_kept_per_product(tmp_path):
                                        ("0", False), ("true", True), ("YES", True), ("1", True)])
 def test_yaml_bools_are_strict_strings(tmp_path, raw, want):
     cfg = _yaml_cfg(tmp_path, "stofs_3d_atl_ufs",
-                    f"      ssh_hold_first_record: '{raw}'\n      use_fortran_gen3dth: '{raw}'\n")
+                    f"      ssh_hold_first_record: '{raw}'\n      use_fortran_gen3dth: '{raw}'\n"
+                    f"      use_fortran_gen_nudge: '{raw}'\n")
     assert cfg.obc_ssh_hold_first_record is want and cfg.obc_use_fortran_gen3dth is want
+    assert cfg.obc_use_fortran_gen_nudge is want
 
 
-@pytest.mark.parametrize("key", ["ssh_hold_first_record", "use_fortran_gen3dth"])
+@pytest.mark.parametrize("key", ["ssh_hold_first_record", "use_fortran_gen3dth", "use_fortran_gen_nudge"])
 def test_yaml_bool_garbage_raises(tmp_path, key):
     with pytest.raises(ValueError, match=key):
         _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", f"      {key}: maybe\n")
