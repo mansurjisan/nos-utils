@@ -591,11 +591,11 @@ class ForcingConfig:
             datm_lon_min=-98.0, datm_lon_max=-55.0,
             datm_lat_min=10.0, datm_lat_max=53.0,
             datm_dx=0.025,
-            # UFS-Coastal resource layout (nowcast 24h + forecast 108h = 132h)
+            # UFS-Coastal resource layout (nowcast 24h + forecast 96h = 120h) MJ (10/02/26)
             ufs_datm_tasks=120,
             ufs_schism_tasks=1080,
             ufs_total_tasks=1200,
-            ufs_nhours_fcst=132,
+            ufs_nhours_fcst=120,
             ufs_dt_atmos=720,
         )
         defaults.update(overrides)
