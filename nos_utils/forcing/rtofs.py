@@ -2259,10 +2259,12 @@ class RTOFSProcessor(ForcingProcessor):
     def _ops_ssh_boundary(self, ssh_path, n_files, first_only=False) -> Optional[np.ndarray]:
         """Boundary SSH (nt, n_bnd) float32 in m from SSH_1(_adt).nc, gen_3Dth rules; None to fall back.
 
-        As the f90 (real*4): ssh = surf_el * 1e-3 from the packed variable, float32 weights
-        and sums. first_only reads record 0 only (the held ops elev2D).
+        Under the ops timeline, as the f90 (real*4): ssh = surf_el * 1e-3 from the packed
+        variable, float32 weights and sums. Other configs keep the float64 path on the ssh
+        variable. first_only reads record 0 only (the held ops elev2D).
         """
-        f32 = np.float32
+        ops = self._ops_timeline
+        f32 = np.float32 if ops else np.float64
         try:
             with Dataset(str(ssh_path)) as ds:
                 nt = ds.dimensions["time"].size
@@ -2271,15 +2273,15 @@ class RTOFSProcessor(ForcingProcessor):
                                    f"files — elev2D not from the ops-equivalent path", "elev2D")
                     return None
                 sl = slice(0, 1) if first_only else slice(None)
-                if "surf_el" in ds.variables:
+                if ops and "surf_el" in ds.variables:
                     v = ds.variables["surf_el"]
                     v.set_auto_maskandscale(False)
                     ssh = np.asarray(v[sl], f32) * f32(1e-3)
                 else:
                     ssh = np.ma.filled(ds.variables["ssh"][sl], -30000.0).astype(f32)
                 lon, lat = ds.variables["xlon"][:], ds.variables["ylat"][:]
-            ssh = np.where(np.isfinite(ssh), ssh, f32(-30.0)).astype(f32)
-            ix, iy, w, inside = self._ops_weights(lon, lat, single=True)
+            ssh = np.where(np.isfinite(ssh), ssh, f32(-30.0 if ops else -30000.0)).astype(f32)
+            ix, iy, w, inside = self._ops_weights(lon, lat, single=ops)
             wet = ssh[0] >= f32(DRY_SSH)
             cj, ci = corner_cells(ix, iy)
             cj, ci, n_dry = dry_parents(wet, cj, ci)
@@ -2288,8 +2290,11 @@ class RTOFSProcessor(ForcingProcessor):
             for t in range(ssh.shape[0]):
                 s_t, n = fix_ssh(ssh[t], wet)
                 n_fix += n
-                acc = interpolate4(np.asarray(s_t, f32)[cj, ci].T, w.astype(f32))
-                out[t] = np.where(inside, acc, f32(0))
+                if ops:
+                    acc = interpolate4(np.asarray(s_t, f32)[cj, ci].T, w.astype(f32))
+                    out[t] = np.where(inside, acc, f32(0))
+                else:
+                    out[t] = (w * s_t[cj, ci].T).sum(axis=1)
         except Exception as e:
             self._ops_note(f"ops-equivalent elev2D unavailable ({e})", "elev2D")
             return None

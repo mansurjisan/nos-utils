@@ -65,6 +65,22 @@ def test_ops_ssh_boundary_uses_packed_surf_el_as_float32(tmp_path):
     np.testing.assert_array_equal(got[0], want)
 
 
+def test_non_ops_timeline_keeps_float64_ssh_path(tmp_path):
+    lons = np.array([0.0, 1.0, 2.0, 3.0])
+    lats = np.array([0.0, 1.0, 2.0, 3.0])
+    ssh = (np.random.default_rng(3).uniform(0.1, 0.9, (4, 4)) / 7).astype(np.float64)
+    p = tmp_path / "SSH_1.nc"
+    _write_ssh1(p, lons, lats, [ssh])
+    proc = _proc(tmp_path, [1.3, 2.1], [0.4, 1.7], obc_interp_mode=1, obc_ops_timeline=False)
+    got = proc._ops_ssh_boundary(p, 1)
+    assert got.dtype == np.float64
+    LO, LA = np.meshgrid(lons, lats)
+    ix, iy, w, _ = oi.parent_weights_2d(LO, LA, [1.3, 2.1], [0.4, 1.7])
+    cj, ci = oi.corner_cells(ix, iy)
+    stored = ssh.astype(f32).astype(np.float64)
+    np.testing.assert_array_equal(got[0], (w * stored[cj, ci].T).sum(axis=1))
+
+
 def test_blend_record_0_is_the_adt_field_bit_exact(setup):
     cfg, proc, files, ssh_1, work, tmp = setup
     with Dataset(str(ssh_1)) as ds:
