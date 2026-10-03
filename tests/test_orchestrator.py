@@ -543,3 +543,41 @@ def test_dynamic_adjust_phase_offset(tmp_path, monkeypatch):
     cfg.obc_ops_timeline = False
     orch._run_dynamic_adjust(tmp_path, "forecast")
     assert seen == [0, cfg.nowcast_hours, 0]
+
+
+def test_dynamic_adjust_station_in_resolution(tmp_path, monkeypatch):
+    """Model station.in comes from the fix dir (first candidate wins); it is never read as the 11-station bias list."""
+    from nos_utils.config import ForcingConfig
+    from nos_utils.forcing import dynamic_adjust as da
+    from nos_utils.orchestrator import PrepOrchestrator
+
+    seen = {}
+
+    class Stub:
+        def __init__(self, *a, **k):
+            seen.update(k)
+
+        def process(self):
+            return None
+
+    monkeypatch.setattr(da, "DynamicAdjustProcessor", Stub)
+    fix = tmp_path / "fix"
+    fix.mkdir()
+    cfg = ForcingConfig.for_stofs_3d_atl(pdy="20261001", cyc=12)
+    orch = PrepOrchestrator(cfg, {"output": tmp_path, "fix": fix}, run_name="stofs_3d_atl_ufs")
+
+    orch._run_dynamic_adjust(tmp_path)
+    assert seen["station_in"] is None
+
+    (fix / "stofs_3d_atl_ufs_station.in").write_text("x")
+    orch._run_dynamic_adjust(tmp_path)
+    assert seen["station_in"] == fix / "stofs_3d_atl_ufs_station.in"
+    assert seen["station_bp"] is None
+
+    (fix / "stofs_3d_atl_station.in").write_text("x")
+    orch._run_dynamic_adjust(tmp_path)
+    assert seen["station_in"] == fix / "stofs_3d_atl_station.in"
+
+    (fix / "stofs_3d_atl_ufs.station.in").write_text("x")
+    orch._run_dynamic_adjust(tmp_path)
+    assert seen["station_in"] == fix / "stofs_3d_atl_ufs.station.in"

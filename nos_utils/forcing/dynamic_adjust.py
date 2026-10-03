@@ -31,6 +31,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -85,6 +86,9 @@ DEFAULT_NAN_THRESHOLD = 0.20
 # interval. Matches operational `gap_idx=10`.
 GAP_MULTIPLIER = 10
 
+# create_npz_NOAA.py skips a station whose dcom file has fewer lines than this.
+MIN_OBS_LINES = 10
+
 
 # =============================================================================
 # Data containers
@@ -122,18 +126,47 @@ _XML_OBS_RE = re.compile(
 )
 
 
-def parse_noaa_xml(xml_path: Path) -> Tuple[List["pd.Timestamp"], List[float]]:
-    """Parse a NOAA CO-OPS water-level XML file.
+def _parse_dcom_text(text: str) -> Tuple[List["pd.Timestamp"], List[float]]:
+    """Ops dcom text rows: ``<sid> 1 WL <date> <HH:MM> <value> <sigma> <flags...>``.
 
-    The operational shell uses awk on fields 4/5/6 which targets the
-    observations block. We parse the same content with a regex that
-    recognises either `<wl t="..." v="..."/>` or `<obs t="..." v="..."/>`
-    and any surrounding whitespace. Missing or non-numeric ``v`` entries
-    are dropped.
+    Mirrors ``awk -F' ' '{print $4 " " $5 ":00," $6 ...}'`` followed by
+    ``create_npz_NOAA.py``: a file with fewer than ``MIN_OBS_LINES`` lines is
+    skipped, a row with an empty field 6 is dropped, and no flag filtering is
+    applied. MJ (10/02/26)
     """
-    text = xml_path.read_text(errors="replace")
+    rows = text.split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()
+    if len(rows) < MIN_OBS_LINES:
+        return [], []
     ts_list: List["pd.Timestamp"] = []
     vals: List[float] = []
+    for row in rows:
+        parts = row.split()
+        if len(parts) < 6:
+            continue
+        try:
+            v = float(parts[5])
+            timestamp = pd.Timestamp(f"{parts[3]} {parts[4]}:00", tz="UTC")
+        except ValueError:
+            continue
+        ts_list.append(timestamp)
+        vals.append(v)
+    return ts_list, vals
+
+
+def parse_noaa_xml(xml_path: Path) -> Tuple[List["pd.Timestamp"], List[float]]:
+    """Parse a NOAA CO-OPS water-level file from ``$DCOMROOT/<day>/coops_waterlvlobs``.
+
+    The ``.xml`` files are whitespace-separated text rows in practice and are
+    parsed as the operational shell does (see ``_parse_dcom_text``). When no
+    text rows are found, fall back to ``<wl|obs t="..." v="..."/>`` attributes;
+    missing or non-finite ``v`` entries are dropped there.
+    """
+    text = xml_path.read_text(errors="replace")
+    ts_list, vals = _parse_dcom_text(text)
+    if ts_list:
+        return ts_list, vals
     for match in _XML_OBS_RE.finditer(text):
         date_str, hhmm, ss, v_str = match.groups()
         try:
@@ -328,6 +361,23 @@ def read_diff_bp(bp_path: Path) -> Dict[str, float]:
     return offsets
 
 
+def read_station_in(path: Path) -> List[str]:
+    """Station IDs of a SCHISM station.in in row order (= staout_1 column order).
+
+    Row ``i`` (0-based) is staout_1 column ``i + 1``. A row without a ``!id``
+    comment yields ``""`` so that later rows keep their index. MJ (10/02/26)
+    """
+    lines = Path(path).read_text(errors="replace").splitlines()
+    try:
+        n = int(lines[1].split()[0])
+    except (IndexError, ValueError):
+        return []
+    return [
+        ln.rsplit("!", 1)[1].strip() if "!" in ln else ""
+        for ln in lines[2:2 + n]
+    ]
+
+
 # =============================================================================
 # Bias computation
 # =============================================================================
@@ -412,14 +462,25 @@ def compute_bias(
     target_start: datetime,
     target_end: datetime,
     nan_threshold: float = DEFAULT_NAN_THRESHOLD,
+    *,
+    model_station_ids: Optional[Sequence[str]] = None,
 ) -> Tuple[float, Dict[str, float]]:
     """Compute the scalar bias to subtract from SSH boundary.
 
-    Returns (average_bias, per_station_bias). When no stations have enough
-    data to compute a bias, returns (``float('nan')``, {}).
+    ``model_station_ids`` lists the model station.in IDs in row order; each bias
+    station reads staout_1 column ``row + 1`` of its first match, as ops
+    ``derive_bias.py``. A station missing from it is skipped (no positional
+    fallback). Returns (average_bias, per_station_bias), the average rounded to
+    3 decimals as ops writes it; when no station has enough data, returns
+    (``float('nan')``, {}).
     """
     if not HAS_PANDAS:
         raise RuntimeError("pandas is required for bias computation")
+
+    model_ids = list(model_station_ids) if model_station_ids is not None else []
+    if not model_ids:
+        log.warning("No model station.in IDs supplied; cannot map staout_1 columns")
+        return float("nan"), {}
 
     ts = pd.Timestamp(target_start, tz=None)
     te = pd.Timestamp(target_end, tz=None)
@@ -442,7 +503,7 @@ def compute_bias(
 
     per_station_bias: Dict[str, np.ndarray] = {}
 
-    for idx_in, sid in enumerate(station_ids_in):
+    for sid in station_ids_in:
         if sid not in obs.station_lons:
             continue
         sta_mask = obs.station_ids == sid
@@ -467,8 +528,18 @@ def compute_bias(
             log.warning(f"Interpolation failed for station {sid}: {exc}")
             continue
 
-        # Model column for this station.
-        model_col = model_staout[m_mask, idx_in + 1]
+        # Model column: first station.in row with this ID, +1 for the time column. MJ (10/02/26)
+        if sid not in model_ids:
+            log.warning(f"Station {sid} not in the model station.in; skipped")
+            continue
+        col = model_ids.index(sid) + 1
+        if col >= model_staout.shape[1]:
+            log.warning(
+                f"Station {sid} maps to staout_1 column {col} but the file has "
+                f"{model_staout.shape[1]} columns; skipped"
+            )
+            continue
+        model_col = model_staout[m_mask, col]
         bias_series = model_col - soyi
         per_station_bias[sid] = bias_series
 
@@ -495,7 +566,7 @@ def compute_bias(
 
     filtered = df_hourly[valid_cols].copy()
     filtered["Average"] = filtered.mean(axis=1)
-    avg_bias = float(filtered["Average"].mean())
+    avg_bias = float(f"{filtered['Average'].mean():.3f}")
 
     per_station_mean = {
         sid: float(np.nanmean(vals)) for sid, vals in per_station_bias.items()
@@ -546,6 +617,12 @@ def densify_hourly(elev_nc: Path) -> bool:
     return True
 
 
+def _bc_average(adj0: float, adj1: float) -> float:
+    """Ops ``bc``: ``scale=5; ($adj0 + $adj1) / 2``, exact sum and quotient truncated at 5 places. MJ (10/02/26)"""
+    total = Decimal(repr(float(adj0))) + Decimal(repr(float(adj1)))
+    return float((total / 2).quantize(Decimal("0.00001"), rounding=ROUND_DOWN))
+
+
 def apply_ssh_time_varying_adjust(
     elev_nc: Path,
     adj0: float,
@@ -564,6 +641,8 @@ def apply_ssh_time_varying_adjust(
         * t>=2 -> value - adj1
     NaN arguments are treated as 0.0 (which leaves that time slice
     unchanged, matching the shell's ``flag_adj0=1; adj0=0.0`` fallback).
+    Each offset is cast to float32 and subtracted in the variable's own
+    precision, as ``ncap2 ... -float($adj)``; the t=1 offset is the bc average.
     """
     if not HAS_NETCDF4:
         raise RuntimeError("netCDF4 is required for SSH adjustment")
@@ -579,7 +658,7 @@ def apply_ssh_time_varying_adjust(
 
     adj0_f = 0.0 if (adj0 is None or math.isnan(adj0)) else float(adj0)
     adj1_f = 0.0 if (adj1 is None or math.isnan(adj1)) else float(adj1)
-    avg = 0.5 * (adj0_f + adj1_f)
+    avg = _bc_average(adj0_f, adj1_f)
 
     try:
         with Dataset(str(elev_nc), "r+") as ds:
@@ -595,12 +674,14 @@ def apply_ssh_time_varying_adjust(
             # Handle masked arrays gracefully.
             if np.ma.isMaskedArray(data):
                 data = data.filled(np.nan)
-            data = np.asarray(data, dtype=np.float64)
+            data = np.asarray(data)
+            if data.dtype.kind != "f":
+                data = data.astype(np.float64)
             k = int(start_offset_hours) + np.arange(n_t)
-            data[k <= 0] -= adj0_f
-            data[k == 1] -= avg
-            data[k >= 2] -= adj1_f
-            var[:] = data.astype(var.dtype, copy=False)
+            data[k <= 0] -= np.float32(adj0_f)
+            data[k == 1] -= np.float32(avg)
+            data[k >= 2] -= np.float32(adj1_f)
+            var[:] = data
         log.info(
             f"Applied SSH dynamic adjust to {elev_nc.name}: "
             f"adj0={adj0_f:.4f} adj1={adj1_f:.4f} avg={avg:.4f}"
@@ -625,7 +706,9 @@ class DynamicAdjustProcessor(ForcingProcessor):
           (``staout_1``).
         - ``prev_param_nml``: Previous cycle's ``param.nml`` (for model
           start time).
-        - ``station_bp`` + ``diff_bp``: from FIX.
+        - ``station_bp`` + ``diff_bp``: from FIX (11 bias stations + datum).
+        - ``station_in``: the model's full station.in from FIX; a bias
+          station's staout_1 column is its row in this file + 1.
         - ``prev_avg_bias_file``: Scalar file produced by the previous
           cycle's run.
         - ``elev2d_th_nc``: ``elev2D.th.nc`` to adjust in-place.
@@ -648,6 +731,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
         prev_staout_1: Optional[Path] = None,
         prev_param_nml: Optional[Path] = None,
         station_bp: Optional[Path] = None,
+        station_in: Optional[Path] = None,
         diff_bp: Optional[Path] = None,
         prev_avg_bias_file: Optional[Path] = None,
         elev2d_th_nc: Optional[Path] = None,
@@ -667,6 +751,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
         self.prev_staout_1 = Path(prev_staout_1) if prev_staout_1 else None
         self.prev_param_nml = Path(prev_param_nml) if prev_param_nml else None
         self.station_bp = Path(station_bp) if station_bp else None
+        self.station_in = Path(station_in) if station_in else None
         self.diff_bp = Path(diff_bp) if diff_bp else None
         self.prev_avg_bias_file = (
             Path(prev_avg_bias_file) if prev_avg_bias_file else None
@@ -818,6 +903,14 @@ class DynamicAdjustProcessor(ForcingProcessor):
             )
             return None
 
+        if self.station_in is None or not self.station_in.exists():
+            warnings.append(
+                f"Model station.in not found ({self.station_in}); "
+                "cannot map staout_1 columns; today's bias = NaN"
+            )
+            return None
+        model_station_ids = read_station_in(self.station_in)
+
         # Override default station metadata with station.bp when provided.
         station_ids = list(self.stations)
         if self.station_bp and self.station_bp.exists():
@@ -840,7 +933,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
             return None
 
         model_staout = read_staout_1(
-            self.prev_staout_1, n_stations=len(station_ids),
+            self.prev_staout_1, n_stations=len(model_station_ids),
         )
         if model_staout is None or model_staout.shape[0] == 0:
             warnings.append(
@@ -885,6 +978,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
                 bias_start,
                 bias_end,
                 nan_threshold=self.nan_threshold,
+                model_station_ids=model_station_ids,
             )
         except Exception as exc:
             warnings.append(f"Bias computation failed: {exc}")
