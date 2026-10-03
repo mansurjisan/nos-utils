@@ -721,7 +721,9 @@ class DynamicAdjustProcessor(ForcingProcessor):
         - ``prev_staout_1``: Previous cycle's model SSH timeseries
           (``staout_1``).
         - ``prev_param_nml``: Previous cycle's ``param.nml`` (for model
-          start time).
+          start time). Not needed when ``model_start`` is given. MJ (10/03/26)
+        - ``model_start``: Time origin of ``prev_staout_1``; ops derives it as
+          today's nowcast start minus one day. MJ (10/03/26)
         - ``station_bp`` + ``diff_bp``: from FIX (11 bias stations + datum).
         - ``station_in``: the model's full station.in from FIX; a bias
           station's staout_1 column is its row in this file + 1.
@@ -748,6 +750,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
         obs_dir: Optional[Path] = None,
         prev_staout_1: Optional[Path] = None,
         prev_param_nml: Optional[Path] = None,
+        model_start: Optional[datetime] = None,
         station_bp: Optional[Path] = None,
         station_in: Optional[Path] = None,
         diff_bp: Optional[Path] = None,
@@ -770,6 +773,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
         )
         self.prev_staout_1 = Path(prev_staout_1) if prev_staout_1 else None
         self.prev_param_nml = Path(prev_param_nml) if prev_param_nml else None
+        self.model_start = model_start
         self.station_bp = Path(station_bp) if station_bp else None
         self.station_in = Path(station_in) if station_in else None
         self.diff_bp = Path(diff_bp) if diff_bp else None
@@ -929,7 +933,9 @@ class DynamicAdjustProcessor(ForcingProcessor):
                 f"({self.prev_staout_1}); today's bias = NaN"
             )
             return None
-        if self.prev_param_nml is None or not self.prev_param_nml.exists():
+        if self.model_start is None and (
+            self.prev_param_nml is None or not self.prev_param_nml.exists()
+        ):
             warnings.append(
                 "Previous cycle param.nml missing; today's bias = NaN"
             )
@@ -974,7 +980,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
             )
             return None
 
-        model_start = read_model_start(self.prev_param_nml)
+        model_start = self.model_start or read_model_start(self.prev_param_nml)
         if model_start is None:
             warnings.append(
                 f"Could not read start time from {self.prev_param_nml}; "
