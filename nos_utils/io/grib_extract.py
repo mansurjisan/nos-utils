@@ -75,6 +75,9 @@ class GRIBExtractor(ABC):
             ``{(variable, level): np.ndarray or None}`` for every requested
             pair (missing records map to ``None``, exactly as ``extract``).
         """
+        if last_record:
+            log.warning(f"{type(self).__name__} cannot take the last matching record; "
+                        f"using the first")
         return {
             (variable, level): self.extract(grib_file, variable, level, domain)
             for variable, level in var_levels
@@ -255,7 +258,9 @@ class Wgrib2Extractor(GRIBExtractor):
            ``-nxny`` sequence ``extract`` uses. Re-matching on the combined
            subset selects the exact same record (and the same first record
            for duplicate-record vars like PRATE) as matching on the full
-           file, so the returned array is byte-identical.
+           file, so the returned array is byte-identical. With
+           ``last_record`` the last matching record is decoded instead, by
+           its number in the combined file's inventory. MJ (10/02/26)
 
         The expensive decode of the ~127 MB source happens once instead of
         once per variable.
@@ -325,6 +330,10 @@ class Wgrib2Extractor(GRIBExtractor):
             parts = line.split(":")
             if len(parts) > 4 and parts[0].isdigit():
                 nums[(parts[3], parts[4])] = int(parts[0])
+        if r.returncode != 0 or not nums:
+            # Decoding the first record instead would silently give the instantaneous PRATE. MJ (10/02/26)
+            raise RuntimeError(f"wgrib2 -s failed on {grib_file.name} (rc={r.returncode}): "
+                               f"{r.stderr[:200]}")
         return nums
 
     def _extract_record_from(
@@ -410,6 +419,8 @@ class Wgrib2Extractor(GRIBExtractor):
                     if coords is not None:
                         return coords
                     # Fall back to evenly spaced points between the requested bounds. MJ (10/02/26)
+                    log.warning("Could not read the grid axes from wgrib2; using evenly spaced "
+                                "points between the requested bounds")
                     lons = np.linspace(lon_min, lon_max, nx)
                     lats = np.linspace(lat_min, lat_max, ny)
                     return lons, lats

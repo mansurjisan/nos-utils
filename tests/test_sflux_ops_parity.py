@@ -104,28 +104,7 @@ class TestOpsChainSelection:
         assert all(b - a == timedelta(hours=1) for a, b in zip(times, times[1:]))
         assert all(proc._parse_fhr(f) > 0 for f in files)
 
-    def test_short_list_is_extended_by_the_previous_day_list(self, tmp_path):
-        root = tmp_path / "gfs"
-        _full_tree(root)
-        for f in (root / "gfs.20260927" / "12" / "atmos").glob("*.f0[6-9]?"):
-            f.unlink()  # today's 12z stops at f059 MJ (10/02/26)
-        _touch(root, "20260926", 12, range(0, 100))
-        proc = _proc(root, tmp_path, phase="forecast")
-        files = proc.find_input_files()
-        times = [proc._parse_valid_time(f) for f in files]
-        assert times[-1] == datetime(2026, 9, 26, 12) + timedelta(hours=99)
-        assert all(b > a for a, b in zip(times, times[1:]))
-        tail = [_key(proc, f) for f in files if proc._parse_valid_time(f) > datetime(2026, 9, 29, 23)]
-        assert {c for c, _ in tail} == {datetime(2026, 9, 26, 12)}
-
-    def test_previous_day_list_alone_when_the_primary_is_empty(self, tmp_path):
-        root = tmp_path / "gfs"
-        _touch(root, "20260926", 12, range(7, 100))
-        proc = _proc(root, tmp_path, phase="forecast")
-        files = proc.find_input_files()
-        assert files and all(f.parents[1].name == "12" and "20260926" in str(f) for f in files)
-
-    def test_undersized_file_leaves_a_hole(self, tmp_path):
+    def test_undersized_file_is_not_used_and_its_hour_is_filled(self, tmp_path, caplog):
         root = tmp_path / "gfs"
         _full_tree(root)
         small = root / "gfs.20260927" / "12" / "atmos" / "gfs.t12z.pgrb2.0p25.f010"
@@ -133,7 +112,8 @@ class TestOpsChainSelection:
         proc = _proc(root, tmp_path, phase="forecast")
         proc.MIN_FILE_SIZE = 500
         files = proc.find_input_files()
-        assert small not in files and len(files) == 127 - 1
+        assert small not in files and len(files) == 127  # 22z comes from the 06z cycle MJ (10/02/26)
+        assert proc._ops_state["filled"] == [datetime(2026, 9, 27, 22)]
 
     def test_ops_size_floor_applies_to_0p25_only_under_the_flag(self, tmp_path):
         on = GFSProcessor(ForcingConfig.for_stofs_3d_atl(PDY, 12), tmp_path, tmp_path)
@@ -147,6 +127,146 @@ class TestOpsChainSelection:
         _full_tree(root)
         proc = _proc(root, tmp_path, gfs_ops_timeline=False)
         assert proc.find_input_files() == proc._build_file_list()
+
+
+def _all_leads_tree(root: Path, first=datetime(2026, 9, 25, 0), last=datetime(2026, 9, 27, 12),
+                    max_lead=120) -> None:
+    c = first
+    while c <= last:
+        _touch(root, c.strftime("%Y%m%d"), c.hour, range(0, max_lead + 1))
+        c += timedelta(hours=6)
+
+
+def _remove(root: Path, cycle: datetime, leads) -> None:
+    for fhr in leads:
+        (root / f"gfs.{cycle:%Y%m%d}" / f"{cycle:%H}" / "atmos"
+         / f"gfs.t{cycle:%H}z.pgrb2.0p25.f{fhr:03d}").unlink(missing_ok=True)
+
+
+class _SourceExtractor:
+    """Grid 2x3; every field holds the valid time of its source file, in hours since 2026-01-01. MJ (10/02/26)"""
+
+    def __init__(self, proc_ref):
+        self.proc_ref = proc_ref
+
+    def get_grid(self, f, domain):
+        return np.arange(3.0), np.arange(2.0)
+
+    def extract_many(self, f, var_levels, domain, **kw):
+        h = (self.proc_ref[0]._parse_valid_time(f) - datetime(2026, 1, 1)).total_seconds() / 3600
+        return {vl: np.full((2, 3), h, dtype=np.float32) for vl in var_levels}
+
+
+def _process(root: Path, tmp_path: Path, phase: str):
+    from netCDF4 import Dataset
+    proc = _proc(root, tmp_path, phase=phase)
+    ref = [proc]
+    proc._extractor = _SourceExtractor(ref)
+    res = proc.process()
+    with Dataset(str(tmp_path / "out" / "sflux_air_1.0001.nc")) as ds:
+        base = datetime(2026, 9, 26)
+        times = [base + timedelta(days=float(t)) for t in ds["time"][:]]
+        values = np.asarray(ds["uwind"][:, 0, 0])
+    return res, times, values
+
+
+class TestDegradedInput:
+    CYCLE = datetime(2026, 9, 27, 12)
+
+    @staticmethod
+    def _hourly(times):
+        return all(b - a == timedelta(hours=1) for a, b in zip(times, times[1:]))
+
+    def test_complete_chain_reports_complete_and_warns_nothing(self, tmp_path, caplog):
+        root = tmp_path / "gfs"
+        _all_leads_tree(root)
+        res, times, _ = _process(root, tmp_path, "forecast")
+        assert times[-1] == self.CYCLE + timedelta(hours=99) and len(times) == 103
+        md = res.metadata
+        assert md["gfs_ops_chain_complete"] and md["gfs_ops_qc_pass"]
+        assert md["gfs_filled_hours"] == [] and md["gfs_held_hours"] == []
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_gap_inside_the_chain_is_filled_from_the_next_older_cycle(self, tmp_path, caplog):
+        root = tmp_path / "gfs"
+        _all_leads_tree(root)
+        _remove(root, datetime(2026, 9, 26, 18), range(1, 7))  # valid 19z-00z gone MJ (10/02/26)
+        res, times, values = _process(root, tmp_path, "nowcast")
+        assert self._hourly(times) and times[0] == datetime(2026, 9, 26, 9)
+        assert times[-1] == self.CYCLE + timedelta(hours=3)
+        md = res.metadata
+        assert not md["gfs_ops_chain_complete"] and md["gfs_ops_qc_pass"]  # 118 of 124 records MJ (10/02/26)
+        assert md["gfs_filled_hours"] == [f"2026092619", "2026092620", "2026092621",
+                                          "2026092622", "2026092623", "2026092700"]
+        assert any("filled from older cycles" in r.message and "0926 19z" in r.message
+                   for r in caplog.records if r.levelname == "WARNING")
+        assert any("GFS ops chain incomplete" in w for w in res.warnings)
+        i = times.index(datetime(2026, 9, 26, 19))
+        assert values[i] == (datetime(2026, 9, 26, 19) - datetime(2026, 1, 1)).total_seconds() / 3600
+
+    @pytest.mark.parametrize("last_lead, n_records", [(70, 95), (50, 75)])
+    def test_truncated_12z_runs_to_the_phase_end_from_the_06z_cycle(
+            self, tmp_path, caplog, last_lead, n_records):
+        root = tmp_path / "gfs"
+        _all_leads_tree(root)
+        _remove(root, self.CYCLE, range(last_lead + 1, 100))
+        proc = _proc(root, tmp_path, phase="forecast")
+        files = proc.find_input_files()
+        assert len([f for f in files if proc._parse_valid_time(f) >= datetime(2026, 9, 26, 12)
+                    and _key(proc, f)[0] == self.CYCLE]) == last_lead
+        res, times, _ = _process(root, tmp_path / "run", "forecast")
+        assert self._hourly(times) and times[-1] == self.CYCLE + timedelta(hours=99)
+        md = res.metadata
+        assert not md["gfs_ops_qc_pass"] and not md["gfs_ops_chain_complete"]
+        assert len(md["gfs_filled_hours"]) == 99 - last_lead and md["gfs_held_hours"] == []
+        filled_from = {_key(proc, f)[0] for f in proc.find_input_files()
+                       if proc._parse_valid_time(f) > self.CYCLE + timedelta(hours=last_lead)}
+        assert filled_from == {datetime(2026, 9, 27, 6)}
+        assert any("would ship the previous day's file" in r.message for r in caplog.records)
+
+    def test_list_under_the_threshold_with_two_cycles_missing_is_still_full(self, tmp_path, caplog):
+        root = tmp_path / "gfs"
+        _all_leads_tree(root)
+        for cyc in (datetime(2026, 9, 27, 6), self.CYCLE):
+            _remove(root, cyc, range(0, 121))
+        res, times, _ = _process(root, tmp_path, "forecast")
+        assert self._hourly(times) and times[0] == datetime(2026, 9, 27, 9)
+        assert times[-1] == self.CYCLE + timedelta(hours=99)
+        assert not res.metadata["gfs_ops_qc_pass"] and res.metadata["gfs_held_hours"] == []
+        assert len(res.metadata["gfs_filled_hours"]) == 103
+
+    def test_data_that_ends_early_is_held_to_the_phase_end(self, tmp_path, caplog):
+        root = tmp_path / "gfs"
+        _all_leads_tree(root, max_lead=60)
+        res, times, values = _process(root, tmp_path, "forecast")
+        end = self.CYCLE + timedelta(hours=99)
+        assert self._hourly(times) and times[-1] == end
+        held = res.metadata["gfs_held_hours"]
+        assert held[0] == "2026093001" and held[-1] == "2026100115" and len(held) == 39
+        last_real = times.index(datetime(2026, 9, 30, 0))
+        assert (values[last_real + 1:] == values[last_real]).all()
+        assert any("holding the last record for 0930 01z..1001 15z (39 h)" in r.message
+                   for r in caplog.records)
+        assert any("GFS data ends early" in w for w in res.warnings)
+        assert not res.metadata["gfs_ops_chain_complete"]
+
+    def test_empty_chain_is_filled_from_yesterday(self, tmp_path):
+        root = tmp_path / "gfs"
+        _all_leads_tree(root, last=datetime(2026, 9, 26, 12))
+        res, times, _ = _process(root, tmp_path, "forecast")
+        assert self._hourly(times) and times[-1] == self.CYCLE + timedelta(hours=99)
+        # hourly leads stop at f120 = 10-01 12z; the last 3 hours are held MJ (10/02/26)
+        assert res.metadata["gfs_held_hours"] == ["2026100113", "2026100114", "2026100115"]
+        assert res.metadata["gfs_unfilled_hours"] == res.metadata["gfs_held_hours"]
+
+    def test_nowcast_window_is_complete_when_only_the_forecast_is_short(self, tmp_path):
+        root = tmp_path / "gfs"
+        _all_leads_tree(root)
+        _remove(root, self.CYCLE, range(4, 100))
+        res, times, _ = _process(root, tmp_path, "nowcast")
+        md = res.metadata
+        assert md["gfs_ops_chain_complete"] and not md["gfs_ops_qc_pass"]
+        assert md["gfs_filled_hours"] == [] and times[-1] == self.CYCLE + timedelta(hours=3)
 
 
 class TestLastPrateRecord:
@@ -359,3 +479,47 @@ class TestConfigGating:
         atm = "forcing:\n  atmospheric:\n    hrrr:\n      rotate_winds: maybe\n"
         with pytest.raises(ValueError):
             _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", mode="standalone", atm=atm)
+
+
+class TestSilentFallbacks:
+    def test_inventory_failure_raises_instead_of_decoding_the_first_prate(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(
+            cmd, 1, "", "boom"))
+        with pytest.raises(RuntimeError, match="wgrib2 -s failed"):
+            _ext()._last_record_numbers(tmp_path / "c.grb2")
+
+    def test_base_extract_many_warns_when_last_record_is_unsupported(self, caplog):
+        from nos_utils.io.grib_extract import CfgribExtractor, GRIBExtractor
+
+        class Plain(GRIBExtractor):
+            def extract(self, *a, **k):
+                return None
+
+            def get_grid(self, *a, **k):
+                return None
+
+        Plain().extract_many(Path("f"), [("PRATE", "surface")], (0, 1, 0, 1), last_record=True)
+        assert any("last matching record" in r.message for r in caplog.records)
+        assert CfgribExtractor.extract_many is GRIBExtractor.extract_many  # cfgrib inherits it. MJ (10/02/26)
+
+    def test_get_grid_warns_when_the_axes_cannot_be_read(self, tmp_path, monkeypatch, caplog):
+        def fake_run(cmd, **kw):
+            if "-small_grib" in cmd:
+                Path(cmd[-1]).write_bytes(b"x")
+            elif "-nxny" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "1:0:(4 x 3)\n", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        lons, _ = _ext().get_grid(tmp_path / "f.grib2", (-80.0, -70.0, 25.0, 35.0))
+        assert lons[0] == -80.0
+        assert any("evenly spaced" in r.message for r in caplog.records)
+
+
+def test_factory_flags_follow_the_final_nws():
+    atl = ForcingConfig.for_stofs_3d_atl(PDY, 12, nws=4)
+    assert atl.gfs_ops_timeline is False and atl.hrrr_rotate_winds is True
+    assert atl.hrrr_small_grib is False
+    kept = ForcingConfig.for_stofs_3d_atl(PDY, 12, nws=4, gfs_ops_timeline=True)
+    assert kept.gfs_ops_timeline is True and kept.hrrr_rotate_winds is True
+    assert ForcingConfig.for_stofs_3d_atl(PDY, 12).gfs_ops_timeline is True

@@ -119,9 +119,10 @@ class ForcingConfig:
     # file; the grid is unchanged. Native-grid extraction only. MJ (10/02/26)
     hrrr_small_grib: bool = False
     # Ops STOFS-3D-ATL GFS sflux chain: valid hour V takes the newest cycle with lead 1-6 h (yesterday
-    # 06z f006, 12z/18z/00z/06z f001-f006, then the cycle's f001-f099), 500 MB size check and the
-    # previous-day 12z list as backup. Off keeps the oldest-cycle-first search of SECOFS and the
-    # coupled paths. MJ (10/02/26)
+    # 06z f006, 12z/18z/00z/06z f001-f006, then the cycle's f001-f099) and a 500 MB size check.
+    # Hours the chain misses are filled from the newest older cycle and a trailing gap holds the
+    # last record, both with a warning (ops would ship the previous day's file). Off keeps the
+    # oldest-cycle-first search of SECOFS and the coupled paths. MJ (10/02/26)
     gfs_ops_timeline: bool = False
 
     # --- DATM input grid (UFS-Coastal nws=4) ---
@@ -536,10 +537,6 @@ class ForcingConfig:
             # HRRR domain (different from GFS/model domain)
             hrrr_lon_min=-98.5, hrrr_lon_max=-49.5,
             hrrr_lat_min=5.5, hrrr_lat_max=50.0,
-            # Ops sflux parity (standalone nws=2). MJ (10/02/26)
-            gfs_ops_timeline=True,
-            hrrr_rotate_winds=False,
-            hrrr_small_grib=True,
             # OBC settings
             obc_roi_2d={"x1": 2805, "x2": 2923, "y1": 1598, "y2": 2325},
             obc_roi_3d={"x1": 482, "x2": 600, "y1": 94, "y2": 821},
@@ -574,6 +571,12 @@ class ForcingConfig:
             tide_nodal_reference="cycle",
         )
         defaults.update(overrides)
+        # Ops sflux parity applies to the standalone files only (nws=2), as in from_yaml;
+        # explicit overrides win. MJ (10/02/26)
+        ops_sflux = defaults.get("nws", 2) == 2
+        for key, value in (("gfs_ops_timeline", ops_sflux), ("hrrr_rotate_winds", not ops_sflux),
+                           ("hrrr_small_grib", ops_sflux)):
+            defaults.setdefault(key, value)
         return cls(**defaults)
 
     @classmethod
