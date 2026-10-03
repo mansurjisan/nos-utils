@@ -200,13 +200,12 @@ class StLawrenceProcessor(ForcingProcessor):
         # source was, as ops runs gen_temp_1 separately from the flux step
         # (`rm -f TEM_1.th` in between). MJ (09/28/26)
         temp_from_sflux: Optional[List[float]] = None
-        if self.sflux_rad_file and self.sflux_rad_file.exists():
+        temp_file = self._sflux_temp_file()
+        if temp_file is not None:
             try:
-                temp_from_sflux = self._temp_from_sflux(
-                    self.sflux_rad_file, datevectors_full
-                )
+                temp_from_sflux = self._temp_from_sflux(temp_file, datevectors_full)
             except Exception as exc:
-                warnings.append(f"Failed to read sflux rad {self.sflux_rad_file}: {exc}")
+                warnings.append(f"Failed to read sflux {temp_file}: {exc}")
         if series is not None and temp_from_sflux is not None:
             series.temp_c = temp_from_sflux
             series.temp_from_sflux = True
@@ -270,7 +269,7 @@ class StLawrenceProcessor(ForcingProcessor):
                 "flux_source": source_used,
                 "csv_used": str(csv_path) if csv_path and source_used
                 and source_used.startswith("obs") else None,
-                "sflux_used": str(self.sflux_rad_file) if self.sflux_rad_file else None,
+                "sflux_used": str(temp_file) if temp_file else None,
                 "n_timesteps": len(series.seconds_from_start) if series else 0,
             },
         )
@@ -493,6 +492,24 @@ class StLawrenceProcessor(ForcingProcessor):
         )
 
     # ----------------------------------------------------- sflux temperature
+
+    def _sflux_temp_file(self) -> Optional[Path]:
+        """File that holds ``stmp``, starting from ``sflux_rad_file``.
+
+        Ops writes every variable to each of its air/prc/rad files, so its rad
+        file carries stmp. The sflux writer here splits them (stmp lives in
+        air only), so a rad file without stmp is swapped for its air sibling.
+        MJ (10/02/26)
+        """
+        rad = self.sflux_rad_file
+        if rad is None or not rad.exists():
+            return None
+        if HAS_NETCDF4:
+            with Dataset(str(rad)) as ds:
+                if "stmp" in ds.variables:
+                    return rad
+        air = rad.with_name(rad.name.replace("rad", "air"))
+        return air if air != rad and air.exists() else rad
 
     def _temp_from_sflux(
         self,
