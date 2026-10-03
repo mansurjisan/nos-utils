@@ -563,7 +563,6 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
-            river_ops_static=True,
             # St. Lawrence river forcing — always on for STOFS-3D-ATL.
             # Ops v3.1 WCOSS2 layout: $COMINlaw/<pdy>/can_streamgauge/
             # 02OA016_hydrometric.csv, then the day-of-year climatology. MJ (09/28/26)
@@ -580,8 +579,9 @@ class ForcingConfig:
         # Ops sflux parity applies to the standalone files only (nws=2), as in from_yaml;
         # explicit overrides win. MJ (10/02/26)
         ops_sflux = defaults.get("nws", 2) == 2
+        # Ops river files: standalone only (coupled build lacks SH_MEM_COMM/PREC_EVAP). MJ (10/03/26)
         for key, value in (("gfs_ops_timeline", ops_sflux), ("hrrr_rotate_winds", not ops_sflux),
-                           ("hrrr_small_grib", ops_sflux)):
+                           ("hrrr_small_grib", ops_sflux), ("river_ops_static", ops_sflux)):
             defaults.setdefault(key, value)
         return cls(**defaults)
 
@@ -623,7 +623,6 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
-            river_ops_static=True,
             # Ops v3.1 WCOSS2 layout: $COMINlaw/<pdy>/can_streamgauge/
             # 02OA016_hydrometric.csv, then the day-of-year climatology. MJ (09/28/26)
             st_lawrence_enabled=True,
@@ -898,11 +897,12 @@ class ForcingConfig:
         _adt_wt = Path(_adt_wt) if _adt_wt else None
 
         # Ops river inputs (static FIX source_sink.in / msource.th / vsink.th, ops source
-        # order): ATL by name, yaml forcing.river.ops_static_files overrides. MJ (10/03/26)
+        # order): standalone (nws=2) ATL by name, yaml forcing.river.ops_static_files
+        # overrides. MJ (10/03/26)
         _river_ops = _strict_bool(
             river.get("ops_static_files") if isinstance(river, dict) else None,
             "forcing.river.ops_static_files",
-            str(_sys.get("name", "")).startswith("stofs_3d_atl"))
+            nws == 2 and str(_sys.get("name", "")).startswith("stofs_3d_atl"))
 
         # NWM river product and target counts
         river_product = river.get("primary", "nwm") if isinstance(river, dict) else "nwm"
