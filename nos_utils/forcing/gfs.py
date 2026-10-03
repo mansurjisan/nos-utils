@@ -48,6 +48,8 @@ class GFSProcessor(ForcingProcessor):
         "sflux": 10_000_000,  # 10 MB (surface-only, ~30 MB typical)
     }
     MIN_FILE_SIZE = 40_000_000  # fallback: 40 MB
+    # stofs_3d_atl_create_surface_forcing_gfs.sh skips 0.25 deg files below this. MJ (10/02/26)
+    OPS_MIN_FILE_SIZE = 500_000_000
 
     # GRIB2 variable mapping: internal name -> (GRIB2 name, level)
     GRIB2_VARIABLES = {
@@ -112,6 +114,8 @@ class GFSProcessor(ForcingProcessor):
         self.direct_datm = direct_datm
         # Set resolution-appropriate file size threshold
         self.MIN_FILE_SIZE = self.MIN_FILE_SIZE_BY_RES.get(resolution, 40_000_000)
+        if config.gfs_ops_timeline and resolution == "0p25":
+            self.MIN_FILE_SIZE = self.OPS_MIN_FILE_SIZE
 
     @property
     def extractor(self) -> GRIBExtractor:
@@ -438,6 +442,9 @@ class GFSProcessor(ForcingProcessor):
         Searches multiple GFS cycles to cover the full nowcast+forecast window.
         If the primary list is incomplete, supplements with backup files.
         """
+        if self.config.gfs_ops_timeline:
+            return self._build_ops_file_list()
+
         primary = self._build_file_list()
 
         # Target: enough files for nowcast + forecast (hourly)
@@ -456,6 +463,89 @@ class GFSProcessor(ForcingProcessor):
             return merged
 
         return primary
+
+    @staticmethod
+    def _ops_chain_cycle(valid: datetime, anchor: datetime) -> Tuple[datetime, int]:
+        """Cycle and lead the ops chain reads for valid hour *valid*.
+
+        Up to *anchor* (the model cycle) each hour comes from the newest GFS
+        cycle that has it at lead 1-6 h (06z f006 for 12z itself, never an f000
+        analysis, which carries no radiation); after it, from the *anchor* cycle's
+        own forecast. MJ (10/02/26)
+        """
+        if valid > anchor:
+            return anchor, int((valid - anchor).total_seconds() // 3600)
+        before = valid - timedelta(hours=1)
+        cyc_dt = before.replace(hour=before.hour - before.hour % 6,
+                                minute=0, second=0, microsecond=0)
+        return cyc_dt, int((valid - cyc_dt).total_seconds() // 3600)
+
+    def _ops_chain_file(self, cyc_dt: datetime, fhr: int) -> Optional[Path]:
+        """Existing, size-checked file of cycle *cyc_dt* at lead *fhr*, else None. MJ (10/02/26)"""
+        cyc = cyc_dt.hour
+        if self.resolution == "sflux":
+            name = f"gfs.t{cyc:02d}z.sfluxgrbf{fhr:03d}.grib2"
+        else:
+            name = f"gfs.t{cyc:02d}z.pgrb2.{self.resolution}.f{fhr:03d}"
+        cyc_root = self.input_path / f"gfs.{cyc_dt.strftime('%Y%m%d')}" / f"{cyc:02d}"
+        for d in (cyc_root / "atmos", cyc_root):
+            f = d / name
+            if not f.exists():
+                continue
+            if self.MIN_FILE_SIZE and not self.validate_file_size(f, self.MIN_FILE_SIZE):
+                log.warning(f"Skipping undersized file: {f.name}")
+                return None
+            return f
+        return None
+
+    def _ops_chain_list(self, anchor: datetime, v_start: datetime, v_end: datetime) -> List[Path]:
+        files: List[Path] = []
+        valid = v_start
+        while valid <= v_end:
+            cyc_dt, fhr = self._ops_chain_cycle(valid, anchor)
+            f = self._ops_chain_file(cyc_dt, fhr)
+            if f is not None:
+                files.append(f)
+            valid += timedelta(hours=1)
+        return files
+
+    def _build_ops_file_list(self) -> List[Path]:
+        """File list of stofs_3d_atl_create_surface_forcing_gfs.sh.
+
+        List 1 is the chain anchored at the model cycle; list 2, the backup, is
+        the same chain anchored 24 h earlier. As in ops, list 2 only extends a
+        list 1 shorter than forecast_hours + 1 files (ops N_list_target=97), and
+        list 2 alone is used when list 1 is empty. Where ops labels the merged
+        records by position, this keeps each file's true valid time. Both lists
+        start 3 h before the nowcast start, the usual pre-window buffer.
+        MJ (10/02/26)
+        """
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+            timedelta(hours=self.config.cyc)
+        nowcast_start = self.time_hotstart or \
+            cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        v_start = nowcast_start - timedelta(hours=3)
+        v_end = cycle_dt + timedelta(hours=self.config.forecast_hours + 3)
+
+        list_1 = self._ops_chain_list(cycle_dt, v_start, v_end)
+        backup_anchor = cycle_dt - timedelta(hours=24)
+        list_2 = self._ops_chain_list(
+            backup_anchor, v_start,
+            min(v_end, backup_anchor + timedelta(hours=self.config.forecast_hours + 3)),
+        )
+        n_target = self.config.forecast_hours + 1
+
+        if len(list_1) > 1:
+            if len(list_1) < n_target and len(list_2) > len(list_1):
+                log.warning(f"Ops GFS list 1 short ({len(list_1)}/{n_target}), "
+                            f"extending with the previous-day list")
+                last = self._parse_valid_time(list_1[-1])
+                return list_1 + [f for f in list_2 if self._parse_valid_time(f) > last]
+            return list_1
+        if len(list_2) > 1:
+            log.warning("Ops GFS list 1 empty, using the previous-day list")
+            return list_2
+        return []
 
     def _build_file_list(self) -> List[Path]:
         """
@@ -755,11 +845,13 @@ class GFSProcessor(ForcingProcessor):
             # One wgrib2 pass extracts every variable for this file. The
             # records, levels and arrays are identical to the previous
             # per-variable extraction; only the (large) file decode is
-            # shared instead of repeated per variable.
+            # shared instead of repeated per variable. Ops takes the last PRATE record
+            # (the period mean). MJ (10/02/26)
             extracted_recs = self.extractor.extract_many(
                 gfs_file,
                 [(grib_var, level) for _, grib_var, level in var_levels],
                 domain,
+                **({"last_record": True} if self.config.gfs_ops_timeline else {}),
             )
 
             # Append per variable — fill array if missing to keep aligned
