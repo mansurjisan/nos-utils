@@ -287,7 +287,7 @@ class TestComputeBias:
         model_staout = np.column_stack([secs, model_vals])
         avg, per = compute_bias(
             obs, model_staout, start,
-            [sid], {}, start, end,
+            [sid], {sid: 0.0}, start, end,
             model_station_ids=[sid],
         )
         assert np.isclose(avg, 0.3, atol=0.05)
@@ -324,7 +324,7 @@ class TestBiasColumnMapping:
         obs = _flat_bundle({"A": 0.1, "B": 0.2}, self.START - timedelta(hours=1), self.END + timedelta(hours=1))
         staout = _hourly_staout([9.0, 0.5, 9.0, 0.9], self.START, self.END + timedelta(hours=1))
         avg, per = compute_bias(
-            obs, staout, self.START, ["A", "B"], {}, self.START, self.END,
+            obs, staout, self.START, ["A", "B"], {"A": 0.0, "B": 0.0}, self.START, self.END,
             model_station_ids=["x", "B", "y", "A"],
         )
         assert per["A"] == pytest.approx(0.8) and per["B"] == pytest.approx(0.3)
@@ -334,7 +334,7 @@ class TestBiasColumnMapping:
         obs = _flat_bundle({"A": 0.0}, self.START - timedelta(hours=1), self.END + timedelta(hours=1))
         staout = _hourly_staout([0.2, 0.7], self.START, self.END + timedelta(hours=1))
         avg, _ = compute_bias(
-            obs, staout, self.START, ["A"], {}, self.START, self.END,
+            obs, staout, self.START, ["A"], {"A": 0.0}, self.START, self.END,
             model_station_ids=["A", "A"],
         )
         assert avg == pytest.approx(0.2)
@@ -343,7 +343,7 @@ class TestBiasColumnMapping:
         obs = _flat_bundle({"A": 0.1, "B": 0.2}, self.START - timedelta(hours=1), self.END + timedelta(hours=1))
         staout = _hourly_staout([0.5, 9.0], self.START, self.END + timedelta(hours=1))
         avg, per = compute_bias(
-            obs, staout, self.START, ["A", "B"], {}, self.START, self.END,
+            obs, staout, self.START, ["A", "B"], {"A": 0.0, "B": 0.0}, self.START, self.END,
             model_station_ids=["A", "other"],
         )
         assert list(per) == ["A"] and avg == pytest.approx(0.4)
@@ -353,7 +353,7 @@ class TestBiasColumnMapping:
         staout = _hourly_staout([0.5], self.START, self.END + timedelta(hours=1))
         for ids in (None, [], ["unrelated"]):
             avg, per = compute_bias(
-                obs, staout, self.START, ["A"], {}, self.START, self.END,
+                obs, staout, self.START, ["A"], {"A": 0.0}, self.START, self.END,
                 model_station_ids=ids,
             )
             assert np.isnan(avg) and per == {}
@@ -362,16 +362,34 @@ class TestBiasColumnMapping:
         obs = _flat_bundle({"A": 0.1}, self.START - timedelta(hours=1), self.END + timedelta(hours=1))
         staout = _hourly_staout([0.5], self.START, self.END + timedelta(hours=1))
         avg, _ = compute_bias(
-            obs, staout, self.START, ["A"], {}, self.START, self.END,
+            obs, staout, self.START, ["A"], {"A": 0.0}, self.START, self.END,
             model_station_ids=["p", "q", "A"],
         )
         assert np.isnan(avg)
+
+    def test_station_with_obs_but_no_datum_entry_fails_like_ops(self):
+        obs = _flat_bundle({"A": 0.1, "B": 0.2}, self.START - timedelta(hours=1), self.END + timedelta(hours=1))
+        staout = _hourly_staout([0.5, 0.6], self.START, self.END + timedelta(hours=1))
+        with pytest.raises(ValueError, match="B"):
+            compute_bias(
+                obs, staout, self.START, ["A", "B"], {"A": 0.0}, self.START, self.END,
+                model_station_ids=["A", "B"],
+            )
+
+    def test_datum_offset_is_added_to_obs(self):
+        obs = _flat_bundle({"A": 0.1}, self.START - timedelta(hours=1), self.END + timedelta(hours=1))
+        staout = _hourly_staout([0.5], self.START, self.END + timedelta(hours=1))
+        avg, _ = compute_bias(
+            obs, staout, self.START, ["A"], {"A": -0.3}, self.START, self.END,
+            model_station_ids=["A"],
+        )
+        assert avg == pytest.approx(0.7)
 
     def test_average_rounded_to_three_decimals_like_ops(self):
         obs = _flat_bundle({"A": 0.0}, self.START - timedelta(hours=1), self.END + timedelta(hours=1))
         staout = _hourly_staout([0.03849], self.START, self.END + timedelta(hours=1))
         avg, _ = compute_bias(
-            obs, staout, self.START, ["A"], {}, self.START, self.END,
+            obs, staout, self.START, ["A"], {"A": 0.0}, self.START, self.END,
             model_station_ids=["A"],
         )
         assert avg == 0.038
@@ -458,7 +476,8 @@ class TestProcessorOpsObsEndToEnd:
     # staout_1 columns follow these station.in rows; filler rows hold a decoy 9.0.
     ROWS = ["f1", "8665530", "f2", "f3", "8670870", "f4"]
 
-    def _scene(self, tmp_path, *, short_for=None, station_in=True, adj0="-0.037\n"):
+    def _scene(self, tmp_path, *, short_for=None, station_in=True, adj0="-0.037\n",
+               diff_ids=("8670870", "8665530"), staout_rows=None):
         obs = tmp_path / "dcom" / "coops_waterlvlobs"
         obs.mkdir(parents=True)
         times = pd.date_range(self.START - timedelta(hours=1), self.END + timedelta(hours=1), freq="6min")
@@ -471,7 +490,12 @@ class TestProcessorOpsObsEndToEnd:
         # model: 8670870 = 0.5004 (bias 0.3004), 8665530 = 0.3002 (bias 0.2002)
         cols = {"f1": 9.0, "8665530": 0.3002, "f2": 9.0, "f3": 9.0, "8670870": 0.5004, "f4": 9.0}
         staout = tmp_path / "staout_1"
-        np.savetxt(staout, _hourly_staout([cols[r] for r in self.ROWS], self.START, self.END + timedelta(hours=24)))
+        np.savetxt(staout, _hourly_staout([cols[r] for r in self.ROWS], self.START, self.END + timedelta(hours=24))[:staout_rows])
+        diff = tmp_path / "diff.bp"
+        diff.write_text(
+            "bpfile\n%d\n" % len(diff_ids or ())
+            + "".join(f"{i + 1} 0 0 0.0 !{sid}\n" for i, sid in enumerate(diff_ids or ()))
+        )
         nml = tmp_path / "param.nml"
         nml.write_text("&CORE\n start_year = 2026\n start_month = 9\n start_day = 29\n start_hour = 12\n/\n")
         sin = tmp_path / "station.in"
@@ -491,7 +515,9 @@ class TestProcessorOpsObsEndToEnd:
             cfg, input_path=out, output_path=out, obs_dir=obs,
             prev_staout_1=staout, prev_param_nml=nml,
             station_in=sin if station_in else None,
+            diff_bp=diff if diff_ids is not None else None,
             prev_avg_bias_file=prev, elev2d_th_nc=elev,
+            archive_prefix="stofs_3d_atl.t12z",
             stations=["8670870", "8665530"], station_lons=[0.0, 0.0], station_lats=[0.0, 0.0],
         )
         return proc, elev, out
@@ -505,6 +531,8 @@ class TestProcessorOpsObsEndToEnd:
         res = proc.process()
         assert res.success, res.errors
         assert (out / "average_bias_today").read_text() == "0.250\n"
+        assert (out / "stofs_3d_atl.t12z.avg_bias").read_text() == "0.250\n"
+        assert {f.name for f in res.output_files} >= {"average_bias_today", "stofs_3d_atl.t12z.avg_bias"}
         assert res.metadata["adj1"] == 0.25
         one = np.float32(1.0)
         np.testing.assert_array_equal(
@@ -525,7 +553,39 @@ class TestProcessorOpsObsEndToEnd:
         assert res.success, res.errors
         assert any("station.in" in w for w in res.warnings)
         assert (out / "average_bias_today").read_text().strip() == "nan"
+        assert (out / "stofs_3d_atl.t12z.avg_bias").read_text() == "0.0\n"
         np.testing.assert_allclose(self._series(elev), [1.037, 1.0185, 1.0, 1.0, 1.0], atol=1e-6)
+
+    def _assert_nan_bias(self, res, out, elev, needle):
+        assert res.success, res.errors
+        assert any(needle in w for w in res.warnings), res.warnings
+        assert (out / "average_bias_today").read_text() == "nan\n"
+        assert (out / "stofs_3d_atl.t12z.avg_bias").read_text() == "0.0\n"
+        np.testing.assert_allclose(self._series(elev), [1.037, 1.0185, 1.0, 1.0, 1.0], atol=1e-6)
+
+    def test_missing_diff_bp_gives_nan_bias(self, tmp_path):
+        proc, elev, out = self._scene(tmp_path, diff_ids=None)
+        self._assert_nan_bias(proc.process(), out, elev, "diff.bp")
+
+    def test_unreadable_diff_bp_gives_nan_bias(self, tmp_path):
+        proc, elev, out = self._scene(tmp_path, diff_ids=())
+        self._assert_nan_bias(proc.process(), out, elev, "diff.bp")
+
+    def test_station_missing_from_diff_bp_gives_nan_bias(self, tmp_path):
+        proc, elev, out = self._scene(tmp_path, diff_ids=("8670870",))
+        self._assert_nan_bias(proc.process(), out, elev, "8665530")
+
+    def test_small_staout_gives_nan_bias(self, tmp_path):
+        proc, elev, out = self._scene(tmp_path, staout_rows=5)
+        self._assert_nan_bias(proc.process(), out, elev, "staout_1 too small (<10000 bytes)")
+
+    def test_no_archive_prefix_writes_only_average_bias_today(self, tmp_path):
+        proc, _, out = self._scene(tmp_path)
+        proc.archive_prefix = None
+        res = proc.process()
+        assert (out / "average_bias_today").exists()
+        assert not list(out.glob("*.avg_bias"))
+        assert all(f.suffix != ".avg_bias" for f in res.output_files)
 
 
 class TestObsDirResolution:

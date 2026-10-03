@@ -568,6 +568,7 @@ def test_dynamic_adjust_station_in_resolution(tmp_path, monkeypatch):
 
     orch._run_dynamic_adjust(tmp_path)
     assert seen["station_in"] is None
+    assert seen["archive_prefix"] == "stofs_3d_atl_ufs.t12z"
 
     (fix / "stofs_3d_atl_ufs_station.in").write_text("x")
     orch._run_dynamic_adjust(tmp_path)

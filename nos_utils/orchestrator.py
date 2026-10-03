@@ -830,6 +830,7 @@ class PrepOrchestrator:
             elev2d_th_nc=output_dir / "elev2D.th.nc",
             bias_window_days=self.config.dynamic_adjust_window_days,
             start_offset_hours=offset,
+            archive_prefix=f"{self.run_name}.t{self.config.cyc:02d}z",
         )
         return proc.process()
 

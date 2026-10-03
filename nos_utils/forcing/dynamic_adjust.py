@@ -89,6 +89,9 @@ GAP_MULTIPLIER = 10
 # create_npz_NOAA.py skips a station whose dcom file has fewer lines than this.
 MIN_OBS_LINES = 10
 
+# Ops only links the previous staout_1 into the bias step when it is at least this large.
+MIN_STAOUT_BYTES = 10000
+
 
 # =============================================================================
 # Data containers
@@ -470,7 +473,8 @@ def compute_bias(
     ``model_station_ids`` lists the model station.in IDs in row order; each bias
     station reads staout_1 column ``row + 1`` of its first match, as ops
     ``derive_bias.py``. A station missing from it is skipped (no positional
-    fallback). Returns (average_bias, per_station_bias), the average rounded to
+    fallback). A station with observations but no ``datum_offsets`` entry
+    raises ``ValueError``, as ops fails the whole bias computation. Returns (average_bias, per_station_bias), the average rounded to
     3 decimals as ops writes it; when no station has enough data, returns
     (``float('nan')``, {}).
     """
@@ -518,8 +522,10 @@ def compute_bias(
         sub_elev = obs.elev[sta_mask][order]
 
         # Convert observations from NAVD88 → xGEOID (add datum offset).
-        offset = datum_offsets.get(sid, 0.0)
-        sub_elev_adj = sub_elev + offset
+        # Ops derive_bias.py fails outright when diff.bp lacks the station. MJ (10/02/26)
+        if sid not in datum_offsets:
+            raise ValueError(f"Station {sid} has observations but no entry in diff.bp")
+        sub_elev_adj = sub_elev + datum_offsets[sid]
 
         # Interpolate obs onto the selected model time vector.
         try:
@@ -716,6 +722,8 @@ class DynamicAdjustProcessor(ForcingProcessor):
     Writes:
         - ``average_bias_today``: Scalar bias (float on a single line)
           into ``output_path`` for next cycle.
+        - ``<archive_prefix>.avg_bias``: the ops archive of adj1 (3-decimal
+          bias, ``0.0`` when today's bias is NaN), read as adj0 next cycle.
         - Adjusted ``elev2D.th.nc`` at ``elev2d_th_nc`` path.
     """
 
@@ -741,9 +749,11 @@ class DynamicAdjustProcessor(ForcingProcessor):
         bias_window_days: int = 2,
         nan_threshold: float = DEFAULT_NAN_THRESHOLD,
         start_offset_hours: int = 0,
+        archive_prefix: Optional[str] = None,
     ) -> None:
         super().__init__(config, input_path, output_path)
         self.start_offset_hours = int(start_offset_hours)
+        self.archive_prefix = archive_prefix
         self.obs_dir = (
             Path(obs_dir) if obs_dir
             else self._resolve_obs_dir(config.pdy)
@@ -838,6 +848,10 @@ class DynamicAdjustProcessor(ForcingProcessor):
         # --- Step 3: write today's bias for the next cycle ---------------
         out_bias_file = self.output_path / "average_bias_today"
         self._write_scalar(out_bias_file, adj_today)
+        archive_file = None
+        if self.archive_prefix:
+            archive_file = self.output_path / f"{self.archive_prefix}.avg_bias"
+            self._write_scalar(archive_file, adj_today, nan_text="0.0")
 
         # --- Step 4: apply bias to elev2D.th.nc --------------------------
         applied = apply_ssh_time_varying_adjust(
@@ -852,6 +866,8 @@ class DynamicAdjustProcessor(ForcingProcessor):
         output_files: List[Path] = []
         if out_bias_file.exists():
             output_files.append(out_bias_file)
+        if archive_file is not None and archive_file.exists():
+            output_files.append(archive_file)
         # Always record elev2D.th.nc as an output so downstream reporting sees
         # the adjusted file, whether or not we changed it.
         output_files.append(self.elev2d_th_nc)
@@ -895,6 +911,12 @@ class DynamicAdjustProcessor(ForcingProcessor):
         if self.prev_staout_1 is None or not self.prev_staout_1.exists():
             warnings.append(
                 "Previous cycle staout_1 missing; today's bias = NaN"
+            )
+            return None
+        if self.prev_staout_1.stat().st_size < MIN_STAOUT_BYTES:
+            warnings.append(
+                f"staout_1 too small (<{MIN_STAOUT_BYTES} bytes) "
+                f"({self.prev_staout_1}); today's bias = NaN"
             )
             return None
         if self.prev_param_nml is None or not self.prev_param_nml.exists():
@@ -950,9 +972,18 @@ class DynamicAdjustProcessor(ForcingProcessor):
             )
             return None
 
-        datum_offsets = {}
+        datum_offsets: Dict[str, float] = {}
         if self.diff_bp and self.diff_bp.exists():
-            datum_offsets = read_diff_bp(self.diff_bp)
+            try:
+                datum_offsets = read_diff_bp(self.diff_bp)
+            except Exception as exc:
+                warnings.append(f"Could not read {self.diff_bp}: {exc}")
+        if not datum_offsets:
+            warnings.append(
+                f"Datum file diff.bp missing or unreadable ({self.diff_bp}); "
+                "today's bias = NaN"
+            )
+            return None
 
         # Bias window: operational derive_bias.py is called with
         # ``yyyymmdd_yesterday_Ncast_dash_fmt`` (the day two cycles back
@@ -1027,11 +1058,13 @@ class DynamicAdjustProcessor(ForcingProcessor):
             )
             return 0.0
 
-    def _write_scalar(self, path: Path, value: Optional[float]) -> None:
+    def _write_scalar(
+        self, path: Path, value: Optional[float], nan_text: str = "nan"
+    ) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             if value is None or (isinstance(value, float) and math.isnan(value)):
-                path.write_text("nan\n")
+                path.write_text(f"{nan_text}\n")
             else:
                 path.write_text(f"{value:.3f}\n")
         except OSError as exc:
