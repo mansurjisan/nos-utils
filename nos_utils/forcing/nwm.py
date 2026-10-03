@@ -15,7 +15,9 @@ Fallback: Monthly climatology when NWM data is unavailable.
 
 import logging
 import re
+import shutil
 from datetime import datetime, timedelta
+from itertools import islice
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -92,6 +94,14 @@ MONTHLY_FLOW_FACTOR = {
 MONTHLY_RIVER_TEMP = {
     1: 4.0, 2: 4.0, 3: 6.0, 4: 10.0, 5: 14.0, 6: 18.0,
     7: 22.0, 8: 24.0, 9: 20.0, 10: 14.0, 11: 8.0, 12: 5.0,
+}
+
+
+# Ops v3.1.5 STOFS-3D-ATL static river inputs: staged name -> ops FIX name. MJ (10/03/26)
+_OPS_RIVER_FIX = {
+    "source_sink.in": "stofs_3d_atl_river_source_sink.in",
+    "msource.th": "stofs_3d_atl_river_msource.th",
+    "vsink.th": "stofs_3d_atl_river_vsink.th",
 }
 
 
@@ -367,7 +377,8 @@ class RiverConfig:
 
     @classmethod
     def from_sources_json(cls, filepath: Path,
-                          sinks_path: Optional[Path] = None) -> "RiverConfig":
+                          sinks_path: Optional[Path] = None,
+                          keep_order: bool = False) -> "RiverConfig":
         """Load STOFS sources.json: {element_id: [fid1, fid2, ...]}.
 
         STOFS-3D-ATL uses VIMS gen_sourcesink.py format where each source
@@ -381,13 +392,15 @@ class RiverConfig:
                 sink elements so source_sink.in includes them. Sink volume
                 timeseries comes from a static vsink.th in FIX, not generated
                 here.
+            keep_order: Keep the json key order (ops gen_sourcesink.py order, which is
+                the source_sink.in order) instead of sorting by element id. MJ (10/03/26)
         """
         import json
         with open(filepath) as f:
             data = json.load(f)
 
         # data: {str(element_id): [int(feature_id), ...]}
-        element_ids = sorted(data.keys(), key=int)
+        element_ids = list(data.keys()) if keep_order else sorted(data.keys(), key=int)
         feature_id_groups = [data[eid] for eid in element_ids]
         node_indices = [int(eid) for eid in element_ids]
         # First feature_id as representative (for backward compat)
@@ -504,7 +517,8 @@ class NWMProcessor(ForcingProcessor):
                             sinks_path = (Path(self.config.sinks_config_file)
                                           if self.config.sinks_config_file else None)
                             self._river_config = RiverConfig.from_sources_json(
-                                path, sinks_path=sinks_path)
+                                path, sinks_path=sinks_path,
+                                keep_order=self.config.river_ops_static)
                         else:
                             self._river_config = RiverConfig.from_json(path)
                     else:
@@ -540,6 +554,16 @@ class NWMProcessor(ForcingProcessor):
         self.create_output_dir()
         n_rivers = self.river_config.n_rivers
         log.info(f"Processing {n_rivers} rivers")
+
+        ops_static = self.config.river_ops_static
+        ops_files: List[Path] = []
+        if ops_static:
+            try:
+                ops_files = self._stage_ops_river_files()
+            except (OSError, ValueError) as e:
+                log.error(f"Ops river inputs: {e}")
+                return ForcingResult(success=False, source=self.SOURCE_NAME,
+                                     errors=[f"Ops river inputs: {e}"])
 
         # Target time steps (hourly grid for vsource/vsink/msource).
         #
@@ -618,7 +642,7 @@ class NWMProcessor(ForcingProcessor):
         # together. A single-timestep msource.th alongside a 55-row vsource.th
         # caused heap corruption at `partition_hgrid_` (V11 nowcast crash).
         # Always generate at the same time grid as vsource/vsink.
-        msource = self._write_msource(times)
+        msource = None if ops_static else self._write_msource(times)
         if msource:
             output_files.append(msource)
 
@@ -628,7 +652,7 @@ class NWMProcessor(ForcingProcessor):
         # during partition with a heap overflow. Generate the time series
         # in-place with zeros (no diversion flow) so the count is always
         # consistent. NWM doesn't provide sink data anyway.
-        if self.is_stofs_mode and self.river_config.n_sinks > 0:
+        if not ops_static and self.is_stofs_mode and self.river_config.n_sinks > 0:
             vsink = self._write_vsink(times)
             if vsink:
                 output_files.append(vsink)
@@ -643,9 +667,10 @@ class NWMProcessor(ForcingProcessor):
             river_th_files = self._write_river_th_files(times, ctl_cfg, nwm_files)
             output_files.extend(river_th_files)
 
-        source_sink = self._write_source_sink()
+        source_sink = None if ops_static else self._write_source_sink()
         if source_sink:
             output_files.append(source_sink)
+        output_files.extend(ops_files)
 
         return ForcingResult(
             success=len(output_files) > 0,
@@ -657,6 +682,7 @@ class NWMProcessor(ForcingProcessor):
                 "nwm_files_used": len(nwm_files),
                 "used_climatology": len(nwm_files) == 0,
                 "stofs_mode": self.is_stofs_mode,
+                "ops_static": ops_static,
                 "phase": self.phase,
             },
         )
@@ -1113,7 +1139,10 @@ class NWMProcessor(ForcingProcessor):
                         src_ncidxs.append(idxs)
 
                 # Sum flow per source element
-                flows = np.zeros(n_sources, dtype=np.float32)
+                # ops gen_sourcesink.py sums in float64; float32 moves the 4th decimal.
+                # MJ (10/03/26)
+                flows = np.zeros(n_sources, dtype=(np.float64 if self.config.river_ops_static
+                                                   else np.float32))
                 for s_idx, idxs in enumerate(src_ncidxs):
                     if idxs:
                         flows[s_idx] = np.sum(streamflow[idxs])
@@ -1427,6 +1456,9 @@ class NWMProcessor(ForcingProcessor):
             with open(output_file, "w") as f:
                 for t_idx, t_hours in enumerate(times):
                     t_seconds = t_hours * 3600.0
+                    if self.config.river_ops_static:
+                        f.write(self._ops_vsource_line(t_idx, t_seconds, flows[t_idx]))
+                        continue
                     values = " ".join(f"{flows[t_idx, r]:.4e}"
                                       for r in range(flows.shape[1]))
                     f.write(f"{t_seconds:G} {values}\n")
@@ -1436,6 +1468,71 @@ class NWMProcessor(ForcingProcessor):
         except Exception as e:
             log.error(f"Failed to write vsource.th: {e}")
             return None
+
+    @staticmethod
+    def _ops_vsource_line(t_idx: int, t_seconds: float, row: np.ndarray) -> str:
+        """One vsource.th row as ops writes it: np.savetxt '%10.4f' columns with the
+        leading blanks stripped, rows 1-2 re-echoed unquoted by the ops QC step (single
+        blanks, times 0 and 3600). MJ (10/03/26)
+        """
+        line = " ".join(f"{v:10.4f}" for v in [t_seconds, *row]).lstrip()
+        if t_idx < 2:
+            line = f"{(0, 3600)[t_idx]} " + " ".join(line.split()[1:])
+        return line + "\n"
+
+    def _find_ops_river_fix(self, name: str) -> Optional[Path]:
+        for fix_dir in self._fix_search_dirs():
+            if (fix_dir / name).is_file():
+                return fix_dir / name
+        return None
+
+    def _stage_ops_river_files(self) -> List[Path]:
+        """Copy the ops FIX source_sink.in / msource.th / vsink.th into the output dir.
+
+        Ops links these static files rather than generating them. They only fit the ops
+        source order and counts, so the json order must equal the source_sink.in source
+        list, msource.th must carry T and S per source, and vsink.th one column per sink.
+        Raises FileNotFoundError when a file is missing and ValueError on a mismatch.
+        MJ (10/03/26)
+        """
+        found = {out: self._find_ops_river_fix(fix) for out, fix in _OPS_RIVER_FIX.items()}
+        missing = [fix for out, fix in _OPS_RIVER_FIX.items() if found[out] is None]
+        if missing:
+            raise FileNotFoundError(
+                f"required STOFS-3D-ATL river FIX file(s) {', '.join(missing)} not found in "
+                f"{[str(d) for d in self._fix_search_dirs()]} "
+                f"(stage them with tools/fetch_stofs_3d_atl_fix.sh)")
+
+        cfg = self.river_config
+        n_src = cfg.n_rivers
+        with open(found["source_sink.in"]) as f:
+            head = [ln.strip() for ln in islice(f, n_src + 3)]
+        if len(head) < n_src + 3 or head[0] != str(n_src):
+            raise ValueError(
+                f"{found['source_sink.in'].name} declares "
+                f"{head[0] if head else 'nothing'} sources, river json has {n_src}")
+        for i, (got, want) in enumerate(zip(head[1:n_src + 1], cfg.node_indices)):
+            if got != str(want):
+                raise ValueError(
+                    f"source {i + 1} is element {got} in {found['source_sink.in'].name} but "
+                    f"{want} in the river json; vsource.th columns would be misordered")
+        n_sink = int(head[n_src + 2])
+
+        for out, want_cols in (("msource.th", 1 + 2 * n_src), ("vsink.th", 1 + n_sink)):
+            with open(found[out]) as f:
+                got_cols = len(f.readline().split())
+            if got_cols != want_cols:
+                raise ValueError(f"{found[out].name} has {got_cols} columns, expected "
+                                 f"{want_cols} for {n_src} sources and {n_sink} sinks")
+
+        staged = []
+        for out in _OPS_RIVER_FIX:
+            dst = self.output_path / out
+            shutil.copy2(found[out], dst)
+            staged.append(dst)
+        log.info(f"Staged ops river FIX files from {found['source_sink.in'].parent}: "
+                 f"{n_src} sources, {n_sink} sinks")
+        return staged
 
     def _write_vsink(self, times: List[float]) -> Optional[Path]:
         """Write vsink.th — volume sink time history (zero flow).

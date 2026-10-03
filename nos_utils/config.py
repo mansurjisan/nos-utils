@@ -304,6 +304,11 @@ class ForcingConfig:
     # Target and minimum NWM file counts for STOFS-style assembly
     nwm_n_list_target: int = 55
     nwm_n_list_min: int = 31
+    # STOFS-3D-ATL ops river inputs: sources in the ops json order, source_sink.in /
+    # msource.th / vsink.th copied from the ops FIX files (1348 sources, 1,986,300 sinks,
+    # fresh-water T/S), vsource.th in ops format. A missing FIX file fails the NWM step.
+    # MJ (10/03/26)
+    river_ops_static: bool = False
 
     # St. Lawrence River climatology (STOFS-3D-ATL only).
     # When True, the orchestrator runs StLawrenceProcessor which reads the
@@ -558,6 +563,7 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
+            river_ops_static=True,
             # St. Lawrence river forcing — always on for STOFS-3D-ATL.
             # Ops v3.1 WCOSS2 layout: $COMINlaw/<pdy>/can_streamgauge/
             # 02OA016_hydrometric.csv, then the day-of-year climatology. MJ (09/28/26)
@@ -617,6 +623,7 @@ class ForcingConfig:
             nwm_product="medium_range_mem1",
             nwm_n_list_target=121,
             nwm_n_list_min=97,
+            river_ops_static=True,
             # Ops v3.1 WCOSS2 layout: $COMINlaw/<pdy>/can_streamgauge/
             # 02OA016_hydrometric.csv, then the day-of-year climatology. MJ (09/28/26)
             st_lawrence_enabled=True,
@@ -890,6 +897,13 @@ class ForcingConfig:
             _adt_wt = "stofs_3d_atl_ufs.adt_weight.nc"
         _adt_wt = Path(_adt_wt) if _adt_wt else None
 
+        # Ops river inputs (static FIX source_sink.in / msource.th / vsink.th, ops source
+        # order): ATL by name, yaml forcing.river.ops_static_files overrides. MJ (10/03/26)
+        _river_ops = _strict_bool(
+            river.get("ops_static_files") if isinstance(river, dict) else None,
+            "forcing.river.ops_static_files",
+            str(_sys.get("name", "")).startswith("stofs_3d_atl"))
+
         # NWM river product and target counts
         river_product = river.get("primary", "nwm") if isinstance(river, dict) else "nwm"
         nwm_product = "medium_range_mem1" if river_product == "nwm" and \
@@ -936,6 +950,7 @@ class ForcingConfig:
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
             adt_weight_file=_adt_wt,
             nwm_product=nwm_product,
+            river_ops_static=_river_ops,
         )
 
         # HRRR domain bounds (optional, falls back to main domain)
