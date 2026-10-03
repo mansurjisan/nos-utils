@@ -23,6 +23,7 @@ from nos_utils.forcing.dynamic_adjust import (  # noqa: E402
     read_model_start,
     read_station_in,
     _bc_average,
+    _mode,
     DEFAULT_STATIONS,
     DEFAULT_STATION_LONS,
     DEFAULT_STATION_LATS,
@@ -393,6 +394,34 @@ class TestBiasColumnMapping:
             model_station_ids=["A"],
         )
         assert avg == 0.038
+
+
+class TestModeHelper:
+    """_mode must equal scipy.stats.mode: the smallest of the most frequent values."""
+
+    @staticmethod
+    def _scipy_mode(a):
+        from scipy import stats
+        return float(np.ravel(stats.mode(a).mode)[0])
+
+    def test_ties_return_the_smallest_value(self):
+        for a in ([3, 1, 1, 3, 2], [5.0, 4.0, 4.0, 5.0], [2, 2, 1, 1, 3, 3], [7]):
+            arr = np.asarray(a, dtype=float)
+            assert _mode(arr) == self._scipy_mode(arr)
+        assert _mode(np.array([3.0, 1.0, 1.0, 3.0, 2.0])) == 1.0
+
+    def test_float_day_diffs_of_a_gappy_record(self):
+        rng = np.random.default_rng(7)
+        six_min = 6.0 / 1440.0
+        for _ in range(20):
+            steps = np.where(rng.random(400) < 0.05, rng.integers(10, 40, 400) * six_min, six_min)
+            t_days = 20000.0 + np.cumsum(steps)
+            dt = np.diff(t_days)
+            assert _mode(dt) == self._scipy_mode(dt)
+
+    def test_integer_valued_diffs_with_equal_counts(self):
+        arr = np.array([0.5, 0.25, 0.5, 0.25, 0.75])
+        assert _mode(arr) == self._scipy_mode(arr) == 0.25
 
 
 class TestOpsApplyArithmetic:

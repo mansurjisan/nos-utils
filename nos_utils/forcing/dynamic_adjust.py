@@ -49,7 +49,7 @@ except ImportError:
     HAS_PANDAS = False
 
 try:
-    from scipy import interpolate, stats
+    from scipy import interpolate
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
@@ -406,6 +406,16 @@ def _valid_station_mask(
     return True, (np.where(mask)[0][order])
 
 
+def _mode(values: np.ndarray) -> float:
+    """Smallest of the most frequent values, as ``scipy.stats.mode`` returns it.
+
+    ``stats.mode(..., keepdims=)`` does not exist before scipy 1.9 (WCOSS2 python 3.8
+    modules). MJ (10/03/26)
+    """
+    uniq, counts = np.unique(values, return_counts=True)
+    return float(uniq[np.argmax(counts)])
+
+
 def _interpolate_obs_to_model(
     obs_times: np.ndarray, obs_elev: np.ndarray, model_times: np.ndarray,
 ) -> np.ndarray:
@@ -427,7 +437,7 @@ def _interpolate_obs_to_model(
     dt = np.diff(t_days)
     if dt.size == 0:
         return np.full_like(m_days, np.nan, dtype=float)
-    mode_dt = float(stats.mode(dt, keepdims=False).mode)
+    mode_dt = _mode(dt)
     gap_thresh = mode_dt * GAP_MULTIPLIER
     gap_idx = np.where(dt > gap_thresh)[0]
 
