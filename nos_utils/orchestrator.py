@@ -745,7 +745,8 @@ class PrepOrchestrator:
         script (NOAA obs, previous cycle staout_1, param.nml, avg bias,
         FIX .bp files) from ``self.paths``:
           * ``noaa_obs``  -> ``$DCOMROOT/<pdy>/coops_waterlvlobs`` directory
-          * ``prev_rerun`` -> ``$COMOUT_PREV/rerun`` directory
+          * ``prev_comout`` -> ``$COMOUT_PREV`` (previous cycle's COMOUT root)
+          * ``prev_rerun`` -> ``$COMINrerun`` flat-directory override
           * ``fix``        -> directory containing station.bp + diff.bp
             + the model station.in
         Any missing path causes the processor to degrade to a zero-bias
@@ -796,21 +797,38 @@ class PrepOrchestrator:
         prev_staout_1 = None
         prev_param_nml = None
         prev_avg_bias = None
+        cycle_tag = f"t{self.config.cyc:02d}z"
+        # Ops layout: $COMOUT_PREV/staout_1 + $COMOUT_PREV/rerun/<run>.<cycle>.avg_bias, model start
+        # = today's nowcast start - 24 h. COMINrerun (one flat dir) overrides it by hand. MJ (10/03/26)
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + timedelta(hours=self.config.cyc)
+        model_start = cycle_dt - timedelta(hours=int(self.config.nowcast_hours) + 24)
         if prev_rerun:
             prev = Path(prev_rerun)
             if (prev / "staout_1").exists():
                 prev_staout_1 = prev / "staout_1"
-            cycle_tag = f"t{self.config.cyc:02d}z"
             for pnl in (prev / f"{self.run_name}.{cycle_tag}.param.nml",
                         prev / "param.nml"):
                 if pnl.exists():
                     prev_param_nml = pnl
+                    model_start = None
                     break
             for ab in (prev / f"{self.run_name}.{cycle_tag}.avg_bias",
                        prev / "average_bias_today"):
                 if ab.exists():
                     prev_avg_bias = ab
                     break
+        elif self.paths.get("prev_comout"):
+            prev = Path(self.paths["prev_comout"])
+            if (prev / "staout_1").exists():
+                prev_staout_1 = prev / "staout_1"
+            ab = prev / "rerun" / f"{self.run_name}.{cycle_tag}.avg_bias"
+            if ab.exists():
+                prev_avg_bias = ab
+        log.info(
+            f"Dynamic adjust previous-cycle inputs: staout_1={prev_staout_1} "
+            f"avg_bias={prev_avg_bias} "
+            f"model_start={model_start if model_start else prev_param_nml}"
+        )
 
         # Ops ramps from the nowcast start; the forecast file starts nowcast_hours later. MJ (10/02/26)
         offset = (int(self.config.nowcast_hours)
@@ -823,6 +841,7 @@ class PrepOrchestrator:
             obs_dir=obs_dir,
             prev_staout_1=prev_staout_1,
             prev_param_nml=prev_param_nml,
+            model_start=model_start,
             station_bp=station_bp,
             station_in=station_in,
             diff_bp=diff_bp,
@@ -1212,6 +1231,25 @@ class PrepOrchestrator:
             archived.append(dst)
             log.info(f"  Archived ADT field -> {dst.name}")
 
+    def _archive_dynamic_adjust_bias(self, work_dir: Path, comout: Path, archived: List[Path]) -> None:
+        """Put today's bias in $COMOUTrerun under the ops names (adj0 for the next cycle). MJ (10/03/26)"""
+        import shutil
+
+        if not getattr(self.config, "dynamic_adjust_enabled", False):
+            return
+        rerun = Path(self.paths["comout_rerun"]) if self.paths.get("comout_rerun") else comout / "rerun"
+        cycle = f"t{self.config.cyc:02d}z"
+        for src_name, dst_name in (
+            (f"{self.run_name}.{cycle}.avg_bias", f"{self.run_name}.{cycle}.avg_bias"),
+            ("average_bias_today", "average_bias_today_output_adj_p"),
+        ):
+            src = work_dir / src_name
+            if src.exists():
+                rerun.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, rerun / dst_name)
+                archived.append(rerun / dst_name)
+                log.info(f"  Archived dynamic-adjust bias {src_name} -> {rerun / dst_name}")
+
     def _archive_obc_qc_artifacts(
         self, work_dir: Path, comout: Path, archived: List[Path],
     ) -> None:
@@ -1332,6 +1370,7 @@ class PrepOrchestrator:
                     log.warning(f"  Failed to tar HRRR sflux: {e}")
 
         self._archive_adt_field(work_dir, comout, archived)
+        self._archive_dynamic_adjust_bias(work_dir, comout, archived)
 
         if manifest_on:
             # --- Declarative manifest path (opt-in) ---

@@ -105,6 +105,8 @@ def config_from_env(
         "adt": "COMINadt",
         "gfswave": "COMINgfswave",
         "prev_rerun": "COMINrerun",
+        "prev_comout": "COMOUT_PREV",
+        "comout_rerun": "COMOUTrerun",
         "fix": "FIXofs",
         "output": "DATA",
         "comout": "COMOUT",
