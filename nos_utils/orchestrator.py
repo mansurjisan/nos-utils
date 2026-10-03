@@ -747,6 +747,7 @@ class PrepOrchestrator:
           * ``noaa_obs``  -> ``$DCOMROOT/<pdy>/coops_waterlvlobs`` directory
           * ``prev_rerun`` -> ``$COMOUT_PREV/rerun`` directory
           * ``fix``        -> directory containing station.bp + diff.bp
+            + the model station.in
         Any missing path causes the processor to degrade to a zero-bias
         correction (see DynamicAdjustProcessor for details).
         """
@@ -759,17 +760,28 @@ class PrepOrchestrator:
         # Resolve FIX inputs — search for the STOFS-3D-ATL naming first
         # then any matching pattern.
         station_bp = None
+        station_in = None
         diff_bp = None
         if fix_dir:
             fix_path = Path(fix_dir)
             for name in (
                 "stofs_3d_atl_obc_adjust_station.bp",
-                f"{self.run_name}_station.in",
                 "station.bp",
             ):
                 cand = fix_path / name
                 if cand.exists():
                     station_bp = cand
+                    break
+            # Full model station.in: staout_1 column order, as ops derive_bias.py. MJ (10/02/26)
+            for name in (
+                f"{self.run_name}.station.in",
+                "stofs_3d_atl_station.in",
+                f"{self.run_name}_station.in",
+                "station.in",
+            ):
+                cand = fix_path / name
+                if cand.exists():
+                    station_in = cand
                     break
             for name in (
                 "stofs_3d_atl_obc_adjust_msl_geoid.bp",
@@ -812,11 +824,13 @@ class PrepOrchestrator:
             prev_staout_1=prev_staout_1,
             prev_param_nml=prev_param_nml,
             station_bp=station_bp,
+            station_in=station_in,
             diff_bp=diff_bp,
             prev_avg_bias_file=prev_avg_bias,
             elev2d_th_nc=output_dir / "elev2D.th.nc",
             bias_window_days=self.config.dynamic_adjust_window_days,
             start_offset_hours=offset,
+            archive_prefix=f"{self.run_name}.t{self.config.cyc:02d}z",
         )
         return proc.process()
 

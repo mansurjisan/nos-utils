@@ -31,6 +31,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -48,7 +49,7 @@ except ImportError:
     HAS_PANDAS = False
 
 try:
-    from scipy import interpolate, stats
+    from scipy import interpolate
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
@@ -84,6 +85,12 @@ DEFAULT_NAN_THRESHOLD = 0.20
 # "Gap" threshold for observation validity: multiples of the modal sample
 # interval. Matches operational `gap_idx=10`.
 GAP_MULTIPLIER = 10
+
+# create_npz_NOAA.py skips a station whose dcom file has fewer lines than this.
+MIN_OBS_LINES = 10
+
+# Ops only links the previous staout_1 into the bias step when it is at least this large.
+MIN_STAOUT_BYTES = 10000
 
 
 # =============================================================================
@@ -122,18 +129,47 @@ _XML_OBS_RE = re.compile(
 )
 
 
-def parse_noaa_xml(xml_path: Path) -> Tuple[List["pd.Timestamp"], List[float]]:
-    """Parse a NOAA CO-OPS water-level XML file.
+def _parse_dcom_text(text: str) -> Tuple[List["pd.Timestamp"], List[float]]:
+    """Ops dcom text rows: ``<sid> 1 WL <date> <HH:MM> <value> <sigma> <flags...>``.
 
-    The operational shell uses awk on fields 4/5/6 which targets the
-    observations block. We parse the same content with a regex that
-    recognises either `<wl t="..." v="..."/>` or `<obs t="..." v="..."/>`
-    and any surrounding whitespace. Missing or non-numeric ``v`` entries
-    are dropped.
+    Mirrors ``awk -F' ' '{print $4 " " $5 ":00," $6 ...}'`` followed by
+    ``create_npz_NOAA.py``: a file with fewer than ``MIN_OBS_LINES`` lines is
+    skipped, a row with an empty field 6 is dropped, and no flag filtering is
+    applied. MJ (10/02/26)
     """
-    text = xml_path.read_text(errors="replace")
+    rows = text.split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()
+    if len(rows) < MIN_OBS_LINES:
+        return [], []
     ts_list: List["pd.Timestamp"] = []
     vals: List[float] = []
+    for row in rows:
+        parts = row.split()
+        if len(parts) < 6:
+            continue
+        try:
+            v = float(parts[5])
+            timestamp = pd.Timestamp(f"{parts[3]} {parts[4]}:00", tz="UTC")
+        except ValueError:
+            continue
+        ts_list.append(timestamp)
+        vals.append(v)
+    return ts_list, vals
+
+
+def parse_noaa_xml(xml_path: Path) -> Tuple[List["pd.Timestamp"], List[float]]:
+    """Parse a NOAA CO-OPS water-level file from ``$DCOMROOT/<day>/coops_waterlvlobs``.
+
+    The ``.xml`` files are whitespace-separated text rows in practice and are
+    parsed as the operational shell does (see ``_parse_dcom_text``). When no
+    text rows are found, fall back to ``<wl|obs t="..." v="..."/>`` attributes;
+    missing or non-finite ``v`` entries are dropped there.
+    """
+    text = xml_path.read_text(errors="replace")
+    ts_list, vals = _parse_dcom_text(text)
+    if ts_list:
+        return ts_list, vals
     for match in _XML_OBS_RE.finditer(text):
         date_str, hhmm, ss, v_str = match.groups()
         try:
@@ -328,6 +364,23 @@ def read_diff_bp(bp_path: Path) -> Dict[str, float]:
     return offsets
 
 
+def read_station_in(path: Path) -> List[str]:
+    """Station IDs of a SCHISM station.in in row order (= staout_1 column order).
+
+    Row ``i`` (0-based) is staout_1 column ``i + 1``. A row without a ``!id``
+    comment yields ``""`` so that later rows keep their index. MJ (10/02/26)
+    """
+    lines = Path(path).read_text(errors="replace").splitlines()
+    try:
+        n = int(lines[1].split()[0])
+    except (IndexError, ValueError):
+        return []
+    return [
+        ln.rsplit("!", 1)[1].strip() if "!" in ln else ""
+        for ln in lines[2:2 + n]
+    ]
+
+
 # =============================================================================
 # Bias computation
 # =============================================================================
@@ -353,6 +406,16 @@ def _valid_station_mask(
     return True, (np.where(mask)[0][order])
 
 
+def _mode(values: np.ndarray) -> float:
+    """Smallest of the most frequent values, as ``scipy.stats.mode`` returns it.
+
+    ``stats.mode(..., keepdims=)`` does not exist before scipy 1.9 (WCOSS2 python 3.8
+    modules). MJ (10/03/26)
+    """
+    uniq, counts = np.unique(values, return_counts=True)
+    return float(uniq[np.argmax(counts)])
+
+
 def _interpolate_obs_to_model(
     obs_times: np.ndarray, obs_elev: np.ndarray, model_times: np.ndarray,
 ) -> np.ndarray:
@@ -374,7 +437,7 @@ def _interpolate_obs_to_model(
     dt = np.diff(t_days)
     if dt.size == 0:
         return np.full_like(m_days, np.nan, dtype=float)
-    mode_dt = float(stats.mode(dt, keepdims=False).mode)
+    mode_dt = _mode(dt)
     gap_thresh = mode_dt * GAP_MULTIPLIER
     gap_idx = np.where(dt > gap_thresh)[0]
 
@@ -412,14 +475,26 @@ def compute_bias(
     target_start: datetime,
     target_end: datetime,
     nan_threshold: float = DEFAULT_NAN_THRESHOLD,
+    *,
+    model_station_ids: Optional[Sequence[str]] = None,
 ) -> Tuple[float, Dict[str, float]]:
     """Compute the scalar bias to subtract from SSH boundary.
 
-    Returns (average_bias, per_station_bias). When no stations have enough
-    data to compute a bias, returns (``float('nan')``, {}).
+    ``model_station_ids`` lists the model station.in IDs in row order; each bias
+    station reads staout_1 column ``row + 1`` of its first match, as ops
+    ``derive_bias.py``. A station missing from it is skipped (no positional
+    fallback). A station with observations but no ``datum_offsets`` entry
+    raises ``ValueError``, as ops fails the whole bias computation. Returns (average_bias, per_station_bias), the average rounded to
+    3 decimals as ops writes it; when no station has enough data, returns
+    (``float('nan')``, {}).
     """
     if not HAS_PANDAS:
         raise RuntimeError("pandas is required for bias computation")
+
+    model_ids = list(model_station_ids) if model_station_ids is not None else []
+    if not model_ids:
+        log.warning("No model station.in IDs supplied; cannot map staout_1 columns")
+        return float("nan"), {}
 
     ts = pd.Timestamp(target_start, tz=None)
     te = pd.Timestamp(target_end, tz=None)
@@ -442,7 +517,7 @@ def compute_bias(
 
     per_station_bias: Dict[str, np.ndarray] = {}
 
-    for idx_in, sid in enumerate(station_ids_in):
+    for sid in station_ids_in:
         if sid not in obs.station_lons:
             continue
         sta_mask = obs.station_ids == sid
@@ -457,8 +532,10 @@ def compute_bias(
         sub_elev = obs.elev[sta_mask][order]
 
         # Convert observations from NAVD88 → xGEOID (add datum offset).
-        offset = datum_offsets.get(sid, 0.0)
-        sub_elev_adj = sub_elev + offset
+        # Ops derive_bias.py fails outright when diff.bp lacks the station. MJ (10/02/26)
+        if sid not in datum_offsets:
+            raise ValueError(f"Station {sid} has observations but no entry in diff.bp")
+        sub_elev_adj = sub_elev + datum_offsets[sid]
 
         # Interpolate obs onto the selected model time vector.
         try:
@@ -467,8 +544,18 @@ def compute_bias(
             log.warning(f"Interpolation failed for station {sid}: {exc}")
             continue
 
-        # Model column for this station.
-        model_col = model_staout[m_mask, idx_in + 1]
+        # Model column: first station.in row with this ID, +1 for the time column. MJ (10/02/26)
+        if sid not in model_ids:
+            log.warning(f"Station {sid} not in the model station.in; skipped")
+            continue
+        col = model_ids.index(sid) + 1
+        if col >= model_staout.shape[1]:
+            log.warning(
+                f"Station {sid} maps to staout_1 column {col} but the file has "
+                f"{model_staout.shape[1]} columns; skipped"
+            )
+            continue
+        model_col = model_staout[m_mask, col]
         bias_series = model_col - soyi
         per_station_bias[sid] = bias_series
 
@@ -495,7 +582,7 @@ def compute_bias(
 
     filtered = df_hourly[valid_cols].copy()
     filtered["Average"] = filtered.mean(axis=1)
-    avg_bias = float(filtered["Average"].mean())
+    avg_bias = float(f"{filtered['Average'].mean():.3f}")
 
     per_station_mean = {
         sid: float(np.nanmean(vals)) for sid, vals in per_station_bias.items()
@@ -546,6 +633,12 @@ def densify_hourly(elev_nc: Path) -> bool:
     return True
 
 
+def _bc_average(adj0: float, adj1: float) -> float:
+    """Ops ``bc``: ``scale=5; ($adj0 + $adj1) / 2``, exact sum and quotient truncated at 5 places. MJ (10/02/26)"""
+    total = Decimal(repr(float(adj0))) + Decimal(repr(float(adj1)))
+    return float((total / 2).quantize(Decimal("0.00001"), rounding=ROUND_DOWN))
+
+
 def apply_ssh_time_varying_adjust(
     elev_nc: Path,
     adj0: float,
@@ -564,6 +657,8 @@ def apply_ssh_time_varying_adjust(
         * t>=2 -> value - adj1
     NaN arguments are treated as 0.0 (which leaves that time slice
     unchanged, matching the shell's ``flag_adj0=1; adj0=0.0`` fallback).
+    Each offset is cast to float32 and subtracted in the variable's own
+    precision, as ``ncap2 ... -float($adj)``; the t=1 offset is the bc average.
     """
     if not HAS_NETCDF4:
         raise RuntimeError("netCDF4 is required for SSH adjustment")
@@ -579,7 +674,7 @@ def apply_ssh_time_varying_adjust(
 
     adj0_f = 0.0 if (adj0 is None or math.isnan(adj0)) else float(adj0)
     adj1_f = 0.0 if (adj1 is None or math.isnan(adj1)) else float(adj1)
-    avg = 0.5 * (adj0_f + adj1_f)
+    avg = _bc_average(adj0_f, adj1_f)
 
     try:
         with Dataset(str(elev_nc), "r+") as ds:
@@ -595,12 +690,14 @@ def apply_ssh_time_varying_adjust(
             # Handle masked arrays gracefully.
             if np.ma.isMaskedArray(data):
                 data = data.filled(np.nan)
-            data = np.asarray(data, dtype=np.float64)
+            data = np.asarray(data)
+            if data.dtype.kind != "f":
+                data = data.astype(np.float64)
             k = int(start_offset_hours) + np.arange(n_t)
-            data[k <= 0] -= adj0_f
-            data[k == 1] -= avg
-            data[k >= 2] -= adj1_f
-            var[:] = data.astype(var.dtype, copy=False)
+            data[k <= 0] -= np.float32(adj0_f)
+            data[k == 1] -= np.float32(avg)
+            data[k >= 2] -= np.float32(adj1_f)
+            var[:] = data
         log.info(
             f"Applied SSH dynamic adjust to {elev_nc.name}: "
             f"adj0={adj0_f:.4f} adj1={adj1_f:.4f} avg={avg:.4f}"
@@ -625,7 +722,9 @@ class DynamicAdjustProcessor(ForcingProcessor):
           (``staout_1``).
         - ``prev_param_nml``: Previous cycle's ``param.nml`` (for model
           start time).
-        - ``station_bp`` + ``diff_bp``: from FIX.
+        - ``station_bp`` + ``diff_bp``: from FIX (11 bias stations + datum).
+        - ``station_in``: the model's full station.in from FIX; a bias
+          station's staout_1 column is its row in this file + 1.
         - ``prev_avg_bias_file``: Scalar file produced by the previous
           cycle's run.
         - ``elev2d_th_nc``: ``elev2D.th.nc`` to adjust in-place.
@@ -633,6 +732,8 @@ class DynamicAdjustProcessor(ForcingProcessor):
     Writes:
         - ``average_bias_today``: Scalar bias (float on a single line)
           into ``output_path`` for next cycle.
+        - ``<archive_prefix>.avg_bias``: the ops archive of adj1 (3-decimal
+          bias, ``0.0`` when today's bias is NaN), read as adj0 next cycle.
         - Adjusted ``elev2D.th.nc`` at ``elev2d_th_nc`` path.
     """
 
@@ -648,6 +749,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
         prev_staout_1: Optional[Path] = None,
         prev_param_nml: Optional[Path] = None,
         station_bp: Optional[Path] = None,
+        station_in: Optional[Path] = None,
         diff_bp: Optional[Path] = None,
         prev_avg_bias_file: Optional[Path] = None,
         elev2d_th_nc: Optional[Path] = None,
@@ -657,9 +759,11 @@ class DynamicAdjustProcessor(ForcingProcessor):
         bias_window_days: int = 2,
         nan_threshold: float = DEFAULT_NAN_THRESHOLD,
         start_offset_hours: int = 0,
+        archive_prefix: Optional[str] = None,
     ) -> None:
         super().__init__(config, input_path, output_path)
         self.start_offset_hours = int(start_offset_hours)
+        self.archive_prefix = archive_prefix
         self.obs_dir = (
             Path(obs_dir) if obs_dir
             else self._resolve_obs_dir(config.pdy)
@@ -667,6 +771,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
         self.prev_staout_1 = Path(prev_staout_1) if prev_staout_1 else None
         self.prev_param_nml = Path(prev_param_nml) if prev_param_nml else None
         self.station_bp = Path(station_bp) if station_bp else None
+        self.station_in = Path(station_in) if station_in else None
         self.diff_bp = Path(diff_bp) if diff_bp else None
         self.prev_avg_bias_file = (
             Path(prev_avg_bias_file) if prev_avg_bias_file else None
@@ -753,6 +858,10 @@ class DynamicAdjustProcessor(ForcingProcessor):
         # --- Step 3: write today's bias for the next cycle ---------------
         out_bias_file = self.output_path / "average_bias_today"
         self._write_scalar(out_bias_file, adj_today)
+        archive_file = None
+        if self.archive_prefix:
+            archive_file = self.output_path / f"{self.archive_prefix}.avg_bias"
+            self._write_scalar(archive_file, adj_today, nan_text="0.0")
 
         # --- Step 4: apply bias to elev2D.th.nc --------------------------
         applied = apply_ssh_time_varying_adjust(
@@ -767,6 +876,8 @@ class DynamicAdjustProcessor(ForcingProcessor):
         output_files: List[Path] = []
         if out_bias_file.exists():
             output_files.append(out_bias_file)
+        if archive_file is not None and archive_file.exists():
+            output_files.append(archive_file)
         # Always record elev2D.th.nc as an output so downstream reporting sees
         # the adjusted file, whether or not we changed it.
         output_files.append(self.elev2d_th_nc)
@@ -812,11 +923,25 @@ class DynamicAdjustProcessor(ForcingProcessor):
                 "Previous cycle staout_1 missing; today's bias = NaN"
             )
             return None
+        if self.prev_staout_1.stat().st_size < MIN_STAOUT_BYTES:
+            warnings.append(
+                f"staout_1 too small (<{MIN_STAOUT_BYTES} bytes) "
+                f"({self.prev_staout_1}); today's bias = NaN"
+            )
+            return None
         if self.prev_param_nml is None or not self.prev_param_nml.exists():
             warnings.append(
                 "Previous cycle param.nml missing; today's bias = NaN"
             )
             return None
+
+        if self.station_in is None or not self.station_in.exists():
+            warnings.append(
+                f"Model station.in not found ({self.station_in}); "
+                "cannot map staout_1 columns; today's bias = NaN"
+            )
+            return None
+        model_station_ids = read_station_in(self.station_in)
 
         # Override default station metadata with station.bp when provided.
         station_ids = list(self.stations)
@@ -840,7 +965,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
             return None
 
         model_staout = read_staout_1(
-            self.prev_staout_1, n_stations=len(station_ids),
+            self.prev_staout_1, n_stations=len(model_station_ids),
         )
         if model_staout is None or model_staout.shape[0] == 0:
             warnings.append(
@@ -857,9 +982,18 @@ class DynamicAdjustProcessor(ForcingProcessor):
             )
             return None
 
-        datum_offsets = {}
+        datum_offsets: Dict[str, float] = {}
         if self.diff_bp and self.diff_bp.exists():
-            datum_offsets = read_diff_bp(self.diff_bp)
+            try:
+                datum_offsets = read_diff_bp(self.diff_bp)
+            except Exception as exc:
+                warnings.append(f"Could not read {self.diff_bp}: {exc}")
+        if not datum_offsets:
+            warnings.append(
+                f"Datum file diff.bp missing or unreadable ({self.diff_bp}); "
+                "today's bias = NaN"
+            )
+            return None
 
         # Bias window: operational derive_bias.py is called with
         # ``yyyymmdd_yesterday_Ncast_dash_fmt`` (the day two cycles back
@@ -885,6 +1019,7 @@ class DynamicAdjustProcessor(ForcingProcessor):
                 bias_start,
                 bias_end,
                 nan_threshold=self.nan_threshold,
+                model_station_ids=model_station_ids,
             )
         except Exception as exc:
             warnings.append(f"Bias computation failed: {exc}")
@@ -933,11 +1068,13 @@ class DynamicAdjustProcessor(ForcingProcessor):
             )
             return 0.0
 
-    def _write_scalar(self, path: Path, value: Optional[float]) -> None:
+    def _write_scalar(
+        self, path: Path, value: Optional[float], nan_text: str = "nan"
+    ) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             if value is None or (isinstance(value, float) and math.isnan(value)):
-                path.write_text("nan\n")
+                path.write_text(f"{nan_text}\n")
             else:
                 path.write_text(f"{value:.3f}\n")
         except OSError as exc:
