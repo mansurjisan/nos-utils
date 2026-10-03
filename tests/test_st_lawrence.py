@@ -320,6 +320,31 @@ class TestStLawrenceTempFromSflux:
         assert np.allclose(data[:, 1], expected, atol=0.01)
 
 
+    def test_stmp_is_read_from_the_air_file_when_rad_lacks_it(self, tmp_path):
+        pdy = "20260401"
+        input_dir = tmp_path / "comin"
+        _write_hydrometric_csv(
+            input_dir / pdy / "can_streamgauge" / DEFAULT_CSV_NAME,
+            start_date="2026-03-31", n_days=8,
+        )
+        start = datetime(2026, 3, 31, 12, 0, 0)
+        _write_fake_sflux_rad(tmp_path / "sflux" / "sflux_air_1.0001.nc", start, n_times=192)
+        rad = tmp_path / "sflux" / "sflux_rad_1.0001.nc"
+        with nc.Dataset(str(rad), "w") as ds:  # the sflux writer's rad file: no stmp. MJ (10/02/26)
+            ds.createDimension("time", 192)
+            ds.createVariable("dlwrf", "f4", ("time",))[:] = 300.0
+
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy=pdy, cyc=12)
+        proc = StLawrenceProcessor(cfg, input_dir, tmp_path / "out", sflux_rad_file=rad)
+        result = proc.process()
+
+        assert result.success
+        assert result.metadata["sflux_used"].endswith("sflux_air_1.0001.nc")
+        assert not any("Failed to read sflux" in w for w in result.warnings)
+        data = np.loadtxt(tmp_path / "out" / "TEM_1.th")
+        assert np.allclose(data[:, 1], AIR_TO_WATER_SLOPE * 10.0 + AIR_TO_WATER_INTERCEPT, atol=0.01)
+
+
 class TestArchiveFallback:
     """Previous-cycle archive fallback when CSV is missing entirely."""
 

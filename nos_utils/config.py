@@ -109,6 +109,21 @@ class ForcingConfig:
     hrrr_lon_max: Optional[float] = None
     hrrr_lat_min: Optional[float] = None
     hrrr_lat_max: Optional[float] = None
+    # HRRR 10 m winds on the native Lambert grid are rotated to earth-relative by default. Ops
+    # STOFS-3D-ATL (wgrib2 -small_grib + -netcdf only) keeps them grid-relative, which is about 17
+    # deg off over the Atlantic and physically wrong; False exists only for bit parity with ops.
+    # Native-grid extraction (igrd_met=0) only. MJ (10/02/26)
+    hrrr_rotate_winds: bool = True
+    # Subset each native HRRR record with wgrib2 -small_grib over hrrr_domain before decoding, as
+    # ops does. wgrib2 re-packs the values, so some are 1 float32 ulp off a decode of the full
+    # file; the grid is unchanged. Native-grid extraction only. MJ (10/02/26)
+    hrrr_small_grib: bool = False
+    # Ops STOFS-3D-ATL GFS sflux chain: valid hour V takes the newest cycle with lead 1-6 h (yesterday
+    # 06z f006, 12z/18z/00z/06z f001-f006, then the cycle's f001-f099) and a 500 MB size check.
+    # Hours the chain misses are filled from the newest older cycle and a trailing gap holds the
+    # last record, both with a warning (ops would ship the previous day's file). Off keeps the
+    # oldest-cycle-first search of SECOFS and the coupled paths. MJ (10/02/26)
+    gfs_ops_timeline: bool = False
 
     # --- DATM input grid (UFS-Coastal nws=4) ---
     # Wide DATM forcing grid for blended HRRR+GFS input to CDEPS.
@@ -556,6 +571,12 @@ class ForcingConfig:
             tide_nodal_reference="cycle",
         )
         defaults.update(overrides)
+        # Ops sflux parity applies to the standalone files only (nws=2), as in from_yaml;
+        # explicit overrides win. MJ (10/02/26)
+        ops_sflux = defaults.get("nws", 2) == 2
+        for key, value in (("gfs_ops_timeline", ops_sflux), ("hrrr_rotate_winds", not ops_sflux),
+                           ("hrrr_small_grib", ops_sflux)):
+            defaults.setdefault(key, value)
         return cls(**defaults)
 
     @classmethod
@@ -846,6 +867,21 @@ class ForcingConfig:
         # HRRR blend domain (may differ from main domain)
         hrrr_blend = atm.get("hrrr_blend", {})
 
+        # Ops sflux parity: only the standalone (nws=2) STOFS-3D-ATL files mirror ops; the coupled
+        # path blends HRRR/GFS into DATM and keeps the default search and wind rotation. The yaml
+        # keys forcing.atmospheric.gfs.ops_timeline / hrrr.rotate_winds / hrrr.small_grib override the name rule.
+        # MJ (10/02/26)
+        _ops_sflux = nws == 2 and str(_sys.get("name", "")).startswith("stofs_3d_atl")
+        _gfs_ops_tl = _strict_bool(
+            atm.get("gfs", {}).get("ops_timeline") if isinstance(atm.get("gfs"), dict) else None,
+            "forcing.atmospheric.gfs.ops_timeline", _ops_sflux)
+        _hrrr_rot = _strict_bool(
+            atm.get("hrrr", {}).get("rotate_winds") if isinstance(atm.get("hrrr"), dict) else None,
+            "forcing.atmospheric.hrrr.rotate_winds", not _ops_sflux)
+        _hrrr_sg = _strict_bool(
+            atm.get("hrrr", {}).get("small_grib") if isinstance(atm.get("hrrr"), dict) else None,
+            "forcing.atmospheric.hrrr.small_grib", _ops_sflux)
+
         # ADT satellite SSH blending
         adt = ocean.get("adt", {}) if isinstance(ocean, dict) else {}
         _sys = data.get("system", {}) if isinstance(data.get("system"), dict) else {}
@@ -894,6 +930,9 @@ class ForcingConfig:
             obc_interp_mode=_interp_mode,
             obc_ssh_hold_first_record=_hold,
             obc_ops_timeline=_ops_tl,
+            gfs_ops_timeline=_gfs_ops_tl,
+            hrrr_rotate_winds=_hrrr_rot,
+            hrrr_small_grib=_hrrr_sg,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
             adt_weight_file=_adt_wt,
             nwm_product=nwm_product,

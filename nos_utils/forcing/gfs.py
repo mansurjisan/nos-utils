@@ -48,6 +48,13 @@ class GFSProcessor(ForcingProcessor):
         "sflux": 10_000_000,  # 10 MB (surface-only, ~30 MB typical)
     }
     MIN_FILE_SIZE = 40_000_000  # fallback: 40 MB
+    # stofs_3d_atl_create_surface_forcing_gfs.sh skips 0.25 deg files below this. MJ (10/02/26)
+    OPS_MIN_FILE_SIZE = 500_000_000
+    # Records the ops script needs (N_dim_cr_min) before it ships its own list instead of
+    # copying the previous day's file, and how far back (6 h cycles) a missing hour is
+    # searched for. MJ (10/02/26)
+    OPS_MIN_RECORDS = 110
+    OPS_FILL_CYCLES = 12
 
     # GRIB2 variable mapping: internal name -> (GRIB2 name, level)
     GRIB2_VARIABLES = {
@@ -112,6 +119,10 @@ class GFSProcessor(ForcingProcessor):
         self.direct_datm = direct_datm
         # Set resolution-appropriate file size threshold
         self.MIN_FILE_SIZE = self.MIN_FILE_SIZE_BY_RES.get(resolution, 40_000_000)
+        if config.gfs_ops_timeline and resolution == "0p25":
+            self.MIN_FILE_SIZE = self.OPS_MIN_FILE_SIZE
+        # Set by _build_ops_file_list for the result metadata. MJ (10/02/26)
+        self._ops_state: Dict[str, object] = {}
 
     @property
     def extractor(self) -> GRIBExtractor:
@@ -376,9 +387,14 @@ class GFSProcessor(ForcingProcessor):
         # Step 3: Filter to phase-specific time window
         extracted = self._filter_to_time_window(extracted)
 
-        # Step 4: Write output
         output_files = []
         warnings = []
+        ops_meta: Dict[str, object] = {}
+        if self.config.gfs_ops_timeline:
+            extracted, held = self._hold_last_record(extracted)
+            ops_meta = self._ops_metadata(held, warnings)
+
+        # Step 4: Write output
 
         # Output mode:
         #   direct_datm=True  → write datm_forcing.nc directly via DATMWriter.
@@ -428,6 +444,7 @@ class GFSProcessor(ForcingProcessor):
                 "variables": self.variables,
                 "resolution": self.resolution,
                 "grid_shape": (len(extracted["lats"]), len(extracted["lons"])),
+                **ops_meta,
             },
         )
 
@@ -438,6 +455,9 @@ class GFSProcessor(ForcingProcessor):
         Searches multiple GFS cycles to cover the full nowcast+forecast window.
         If the primary list is incomplete, supplements with backup files.
         """
+        if self.config.gfs_ops_timeline:
+            return self._build_ops_file_list()
+
         primary = self._build_file_list()
 
         # Target: enough files for nowcast + forecast (hourly)
@@ -456,6 +476,175 @@ class GFSProcessor(ForcingProcessor):
             return merged
 
         return primary
+
+    @staticmethod
+    def _ops_chain_cycle(valid: datetime, anchor: datetime) -> Tuple[datetime, int]:
+        """Cycle and lead the ops chain reads for valid hour *valid*.
+
+        Up to *anchor* (the model cycle) each hour comes from the newest GFS
+        cycle that has it at lead 1-6 h (06z f006 for 12z itself, never an f000
+        analysis, which carries no radiation); after it, from the *anchor* cycle's
+        own forecast. MJ (10/02/26)
+        """
+        if valid > anchor:
+            return anchor, int((valid - anchor).total_seconds() // 3600)
+        before = valid - timedelta(hours=1)
+        cyc_dt = before.replace(hour=before.hour - before.hour % 6,
+                                minute=0, second=0, microsecond=0)
+        return cyc_dt, int((valid - cyc_dt).total_seconds() // 3600)
+
+    def _ops_chain_file(self, cyc_dt: datetime, fhr: int) -> Optional[Path]:
+        """Existing, size-checked file of cycle *cyc_dt* at lead *fhr*, else None. MJ (10/02/26)"""
+        cyc = cyc_dt.hour
+        if self.resolution == "sflux":
+            name = f"gfs.t{cyc:02d}z.sfluxgrbf{fhr:03d}.grib2"
+        else:
+            name = f"gfs.t{cyc:02d}z.pgrb2.{self.resolution}.f{fhr:03d}"
+        cyc_root = self.input_path / f"gfs.{cyc_dt.strftime('%Y%m%d')}" / f"{cyc:02d}"
+        for d in (cyc_root / "atmos", cyc_root):
+            f = d / name
+            if not f.exists():
+                continue
+            if self.MIN_FILE_SIZE and not self.validate_file_size(f, self.MIN_FILE_SIZE):
+                log.warning(f"Skipping undersized file: {f.name}")
+                return None
+            return f
+        return None
+
+    def _ops_chain_list(self, anchor: datetime, v_start: datetime, v_end: datetime) -> List[Path]:
+        files: List[Path] = []
+        valid = v_start
+        while valid <= v_end:
+            cyc_dt, fhr = self._ops_chain_cycle(valid, anchor)
+            f = self._ops_chain_file(cyc_dt, fhr)
+            if f is not None:
+                files.append(f)
+            valid += timedelta(hours=1)
+        return files
+
+    def _fill_file_for_hour(self, valid: datetime, cycle_dt: datetime) -> Optional[Path]:
+        """Newest cycle that has *valid* at lead >= 1 h (any lead, searched back 3 days).
+
+        The first candidate is the ops chain's own pick; older cycles follow when
+        it is missing. MJ (10/02/26)
+        """
+        newest = min(valid - timedelta(hours=1), cycle_dt)
+        cyc_dt = newest.replace(hour=newest.hour - newest.hour % 6,
+                                minute=0, second=0, microsecond=0)
+        for k in range(self.OPS_FILL_CYCLES):
+            older = cyc_dt - timedelta(hours=6 * k)
+            f = self._ops_chain_file(older, int((valid - older).total_seconds() // 3600))
+            if f is not None:
+                return f
+        return None
+
+    def _build_ops_file_list(self) -> List[Path]:
+        """File list of stofs_3d_atl_create_surface_forcing_gfs.sh, plus gap fill.
+
+        The chain is anchored at the model cycle and starts 3 h before the nowcast
+        start, the usual pre-window buffer. Ops ships its list only with
+        OPS_MIN_RECORDS records (counted from the nowcast start) and otherwise
+        copies the previous day's file; its previous-day backup list holds at most
+        100 records, so it is never what ships and is not reproduced. Here every
+        hour of this phase's window the chain misses is filled from the newest
+        older cycle that has it, with a warning naming the hours (ops labels its
+        records by position, so a gap there shifts every later record). The
+        result metadata says whether the chain was complete. MJ (10/02/26)
+        """
+        cycle_dt = datetime.strptime(self.config.pdy, "%Y%m%d") + \
+            timedelta(hours=self.config.cyc)
+        nowcast_start = self.time_hotstart or \
+            cycle_dt - timedelta(hours=self.config.nowcast_hours)
+        v_start = nowcast_start - timedelta(hours=3)
+        v_end = cycle_dt + timedelta(hours=self.config.forecast_hours + 3)
+
+        files = self._ops_chain_list(cycle_dt, v_start, v_end)
+        n_records = sum(1 for f in files if self._parse_valid_time(f) >= nowcast_start)
+        qc_pass = n_records >= self.OPS_MIN_RECORDS
+        if not qc_pass:
+            log.warning(f"Ops GFS chain has {n_records} records (< {self.OPS_MIN_RECORDS}): "
+                        f"ops would ship the previous day's file instead")
+
+        t_start, t_end = self._get_time_window()
+        have = {self._parse_valid_time(f) for f in files}
+        filled: List[datetime] = []
+        unfilled: List[datetime] = []
+        valid = t_start
+        while valid <= t_end:
+            if valid not in have:
+                f = self._fill_file_for_hour(valid, cycle_dt)
+                if f is not None:
+                    files.append(f)
+                    filled.append(valid)
+                else:
+                    unfilled.append(valid)
+            valid += timedelta(hours=1)
+        if filled:
+            log.warning(f"Ops GFS chain missed {len(filled)} hours of the {self.phase} window, "
+                        f"filled from older cycles: {self._fmt_hours(filled)}")
+        if unfilled:
+            log.warning(f"No GFS file for {len(unfilled)} hours of the {self.phase} window: "
+                        f"{self._fmt_hours(unfilled)}")
+
+        self._ops_state = {"chain_complete": not filled and not unfilled, "qc_pass": qc_pass,
+                           "filled": filled, "unfilled": unfilled}
+        return files
+
+    @staticmethod
+    def _fmt_hours(hours: List[datetime]) -> str:
+        """Hours as runs, e.g. ``0926 19z..0927 00z (6 h), 0928 03z``. MJ (10/02/26)"""
+        runs: List[List[datetime]] = []
+        for h in sorted(hours):
+            if runs and h - runs[-1][-1] == timedelta(hours=1):
+                runs[-1].append(h)
+            else:
+                runs.append([h])
+        return ", ".join(
+            r[0].strftime("%m%d %Hz") if len(r) == 1
+            else f"{r[0]:%m%d %Hz}..{r[-1]:%m%d %Hz} ({len(r)} h)"
+            for r in runs)
+
+    def _hold_last_record(self, extracted: dict):
+        """Repeat the last record hourly up to the phase window end, with a warning.
+
+        SCHISM runs sflux with fail_if_missing, so a file that stops before the
+        phase end aborts the run; ops reaches the same result by re-timing its
+        last record to day 10. Returns (extracted, held hours). MJ (10/02/26)
+        """
+        times = extracted["times"]
+        _, t_end = self._get_time_window()
+        held: List[datetime] = []
+        if not times or times[-1] >= t_end:
+            return extracted, held
+        t = times[-1]
+        while t < t_end:
+            t += timedelta(hours=1)
+            held.append(t)
+        for var, arrays in extracted["data"].items():
+            if arrays:
+                arrays.extend(arrays[-1].copy() for _ in held)
+        extracted["times"] = times + held
+        log.warning(f"GFS data ends at {times[-1]:%m%d %Hz}, before the {self.phase} window end "
+                    f"{t_end:%m%d %Hz}: holding the last record for {self._fmt_hours(held)}")
+        return extracted, held
+
+    def _ops_metadata(self, held: List[datetime], warnings: List[str]) -> Dict[str, object]:
+        state = self._ops_state
+        filled = state.get("filled", [])
+        unfilled = state.get("unfilled", [])
+        if filled:
+            warnings.append(f"GFS ops chain incomplete: filled {self._fmt_hours(filled)}")
+        if unfilled:
+            warnings.append(f"GFS files missing for {self._fmt_hours(unfilled)}")
+        if held:
+            warnings.append(f"GFS data ends early: held the last record for {self._fmt_hours(held)}")
+        return {
+            "gfs_ops_chain_complete": bool(state.get("chain_complete", True)) and not held,
+            "gfs_ops_qc_pass": bool(state.get("qc_pass", True)),
+            "gfs_filled_hours": [h.strftime("%Y%m%d%H") for h in filled],
+            "gfs_unfilled_hours": [h.strftime("%Y%m%d%H") for h in unfilled],
+            "gfs_held_hours": [h.strftime("%Y%m%d%H") for h in held],
+        }
 
     def _build_file_list(self) -> List[Path]:
         """
@@ -755,11 +944,13 @@ class GFSProcessor(ForcingProcessor):
             # One wgrib2 pass extracts every variable for this file. The
             # records, levels and arrays are identical to the previous
             # per-variable extraction; only the (large) file decode is
-            # shared instead of repeated per variable.
+            # shared instead of repeated per variable. Ops takes the last PRATE record
+            # (the period mean). MJ (10/02/26)
             extracted_recs = self.extractor.extract_many(
                 gfs_file,
                 [(grib_var, level) for _, grib_var, level in var_levels],
                 domain,
+                **({"last_record": True} if self.config.gfs_ops_timeline else {}),
             )
 
             # Append per variable — fill array if missing to keep aligned

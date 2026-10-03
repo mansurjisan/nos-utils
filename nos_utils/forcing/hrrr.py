@@ -398,10 +398,14 @@ class HRRRProcessor(ForcingProcessor):
                     subset_file = tmpdir / f"match_{hrrr_file.stem}_{var}.grb2"
                     bin_file = tmpdir / f"data_{hrrr_file.stem}_{var}.bin"
 
+                    write_opts = ["-grib"]
+                    if self.config.hrrr_small_grib:
+                        lo, hi, la, lb = self.config.hrrr_domain
+                        write_opts = ["-small_grib", f"{lo}:{hi}", f"{la}:{lb}"]
                     cmd1 = [
                         self.extractor.wgrib2, str(hrrr_file),
                         "-match", match_str,
-                        "-grib", str(subset_file),
+                        *write_opts, str(subset_file),
                     ]
                     r1 = subprocess.run(cmd1, capture_output=True, text=True, timeout=300)
                     if r1.returncode != 0 or not subset_file.exists():
@@ -482,7 +486,10 @@ class HRRRProcessor(ForcingProcessor):
                 # Rotate grid-relative winds to earth coordinates
                 # HRRR Lambert Conformal stores winds relative to the grid,
                 # not earth. Fortran does this via w3fc07 subroutine.
-                if "uwind" in file_data and "vwind" in file_data and native_lons is not None:
+                # hrrr_rotate_winds=False keeps them grid-relative as ops STOFS-3D-ATL does
+                # (wrong by ~17 deg there; parity only). MJ (10/02/26)
+                if (self.config.hrrr_rotate_winds and "uwind" in file_data
+                        and "vwind" in file_data and native_lons is not None):
                     u_grid = file_data["uwind"]
                     v_grid = file_data["vwind"]
                     u_earth, v_earth = self._rotate_winds_lcc(

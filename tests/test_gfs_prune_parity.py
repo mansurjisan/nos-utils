@@ -90,7 +90,7 @@ def stofs_proc(tmp_path):
     """GFSProcessor over a realistic multi-cycle STOFS-3D-ATL nowcast."""
     pdy = "20260401"
     gfs_root = _make_multicycle_gfs_dir(tmp_path, pdy)
-    cfg = ForcingConfig.for_stofs_3d_atl(pdy=pdy, cyc=12)
+    cfg = ForcingConfig.for_stofs_3d_atl(pdy=pdy, cyc=12, gfs_ops_timeline=False)  # the multi-cycle search. MJ (10/02/26)
     proc = GFSProcessor(cfg, gfs_root, tmp_path / "out", phase="nowcast")
     proc.MIN_FILE_SIZE = 0  # mock files are tiny
     return proc

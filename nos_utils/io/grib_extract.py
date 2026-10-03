@@ -55,6 +55,7 @@ class GRIBExtractor(ABC):
         grib_file: Path,
         var_levels: "list[Tuple[str, str]]",
         domain: Tuple[float, float, float, float],
+        last_record: bool = False,
     ) -> "dict":
         """
         Extract several (variable, level) records from one GRIB2 file.
@@ -65,10 +66,18 @@ class GRIBExtractor(ABC):
         :class:`Wgrib2Extractor` overrides this to decode/subset the (large)
         source file only once.
 
+        ``last_record`` takes the last matching record instead of the first
+        when a (variable, level) matches several, as wgrib2 ``-netcdf`` does
+        (GFS carries an instantaneous and a period-mean PRATE). Only
+        :class:`Wgrib2Extractor` honours it. MJ (10/02/26)
+
         Returns:
             ``{(variable, level): np.ndarray or None}`` for every requested
             pair (missing records map to ``None``, exactly as ``extract``).
         """
+        if last_record:
+            log.warning(f"{type(self).__name__} cannot take the last matching record; "
+                        f"using the first")
         return {
             (variable, level): self.extract(grib_file, variable, level, domain)
             for variable, level in var_levels
@@ -231,6 +240,7 @@ class Wgrib2Extractor(GRIBExtractor):
         grib_file: Path,
         var_levels: "list[Tuple[str, str]]",
         domain: Tuple[float, float, float, float],
+        last_record: bool = False,
     ) -> "dict":
         """
         Extract multiple (variable, level) records with a single decode of
@@ -248,7 +258,9 @@ class Wgrib2Extractor(GRIBExtractor):
            ``-nxny`` sequence ``extract`` uses. Re-matching on the combined
            subset selects the exact same record (and the same first record
            for duplicate-record vars like PRATE) as matching on the full
-           file, so the returned array is byte-identical.
+           file, so the returned array is byte-identical. With
+           ``last_record`` the last matching record is decoded instead, by
+           its number in the combined file's inventory. MJ (10/02/26)
 
         The expensive decode of the ~127 MB source happens once instead of
         once per variable.
@@ -280,9 +292,11 @@ class Wgrib2Extractor(GRIBExtractor):
                 )
                 return {vl: None for vl in var_levels}
 
+            last_nums = self._last_record_numbers(combined) if last_record else {}
             for variable, level in var_levels:
                 results[(variable, level)] = self._extract_record_from(
-                    combined, variable, level, tmpdir
+                    combined, variable, level, tmpdir,
+                    last_nums.get((variable, level)),
                 )
 
         return results
@@ -307,12 +321,28 @@ class Wgrib2Extractor(GRIBExtractor):
             parts.append(f"{variable}:{level}")
         return ":(" + "|".join(parts) + "):"
 
+    def _last_record_numbers(self, grib_file: Path) -> dict:
+        """``{(variable, level): number of its last record}`` from the ``-s`` inventory. MJ (10/02/26)"""
+        r = subprocess.run([self.wgrib2, str(grib_file), "-s"],
+                           capture_output=True, text=True, timeout=60)
+        nums: dict = {}
+        for line in r.stdout.splitlines():
+            parts = line.split(":")
+            if len(parts) > 4 and parts[0].isdigit():
+                nums[(parts[3], parts[4])] = int(parts[0])
+        if r.returncode != 0 or not nums:
+            # Decoding the first record instead would silently give the instantaneous PRATE. MJ (10/02/26)
+            raise RuntimeError(f"wgrib2 -s failed on {grib_file.name} (rc={r.returncode}): "
+                               f"{r.stderr[:200]}")
+        return nums
+
     def _extract_record_from(
         self,
         combined_file: Path,
         variable: str,
         level: str,
         tmpdir: Path,
+        record: Optional[int] = None,
     ) -> Optional[np.ndarray]:
         """Pull one record from an already-subset combined GRIB2 file.
 
@@ -326,19 +356,23 @@ class Wgrib2Extractor(GRIBExtractor):
         rec_file.unlink(missing_ok=True)
         bin_file.unlink(missing_ok=True)
 
-        cmd = [
-            self.wgrib2, str(combined_file),
-            "-match", match_str,
-            "-grib", str(rec_file),
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if r.returncode != 0 or not rec_file.exists():
-            log.debug(f"wgrib2 match failed for {variable}:{level}")
-            return None
+        if record is None:
+            cmd = [
+                self.wgrib2, str(combined_file),
+                "-match", match_str,
+                "-grib", str(rec_file),
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0 or not rec_file.exists():
+                log.debug(f"wgrib2 match failed for {variable}:{level}")
+                return None
+            src, number = rec_file, "1"
+        else:
+            src, number = combined_file, str(record)
 
         cmd2 = [
-            self.wgrib2, str(rec_file),
-            "-d", "1",
+            self.wgrib2, str(src),
+            "-d", number,
             "-no_header", "-bin", str(bin_file),
         ]
         r2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=60)
@@ -346,7 +380,7 @@ class Wgrib2Extractor(GRIBExtractor):
             return None
 
         data = np.fromfile(bin_file, dtype=np.float32)
-        nx, ny = self._get_nxny(rec_file)
+        nx, ny = self._get_nxny(src)
         if nx and ny and data.size == nx * ny:
             return data.reshape((ny, nx))
 
@@ -381,9 +415,12 @@ class Wgrib2Extractor(GRIBExtractor):
             if subset_file.exists():
                 nx, ny = self._get_nxny(subset_file)
                 if nx and ny:
-                    # For regular lat/lon grids, reconstruct coords
-                    dx = (lon_max - lon_min) / (nx - 1) if nx > 1 else 0.25
-                    dy = (lat_max - lat_min) / (ny - 1) if ny > 1 else 0.25
+                    coords = self._read_regular_axes(subset_file, nx, ny, domain, tmpdir)
+                    if coords is not None:
+                        return coords
+                    # Fall back to evenly spaced points between the requested bounds. MJ (10/02/26)
+                    log.warning("Could not read the grid axes from wgrib2; using evenly spaced "
+                                "points between the requested bounds")
                     lons = np.linspace(lon_min, lon_max, nx)
                     lats = np.linspace(lat_min, lat_max, ny)
                     return lons, lats
@@ -393,6 +430,47 @@ class Wgrib2Extractor(GRIBExtractor):
         lons = np.arange(lon_min, lon_max + 0.25, 0.25)
         lats = np.arange(lat_min, lat_max + 0.25, 0.25)
         return lons, lats
+
+    def _read_regular_axes(
+        self,
+        subset_file: Path,
+        nx: int,
+        ny: int,
+        domain: Tuple[float, float, float, float],
+        tmpdir: Path,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """True lon/lat of a subset regular grid, as wgrib2 reports them.
+
+        ``-small_grib`` keeps whole grid cells, so the extracted points sit on
+        the source grid (GFS 0.25 deg), not on the requested bounds. Longitudes
+        come back in the domain's own convention (0-360 only for a 0-360
+        domain, as ``coords.lon_convention`` decides). Returns None when the
+        axes cannot be read or the grid is not regular. MJ (10/02/26)
+        """
+        from ..coords import normalize_lon
+
+        axes = {}
+        for name in ("lon", "lat"):
+            out_bin = tmpdir / f"{name}.bin"
+            r = subprocess.run(
+                [self.wgrib2, str(subset_file), "-d", "1",
+                 "-rpn", f"rcl_{name}", "-no_header", "-bin", str(out_bin)],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode != 0 or not out_bin.exists():
+                return None
+            vals = np.fromfile(out_bin, dtype=np.float32)
+            if vals.size != nx * ny:
+                return None
+            axes[name] = vals.reshape((ny, nx)).astype(np.float64)
+
+        lon2d, lat2d = axes["lon"], axes["lat"]
+        if not (np.allclose(lon2d, lon2d[0:1, :]) and np.allclose(lat2d, lat2d[:, 0:1])):
+            return None
+
+        lon_min, lon_max = domain[0], domain[1]
+        convention = "0360" if (lon_min >= 0.0 and lon_max > 180.0) else "pm180"
+        return normalize_lon(lon2d[0, :], convention), lat2d[:, 0]
 
     def regrid_to_latlon(
         self,
