@@ -530,7 +530,8 @@ class BlenderProcessor(ForcingProcessor):
 
         # ---- Lambert Conformal wind rotation (HRRR-sourced cells only) ----
         if (hrrr is not None and "UGRD_10maboveground" in ncout.variables
-                and "VGRD_10maboveground" in ncout.variables and cos_rot is not None):
+                and "VGRD_10maboveground" in ncout.variables and cos_rot is not None
+                and getattr(self.config, "datm_rotate_hrrr_winds", True)):
             log.info("Applying Lambert Conformal wind rotation to HRRR cells...")
             u_v = ncout.variables["UGRD_10maboveground"]
             v_v = ncout.variables["VGRD_10maboveground"]
