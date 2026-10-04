@@ -444,24 +444,36 @@ class TestConfigGating:
         assert cfg.hrrr_small_grib is False
 
     def test_factories(self):
-        atl = ForcingConfig.for_stofs_3d_atl(PDY, 12)
-        assert atl.gfs_ops_timeline is True and atl.hrrr_rotate_winds is False
-        assert atl.hrrr_small_grib is True
-        for other in (ForcingConfig.for_stofs_3d_atl_ufs(PDY, 12), ForcingConfig.for_stofs_3d_pac(PDY, 12),
-                      ForcingConfig.for_secofs(PDY, 12)):
+        for atl in (ForcingConfig.for_stofs_3d_atl(PDY, 12), ForcingConfig.for_stofs_3d_atl_ufs(PDY, 12)):
+            assert atl.gfs_ops_timeline is True and atl.hrrr_rotate_winds is False
+            assert atl.hrrr_small_grib is True and atl.datm_rotate_hrrr_winds is False
+        for other in (ForcingConfig.for_stofs_3d_pac(PDY, 12), ForcingConfig.for_secofs(PDY, 12)):
             assert other.gfs_ops_timeline is False and other.hrrr_rotate_winds is True
-            assert other.hrrr_small_grib is False
+            assert other.hrrr_small_grib is False and other.datm_rotate_hrrr_winds is True
 
     def test_yaml_standalone_atl_follows_ops(self, tmp_path):
         cfg = _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", mode="standalone")
         assert cfg.nws == 2 and cfg.gfs_ops_timeline is True and cfg.hrrr_rotate_winds is False
         assert cfg.hrrr_small_grib is True
 
-    def test_yaml_coupled_atl_and_other_systems_keep_the_defaults(self, tmp_path):
-        for cfg in (_yaml_cfg(tmp_path, "stofs_3d_atl_ufs"),
-                    _yaml_cfg(tmp_path, "secofs_ufs", mode="standalone")):
-            assert cfg.gfs_ops_timeline is False and cfg.hrrr_rotate_winds is True
-            assert cfg.hrrr_small_grib is False
+    def test_yaml_coupled_atl_follows_ops_no_rotation(self, tmp_path):
+        cfg = _yaml_cfg(tmp_path, "stofs_3d_atl_ufs")
+        assert cfg.nws == 4 and cfg.gfs_ops_timeline is True and cfg.hrrr_rotate_winds is False
+        assert cfg.hrrr_small_grib is True and cfg.datm_rotate_hrrr_winds is False
+
+    @pytest.mark.parametrize("name,mode", [
+        ("secofs_ufs", None), ("secofs_ufs", "standalone"), ("secofs_ufs_ww3", None),
+        ("stofs_3d_ak_ufs", None), ("stofs_3d_pac_ufs", None)])
+    def test_yaml_other_systems_keep_the_defaults(self, tmp_path, name, mode):
+        cfg = _yaml_cfg(tmp_path, name, mode=mode)
+        assert cfg.gfs_ops_timeline is False and cfg.hrrr_rotate_winds is True
+        assert cfg.hrrr_small_grib is False and cfg.datm_rotate_hrrr_winds is True
+
+    def test_yaml_blend_rotate_key_overrides(self, tmp_path):
+        atm = "forcing:\n  atmospheric:\n    hrrr:\n      blend_rotate_winds: true\n"
+        assert _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", atm=atm).datm_rotate_hrrr_winds is True
+        atm = "forcing:\n  atmospheric:\n    hrrr:\n      blend_rotate_winds: false\n"
+        assert _yaml_cfg(tmp_path, "secofs_ufs", atm=atm).datm_rotate_hrrr_winds is False
 
     def test_yaml_keys_override_the_name_rule(self, tmp_path):
         atm = ("forcing:\n  atmospheric:\n    gfs:\n      ops_timeline: false\n"
@@ -518,8 +530,34 @@ class TestSilentFallbacks:
 
 def test_factory_flags_follow_the_final_nws():
     atl = ForcingConfig.for_stofs_3d_atl(PDY, 12, nws=4)
-    assert atl.gfs_ops_timeline is False and atl.hrrr_rotate_winds is True
-    assert atl.hrrr_small_grib is False
-    kept = ForcingConfig.for_stofs_3d_atl(PDY, 12, nws=4, gfs_ops_timeline=True)
-    assert kept.gfs_ops_timeline is True and kept.hrrr_rotate_winds is True
+    assert atl.gfs_ops_timeline is True and atl.hrrr_rotate_winds is False
+    assert atl.hrrr_small_grib is True and atl.datm_rotate_hrrr_winds is False
+    kept = ForcingConfig.for_stofs_3d_atl(PDY, 12, nws=4, gfs_ops_timeline=False, hrrr_rotate_winds=True)
+    assert kept.gfs_ops_timeline is False and kept.hrrr_rotate_winds is True
     assert ForcingConfig.for_stofs_3d_atl(PDY, 12).gfs_ops_timeline is True
+
+
+def test_coupled_atl_datm_inputs_use_the_ops_gfs_chain(tmp_path, monkeypatch):
+    """The DATM path reuses GFSProcessor, so the ops chain applies to nws=4 too. MJ (10/03/26)"""
+    from nos_utils.forcing.gfs import GFSProcessor
+    cfg = ForcingConfig.for_stofs_3d_atl_ufs(PDY, 12)
+    proc = GFSProcessor(cfg, tmp_path, tmp_path / "o", resolution="0p25")
+    assert cfg.nws == 4 and proc.MIN_FILE_SIZE == GFSProcessor.OPS_MIN_FILE_SIZE
+    monkeypatch.setattr(GFSProcessor, "_build_ops_file_list", lambda self: ["ops"])
+    assert proc.find_input_files() == ["ops"]
+
+
+def test_hrrr_blend_weight_gating(tmp_path):
+    """0.99 for ATL (factories and name rule), 1.0 elsewhere; yaml key overrides. MJ (10/03/26)"""
+    assert ForcingConfig.for_stofs_3d_atl(PDY, 12).datm_hrrr_weight == 0.99
+    assert ForcingConfig.for_stofs_3d_atl_ufs(PDY, 12).datm_hrrr_weight == 0.99
+    for other in (ForcingConfig.for_secofs(PDY, 12), ForcingConfig.for_stofs_3d_pac(PDY, 12)):
+        assert other.datm_hrrr_weight == 1.0
+    assert _yaml_cfg(tmp_path, "stofs_3d_atl_ufs").datm_hrrr_weight == 0.99
+    for name in ("secofs_ufs", "stofs_3d_ak_ufs", "stofs_3d_pac_ufs"):
+        assert _yaml_cfg(tmp_path, name).datm_hrrr_weight == 1.0
+    atm = "forcing:\n  atmospheric:\n    hrrr:\n      blend_weight: 1.0\n"
+    assert _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", atm=atm).datm_hrrr_weight == 1.0
+    with pytest.raises(ValueError):
+        _yaml_cfg(tmp_path, "stofs_3d_atl_ufs",
+                  atm="forcing:\n  atmospheric:\n    hrrr:\n      blend_weight: 0\n")

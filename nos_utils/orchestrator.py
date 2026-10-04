@@ -1372,6 +1372,12 @@ class PrepOrchestrator:
         self._archive_adt_field(work_dir, comout, archived)
         self._archive_dynamic_adjust_bias(work_dir, comout, archived)
 
+        # Gap #1: St. Lawrence individual files, with or without the manifest flag: the run
+        # stage needs flux.th (ifltype=1 boundary) and the ATL nowcast aborts without it.
+        # Gated on st_lawrence_enabled (ATL only), so other systems' $COMOUT is unchanged.
+        # MJ (10/03/26)
+        self._archive_st_lawrence_extra(work_dir, comout, archived)
+
         if manifest_on:
             # --- Declarative manifest path (opt-in) ---
             # Produces the identical COMMON OBC/river.th/NWM tars as the
@@ -1382,8 +1388,6 @@ class PrepOrchestrator:
             self._archive_via_manifest(
                 manifest, work_dir, comout, archived,
             )
-            # Gap #1: St. Lawrence individual files (st_lawrence_enabled).
-            self._archive_st_lawrence_extra(work_dir, comout, archived)
             # Gap #2: OBC-QC fallback artifacts (obc_min_timesteps > 0).
             self._archive_obc_qc_artifacts(work_dir, comout, archived)
         else:

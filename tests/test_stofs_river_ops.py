@@ -76,12 +76,12 @@ def _stage_nwm(tmp_path, n_hours=6):
 class TestConfigFlag:
     def test_atl_factories(self):
         assert ForcingConfig.for_stofs_3d_atl("20261001", 12).river_ops_static is True
-        assert ForcingConfig.for_stofs_3d_atl_ufs("20261001", 12).river_ops_static is False
+        assert ForcingConfig.for_stofs_3d_atl_ufs("20261001", 12).river_ops_static is True
 
-    def test_atl_factory_follows_nws(self):
+    def test_atl_factory_on_for_standalone_and_coupled(self):
         assert ForcingConfig.for_stofs_3d_atl("20261001", 12, nws=2).river_ops_static is True
-        assert ForcingConfig.for_stofs_3d_atl("20261001", 12, nws=4).river_ops_static is False
-        assert ForcingConfig.for_stofs_3d_atl_ufs("20261001", 12, river_ops_static=True).river_ops_static is True
+        assert ForcingConfig.for_stofs_3d_atl("20261001", 12, nws=4).river_ops_static is True
+        assert ForcingConfig.for_stofs_3d_atl_ufs("20261001", 12, river_ops_static=False).river_ops_static is False
 
     @pytest.mark.parametrize("factory", [
         "for_secofs", "for_secofs_ufs", "for_stofs_3d_pac", "for_stofs_3d_pac_ufs"])
@@ -91,11 +91,11 @@ class TestConfigFlag:
     def test_default_off(self):
         assert ForcingConfig(-90.0, -60.0, 20.0, 40.0, pdy="20261001", cyc=12).river_ops_static is False
 
-    def test_coupled_nws4_off_by_name(self, tmp_path):
+    def test_coupled_nws4_on_by_name(self, tmp_path):
         pytest.importorskip("yaml")
         p = tmp_path / "x.yaml"
         p.write_text("system:\n  name: stofs_3d_atl_ufs\nmodel:\n  physics:\n    nws: 4\n")
-        assert ForcingConfig.from_yaml(p, pdy="20261001", cyc=12).river_ops_static is False
+        assert ForcingConfig.from_yaml(p, pdy="20261001", cyc=12).river_ops_static is True
 
     @pytest.mark.parametrize("name,river,expected", [
         ("stofs_3d_atl_ufs", "", True),

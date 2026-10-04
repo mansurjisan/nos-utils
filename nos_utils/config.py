@@ -114,6 +114,17 @@ class ForcingConfig:
     # deg off over the Atlantic and physically wrong; False exists only for bit parity with ops.
     # Native-grid extraction (igrd_met=0) only. MJ (10/02/26)
     hrrr_rotate_winds: bool = True
+    # DATM blender (nws=4): second Lambert-conformal rotation applied to HRRR-sourced cells after
+    # regridding. True keeps the legacy behaviour (SECOFS: together with hrrr_rotate_winds this
+    # rotates twice, a confirmed separate issue left untouched). False for STOFS-3D-ATL coupled:
+    # ops keeps HRRR winds grid-relative, so no rotation at all reproduces the ops sflux winds
+    # (physically about 17 deg off over the Atlantic; kept for parity only). MJ (10/03/26)
+    datm_rotate_hrrr_winds: bool = True
+    # Weight of HRRR inside its coverage in the DATM blend (GFS gets 1 - weight). 1.0 keeps
+    # 100% HRRR (SECOFS). Ops sflux with an empty sflux_inputs.txt uses the default weights 1 for _1 (GFS)
+    # and 99 for _2 (HRRR), i.e. 0.99*HRRR + 0.01*GFS (sflux_9c.F90:1358-1384,
+    # 3195-3212); STOFS-3D-ATL sets 0.99. MJ (10/03/26)
+    datm_hrrr_weight: float = 1.0
     # Subset each native HRRR record with wgrib2 -small_grib over hrrr_domain before decoding, as
     # ops does. wgrib2 re-packs the values, so some are 1 float32 ulp off a decode of the full
     # file; the grid is unchanged. Native-grid extraction only. MJ (10/02/26)
@@ -576,12 +587,13 @@ class ForcingConfig:
             tide_nodal_reference="cycle",
         )
         defaults.update(overrides)
-        # Ops sflux parity applies to the standalone files only (nws=2), as in from_yaml;
-        # explicit overrides win. MJ (10/02/26)
-        ops_sflux = defaults.get("nws", 2) == 2
-        # Ops river files: standalone only (coupled build lacks SH_MEM_COMM/PREC_EVAP). MJ (10/03/26)
-        for key, value in (("gfs_ops_timeline", ops_sflux), ("hrrr_rotate_winds", not ops_sflux),
-                           ("hrrr_small_grib", ops_sflux), ("river_ops_static", ops_sflux)):
+        # Ops parity for STOFS-3D-ATL, standalone (nws=2) and coupled (nws=4, executable built with
+        # PREC_EVAP): ops GFS chain + last PRATE record, -small_grib HRRR, grid-relative HRRR winds
+        # (no rotation in extraction or in the DATM blender) and the ops static river files.
+        # Explicit overrides win. MJ (10/03/26)
+        for key, value in (("gfs_ops_timeline", True), ("hrrr_rotate_winds", False),
+                           ("datm_rotate_hrrr_winds", False), ("datm_hrrr_weight", 0.99),
+                           ("hrrr_small_grib", True), ("river_ops_static", True)):
             defaults.setdefault(key, value)
         return cls(**defaults)
 
@@ -643,6 +655,12 @@ class ForcingConfig:
             tide_nodal_reference="cycle",
         )
         defaults.update(overrides)
+        # Same ops parity set as for_stofs_3d_atl; the DATM path reuses GFSProcessor/HRRRProcessor
+        # for its gfs_forcing.nc / hrrr_forcing.nc inputs. MJ (10/03/26)
+        for key, value in (("gfs_ops_timeline", True), ("hrrr_rotate_winds", False),
+                           ("datm_rotate_hrrr_winds", False), ("datm_hrrr_weight", 0.99),
+                           ("hrrr_small_grib", True), ("river_ops_static", True)):
+            defaults.setdefault(key, value)
         return cls(**defaults)
 
     @classmethod
@@ -873,17 +891,24 @@ class ForcingConfig:
         # HRRR blend domain (may differ from main domain)
         hrrr_blend = atm.get("hrrr_blend", {})
 
-        # Ops sflux parity: only the standalone (nws=2) STOFS-3D-ATL files mirror ops; the coupled
-        # path blends HRRR/GFS into DATM and keeps the default search and wind rotation. The yaml
-        # keys forcing.atmospheric.gfs.ops_timeline / hrrr.rotate_winds / hrrr.small_grib override the name rule.
-        # MJ (10/02/26)
-        _ops_sflux = nws == 2 and str(_sys.get("name", "")).startswith("stofs_3d_atl")
+        # Ops atmospheric parity: STOFS-3D-ATL, standalone (nws=2) and coupled (nws=4, the DATM path
+        # feeds from the same GFS/HRRR processors); other systems keep the defaults. The yaml keys
+        # forcing.atmospheric.gfs.ops_timeline / hrrr.rotate_winds / hrrr.small_grib /
+        # hrrr.blend_rotate_winds override the name rule. MJ (10/03/26)
+        _ops_sflux = str(_sys.get("name", "")).startswith("stofs_3d_atl")
         _gfs_ops_tl = _strict_bool(
             atm.get("gfs", {}).get("ops_timeline") if isinstance(atm.get("gfs"), dict) else None,
             "forcing.atmospheric.gfs.ops_timeline", _ops_sflux)
         _hrrr_rot = _strict_bool(
             atm.get("hrrr", {}).get("rotate_winds") if isinstance(atm.get("hrrr"), dict) else None,
             "forcing.atmospheric.hrrr.rotate_winds", not _ops_sflux)
+        _datm_rot = _strict_bool(
+            atm.get("hrrr", {}).get("blend_rotate_winds") if isinstance(atm.get("hrrr"), dict) else None,
+            "forcing.atmospheric.hrrr.blend_rotate_winds", not _ops_sflux)
+        _hw = atm.get("hrrr", {}).get("blend_weight") if isinstance(atm.get("hrrr"), dict) else None
+        _hrrr_weight = float(_hw) if _hw is not None else (0.99 if _ops_sflux else 1.0)
+        if not 0.0 < _hrrr_weight <= 1.0:
+            raise ValueError("forcing.atmospheric.hrrr.blend_weight must be in (0, 1]")
         _hrrr_sg = _strict_bool(
             atm.get("hrrr", {}).get("small_grib") if isinstance(atm.get("hrrr"), dict) else None,
             "forcing.atmospheric.hrrr.small_grib", _ops_sflux)
@@ -897,12 +922,12 @@ class ForcingConfig:
         _adt_wt = Path(_adt_wt) if _adt_wt else None
 
         # Ops river inputs (static FIX source_sink.in / msource.th / vsink.th, ops source
-        # order): standalone (nws=2) ATL by name, yaml forcing.river.ops_static_files
-        # overrides. MJ (10/03/26)
+        # order): STOFS-3D-ATL by name (the coupled executable now has PREC_EVAP), yaml
+        # forcing.river.ops_static_files overrides. MJ (10/03/26)
         _river_ops = _strict_bool(
             river.get("ops_static_files") if isinstance(river, dict) else None,
             "forcing.river.ops_static_files",
-            nws == 2 and str(_sys.get("name", "")).startswith("stofs_3d_atl"))
+            str(_sys.get("name", "")).startswith("stofs_3d_atl"))
 
         # NWM river product and target counts
         river_product = river.get("primary", "nwm") if isinstance(river, dict) else "nwm"
@@ -946,6 +971,8 @@ class ForcingConfig:
             obc_ops_timeline=_ops_tl,
             gfs_ops_timeline=_gfs_ops_tl,
             hrrr_rotate_winds=_hrrr_rot,
+            datm_rotate_hrrr_winds=_datm_rot,
+            datm_hrrr_weight=_hrrr_weight,
             hrrr_small_grib=_hrrr_sg,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
             adt_weight_file=_adt_wt,
