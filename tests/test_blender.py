@@ -436,3 +436,21 @@ class TestHrrrBlendRotation:
     def test_default_weight_is_all_hrrr(self, tmp_path):
         _, v, src = self._run(tmp_path, False)
         assert np.allclose(v[src == 1], 0.0, atol=1e-4)
+
+
+class TestHrrrFootprintMask:
+    """Hull-only points outside a curved grid edge are not HRRR. MJ (10/03/26)"""
+
+    def test_concave_bottom_edge(self):
+        from nos_utils.forcing.blender import (
+            _grid_outline_polygon, _points_in_polygon,
+        )
+        x = np.linspace(0.0, 10.0, 11)
+        y = np.linspace(0.0, 10.0, 11)
+        lon2d, lat2d = np.meshgrid(x, y)
+        lat2d = lat2d + 3.0 * np.sin(np.pi * lon2d / 10.0)  # bulges the bottom edge up
+        ring = _grid_outline_polygon(lon2d, lat2d)
+        # (5, 1) is above the hull's bottom (y=0 at the corners) but below the real edge (y=3)
+        pts = np.array([[5.0, 1.0], [5.0, 6.0], [-1.0, 5.0]])
+        got = _points_in_polygon(pts, ring)
+        assert got.tolist() == [False, True, False]

@@ -45,6 +45,35 @@ log = logging.getLogger(__name__)
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
+def _grid_outline_polygon(lon2d, lat2d):
+    """Closed boundary ring of a 2-D lon/lat grid: bottom row, right column,
+    top row reversed, left column reversed. MJ (10/03/26)"""
+    return np.concatenate([
+        np.column_stack([lon2d[0, :], lat2d[0, :]]),
+        np.column_stack([lon2d[1:, -1], lat2d[1:, -1]]),
+        np.column_stack([lon2d[-1, -2::-1], lat2d[-1, -2::-1]]),
+        np.column_stack([lon2d[-2:0:-1, 0], lat2d[-2:0:-1, 0]]),
+    ]).astype(np.float64)
+
+
+def _points_in_polygon(pts, poly, chunk=4000):
+    """Vectorized even-odd ray casting (no matplotlib; WCOSS2 prep env).
+    pts (N,2), poly (M,2) -> bool (N,). MJ (10/03/26)"""
+    px = pts[:, 0].astype(np.float64)
+    py = pts[:, 1].astype(np.float64)
+    x1, y1 = poly[:, 0], poly[:, 1]
+    x2, y2 = np.roll(x1, -1), np.roll(y1, -1)
+    inside = np.zeros(len(px), dtype=bool)
+    for i in range(0, len(px), chunk):
+        x = px[i:i + chunk, None]
+        y = py[i:i + chunk, None]
+        cross = (y1 > y) != (y2 > y)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            xint = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+        inside[i:i + chunk] = (np.sum(cross & (x < xint), axis=1) % 2) == 1
+    return inside
+
+
 def _epoch_seconds(dt: datetime) -> float:
     """Return seconds since 1970-01-01 UTC for a naive-or-aware datetime."""
     if dt.tzinfo is None:
@@ -244,6 +273,18 @@ class BlenderProcessor(ForcingProcessor):
                     target_lon2d.ravel(), target_lat2d.ravel(),
                 ])
                 simplices = tri.find_simplex(target_pts_flat)
+                # ATL (blend weight < 1): the Delaunay hull spills past the
+                # curved HRRR grid edge; ops sflux (bad_node_2) uses GFS only
+                # outside the real grid footprint, so mask to the true outline
+                # of the FULL (unsubsetted) grid. Gated so SECOFS/AK/PAC
+                # (weight 1.0) stay byte-identical. MJ (10/03/26)
+                if float(getattr(self.config, "datm_hrrr_weight", 1.0)) < 1.0:
+                    cand = np.where(simplices >= 0)[0]
+                    ring = _grid_outline_polygon(hrrr_lon2d_full, hrrr_lat2d_full)
+                    keep = _points_in_polygon(target_pts_flat[cand], ring)
+                    simplices[cand[~keep]] = -1
+                    log.info(f"HRRR footprint mask removed {int((~keep).sum())} "
+                             f"hull-only target points")
                 hrrr_valid_mask = (simplices >= 0).reshape(ny, nx)
                 n_covered = int(hrrr_valid_mask.sum())
                 log.info(f"HRRR covers {n_covered}/{ny*nx} target points "
