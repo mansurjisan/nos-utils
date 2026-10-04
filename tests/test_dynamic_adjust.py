@@ -711,3 +711,152 @@ class TestDensifyHourly:
         with nc_mod.Dataset(str(nc)) as ds:
             np.testing.assert_allclose(ds["time_series"][:, 0, 0, 0], np.arange(7), atol=1e-6)
         assert not densify_hourly(nc)
+
+
+class TestOpsLayout:
+    """Previous cycle read from $COMOUT_PREV (ops v3.1 layout); today's bias archived to $COMOUTrerun."""
+
+    RUN = "stofs_3d_atl_ufs"
+
+    def _orch(self, tmp_path, paths=None, pdy="20261001", cfg=None):
+        from nos_utils.orchestrator import PrepOrchestrator
+
+        cfg = cfg or ForcingConfig.for_stofs_3d_atl(pdy=pdy, cyc=12)
+        return PrepOrchestrator(cfg, dict({"output": str(tmp_path / "work")}, **(paths or {})),
+                                run_name=self.RUN, skip_legacy=True)
+
+    def _spy(self, monkeypatch):
+        import nos_utils.forcing.dynamic_adjust as da
+
+        seen = {}
+
+        class Spy:
+            def __init__(self, config, **kw):
+                seen.update(kw)
+
+            def process(self):
+                return None
+
+        monkeypatch.setattr(da, "DynamicAdjustProcessor", Spy)
+        return seen
+
+    def _prev_comout(self, tmp_path):
+        prev = tmp_path / "com" / f"{self.RUN}.20260930"
+        (prev / "rerun").mkdir(parents=True)
+        (prev / "staout_1").write_text("x")
+        (prev / "rerun" / f"{self.RUN}.t12z.avg_bias").write_text("0.123\n")
+        return prev
+
+    def test_comout_prev_root_staout_and_rerun_avg_bias_are_read(self, tmp_path, monkeypatch):
+        prev = self._prev_comout(tmp_path)
+        seen = self._spy(monkeypatch)
+        self._orch(tmp_path, {"prev_comout": str(prev)})._run_dynamic_adjust(tmp_path)
+        assert seen["prev_staout_1"] == prev / "staout_1"
+        assert seen["prev_avg_bias_file"] == prev / "rerun" / f"{self.RUN}.t12z.avg_bias"
+        assert seen["prev_param_nml"] is None
+
+    @pytest.mark.parametrize("pdy,start", [
+        ("20261001", datetime(2026, 9, 29, 12)),
+        ("20260301", datetime(2026, 2, 27, 12)),
+        ("20270101", datetime(2026, 12, 30, 12)),
+    ])
+    def test_model_start_is_todays_nowcast_start_minus_a_day(self, tmp_path, monkeypatch, pdy, start):
+        seen = self._spy(monkeypatch)
+        self._orch(tmp_path, {"prev_comout": str(self._prev_comout(tmp_path))}, pdy=pdy)._run_dynamic_adjust(tmp_path)
+        assert seen["model_start"] == start
+
+    def test_nothing_on_disk_gives_no_previous_inputs(self, tmp_path, monkeypatch):
+        seen = self._spy(monkeypatch)
+        self._orch(tmp_path, {"prev_comout": str(tmp_path / "absent")})._run_dynamic_adjust(tmp_path)
+        assert seen["prev_staout_1"] is None and seen["prev_avg_bias_file"] is None
+
+    def test_comin_rerun_overrides_the_ops_layout(self, tmp_path, monkeypatch):
+        prev = self._prev_comout(tmp_path)
+        flat = tmp_path / "flat"
+        flat.mkdir()
+        for name in ("staout_1", f"{self.RUN}.t12z.param.nml", f"{self.RUN}.t12z.avg_bias"):
+            (flat / name).write_text("y")
+        seen = self._spy(monkeypatch)
+        self._orch(tmp_path, {"prev_comout": str(prev), "prev_rerun": str(flat)})._run_dynamic_adjust(tmp_path)
+        assert seen["prev_staout_1"] == flat / "staout_1"
+        assert seen["prev_param_nml"] == flat / f"{self.RUN}.t12z.param.nml"
+        assert seen["prev_avg_bias_file"] == flat / f"{self.RUN}.t12z.avg_bias"
+        assert seen["model_start"] is None
+
+    def test_comin_rerun_without_param_nml_uses_the_start_rule(self, tmp_path, monkeypatch):
+        flat = tmp_path / "flat"
+        flat.mkdir()
+        (flat / "staout_1").write_text("y")
+        seen = self._spy(monkeypatch)
+        self._orch(tmp_path, {"prev_rerun": str(flat)})._run_dynamic_adjust(tmp_path)
+        assert seen["prev_param_nml"] is None and seen["model_start"] == datetime(2026, 9, 29, 12)
+
+    def test_todays_bias_goes_to_comout_rerun_under_the_ops_names(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / f"{self.RUN}.t12z.avg_bias").write_text("0.250\n")
+        (work / "average_bias_today").write_text("nan\n")
+        rerun = tmp_path / "com" / f"{self.RUN}.20261001" / "rerun"
+        done = []
+        self._orch(tmp_path, {"comout_rerun": str(rerun)})._archive_dynamic_adjust_bias(
+            work, tmp_path / "elsewhere", done)
+        assert sorted(p.name for p in rerun.iterdir()) == [
+            "average_bias_today_output_adj_p", f"{self.RUN}.t12z.avg_bias"]
+        assert (rerun / "average_bias_today_output_adj_p").read_text() == "nan\n"
+        assert (rerun / f"{self.RUN}.t12z.avg_bias").read_text() == "0.250\n"
+        assert len(done) == 2
+
+    def test_comout_rerun_defaults_to_comout_slash_rerun(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / f"{self.RUN}.t12z.avg_bias").write_text("0.1\n")
+        comout = tmp_path / "com" / f"{self.RUN}.20261001"
+        self._orch(tmp_path)._archive_dynamic_adjust_bias(work, comout, [])
+        assert (comout / "rerun" / f"{self.RUN}.t12z.avg_bias").read_text() == "0.1\n"
+
+    def test_no_bias_files_or_no_dynamic_adjust_archives_nothing(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        comout = tmp_path / "com"
+        self._orch(tmp_path)._archive_dynamic_adjust_bias(work, comout, [])
+        (work / f"{self.RUN}.t12z.avg_bias").write_text("0.1\n")
+        (work / "average_bias_today").write_text("0.1\n")
+        secofs = ForcingConfig.for_secofs_ufs(pdy="20261001", cyc=12)
+        assert not secofs.dynamic_adjust_enabled
+        self._orch(tmp_path, cfg=secofs)._archive_dynamic_adjust_bias(work, comout, [])
+        assert not (comout / "rerun").exists()
+
+    def test_archive_to_comout_includes_the_bias_files(self, tmp_path):
+        from nos_utils.orchestrator import PrepResult
+
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / f"{self.RUN}.t12z.avg_bias").write_text("0.1\n")
+        comout = tmp_path / "com" / f"{self.RUN}.20261001"
+        self._orch(tmp_path).archive_to_comout(PrepResult(success=True, phase="nowcast"), comout)
+        assert (comout / "rerun" / f"{self.RUN}.t12z.avg_bias").is_file()
+
+    def test_chain_through_the_orchestrator(self, tmp_path):
+        """Yesterday's COMOUT root staout_1 + rerun avg_bias give adj0 and a computed adj1; today's bias is archived."""
+        import shutil
+
+        helper = TestProcessorOpsObsEndToEnd()
+        _, elev, out = helper._scene(tmp_path)
+        prev = tmp_path / "com" / f"{self.RUN}.20260930"
+        (prev / "rerun").mkdir(parents=True)
+        shutil.copy(str(tmp_path / "staout_1"), str(prev / "staout_1"))
+        (prev / "rerun" / f"{self.RUN}.t12z.avg_bias").write_text("-0.037\n")
+        fix = tmp_path / "fix"
+        fix.mkdir()
+        shutil.copy(str(tmp_path / "station.in"), str(fix / "station.in"))
+        shutil.copy(str(tmp_path / "diff.bp"), str(fix / "diff.bp"))
+        today = tmp_path / "com" / f"{self.RUN}.20261001"
+        orch = self._orch(tmp_path, {
+            "output": str(out), "noaa_obs": str(tmp_path / "dcom" / "coops_waterlvlobs"),
+            "fix": str(fix), "prev_comout": str(prev), "comout_rerun": str(today / "rerun")})
+        res = orch._run_dynamic_adjust(out)
+        assert res.success, res.errors
+        assert res.metadata["adj0"] == -0.037 and res.metadata["adj1"] == 0.25
+        orch._archive_dynamic_adjust_bias(out, today, [])
+        assert (today / "rerun" / f"{self.RUN}.t12z.avg_bias").read_text() == "0.250\n"
+        assert (today / "rerun" / "average_bias_today_output_adj_p").read_text() == "0.250\n"

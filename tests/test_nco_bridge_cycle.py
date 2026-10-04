@@ -11,7 +11,7 @@ _NCO_VARS = (
     "PDY", "cyc", "CYC", "RUN", "OFS_CONFIG", "DATA", "DATAROOT",
     "COMOUT", "COMIN", "FIXofs", "COMINgfs", "COMINhrrr", "COMINnwm",
     "COMINrtofs", "COMINrtofs_2d", "COMINrtofs_3d", "COMINlaw",
-    "COMINadt", "COMINrerun", "RESTART_DIR", "USE_DATM",
+    "COMINadt", "COMINrerun", "COMOUT_PREV", "COMOUTrerun", "RESTART_DIR", "USE_DATM",
 )
 
 
@@ -68,3 +68,23 @@ def test_invalid_cycle_rejected(monkeypatch, tmp_path, bad):
     monkeypatch.setenv("cyc", bad)
     with pytest.raises(EnvironmentError):
         config_from_env()
+
+
+def test_previous_cycle_dirs_map_to_paths(monkeypatch, tmp_path):
+    """COMOUT_PREV / COMOUTrerun (ops layout) and the COMINrerun override reach the orchestrator."""
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("cyc", "12")
+    monkeypatch.setenv("COMOUT_PREV", str(tmp_path / "prev"))
+    monkeypatch.setenv("COMOUTrerun", str(tmp_path / "com" / "rerun"))
+    monkeypatch.setenv("COMINrerun", str(tmp_path / "flat"))
+    _, paths = config_from_env()
+    assert paths["prev_comout"] == str(tmp_path / "prev")
+    assert paths["comout_rerun"] == str(tmp_path / "com" / "rerun")
+    assert paths["prev_rerun"] == str(tmp_path / "flat")
+
+
+def test_previous_cycle_dirs_absent_when_unset(monkeypatch, tmp_path):
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("cyc", "12")
+    _, paths = config_from_env()
+    assert not {"prev_comout", "comout_rerun", "prev_rerun"} & set(paths)
