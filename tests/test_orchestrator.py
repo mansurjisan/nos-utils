@@ -423,6 +423,13 @@ class TestArchiveManifest:
         on = _payloads(tmp_path / "on")
         assert on == off, f"tar payloads diverged: OFF={off} ON={on}"
 
+    def test_flag_off_stofs_still_archives_st_lawrence(self, tmp_path, monkeypatch):
+        """ATL prep must leave flux.th / TEM_1.th in $COMOUT without NOS_ARCHIVE_MANIFEST. MJ (10/03/26)"""
+        files = self._archive(self._stofs_cfg(), "stofs_3d_atl",
+                              tmp_path, monkeypatch, manifest=None)
+        assert "stofs_3d_atl.t12z.riv.obs.flux.th" in files
+        assert "stofs_3d_atl.t12z.riv.obs.tem_1.th" in files
+
     def test_flag_on_stofs_adds_st_lawrence_and_qc(self, tmp_path,
                                                    monkeypatch):
         """Flag ON + STOFS-shaped config: COMMON set is the SECOFS set

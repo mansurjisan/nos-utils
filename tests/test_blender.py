@@ -381,16 +381,16 @@ class TestRouteBTimeAnchor:
 class TestHrrrBlendRotation:
     """datm_rotate_hrrr_winds gates the blender's Lambert rotation of HRRR cells. MJ (10/03/26)"""
 
-    def _run(self, tmp_path, rotate):
+    def _run(self, tmp_path, rotate, weight=1.0):
         cfg = ForcingConfig(
             lon_min=-80.0, lon_max=-70.0, lat_min=25.0, lat_max=35.0,
             pdy="20260401", cyc=12, nowcast_hours=1, forecast_hours=2, nws=4,
             datm_lon_min=-78.0, datm_lon_max=-72.0, datm_lat_min=27.0, datm_lat_max=33.0,
-            datm_dx=1.0, datm_rotate_hrrr_winds=rotate,
+            datm_dx=1.0, datm_rotate_hrrr_winds=rotate, datm_hrrr_weight=weight,
         )
         cycle = datetime.strptime(cfg.pdy, "%Y%m%d") + timedelta(hours=cfg.cyc)
         times = [cycle - timedelta(hours=1) + timedelta(hours=h) for h in range(7)]
-        in_dir = tmp_path / f"in{rotate}"
+        in_dir = tmp_path / f"in{rotate}{weight}"
         in_dir.mkdir()
         _make_gfs_forcing(
             in_dir / "gfs_forcing.nc", times,
@@ -407,7 +407,7 @@ class TestHrrrBlendRotation:
              "vwind": [np.zeros(shape, np.float32) for _ in times]},
             times, lon2d, lat2d, in_dir / "hrrr_forcing.nc", source_name="HRRR",
         )
-        out_dir = tmp_path / f"out{rotate}"
+        out_dir = tmp_path / f"out{rotate}{weight}"
         res = BlenderProcessor(cfg, in_dir, out_dir, target_dx=cfg.datm_dx).process()
         assert res.success, res.errors
         with netCDF4.Dataset(str(out_dir / "datm_forcing.nc")) as ds:
@@ -424,4 +424,15 @@ class TestHrrrBlendRotation:
         u, v, src = self._run(tmp_path, False)
         assert src.any()
         assert np.allclose(u[src == 1], 5.0, atol=1e-4)
+        assert np.allclose(v[src == 1], 0.0, atol=1e-4)
+
+    def test_hrrr_weight_blends_inside_coverage(self, tmp_path):
+        """GFS test wind is 5.0, HRRR 5.0 / 0.0 (u / v); weight 0.99 gives v = 0.99*0 + 0.01*(-1)."""
+        u, v, src = self._run(tmp_path, False, weight=0.99)
+        assert np.allclose(u[src == 1], 5.0, atol=1e-4)
+        assert np.allclose(v[src == 1], -0.01, atol=1e-4)
+        assert np.allclose(v[src == 0], -1.0, atol=1e-4)
+
+    def test_default_weight_is_all_hrrr(self, tmp_path):
+        _, v, src = self._run(tmp_path, False)
         assert np.allclose(v[src == 1], 0.0, atol=1e-4)

@@ -545,3 +545,19 @@ def test_coupled_atl_datm_inputs_use_the_ops_gfs_chain(tmp_path, monkeypatch):
     assert cfg.nws == 4 and proc.MIN_FILE_SIZE == GFSProcessor.OPS_MIN_FILE_SIZE
     monkeypatch.setattr(GFSProcessor, "_build_ops_file_list", lambda self: ["ops"])
     assert proc.find_input_files() == ["ops"]
+
+
+def test_hrrr_blend_weight_gating(tmp_path):
+    """0.99 for ATL (factories and name rule), 1.0 elsewhere; yaml key overrides. MJ (10/03/26)"""
+    assert ForcingConfig.for_stofs_3d_atl(PDY, 12).datm_hrrr_weight == 0.99
+    assert ForcingConfig.for_stofs_3d_atl_ufs(PDY, 12).datm_hrrr_weight == 0.99
+    for other in (ForcingConfig.for_secofs(PDY, 12), ForcingConfig.for_stofs_3d_pac(PDY, 12)):
+        assert other.datm_hrrr_weight == 1.0
+    assert _yaml_cfg(tmp_path, "stofs_3d_atl_ufs").datm_hrrr_weight == 0.99
+    for name in ("secofs_ufs", "stofs_3d_ak_ufs", "stofs_3d_pac_ufs"):
+        assert _yaml_cfg(tmp_path, name).datm_hrrr_weight == 1.0
+    atm = "forcing:\n  atmospheric:\n    hrrr:\n      blend_weight: 1.0\n"
+    assert _yaml_cfg(tmp_path, "stofs_3d_atl_ufs", atm=atm).datm_hrrr_weight == 1.0
+    with pytest.raises(ValueError):
+        _yaml_cfg(tmp_path, "stofs_3d_atl_ufs",
+                  atm="forcing:\n  atmospheric:\n    hrrr:\n      blend_weight: 0\n")

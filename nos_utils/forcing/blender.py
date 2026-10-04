@@ -497,10 +497,19 @@ class BlenderProcessor(ForcingProcessor):
                         hrrr_regrid = np.full(ny * nx, np.nan, dtype=np.float32)
                         hrrr_regrid[valid_flat_indices] = hrrr_interp_valid
                         hrrr_regrid = hrrr_regrid.reshape(ny, nx)
-                        combined = np.where(
-                            hrrr_valid_mask & ~np.isnan(hrrr_regrid),
-                            hrrr_regrid, gfs_regrid,
-                        )
+                        hrrr_cells = hrrr_valid_mask & ~np.isnan(hrrr_regrid)
+                        w_h = float(getattr(self.config, "datm_hrrr_weight", 1.0))
+                        if w_h < 1.0:
+                            # Ops sflux inside HRRR coverage: w*HRRR + (1-w)*GFS; plain HRRR
+                            # where GFS has no value. MJ (10/03/26)
+                            mixed = np.where(
+                                np.isfinite(gfs_regrid),
+                                w_h * hrrr_regrid + (1.0 - w_h) * gfs_regrid,
+                                hrrr_regrid,
+                            ).astype(np.float32)
+                            combined = np.where(hrrr_cells, mixed, gfs_regrid)
+                        else:
+                            combined = np.where(hrrr_cells, hrrr_regrid, gfs_regrid)
                     else:
                         combined = gfs_regrid
                 else:
