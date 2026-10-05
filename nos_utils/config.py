@@ -433,8 +433,16 @@ class ForcingConfig:
     # midpoint; "cycle" at the cycle midpoint in both phases (ops one-run
     # tide_fac input). MJ (10/02/26)
     tide_nodal_reference: str = "phase"
+    # ADCIRC (STOFS-2D-Global) nodal-factor reference for compute_adcirc_tides: "midrun"
+    # (factors at the middle of the run, his default) or "start". MJ (10/05/26)
+    adcirc_nodal_reference: str = "midrun"
 
     def __post_init__(self):
+        if self.adcirc_nodal_reference not in ("midrun", "start"):
+            raise ValueError(
+                f"adcirc_nodal_reference must be 'midrun' or 'start', "
+                f"got {self.adcirc_nodal_reference!r}"
+            )
         if self.tide_nodal_reference not in ("phase", "cycle"):
             raise ValueError(
                 f"tide_nodal_reference must be 'phase' or 'cycle', "
@@ -738,6 +746,27 @@ class ForcingConfig:
             ufs_total_tasks=4072,
             ufs_nhours_fcst=108,
             ufs_dt_atmos=720,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
+    def for_stofs_2d_glo(cls, pdy: str, cyc: int, **overrides) -> "ForcingConfig":
+        """Factory with STOFS-2D-Global defaults (ADCIRC, GFS to OWI NetCDF, nws=14).
+
+        Global domain, 6 h nowcast and 180 h forecast, GFS 0.25 deg, and the 15
+        constituents of the zcobell/stofs_2d_global example config. No SCHISM-side
+        extras (rivers, ADT, nudging, dynamic adjust). MJ (10/05/26)
+        """
+        defaults = dict(
+            lon_min=-180.0, lon_max=180.0,
+            lat_min=-90.0, lat_max=90.0,
+            pdy=pdy, cyc=cyc,
+            nowcast_hours=6, forecast_hours=180,
+            gfs_resolution="0p25",
+            met_num=1, nws=14,
+            tidal_constituents=["K1", "O1", "P1", "Q1", "M2", "S2", "N2", "K2",
+                                "MF", "MM", "M4", "MS4", "MN4", "SA", "SSA"],
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -1235,6 +1264,22 @@ class ForcingConfig:
         nodal_ref = tidal.get("nodal_reference") if isinstance(tidal, dict) else None
         if nodal_ref is not None:
             kwargs["tide_nodal_reference"] = nodal_ref
+        if str(_sys.get("name", "")).startswith("stofs_2d_glo"):
+            # ADCIRC system: yaml-less defaults follow for_stofs_2d_glo, yaml keys override. MJ (10/05/26)
+            kwargs["nws"] = int(physics.get("nws", 14))  # ADCIRC has no ufs/standalone split
+            if not ("nowcast_hours" in run or "hindcast_days" in run):
+                kwargs["nowcast_hours"] = 6
+            if not ("forecast_hours" in run or "forecast_days" in run):
+                kwargs["forecast_hours"] = 180
+            if "resolution" not in (gfs_cfg if isinstance(gfs_cfg, dict) else {}):
+                kwargs["gfs_resolution"] = "0p25"
+            kwargs["met_num"] = 1
+            _consts = tidal.get("constituents") if isinstance(tidal, dict) else None
+            if _consts:
+                kwargs["tidal_constituents"] = [str(c).upper() for c in _consts]
+            _anr = tidal.get("adcirc_nodal_reference") if isinstance(tidal, dict) else None
+            if _anr is not None:
+                kwargs["adcirc_nodal_reference"] = _anr
         if grid_file:
             kwargs["grid_file"] = Path(grid_file)
 
