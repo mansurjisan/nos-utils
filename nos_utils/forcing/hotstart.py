@@ -113,6 +113,8 @@ class HotstartProcessor(ForcingProcessor):
         output_path: Path,
         run_name: str = "secofs",
         max_lookback_days: int = 3,
+        min_size: Optional[int] = None,
+        max_age_days: Optional[int] = None,
     ):
         """
         Args:
@@ -125,6 +127,8 @@ class HotstartProcessor(ForcingProcessor):
         super().__init__(config, input_path, output_path)
         self.run_name = run_name
         self.max_lookback_days = max_lookback_days
+        self.min_size = self.MIN_HOTSTART_SIZE if min_size is None else int(min_size)
+        self.max_age_days = max_age_days
 
     def process(self) -> ForcingResult:
         """
@@ -681,8 +685,17 @@ class HotstartProcessor(ForcingProcessor):
         valid = []
         for f in candidates:
             try:
-                if f.stat().st_size >= self.MIN_HOTSTART_SIZE:
-                    valid.append(f)
+                if f.stat().st_size < self.min_size:
+                    continue
+                if self.max_age_days is not None:
+                    # Tag date older than PDY-max_age_days is never used (production searches
+                    # PDY-1..PDY-5 only, prep_processing.sh:340). MJ (10/05/26)
+                    tag = self._parse_file_datetime(f)
+                    oldest = datetime.strptime(self.config.pdy, "%Y%m%d") - timedelta(
+                        days=self.max_age_days)
+                    if tag is not None and tag < oldest:
+                        continue
+                valid.append(f)
             except OSError:
                 continue
 

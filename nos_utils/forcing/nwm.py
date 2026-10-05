@@ -472,6 +472,8 @@ class NWMProcessor(ForcingProcessor):
         phase: Optional[str] = None,
         time_hotstart: Optional[datetime] = None,
         buffer_hours: Optional[int] = None,
+        prev_rerun_dir: Optional[Path] = None,
+        archive_prefix: Optional[str] = None,
     ):
         """
         Args:
@@ -487,8 +489,13 @@ class NWMProcessor(ForcingProcessor):
                 ``config.obc_buffer_hours`` when set on the
                 ``ForcingConfig``, otherwise to ``DEFAULT_BUFFER_HOURS``
                 (3h, matching legacy COMF). Applied to phase != None only.
+            prev_rerun_dir: Previous cycle's rerun dir (``$COMOUT_PREV/rerun``); only read
+                when ``config.ops_bad_day_checks`` and too few NWM files exist.
+            archive_prefix: ``<run>.t<cyc>z``, the prefix of the archived ``vsource.th``.
         """
         super().__init__(config, input_path, output_path)
+        self.prev_rerun_dir = Path(prev_rerun_dir) if prev_rerun_dir else None
+        self.archive_prefix = archive_prefix
         self._river_config = river_config
         self.phase = phase
         self.time_hotstart = time_hotstart
@@ -605,6 +612,18 @@ class NWMProcessor(ForcingProcessor):
                  f"stofs_mode={self.is_stofs_mode} reaches={n_reaches} "
                  f"target_hours={n_target}",
         )
+        # Fewer than nwm_n_list_min NWM hours: use yesterday's archived vsource.th, or fail
+        # as the production completeness gate does. MJ (10/05/26)
+        prev_vsource: Optional[List[str]] = None
+        if (self.config.ops_bad_day_checks and self.is_stofs_mode
+                and len(nwm_files) < self.config.nwm_n_list_min):
+            prev_vsource = self._prev_vsource_lines(n_target)
+            if prev_vsource is None:
+                msg = (f"Only {len(nwm_files)} NWM files (< nwm_n_list_min="
+                       f"{self.config.nwm_n_list_min}) and no archived vsource.th in "
+                       f"{self.prev_rerun_dir}")
+                log.error(msg)
+                return ForcingResult(success=False, source=self.SOURCE_NAME, errors=[msg])
         if nwm_files:
             log.info(f"Found {len(nwm_files)} NWM files")
             if self.is_stofs_mode:
@@ -634,6 +653,8 @@ class NWMProcessor(ForcingProcessor):
         output_files = []
 
         vsource = self._write_vsource(flows, times)
+        if vsource and prev_vsource is not None:
+            vsource.write_text("".join(prev_vsource))
         if vsource:
             output_files.append(vsource)
 
@@ -681,6 +702,7 @@ class NWMProcessor(ForcingProcessor):
                 "n_timesteps": len(times),
                 "nwm_files_used": len(nwm_files),
                 "used_climatology": len(nwm_files) == 0,
+                "vsource_from_previous_cycle": prev_vsource is not None,
                 "stofs_mode": self.is_stofs_mode,
                 "ops_static": ops_static,
                 "phase": self.phase,
@@ -690,6 +712,37 @@ class NWMProcessor(ForcingProcessor):
     # ------------------------------------------------------------------
     # Phase helpers
     # ------------------------------------------------------------------
+
+    def _prev_vsource_lines(self, n_target: int) -> Optional[List[str]]:
+        """Yesterday's archived vsource.th shifted to today's axis and padded to ``n_target`` rows.
+
+        Production keeps rows 25.. of ``$COMOUT_PREV/rerun/<RUN>.<cycle>.vsource.th``, repeats the
+        last row up to the target length and restarts the clock at 0
+        (stofs_3d_atl_create_river_forcing_nwm.sh:408-441). Here each phase has its own file:
+        yesterday's forecast file starts at yesterday's cycle, which is today's nowcast start
+        (no shift for the nowcast phase, 24 rows for the forecast phase); the nowcast file is
+        used, shifted by 24 rows, only when the forecast file is missing. MJ (10/05/26)
+        """
+        if self.prev_rerun_dir is None or not self.archive_prefix:
+            return None
+        fcst = self.prev_rerun_dir / f"{self.archive_prefix}.vsource.fcst.th"
+        now = self.prev_rerun_dir / f"{self.archive_prefix}.vsource.th"
+        if self.phase == "forecast":
+            src, drop = fcst, 24
+        elif fcst.is_file():
+            src, drop = fcst, 0
+        else:
+            src, drop = now, 24
+        if not src.is_file():
+            return None
+        rows = [ln.split(None, 1)[1].rstrip("\n") for ln in src.read_text().splitlines()
+                if len(ln.split(None, 1)) == 2][drop:]
+        if not rows:
+            return None
+        rows += [rows[-1]] * (n_target - len(rows))
+        log.warning(f"NWM: using previous-cycle vsource.th {src.name} (drop {drop}, "
+                    f"{len(rows)} rows)")
+        return [f"{i * 3600} {r}\n" for i, r in enumerate(rows[:n_target])]
 
     def _phase_start_time(self) -> datetime:
         """Return the absolute datetime of the row ``t=0`` in the output.

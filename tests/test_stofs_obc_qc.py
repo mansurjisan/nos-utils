@@ -26,8 +26,8 @@ def _write_obc_file(path: Path, nt: int, n_bnd: int = 4, var: str = "time_series
         v[:] = 0.0
 
 
-def _make_orchestrator(tmp_path: Path, **paths) -> PrepOrchestrator:
-    cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+def _make_orchestrator(tmp_path: Path, bad_day=False, **paths) -> PrepOrchestrator:
+    cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12, ops_bad_day_checks=bad_day)
     full_paths = {"output": str(tmp_path)}
     full_paths.update({k: str(v) for k, v in paths.items()})
     return PrepOrchestrator(cfg, paths=full_paths, run_name="stofs_3d_atl",

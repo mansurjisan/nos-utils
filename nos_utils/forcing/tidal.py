@@ -78,6 +78,7 @@ class TidalProcessor(ForcingProcessor):
         super().__init__(config, input_path, output_path)
         self.phase = phase
         self.time_hotstart = time_hotstart
+        self._fortran_failure = ""
 
     def process(self) -> ForcingResult:
         """
@@ -109,14 +110,28 @@ class TidalProcessor(ForcingProcessor):
         )
 
         # Mode 0: Fortran tide_fac executable (production, most accurate)
+        self._fortran_failure = "no bctides template"
         if template and Path(template).exists():
             result = self._call_fortran_tide_fac(Path(template), output_file)
+            if result and self.config.ops_bad_day_checks and output_file.stat().st_size < 1000:
+                # create_bctides_in.sh:62-70 keeps bctides.in only above 1000 bytes. MJ (10/05/26)
+                result = False
+                self._fortran_failure = "tide_fac wrote a bctides.in under 1000 bytes"
             if result:
                 return ForcingResult(
                     success=True, source=self.SOURCE_NAME,
                     output_files=[output_file],
                     metadata={"mode": "fortran_tide_fac"},
                 )
+
+        if self.config.ops_bad_day_checks:
+            # Production has no Python nodal-factor fallback: stofs_3d_atl_create_bctides_in.sh:34-75
+            # runs stofs_3d_atl_tide_fac only, and prep_processing.sh:425 fails without bctides.
+            # MJ (10/05/26)
+            msg = (f"STOFS-3D-ATL needs the Fortran tide_fac to build bctides.in "
+                   f"({self._fortran_failure}); Python nodal factors are not used")
+            log.error(msg)
+            return ForcingResult(success=False, source=self.SOURCE_NAME, errors=[msg])
 
         # Mode 1: Template-based with Python nodal corrections
         if template and Path(template).exists():
@@ -280,6 +295,7 @@ class TidalProcessor(ForcingProcessor):
 
         if exe is None:
             log.debug("No Fortran tide_fac executable found in EXECnos/EXECofs/EXECstofs3d")
+            self._fortran_failure = "no tide_fac executable in EXECnos/EXECofs/EXECstofs3d"
             return False
 
         start_time = self._compute_start_time()
@@ -320,6 +336,7 @@ class TidalProcessor(ForcingProcessor):
 
             if result.returncode != 0:
                 log.warning(f"tide_fac returned {result.returncode}: {result.stderr[:200]}")
+                self._fortran_failure = f"tide_fac returned {result.returncode}: {result.stderr[:200]}"
                 return False
 
             if output_path.exists():
@@ -327,13 +344,16 @@ class TidalProcessor(ForcingProcessor):
                 return True
 
             log.warning("tide_fac completed but bctides.in not found")
+            self._fortran_failure = "tide_fac completed but wrote no bctides.in"
             return False
 
         except subprocess.TimeoutExpired:
             log.warning("Fortran tide_fac timed out")
+            self._fortran_failure = "tide_fac timed out"
             return False
         except Exception as e:
             log.warning(f"Error calling Fortran tide_fac: {e}")
+            self._fortran_failure = f"error calling tide_fac: {e}"
             return False
 
     def _process_template(self, template_path: Path, output_path: Path) -> bool:
