@@ -15,7 +15,8 @@ variable subset, read with xarray/cfgrib, interpolate linearly to hourly steps a
 write fort.221.nc (pressure), fort.222.nc (winds), fort.225.nc (ice) and the
 fort.22 descriptor.
 
-xarray, cfgrib and eccodes are imported only when a conversion runs.
+xarray, cfgrib and eccodes are imported when process() starts (a missing one fails
+before any GRIB file is copied).
 
 Public API::
 
@@ -46,7 +47,7 @@ DEFAULT_VARIABLES = [
     "ICEC:surface",
 ]
 
-# GRIB shortName filters per output key, in the order he reads them
+# GRIB shortName filters per output key, in the order he reads them. MJ (10/05/26)
 _VAR_MAP = {
     "prmsl": {"shortName": "prmsl"},
     "10u": {"shortName": "10u"},
@@ -270,6 +271,11 @@ def adcirc_met_windows(
     }
 
 
+def match_inventory(lines: List[str], variables: List[str]) -> List[str]:
+    """wgrib2 -s inventory lines containing any variable string (substring match, as his code)."""
+    return [line for line in lines if any(var in line for var in variables)]
+
+
 class LocalGfsSource:
     """Copies GFS GRIB2 files from COMINgfs, optionally subsetting with wgrib2."""
 
@@ -323,8 +329,7 @@ class LocalGfsSource:
         inv = subprocess.run([self._wgrib2, str(src), "-s"],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              universal_newlines=True, check=True)
-        matching = [line for line in inv.stdout.splitlines()
-                    if any(var in line for var in self._variables)]
+        matching = match_inventory(inv.stdout.splitlines(), self._variables)
         if not matching:
             log.warning("No matching variables found in %s, copying full file", src)
             shutil.copy2(src, dst)
@@ -335,6 +340,11 @@ class LocalGfsSource:
                              universal_newlines=True, check=False)
         if res.returncode != 0:
             raise RuntimeError("wgrib2 subsetting failed for {}: {}".format(src, res.stderr))
+
+
+def check_dependencies():
+    """Fail fast (before any GRIB copy) when xarray, cfgrib or ecCodes is unusable."""
+    return _import_xarray()
 
 
 def _import_xarray():
@@ -352,6 +362,13 @@ def _import_xarray():
             "cfgrib with a working ecCodes library is required to read GFS GRIB2 "
             "(pip install cfgrib eccodes; on a node set ECCODES_DIR or load the "
             "eccodes module): {}".format(exc)
+        ) from exc
+    try:
+        import eccodes  # noqa: F401
+    except Exception as exc:
+        raise MetDependencyError(
+            "the eccodes Python module / ecCodes library is not usable "
+            "(pip install eccodes; set ECCODES_DIR or load the eccodes module): {}".format(exc)
         ) from exc
     return xr
 
@@ -396,7 +413,7 @@ def write_owi_netcdf(grib2_files: List[Path], out_dir: Path) -> dict:
                 engine="cfgrib",
                 backend_kwargs={"indexpath": "", "filter_by_keys": filter_keys},
             )
-            # one timestep per file, possibly from different cycles: use valid_time only
+            # one timestep per file, possibly from different cycles: use valid_time only. MJ (10/05/26)
             ds = ds.expand_dims("valid_time")
             ds = ds.drop_vars([c for c in ("step", "time") if c in ds.coords])
             file_datasets.append(ds)
@@ -509,6 +526,7 @@ class AdcircMetProcessor:
 
     def process(self, start: datetime, end: datetime, out_dir: Path,
                 phase: str = "nowcast") -> AdcircMetResult:
+        check_dependencies()  # before the GRIB copies, so a missing package fails in seconds. MJ (10/05/26)
         out_dir = Path(out_dir)
         meteo_dir = out_dir / self.meteo_subdir
         meteo_dir.mkdir(parents=True, exist_ok=True)

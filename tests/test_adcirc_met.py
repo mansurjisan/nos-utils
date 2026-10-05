@@ -207,6 +207,37 @@ def test_missing_dependency_message():
             am._import_xarray()
 
 
+_INVENTORY = [
+    "1:0:d=2026100512:PRMSL:mean sea level:anl:",
+    "2:1:d=2026100512:UGRD:10 m above ground:anl:",
+    "3:2:d=2026100512:VGRD:10 m above ground:anl:",
+    "4:3:d=2026100512:UGRD:850 mb:anl:",
+    "5:4:d=2026100512:VGRD:500 mb:anl:",
+    "6:5:d=2026100512:UGRD:planetary boundary layer:anl:",
+    "7:6:d=2026100512:ICEC:surface:anl:",
+    "8:7:d=2026100512:TMP:2 m above ground:anl:",
+]
+
+
+def test_default_subset_matches_only_10m_winds():
+    got = am.match_inventory(_INVENTORY, am.DEFAULT_VARIABLES)
+    assert [g.split(":")[0] for g in got] == ["1", "2", "3", "7"]
+
+
+def test_bare_names_would_pull_every_level():
+    got = am.match_inventory(_INVENTORY, ["PRMSL", "UGRD", "VGRD", "ICEC"])
+    assert len(got) == 7  # the failure mode the 10 m strings avoid
+
+
+def test_dependencies_checked_before_any_copy(tmp_path):
+    proc = am.AdcircMetProcessor(tmp_path / "tank", subset=False)
+    with mock.patch.dict(sys.modules, {"eccodes": None}):
+        with pytest.raises(am.MetDependencyError, match="ecCodes|eccodes"):
+            proc.process(datetime(2026, 10, 5, 0), datetime(2026, 10, 5, 6),
+                         tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
 def test_wgrib2_subset_with_fake_binary(tmp_path):
     fake = tmp_path / "wgrib2"
     fake.write_text(
