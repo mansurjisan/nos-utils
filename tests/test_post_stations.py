@@ -272,3 +272,15 @@ def test_empty_inputs_rejected(tmp_path):
             staout, {"elev": VAR_DEFS["elev"]}, [],
             tmp_path / "o.nc", base_date=BASE_DATE,
         )
+
+
+def test_load_staout_repairs_fortran_exponentless_floats(tmp_path):
+    from nos_utils.post.stations import _load_staout
+
+    f = tmp_path / "staout_1"
+    f.write_text(" 300.0 0.427-100 1.5\n 600.0 -0.1E+01 2.0-101\n")
+    data = _load_staout(f)
+    assert data.shape == (2, 3)
+    assert data[0, 1] == 0.427e-100
+    assert data[1, 2] == 2.0e-101
+    assert data[1, 1] == -1.0

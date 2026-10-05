@@ -27,6 +27,8 @@ import json
 from pathlib import Path
 from typing import Iterable, List, Mapping, Optional, Tuple, Union
 
+import io
+import re
 import numpy as np
 
 FILL_VALUE = -99999.0
@@ -80,6 +82,28 @@ def _staout_index(staout_fname: str) -> int:
         )
 
 
+_FORTRAN_EXP = re.compile(r"(\d)([+-]\d{2,3})(?=\s|$)")
+
+
+def _load_staout(path: Union[str, Path]) -> np.ndarray:
+    """Staout text as a float array, tolerating Fortran exponent-less floats.
+
+    Fortran drops the ``E`` when the exponent has three digits
+    (``0.427-100``), which np.loadtxt rejects; production repairs these
+    in ``generate_station_timeseries.py:58-72`` (nco_v315). The fast
+    path is unchanged; only a file that fails to parse is rewritten.
+    Unlike production, the first data row is kept (its pandas read_csv
+    consumes it as a header, so production's t=360 record is
+    extrapolated). MJ (10/05/26)
+    """
+    try:
+        return np.loadtxt(path, ndmin=2)
+    except ValueError:
+        with open(path) as f:
+            text = _FORTRAN_EXP.sub(r"\1e\2", f.read())
+        return np.loadtxt(io.StringIO(text), ndmin=2)
+
+
 def _interp_staout(
     path: Union[str, Path], nstation: int, interval_seconds: float
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -92,7 +116,7 @@ def _interp_staout(
     """
     from scipy import interpolate
 
-    data = np.loadtxt(path, ndmin=2)
+    data = _load_staout(path)
     if data.shape[1] != nstation + 1:
         raise ValueError(
             f"{path}: expected time + {nstation} station columns, "
