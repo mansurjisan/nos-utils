@@ -313,7 +313,7 @@ class TestNodalReference:
             return real(start, consts, run_days=run_days)
 
         monkeypatch.setattr(tidal, "compute_nodal_corrections", spy)
-        cfg = self._atl()
+        cfg = self._atl(ops_bad_day_checks=False)  # the Python path is the non-ATL-ops route
         for phase in ("nowcast", "forecast"):
             out = tmp_path / phase
             TidalProcessor(cfg, tmp_path / "none", out, phase=phase).process()

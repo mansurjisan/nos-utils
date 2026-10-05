@@ -689,6 +689,7 @@ class TestStLawrenceFailLoud:
         cfg = _cfg()
         cfg.st_lawrence_enabled = True
         cfg.critical_sources = []
+        cfg.ops_bad_day_checks = False  # this class tests the St. Lawrence gate alone
         paths = {"output": str(tmp_path / "work"), "fix": str(fix)}
         return PrepOrchestrator(cfg, paths, run_name="stofs_3d_atl_ufs").run(
             phase="nowcast")

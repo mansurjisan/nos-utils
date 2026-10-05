@@ -320,6 +320,11 @@ class ForcingConfig:
     # fresh-water T/S), vsource.th in ops format. A missing FIX file fails the NWM step.
     # MJ (10/03/26)
     river_ops_static: bool = False
+    # STOFS-3D-ATL bad-day behaviour of production v3.1.5: restart over restart_min_bytes in
+    # PDY-1..PDY-5, COLDSTART=YES refused, OBC and nudging files required, no Python tide_fac
+    # fallback, NWM vsource backup, previous-cycle reuse via COMOUT_PREV/rerun. MJ (10/05/26)
+    ops_bad_day_checks: bool = False
+    restart_min_bytes: int = 20 * 1024 ** 3
 
     # St. Lawrence River climatology (STOFS-3D-ATL only).
     # When True, the orchestrator runs StLawrenceProcessor which reads the
@@ -593,7 +598,8 @@ class ForcingConfig:
         # Explicit overrides win. MJ (10/03/26)
         for key, value in (("gfs_ops_timeline", True), ("hrrr_rotate_winds", False),
                            ("datm_rotate_hrrr_winds", False), ("datm_hrrr_weight", 0.99),
-                           ("hrrr_small_grib", True), ("river_ops_static", True)):
+                           ("hrrr_small_grib", True), ("river_ops_static", True),
+                           ("ops_bad_day_checks", True)):
             defaults.setdefault(key, value)
         return cls(**defaults)
 
@@ -659,7 +665,8 @@ class ForcingConfig:
         # for its gfs_forcing.nc / hrrr_forcing.nc inputs. MJ (10/03/26)
         for key, value in (("gfs_ops_timeline", True), ("hrrr_rotate_winds", False),
                            ("datm_rotate_hrrr_winds", False), ("datm_hrrr_weight", 0.99),
-                           ("hrrr_small_grib", True), ("river_ops_static", True)):
+                           ("hrrr_small_grib", True), ("river_ops_static", True),
+                           ("ops_bad_day_checks", True)):
             defaults.setdefault(key, value)
         return cls(**defaults)
 
@@ -1119,6 +1126,14 @@ class ForcingConfig:
                 obc_dyn = bool(prep_extras["obc_dynamic_adjust"])
                 kwargs["dynamic_adjust_enabled"] = obc_dyn
                 kwargs["obc_min_timesteps"] = 21 if obc_dyn else 0
+
+        # ATL production bad-day checks by name; prep.ops_bad_day_checks overrides. MJ (10/05/26)
+        kwargs["ops_bad_day_checks"] = _strict_bool(
+            prep.get("ops_bad_day_checks") if isinstance(prep, dict) else None,
+            "prep.ops_bad_day_checks",
+            str(_sys.get("name", "")).startswith("stofs_3d_atl"))
+        if isinstance(prep, dict) and prep.get("restart_min_bytes") is not None:
+            kwargs["restart_min_bytes"] = int(prep["restart_min_bytes"])
 
         if isinstance(prep, dict) and prep.get("critical_sources") is not None:
             kwargs["critical_sources"] = [

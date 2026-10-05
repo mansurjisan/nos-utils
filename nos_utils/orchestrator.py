@@ -283,7 +283,8 @@ class PrepOrchestrator:
             # coverage at cycle boundaries.
             if self.config.obc_min_timesteps > 0:
                 qc_result = self._qc_obc_dimensions(
-                    output_dir, (rtofs_result.metadata or {}).get("n_source_records"))
+                    output_dir, (rtofs_result.metadata or {}).get("n_source_records"),
+                    phase=phase)
                 if qc_result is not None:
                     results.append(qc_result)
         elif self.skip_legacy:
@@ -292,6 +293,8 @@ class PrepOrchestrator:
         # Dynamic SSH adjust: NOAA tide-gauge bias correction on elev2D.th.nc.
         # Must run after RTOFS has produced the non-adjusted file.
         if self.config.dynamic_adjust_enabled:
+            if self.config.ops_bad_day_checks:
+                self._snapshot_pre_adjust(output_dir)
             results.append(self._run_dynamic_adjust(output_dir, phase))
 
         # Nudging needs RTOFS to have completed
@@ -306,6 +309,9 @@ class PrepOrchestrator:
         if self.config.nws == 4:
             results.append(self._run_datm(output_dir))
             results.append(self._run_ufs_config(output_dir, phase, time_hotstart))
+
+        if self.config.ops_bad_day_checks:
+            results.append(self._check_ops_obc_inputs(output_dir))
 
         # Step 9: Write time marker files (matches ORG behavior)
         self._write_time_markers(output_dir, phase, time_hotstart)
@@ -369,6 +375,14 @@ class PrepOrchestrator:
             log.error("Critical prep source ST_LAWRENCE FAILED: no flux.th produced")
             success = False
 
+        # Production's prep aborts on a missing restart, OBC or nudging file
+        # (exstofs_3d_atl_prep_processing.sh:650-746), so these are always critical. MJ (10/05/26)
+        if self.config.ops_bad_day_checks:
+            gate_failed = sorted({"HOTSTART", "OBC_QC", "NUDGING", "OPS_OBC_INPUTS"} & failed)
+            if gate_failed:
+                log.error(f"Critical prep sources FAILED (ATL bad-day checks): {gate_failed}")
+                success = False
+
         prep_result = PrepResult(
             success=success, phase=phase,
             results=results, elapsed_seconds=elapsed,
@@ -397,9 +411,20 @@ class PrepOrchestrator:
         from .forcing.hotstart import HotstartProcessor
 
         restart_dir = self.paths.get("restart", self.paths.get("comout", output_dir))
+        gate = self.config.ops_bad_day_checks
+        if gate and os.environ.get("COLDSTART", "").strip().upper() == "YES":
+            # exstofs_3d_atl_prep_processing.sh:306-330 err_exit. MJ (10/05/26)
+            msg = ("COLDSTART=YES is forbidden for STOFS-3D-ATL (baroclinic T/S must start "
+                   "from a recent restart); set COLDSTART=NO")
+            log.error(msg)
+            return ForcingResult(success=False, source="HOTSTART", errors=[msg])
+        extra = {}
+        if gate:
+            # Restart over 20 GiB in the PDY-1..PDY-5 directories (prep_processing.sh:340-351). MJ (10/05/26)
+            extra = dict(max_lookback_days=5, min_size=self.config.restart_min_bytes)
         proc = HotstartProcessor(
             self.config, restart_dir, output_dir,
-            run_name=self.run_name,
+            run_name=self.run_name, **extra,
         )
         result = proc.process()
 
@@ -417,6 +442,18 @@ class PrepOrchestrator:
                 # steps (and the J-job archive logic) can pick it up.
                 result.metadata["comout_init_path"] = str(staged)
                 result.output_files.append(staged)
+
+        if gate and result.success and (result.metadata or {}).get("ihot") != 1:
+            # No restart found: only a seeded init file of full size lets the cycle start.
+            # Production err_exit "RESTART FILE NOT FOUND" (prep_processing.sh:388). MJ (10/05/26)
+            seed = (Path(comout) / init_filename) if comout is not None else None
+            if seed is None or not seed.is_file() or seed.stat().st_size < self.config.restart_min_bytes:
+                msg = (f"RESTART FILE NOT FOUND: no restart over {self.config.restart_min_bytes} bytes "
+                       f"in {self.run_name}.<PDY-1..PDY-5> under {restart_dir} and no seeded init file "
+                       f"{seed}")
+                log.error(msg)
+                return ForcingResult(success=False, source="HOTSTART",
+                                     errors=[msg], warnings=result.warnings)
 
         return result
 
@@ -455,14 +492,30 @@ class PrepOrchestrator:
         )
         return proc.process()
 
+    def _prev_rerun(self) -> Optional[Path]:
+        """Previous cycle's rerun dir: COMINrerun if set, else ``$COMOUT_PREV/rerun`` for ATL.
+
+        Production reads yesterday's reruns from ``${COMOUT_PREV}/rerun`` (e.g.
+        stofs_3d_atl_create_river_st_lawrence.sh:189, ..._non_adjust.sh:699). MJ (10/05/26)
+        """
+        if self.paths.get("prev_rerun"):
+            return Path(self.paths["prev_rerun"])
+        if self.config.ops_bad_day_checks and self.paths.get("prev_comout"):
+            return Path(self.paths["prev_comout"]) / "rerun"
+        return None
+
     def _run_nwm(self, output_dir: Path, phase: str = "nowcast",
                  time_hotstart=None) -> ForcingResult:
         """Step 4: NWM river forcing."""
         from .forcing.nwm import NWMProcessor
 
+        extra = {}
+        if self.config.ops_bad_day_checks:
+            extra = dict(prev_rerun_dir=self._prev_rerun(),
+                         archive_prefix=f"{self.run_name}.t{self.config.cyc:02d}z")
         proc = NWMProcessor(
             self.config, self.paths["nwm"], output_dir,
-            phase=phase, time_hotstart=time_hotstart,
+            phase=phase, time_hotstart=time_hotstart, **extra,
         )
         return proc.process()
 
@@ -491,7 +544,7 @@ class PrepOrchestrator:
                 sflux_rad = p
                 break
 
-        prev_rerun = self.paths.get("prev_rerun")
+        prev_rerun = self._prev_rerun()
         clim_file = None
         if "fix" in self.paths:
             clim_file = Path(self.paths["fix"]) / self.config.st_lawrence_clim_name
@@ -619,8 +672,19 @@ class PrepOrchestrator:
         "uv3D.th.nc": "uv3dth",
     }
 
+    def _obc_archive_name(self, archive_base: str, phase: str) -> str:
+        """``<run>.<cycle>.<base>.nc``; the forecast-phase file gets ``.fcst`` before the suffix.
+
+        Production has one file per cycle; nos-workflow preps two phases with different time
+        axes, so the forecast file needs its own name instead of overwriting the nowcast one.
+        MJ (10/05/26)
+        """
+        tag = ".fcst" if phase == "forecast" else ""
+        return f"{self.run_name}.t{self.config.cyc:02d}z.{archive_base}{tag}.nc"
+
     def _qc_obc_dimensions(self, output_dir: Path,
-                           source_counts: Optional[Dict[str, int]] = None) -> Optional[ForcingResult]:
+                           source_counts: Optional[Dict[str, int]] = None,
+                           phase: str = "nowcast") -> Optional[ForcingResult]:
         """Validate OBC time dims and fall back to COMOUT_PREV on short files.
 
         With the ops timeline the phase files are slices of the 6-hourly series, so the
@@ -672,7 +736,7 @@ class PrepOrchestrator:
         if not short_files:
             return None
 
-        prev_rerun = self.paths.get("prev_rerun")
+        prev_rerun = self._prev_rerun()
         warnings: List[str] = [
             f"OBC QC: {name} has {file_dims[name]} records < "
             f"{min_t} (operational N_dim_cr_max)" for name in short_files
@@ -699,12 +763,16 @@ class PrepOrchestrator:
             candidates: List[Path] = []
             if archive_base is not None:
                 candidates.append(
-                    prev / f"{self.run_name}.{cycle_tag}.{archive_base}.nc"
+                    prev / (self._obc_archive_name(archive_base, phase)
+                            if self.config.ops_bad_day_checks
+                            else f"{self.run_name}.{cycle_tag}.{archive_base}.nc")
                 )
-            candidates.extend([
-                prev / f"{self.run_name}.{cycle_tag}.{name}",
-                prev / name,
-            ])
+            if not self.config.ops_bad_day_checks:
+                # The active-name alternatives can hold the bias-adjusted elev2D. MJ (10/05/26)
+                candidates.extend([
+                    prev / f"{self.run_name}.{cycle_tag}.{name}",
+                    prev / name,
+                ])
             for src in candidates:
                 if src.exists():
                     dst = output_dir / name
@@ -737,6 +805,50 @@ class PrepOrchestrator:
                 "n_fallback_copied": len(copied),
             },
         )
+
+    _OPS_OBC_INPUTS = ("elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc",
+                       "TEM_nu.nc", "SAL_nu.nc")
+    _OPS_RUN_INPUTS = ("param.nml", "bctides.in", "msource.th", "vsink.th", "vsource.th",
+                       "flux.th", "TEM_1.th") + _OPS_OBC_INPUTS
+
+    def _check_ops_obc_inputs(self, output_dir: Path) -> ForcingResult:
+        """End-of-prep completeness check over production's final product list.
+
+        param.nml, bctides, msource/vsink/vsource, flux.th, TEM_1, sflux inputs, GFS and HRRR
+        air/prc/rad, the four OBC and two nudging files, each non-empty (``-s``); the restart
+        is gated in the HOTSTART step. Production err_exit "Forcing files are incomplete"
+        (nco_v315 scripts/stofs_3d_atl/exstofs_3d_atl_prep_processing.sh:398-746). MJ (10/05/26)
+        """
+        wanted = list(self._OPS_RUN_INPUTS)
+        if self.config.nws == 4:
+            wanted += ["gfs_forcing.nc"] + (["hrrr_forcing.nc"] if self.config.met_num >= 2 else [])
+        else:
+            wanted.append("sflux/sflux_inputs.txt")
+            for stack in ("1", "2") if self.config.met_num >= 2 else ("1",):
+                for var in ("air", "prc", "rad"):
+                    hits = sorted((output_dir / "sflux").glob(f"sflux_{var}_{stack}.*.nc"))
+                    wanted.append(str(hits[0].relative_to(output_dir)) if hits
+                                  else f"sflux/sflux_{var}_{stack}.*.nc")
+        missing = [n for n in wanted
+                   if not (output_dir / n).is_file() or (output_dir / n).stat().st_size == 0]
+        if missing:
+            msg = f"Prep products missing or empty in {output_dir}: {missing}"
+            log.error(msg)
+            return ForcingResult(success=False, source="OPS_OBC_INPUTS", errors=[msg])
+        return ForcingResult(success=True, source="OPS_OBC_INPUTS")
+
+    def _snapshot_pre_adjust(self, output_dir: Path) -> None:
+        """Keep elev2D.th.nc as it is before the in-place dynamic adjust rewrites it.
+
+        Production archives ``elev2dth_non_adj`` before the adjust
+        (stofs_3d_atl_create_obc_3d_th_non_adjust.sh:687). MJ (10/05/26)
+        """
+        import shutil
+
+        src = output_dir / "elev2D.th.nc"
+        if src.exists():
+            (output_dir / "pre_adjust").mkdir(exist_ok=True)
+            shutil.copy2(src, output_dir / "pre_adjust" / src.name)
 
     def _run_dynamic_adjust(self, output_dir: Path, phase: str = "nowcast") -> ForcingResult:
         """Apply NOAA tide-gauge bias correction to elev2D.th.nc.
@@ -1267,6 +1379,8 @@ class PrepOrchestrator:
 
         if getattr(self.config, "obc_min_timesteps", 0) <= 0:
             return
+        if self.config.ops_bad_day_checks:
+            return  # written to rerun/ by _archive_bad_day_rerun
 
         prefix = self.run_name
         cycle = f"t{self.config.cyc:02d}z"
@@ -1280,6 +1394,36 @@ class PrepOrchestrator:
                     f"  Archived OBC-QC artifact {active_name} -> "
                     f"{dst.name}"
                 )
+
+    def _archive_bad_day_rerun(self, work_dir: Path, comout: Path, phase: str,
+                               archived: List[Path]) -> None:
+        """Put the next cycle's fallback inputs in ``$COMOUTrerun`` as production does.
+
+        Pre-adjust elev2dth_non_adj, tem3dth/sal3dth/uv3dth (non_adjust.sh:687-705), vsource.th
+        (river_forcing_nwm.sh:408-441) and the St. Lawrence flux/TEM_1 files
+        (river_st_lawrence.sh:122-193). Gated on ops_bad_day_checks. MJ (10/05/26)
+        """
+        import shutil
+
+        if not self.config.ops_bad_day_checks:
+            return
+        rerun = Path(self.paths["comout_rerun"]) if self.paths.get("comout_rerun") else Path(comout) / "rerun"
+        rerun.mkdir(parents=True, exist_ok=True)
+        prefix = f"{self.run_name}.t{self.config.cyc:02d}z"
+        tag = ".fcst" if phase == "forecast" else ""
+        pairs = []
+        for active, base in self._OBC_ARCHIVE_NAMES.items():
+            src = work_dir / "pre_adjust" / active
+            pairs.append((src if src.exists() else work_dir / active,
+                          self._obc_archive_name(base, phase)))
+        pairs.append((work_dir / "vsource.th", f"{prefix}.vsource{tag}.th"))
+        pairs.append((work_dir / "flux.th", f"{prefix}.riv.obs.flux.th"))
+        pairs.append((work_dir / "TEM_1.th", f"{prefix}.riv.obs.tem_1.th"))
+        for src, name in pairs:
+            if src.exists():
+                shutil.copy2(src, rerun / name)
+                archived.append(rerun / name)
+                log.info(f"  Archived {src.name} -> {rerun / name}")
 
     def archive_to_comout(self, result: PrepResult, comout: Path) -> List[Path]:
         """
@@ -1377,6 +1521,7 @@ class PrepOrchestrator:
         # Gated on st_lawrence_enabled (ATL only), so other systems' $COMOUT is unchanged.
         # MJ (10/03/26)
         self._archive_st_lawrence_extra(work_dir, comout, archived)
+        self._archive_bad_day_rerun(work_dir, comout, phase, archived)
 
         if manifest_on:
             # --- Declarative manifest path (opt-in) ---

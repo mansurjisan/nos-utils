@@ -452,11 +452,15 @@ class TestArchiveManifest:
             "stofs_3d_atl.t12z.riv.obs.flux.th",
             "stofs_3d_atl.t12z.riv.obs.tem_1.th",
         }
+        # ATL bad-day checks: OBC-QC archives and the next-cycle fallbacks live in rerun/.
         obc_qc = {
-            "stofs_3d_atl.t12z.elev2dth_non_adj.nc",
-            "stofs_3d_atl.t12z.tem3dth.nc",
-            "stofs_3d_atl.t12z.sal3dth.nc",
-            "stofs_3d_atl.t12z.uv3dth.nc",
+            "rerun/stofs_3d_atl.t12z.elev2dth_non_adj.nc",
+            "rerun/stofs_3d_atl.t12z.tem3dth.nc",
+            "rerun/stofs_3d_atl.t12z.sal3dth.nc",
+            "rerun/stofs_3d_atl.t12z.uv3dth.nc",
+            "rerun/stofs_3d_atl.t12z.vsource.th",
+            "rerun/stofs_3d_atl.t12z.riv.obs.flux.th",
+            "rerun/stofs_3d_atl.t12z.riv.obs.tem_1.th",
         }
         assert common.issubset(files), (
             f"missing COMMON entries: {common - files}"

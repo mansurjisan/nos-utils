@@ -113,6 +113,7 @@ class HotstartProcessor(ForcingProcessor):
         output_path: Path,
         run_name: str = "secofs",
         max_lookback_days: int = 3,
+        min_size: Optional[int] = None,
     ):
         """
         Args:
@@ -125,6 +126,7 @@ class HotstartProcessor(ForcingProcessor):
         super().__init__(config, input_path, output_path)
         self.run_name = run_name
         self.max_lookback_days = max_lookback_days
+        self.min_size = self.MIN_HOTSTART_SIZE if min_size is None else int(min_size)
 
     def process(self) -> ForcingResult:
         """
@@ -681,7 +683,7 @@ class HotstartProcessor(ForcingProcessor):
         valid = []
         for f in candidates:
             try:
-                if f.stat().st_size >= self.MIN_HOTSTART_SIZE:
+                if f.stat().st_size >= self.min_size:
                     valid.append(f)
             except OSError:
                 continue

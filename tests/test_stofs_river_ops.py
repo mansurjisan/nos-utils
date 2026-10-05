@@ -39,6 +39,7 @@ def _fix_dir(tmp_path, **override):
 def _cfg(fix, **kw):
     kw.setdefault("nowcast_hours", 2)
     kw.setdefault("forecast_hours", 2)
+    kw.setdefault("ops_bad_day_checks", False)  # these fixtures carry a handful of NWM files
     return ForcingConfig.for_stofs_3d_atl(
         pdy="20261001", cyc=12,
         river_config_file=fix / "stofs_3d_atl_river_sources_conus.json", **kw)
