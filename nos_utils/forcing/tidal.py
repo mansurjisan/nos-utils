@@ -116,7 +116,7 @@ class TidalProcessor(ForcingProcessor):
             if result and self.config.ops_bad_day_checks and output_file.stat().st_size < 1000:
                 # create_bctides_in.sh:62-70 keeps bctides.in only above 1000 bytes. MJ (10/05/26)
                 result = False
-                self._fortran_failure = f"tide_fac wrote a bctides.in under 1000 bytes"
+                self._fortran_failure = "tide_fac wrote a bctides.in under 1000 bytes"
             if result:
                 return ForcingResult(
                     success=True, source=self.SOURCE_NAME,

@@ -77,7 +77,7 @@ class TestHotstartGate:
         _restart(tmp_path / "com", "20260930")
         monkeypatch.setattr(hs.HotstartProcessor, "stage_init_to_comout", lambda *a, **k: None)
         res = _orch(tmp_path, _atl())._run_hotstart(tmp_path / "work")
-        assert res.success is False and "RESTART FILE NOT FOUND" in res.errors[0]
+        assert res.success is False and "init file missing or under" in res.errors[0]
 
     def test_found_restart_with_undersized_init_fails(self, tmp_path):
         _restart(tmp_path / "com", "20260930")
@@ -210,15 +210,15 @@ class TestObcInputsGate:
 class TestForecastPhaseDoesNotInheritNowcastAtmosphere:
     def test_stale_hrrr_files_are_cleared_before_the_phase(self, tmp_path, monkeypatch):
         from nos_utils.forcing.base import ForcingResult
-        out = _obc_dir(tmp_path)  # a complete nowcast leftover set, HRRR included
+        out = _obc_dir(tmp_path)  # a complete nowcast leftover set, HRRR included MJ (10/05/26)
         (out / "hrrr_forcing.nc").write_bytes(b"x")
         orch = _orch(tmp_path, _atl(st_lawrence_enabled=False))
-        ok = lambda src: (lambda *a, **k: ForcingResult(success=True, source=src))  # noqa: E731
+        ok = lambda src: (lambda *a, **k: ForcingResult(success=True, source=src))  # noqa: E731  MJ (10/05/26)
         for n, src in (("_run_hotstart", "HOTSTART"), ("_run_tidal", "TIDAL"),
                        ("_run_param_nml", "PARAM_NML")):
             monkeypatch.setattr(orch, n, ok(src))
         monkeypatch.setattr(orch, "_write_time_markers", lambda *a, **k: None)
-        res = orch.run(phase="forecast")  # no GFS/HRRR path: nothing regenerates the atmosphere
+        res = orch.run(phase="forecast")  # no GFS/HRRR path: nothing regenerates the atmosphere MJ (10/05/26)
         assert not (out / "sflux" / "sflux_air_2.0001.nc").exists()
         assert res.success is False
 

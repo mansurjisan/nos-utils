@@ -458,9 +458,13 @@ class PrepOrchestrator:
             # at the end of prep (prep_processing.sh:713-727, err_exit :388). MJ (10/05/26)
             seed = (Path(comout) / init_filename) if comout is not None else None
             if seed is None or not seed.is_file() or seed.stat().st_size < self.config.restart_min_bytes:
-                msg = (f"RESTART FILE NOT FOUND: no restart over {self.config.restart_min_bytes} bytes "
-                       f"in {self.run_name}.<PDY-1..PDY-5> under {restart_dir} and no seeded init file "
-                       f"{seed}")
+                if (result.metadata or {}).get("ihot") == 1:
+                    msg = (f"init file missing or under {self.config.restart_min_bytes} bytes after "
+                           f"staging the found restart: {seed}")
+                else:
+                    msg = (f"RESTART FILE NOT FOUND: no restart over {self.config.restart_min_bytes} "
+                           f"bytes in {self.run_name}.<PDY-1..PDY-5> under {restart_dir} and no "
+                           f"seeded init file {seed}")
                 log.error(msg)
                 return ForcingResult(success=False, source="HOTSTART",
                                      errors=[msg], warnings=result.warnings)
