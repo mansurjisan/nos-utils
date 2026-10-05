@@ -452,7 +452,7 @@ class TestArchiveManifest:
             "stofs_3d_atl.t12z.riv.obs.flux.th",
             "stofs_3d_atl.t12z.riv.obs.tem_1.th",
         }
-        # ATL bad-day checks: OBC-QC archives and the next-cycle fallbacks live in rerun/.
+        # ATL bad-day checks: OBC-QC archives and the next-cycle fallbacks live in rerun/. MJ (10/05/26)
         obc_qc = {
             "rerun/stofs_3d_atl.t12z.elev2dth_non_adj.nc",
             "rerun/stofs_3d_atl.t12z.tem3dth.nc",

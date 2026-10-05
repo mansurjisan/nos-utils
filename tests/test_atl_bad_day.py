@@ -53,7 +53,7 @@ class TestHotstartGate:
         assert "RESTART FILE NOT FOUND" in res.errors[0]
 
     def test_restart_inside_window_passes(self, tmp_path):
-        _restart(tmp_path / "com", "20260927")  # PDY-4
+        _restart(tmp_path / "com", "20260927")  # PDY-4 MJ (10/05/26)
         res = _orch(tmp_path, _atl())._run_hotstart(tmp_path / "work")
         assert res.success and res.metadata["ihot"] == 1
 
@@ -69,6 +69,34 @@ class TestHotstartGate:
     def test_too_small_restart_fails(self, tmp_path):
         _restart(tmp_path / "com", "20260930")
         res = _orch(tmp_path, _atl(restart_min_bytes=10 ** 9))._run_hotstart(tmp_path / "work")
+        assert res.success is False
+
+    def test_found_restart_but_no_init_file_fails(self, tmp_path, monkeypatch):
+        # a failed nccopy leaves no init file even though a restart was found MJ (10/05/26)
+        import nos_utils.forcing.hotstart as hs
+        _restart(tmp_path / "com", "20260930")
+        monkeypatch.setattr(hs.HotstartProcessor, "stage_init_to_comout", lambda *a, **k: None)
+        res = _orch(tmp_path, _atl())._run_hotstart(tmp_path / "work")
+        assert res.success is False and "RESTART FILE NOT FOUND" in res.errors[0]
+
+    def test_found_restart_with_undersized_init_fails(self, tmp_path):
+        _restart(tmp_path / "com", "20260930")
+        res = _orch(tmp_path, _atl(restart_min_bytes=100))._run_hotstart(tmp_path / "work")
+        assert res.success
+        init = tmp_path / "com" / f"{RUN}.20261001" / f"{RUN}.t12z.20261001.init.nowcast.nc"
+        assert init.stat().st_size >= 100
+        res = _orch(tmp_path, _atl(restart_min_bytes=init.stat().st_size + 1))._run_hotstart(
+            tmp_path / "work2")
+        assert res.success is False
+
+    def test_restart_older_than_pdy_minus_5_in_the_comout_leaf_is_ignored(self, tmp_path):
+        # tagged PDY-10 inside today's COMOUT leaf MJ (10/05/26)
+        leaf = tmp_path / "com" / f"{RUN}.20261001"
+        leaf.mkdir(parents=True)
+        _restart(tmp_path / "com", "20260921", name="old.t12z.20260921.rst.nowcast.nc")
+        (tmp_path / "com" / f"{RUN}.20260921" / "old.t12z.20260921.rst.nowcast.nc").rename(
+            leaf / f"{RUN}.t12z.20260921.rst.nowcast.nc")
+        res = _orch(tmp_path, _atl(), restart=leaf)._run_hotstart(tmp_path / "work")
         assert res.success is False
 
     def test_seeded_init_file_passes(self, tmp_path):
@@ -105,7 +133,7 @@ class TestHotstartGate:
 
     def test_restart_root_follows_overridden_comout(self, tmp_path):
         # COMOUT=<root>/<run>.PDY: the processor also searches the parent, so an override
-        # of COMOUT alone reaches the restart in the sibling PDY-1 dir.
+        # of COMOUT alone reaches the restart in the sibling PDY-1 dir. MJ (10/05/26)
         root = tmp_path / "alt"
         _restart(root, "20260930")
         res = _orch(tmp_path, _atl(), restart=root / f"{RUN}.20261001",
@@ -149,9 +177,15 @@ class TestObcInputsGate:
     def _run(self, tmp_path, monkeypatch, cfg, with_obc):
         from nos_utils.forcing.base import ForcingResult
         orch = _orch(tmp_path, cfg)
-        ok = lambda src: (lambda *a, **k: ForcingResult(success=True, source=src))  # noqa: E731
+        ok = lambda src: (lambda *a, **k: ForcingResult(success=True, source=src))  # noqa: E731  MJ (10/05/26)
         monkeypatch.setattr(orch, "_run_hotstart", ok("HOTSTART"))
-        monkeypatch.setattr(orch, "_run_tidal", ok("TIDAL"))
+
+        def tidal(*a, **k):  # stands in for the GFS/HRRR steps of this phase MJ (10/05/26)
+            if with_obc:
+                _obc_dir(tmp_path)
+            return ForcingResult(success=True, source="TIDAL")
+
+        monkeypatch.setattr(orch, "_run_tidal", tidal)
         monkeypatch.setattr(orch, "_run_param_nml", ok("PARAM_NML"))
         monkeypatch.setattr(orch, "_run_datm", ok("DATM"))
         monkeypatch.setattr(orch, "_run_ufs_config", ok("UFS_CONFIG"))
@@ -173,11 +207,27 @@ class TestObcInputsGate:
         assert self._run(tmp_path, monkeypatch, cfg, with_obc=False).success is True
 
 
+class TestForecastPhaseDoesNotInheritNowcastAtmosphere:
+    def test_stale_hrrr_files_are_cleared_before_the_phase(self, tmp_path, monkeypatch):
+        from nos_utils.forcing.base import ForcingResult
+        out = _obc_dir(tmp_path)  # a complete nowcast leftover set, HRRR included
+        (out / "hrrr_forcing.nc").write_bytes(b"x")
+        orch = _orch(tmp_path, _atl(st_lawrence_enabled=False))
+        ok = lambda src: (lambda *a, **k: ForcingResult(success=True, source=src))  # noqa: E731
+        for n, src in (("_run_hotstart", "HOTSTART"), ("_run_tidal", "TIDAL"),
+                       ("_run_param_nml", "PARAM_NML")):
+            monkeypatch.setattr(orch, n, ok(src))
+        monkeypatch.setattr(orch, "_write_time_markers", lambda *a, **k: None)
+        res = orch.run(phase="forecast")  # no GFS/HRRR path: nothing regenerates the atmosphere
+        assert not (out / "sflux" / "sflux_air_2.0001.nc").exists()
+        assert res.success is False
+
+
 class TestTideFacRequired:
     def _fix(self, tmp_path):
         fix = tmp_path / "fix"
         fix.mkdir(exist_ok=True)
-        (fix / "sys.bctides.in_template").write_text("T\n")
+        (fix / "sys.bctides.in_template").write_text("T" * 1200 + "\n")
         return fix
 
     def _clear_env(self, monkeypatch):
@@ -212,6 +262,17 @@ class TestTideFacRequired:
         res = TidalProcessor(_atl(), self._fix(tmp_path), tmp_path / "w").process()
         assert res.success and res.metadata["mode"] == "fortran_tide_fac"
 
+    def test_undersized_bctides_fails_for_atl(self, tmp_path, monkeypatch):
+        exe_dir = tmp_path / "exec"
+        exe_dir.mkdir()
+        exe = exe_dir / "stofs_3d_atl_tide_fac"
+        exe.write_text("#!/bin/sh\ncat > /dev/null\necho tiny > bctides.in\n")
+        exe.chmod(0o755)
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("EXECstofs3d", str(exe_dir))
+        res = TidalProcessor(_atl(), self._fix(tmp_path), tmp_path / "w").process()
+        assert res.success is False and "1000 bytes" in res.errors[0]
+
     def test_other_systems_keep_the_python_fallback(self, tmp_path, monkeypatch):
         self._clear_env(monkeypatch)
         cfg = _atl(ops_bad_day_checks=False)
@@ -240,7 +301,7 @@ class TestPreAdjustArchive:
         self._elev_mark(work / "elev2D.th.nc", 1.0)
         orch = _orch(tmp_path, _atl())
         orch._snapshot_pre_adjust(work)
-        self._elev_mark(work / "elev2D.th.nc", 9.0)  # the in-place dynamic adjust
+        self._elev_mark(work / "elev2D.th.nc", 9.0)  # the in-place dynamic adjust MJ (10/05/26)
         comout = tmp_path / "com" / f"{RUN}.20261001"
         arch = []
         orch._archive_bad_day_rerun(work, comout, "nowcast", arch)
@@ -275,7 +336,7 @@ class TestPreAdjustArchive:
         work = self._work(tmp_path, elev_nt=5)
         prev = tmp_path / "com" / f"{RUN}.20260930"
         _write_obc_file(prev / "rerun" / f"{RUN}.t12z.elev2dth_non_adj.nc", nt=25)
-        # An adjusted copy under the active name must not be picked up.
+        # An adjusted copy under the active name must not be picked up. MJ (10/05/26)
         _write_obc_file(prev / "rerun" / "elev2D.th.nc", nt=25)
         self._elev_mark(prev / "rerun" / "elev2D.th.nc", 7.0)
         self._elev_mark(prev / "rerun" / f"{RUN}.t12z.elev2dth_non_adj.nc", 1.0)
@@ -378,7 +439,7 @@ class TestNwmMinimum:
         rows = (tmp_path / "out" / "vsource.th").read_text().splitlines()
         assert rows[0].split()[:2] == ["0", "0.0"]
         assert rows[2].split()[:2] == ["7200", "2.0"]
-        assert len(rows) == 2 + 3 + 1  # nowcast_hours 2 + buffer + 1
+        assert len(rows) == 2 + 3 + 1  # nowcast_hours 2 + buffer + 1 MJ (10/05/26)
 
     def test_forecast_drops_24_rows_and_pads_with_last(self, tmp_path):
         _prev_vsource(tmp_path / "rerun", f"{RUN}.t12z.vsource.fcst.th", 30)
@@ -388,7 +449,7 @@ class TestNwmMinimum:
         assert len(rows) == 12
         assert rows[0].split() == ["0", "24.0", "24.5", "24.9"]
         assert rows[5].split() == ["18000", "29.0", "29.5", "29.9"]
-        assert rows[6].split()[1:] == ["29.0", "29.5", "29.9"]  # padded with the last row
+        assert rows[6].split()[1:] == ["29.0", "29.5", "29.9"]  # padded with the last row MJ (10/05/26)
         assert [int(r.split()[0]) for r in rows] == [i * 3600 for i in range(len(rows))]
 
     def test_nowcast_falls_back_to_nowcast_file_shifted(self, tmp_path):

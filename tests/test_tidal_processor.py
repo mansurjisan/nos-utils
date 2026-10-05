@@ -253,6 +253,7 @@ class TestNodalReference:
         return (work / "stdin.rec").read_text()
 
     def _atl(self, **kw):
+        kw.setdefault("ops_bad_day_checks", False)  # these tests stub tide_fac with a tiny template MJ (10/05/26)
         return ForcingConfig.for_stofs_3d_atl(
             "20260927", 12, nowcast_hours=24, forecast_hours=96, **kw
         )
@@ -275,7 +276,7 @@ class TestNodalReference:
         self, tmp_path, monkeypatch, caplog
     ):
         cfg = ForcingConfig.for_stofs_3d_atl(
-            "20260927", 12, nowcast_hours=48, forecast_hours=24
+            "20260927", 12, nowcast_hours=48, forecast_hours=24, ops_bad_day_checks=False
         )
         with caplog.at_level("WARNING"):
             text = self._stdin(cfg, tmp_path, monkeypatch, "forecast")
@@ -313,7 +314,7 @@ class TestNodalReference:
             return real(start, consts, run_days=run_days)
 
         monkeypatch.setattr(tidal, "compute_nodal_corrections", spy)
-        cfg = self._atl(ops_bad_day_checks=False)  # the Python path is the non-ATL-ops route
+        cfg = self._atl(ops_bad_day_checks=False)  # the Python path is the non-ATL-ops route MJ (10/05/26)
         for phase in ("nowcast", "forecast"):
             out = tmp_path / phase
             TidalProcessor(cfg, tmp_path / "none", out, phase=phase).process()

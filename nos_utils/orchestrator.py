@@ -166,6 +166,14 @@ class PrepOrchestrator:
 
         output_dir = self.paths["output"]
         output_dir.mkdir(parents=True, exist_ok=True)
+        if self.config.ops_bad_day_checks:
+            # Both phases share $DATA and a missing HRRR is a successful no-op, so the previous
+            # phase's atmospheric files would satisfy the completeness check. Production requires
+            # hrrr.* (prep_processing.sh:595-643). MJ (10/05/26)
+            for stale in list((output_dir / "sflux").glob("sflux_*.nc")) + [
+                    output_dir / "gfs_forcing.nc", output_dir / "hrrr_forcing.nc"]:
+                if stale.is_file():
+                    stale.unlink()
 
         # Step 1: Hotstart
         hotstart_result = self._run_hotstart(output_dir)
@@ -421,7 +429,8 @@ class PrepOrchestrator:
         extra = {}
         if gate:
             # Restart over 20 GiB in the PDY-1..PDY-5 directories (prep_processing.sh:340-351). MJ (10/05/26)
-            extra = dict(max_lookback_days=5, min_size=self.config.restart_min_bytes)
+            extra = dict(max_lookback_days=5, min_size=self.config.restart_min_bytes,
+                         max_age_days=5)
         proc = HotstartProcessor(
             self.config, restart_dir, output_dir,
             run_name=self.run_name, **extra,
@@ -443,9 +452,10 @@ class PrepOrchestrator:
                 result.metadata["comout_init_path"] = str(staged)
                 result.output_files.append(staged)
 
-        if gate and result.success and (result.metadata or {}).get("ihot") != 1:
-            # No restart found: only a seeded init file of full size lets the cycle start.
-            # Production err_exit "RESTART FILE NOT FOUND" (prep_processing.sh:388). MJ (10/05/26)
+        if gate and result.success:
+            # The init file SCHISM reads must be full size whether it was seeded or staged from a
+            # found restart (a failed nccopy returns None); production re-checks the restart size
+            # at the end of prep (prep_processing.sh:713-727, err_exit :388). MJ (10/05/26)
             seed = (Path(comout) / init_filename) if comout is not None else None
             if seed is None or not seed.is_file() or seed.stat().st_size < self.config.restart_min_bytes:
                 msg = (f"RESTART FILE NOT FOUND: no restart over {self.config.restart_min_bytes} bytes "
@@ -1380,7 +1390,7 @@ class PrepOrchestrator:
         if getattr(self.config, "obc_min_timesteps", 0) <= 0:
             return
         if self.config.ops_bad_day_checks:
-            return  # written to rerun/ by _archive_bad_day_rerun
+            return  # written to rerun/ by _archive_bad_day_rerun MJ (10/05/26)
 
         prefix = self.run_name
         cycle = f"t{self.config.cyc:02d}z"
