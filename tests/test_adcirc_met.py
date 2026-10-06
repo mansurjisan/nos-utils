@@ -356,3 +356,224 @@ def test_missing_required_variable_raises_clear_error(tmp_path):
         ec.codes_write(h, f)
     with pytest.raises(am.InsufficientDataError, match="prmsl"):
         am.write_owi_netcdf([p], tmp_path / "o")
+
+
+# --- ops surface forcing from the GFS sfcf files ---------------------------------------------
+
+NY, NX = 3, 4
+CYC = datetime(2026, 10, 4, 0)
+
+
+def _mk_sfcf(comin, cycle, fhr, seed, logf=True):
+    import netCDF4 as nc
+    p = am.sfcf_path(comin, cycle, fhr)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    ds = nc.Dataset(str(p), "w", format="NETCDF4_CLASSIC")
+    ds.fhzero = 6
+    ds.dtp = np.float32(150.0)
+    ds.source = "FV3GFS"
+    ds.createDimension("grid_xt", NX)
+    ds.createDimension("grid_yt", NY)
+    ds.createDimension("time", 1)
+    x = ds.createVariable("grid_xt", "f8", ("grid_xt",))
+    x[:] = np.arange(NX)
+    lon = ds.createVariable("lon", "f8", ("grid_yt", "grid_xt"))
+    lon[:] = np.tile(np.arange(NX, dtype="f8"), (NY, 1))
+    y = ds.createVariable("grid_yt", "f8", ("grid_yt",))
+    y[:] = np.arange(NY)
+    lat = ds.createVariable("lat", "f8", ("grid_yt", "grid_xt"))
+    lat[:] = np.tile(np.arange(NY, dtype="f8")[:, None], (1, NX))
+    t = ds.createVariable("time", "f8", ("time",))
+    t.units = "hours since {:%Y-%m-%d %H:%M:%S}".format(cycle)
+    t[:] = fhr
+    for k, name in enumerate(("ugrd10m", "vgrd10m", "pressfc", "icec")):
+        v = ds.createVariable(name, "f4", ("time", "grid_yt", "grid_xt"), fill_value=np.float32(9.99e20))
+        v.long_name = name
+        v.cell_methods = "time: point"
+        v[0] = np.full((NY, NX), seed * 10 + k, dtype="f4") + np.arange(NY * NX, dtype="f4").reshape(NY, NX)
+    ds.close()
+    if logf:
+        p.with_name(p.name.replace("sfcf", "logf").replace(".nc", ".txt")).write_text("done")
+    return p
+
+
+def _valid_seed(cycle, fhr):
+    return int((cycle + timedelta(hours=fhr) - datetime(2026, 10, 1)).total_seconds() // 3600)
+
+
+def _fill_tank(comin, pairs):
+    for cycle, fhr in pairs:
+        _mk_sfcf(comin, cycle, fhr, _valid_seed(cycle, fhr))
+
+
+def _read(path, var):
+    import netCDF4 as nc
+    with nc.Dataset(str(path)) as d:
+        d.set_auto_maskandscale(False)
+        return d.variables[var][:]
+
+
+def test_getges_picks_smallest_lead_and_falls_back(tmp_path):
+    c18, c12 = CYC - timedelta(hours=6), CYC - timedelta(hours=12)
+    _fill_tank(tmp_path, [(CYC, 0), (c18, 1), (c18, 6), (c12, 6), (c12 - timedelta(hours=6), 12)])
+    assert am.getges_sfcf(tmp_path, CYC) == am.sfcf_path(tmp_path, CYC, 0)
+    assert am.getges_sfcf(tmp_path, CYC - timedelta(hours=5)) == am.sfcf_path(tmp_path, c18, 1)
+    # f000 absent -> the previous cycle's f006; that absent too -> the cycle before, f012
+    assert am.getges_sfcf(tmp_path, c18) == am.sfcf_path(tmp_path, c12, 6)
+    am.sfcf_path(tmp_path, c12, 6).unlink()
+    assert am.getges_sfcf(tmp_path, c18) == am.sfcf_path(tmp_path, c12 - timedelta(hours=6), 12)
+    with pytest.raises(am.FileNotAvailableError, match="no GFS sfcf"):
+        am.getges_sfcf(tmp_path, CYC + timedelta(hours=40))
+
+
+def test_sfcf_windows():
+    ncst = am.sfcf_valid_times(CYC, "ncst")
+    assert (len(ncst), ncst[0], ncst[-1]) == (7, CYC - timedelta(hours=6), CYC)
+    assert len(am.sfcf_valid_times(CYC, "ncst", CYC - timedelta(hours=12))) == 13
+    f1 = am.sfcf_valid_times(CYC, "fcst1")
+    assert (len(f1), f1[0], f1[-1]) == (121, CYC, CYC + timedelta(hours=120))
+    f2 = am.sfcf_valid_times(CYC, "fcst2")
+    assert (len(f2), f2[0], f2[1], f2[-1]) == (
+        21, CYC + timedelta(hours=120), CYC + timedelta(hours=123), CYC + timedelta(hours=180))
+    with pytest.raises(ValueError):
+        am.sfcf_valid_times(CYC, "spinup")
+    with pytest.raises(am.MetForcingError):
+        am.sfcf_valid_times(CYC, "ncst", CYC + timedelta(hours=1))
+
+
+def test_ncst_layout_values_and_manifest(tmp_path):
+    import netCDF4 as nc
+    tank, out = tmp_path / "gfs", tmp_path / "rerun"
+    c18 = CYC - timedelta(hours=6)
+    # valid 18 -> f001 of 17z does not exist; f000 absent so it falls back to 12z f006
+    _fill_tank(tank, [(CYC - timedelta(hours=12), 6)] + [(c18, h) for h in range(1, 6)] + [(CYC, 0)])
+    files = am.build_sfcf_forcing(tank, CYC, "ncst", out)
+    assert sorted(files) == ["221", "222", "225"]
+    assert sorted(p.name for p in out.iterdir()) == sorted(
+        ["stofs_2d_glo_ncst.{}.nc".format(n) for n in files] + ["stofs_2d_glo_ncst.sfcf_manifest.json"])
+    with nc.Dataset(str(files["222"])) as d:
+        assert d.data_model == "NETCDF4_CLASSIC"
+        assert [k for k in d.dimensions] == ["grid_xt", "grid_yt", "record"]
+        assert d.dimensions["record"].isunlimited() and len(d.dimensions["record"]) == 7
+        assert list(d.variables) == ["grid_xt", "grid_yt", "lat", "lon", "time", "ugrd10m", "vgrd10m"]
+        assert d.variables["lat"].dimensions == ("record", "grid_yt", "grid_xt")
+        assert d.variables["time"].dimensions == () and d.variables["time"].cell_methods == "time: mean"
+        assert d.variables["ugrd10m"].cell_methods == "time: point time: mean"
+        assert d.variables["ugrd10m"].filters()["zlib"] and d.variables["ugrd10m"].filters()["shuffle"]
+        assert d.variables["ugrd10m"].chunking() == [1, NY, NX]
+        assert d.variables["lat"].dtype == np.dtype("f8") and d.variables["ugrd10m"].dtype == np.dtype("f4")
+        assert d.getncattr("fhzero") == 6 and d.getncattr("dtp") == np.float32(150.0)
+        assert d.variables["ugrd10m"].getncattr("_FillValue") == np.float32(9.99e20)
+    # record 0 is 12z f006 (time 6, units from that file), records 1-5 are 18z f001-f005, record 6 is 00z f000
+    src = [am.sfcf_path(tank, CYC - timedelta(hours=12), 6)] + [am.sfcf_path(tank, c18, h) for h in range(1, 6)] \
+        + [am.sfcf_path(tank, CYC, 0)]
+    for n, names in am.SFC_OUTPUTS:
+        for v in names:
+            got = _read(files[n], v)
+            assert got.shape == (7, NY, NX)
+            for r, s in enumerate(src):
+                assert np.array_equal(got[r], _read(s, v)[0])
+    with nc.Dataset(str(files["225"])) as d:
+        assert list(d.variables) == ["grid_xt", "grid_yt", "icec", "lat", "lon", "time"]
+    with nc.Dataset(str(files["221"])) as d:
+        assert d.variables["time"].units == "hours since 2026-10-03 12:00:00" and d.variables["time"][...] == 6
+    man = json.loads((out / "stofs_2d_glo_ncst.sfcf_manifest.json").read_text())
+    assert man["nfiles"] == 7 and man["files"][0]["source_location"] == str(src[0])
+
+
+def test_ncst_start_override_gives_fewer_records(tmp_path):
+    c18 = CYC - timedelta(hours=6)
+    _fill_tank(tmp_path / "g", [(c18, h) for h in range(1, 6)] + [(CYC, 0)])
+    files = am.build_sfcf_forcing(tmp_path / "g", CYC, "ncst", tmp_path / "o", start=CYC - timedelta(hours=5))
+    assert _read(files["225"], "icec").shape[0] == 6
+
+
+def test_fcst1_and_fcst2_record_counts_and_stride(tmp_path):
+    tank = tmp_path / "g"
+    _fill_tank(tank, [(CYC, 0)] + [(CYC, h) for h in range(1, 121)])
+    f1 = am.build_sfcf_forcing(tank, CYC, "fcst1", tmp_path / "o")
+    p = _read(f1["221"], "pressfc")
+    assert p.shape[0] == 121
+    assert p[7][0, 0] == _valid_seed(CYC, 7) * 10 + 2
+    _fill_tank(tank, [(CYC, h) for h in range(120, 181, 3)])
+    f2 = am.build_sfcf_forcing(tank, CYC, "fcst2", tmp_path / "o")
+    q = _read(f2["222"], "ugrd10m")
+    assert q.shape[0] == 21
+    assert q[1][0, 0] == _valid_seed(CYC, 123) * 10 + 0
+
+
+def test_forecast_waits_then_fails_clearly(tmp_path):
+    tank = tmp_path / "g"
+    _fill_tank(tank, [(CYC, h) for h in range(120, 178, 3)])  # f180 is missing
+    clock = {"t": 0.0}
+    naps = []
+
+    def sleep(s):
+        naps.append(s)
+        clock["t"] += s
+
+    with pytest.raises(am.FileNotAvailableError, match="sfcf180"):
+        am.build_sfcf_forcing(tank, CYC, "fcst2", tmp_path / "o", wait_s=25, poll_s=10,
+                              sleep=sleep, clock=lambda: clock["t"])
+    assert naps == [10, 10, 5]
+    assert list((tmp_path / "o").glob("*.nc*")) == []  # no final or .partial files from a failed run
+
+    def sleep_and_land(s):
+        _mk_sfcf(tank, CYC, 180, 1)
+        sleep(s)
+
+    files = am.build_sfcf_forcing(tank, CYC, "fcst2", tmp_path / "o", wait_s=25, poll_s=10,
+                                  sleep=sleep_and_land, clock=lambda: clock["t"])
+    assert _read(files["221"], "pressfc").shape[0] == 21
+
+
+def test_current_cycle_f000_is_not_waited_for(tmp_path):
+    # fcst1 record 0 (valid == cycle) goes through getges, so it never waits
+    _fill_tank(tmp_path / "g", [(CYC - timedelta(hours=6), 6)] + [(CYC, h) for h in range(1, 121)])
+    files = am.build_sfcf_forcing(tmp_path / "g", CYC, "fcst1", tmp_path / "o", wait_s=0,
+                                  sleep=lambda s: pytest.fail("waited"))
+    assert _read(files["221"], "pressfc").shape[0] == 121
+
+
+def _age(p, seconds):
+    t = p.stat().st_mtime - seconds
+    os.utime(str(p), (t, t))
+
+
+def test_fresh_sfcf_needs_its_logf_marker(tmp_path):
+    p = _mk_sfcf(tmp_path, CYC, 1, 1, logf=False)
+    assert not am._sfcf_ready(p)  # just written, no logf: still being copied
+    _age(p, 3600)
+    assert am._sfcf_ready(p)  # old: a retrospective file
+    q = _mk_sfcf(tmp_path, CYC, 2, 1, logf=False)
+    assert not am._sfcf_ready(q)
+    q.with_name("gfs.t00z.logf002.txt").write_text("done")
+    assert am._sfcf_ready(q)
+
+
+def test_realtime_cycle_record_waits_for_f000_before_falling_back(tmp_path):
+    c18 = CYC - timedelta(hours=6)
+    _fill_tank(tmp_path, [(c18, h) for h in range(1, 7)])
+    for h in range(1, 7):
+        _age(am.sfcf_path(tmp_path, c18, h), 3600)
+    epoch = __import__("calendar").timegm(CYC.timetuple())
+    naps = []
+
+    def sleep(s):
+        naps.append(s)
+        p = _mk_sfcf(tmp_path, CYC, 0, 5)
+        _age(p, 3600)
+
+    files = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC - timedelta(hours=1), wait_s=30,
+                                  sleep=sleep, clock=lambda: 0.0, now=lambda: epoch + 600)
+    assert naps == [10]
+    assert _read(files["221"], "pressfc")[1][0, 0] == 52
+    assert str(am.sfcf_path(tmp_path, CYC, 0)) in (tmp_path / "o" / "stofs_2d_glo_ncst.sfcf_manifest.json").read_text()
+
+
+def test_retrospective_cycle_record_does_not_wait(tmp_path):
+    c18 = CYC - timedelta(hours=6)
+    _fill_tank(tmp_path, [(c18, h) for h in range(1, 7)])
+    epoch = __import__("calendar").timegm(CYC.timetuple())
+    am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC - timedelta(hours=1), wait_s=30,
+                          sleep=lambda s: pytest.fail("waited"), now=lambda: epoch + 3 * 86400)
