@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import calendar
 import logging
 import os
 import shutil
@@ -595,8 +596,9 @@ class AdcircMetProcessor:
 
 SFC_SEGMENTS = ("ncst", "fcst1", "fcst2")
 SFC_OUTPUTS = (("221", ("pressfc",)), ("222", ("ugrd10m", "vgrd10m")), ("225", ("icec",)))
-_SFC_TAGS = {"221": "pressfc", "222": "uvgrd10m", "225": "icec"}  # the ops intermediate file names
 _GETGES_FHEND = 384
+_SFCF_SETTLED_S = 900  # an sfcf file this old without a logf marker is a retrospective one. MJ (10/06/26)
+_REALTIME_S = 12 * 3600  # f000 is waited for only this long after the cycle time. MJ (10/06/26)
 
 
 def sfcf_path(comin_gfs, cycle: datetime, fhr: int) -> Path:
@@ -639,36 +641,35 @@ def sfcf_valid_times(cycle: datetime, segment: str, start: Optional[datetime] = 
     return out
 
 
-def _nco_stamp(t: datetime) -> str:
-    return "{:%a %b} {:>2} {:%H:%M:%S %Y}".format(t, t.day, t)
+def _sfcf_ready(path: Path) -> bool:
+    """Non-empty and, unless old enough to be complete, its logf marker exists (GFS writes sfcf straight into COM)."""
+    if not (path.is_file() and path.stat().st_size > 0):
+        return False
+    logf = path.with_name(path.name.replace("sfcf", "logf").replace(".nc", ".txt"))
+    return logf.exists() or time.time() - path.stat().st_mtime > _SFCF_SETTLED_S
 
 
-def _history(valids: List[datetime], names: Tuple[str, ...], num: str, tag: str, now: datetime) -> str:
-    ymdh = ["{:%Y%m%d%H}".format(v) for v in valids]
-    ncks = "ncks -v time,grid_xt,lon,grid_yt,lat,{} swnd.{} {}.{}.nc".format(",".join(names), ymdh[0], tag, ymdh[0])
-    ncecat = "ncecat {} tmp.{}.nc".format(" ".join("{}.{}.nc".format(tag, y) for y in ymdh), num)
-    ncwa = "ncwa -a time tmp.{0}.nc fort.{0}.nc".format(num)
-    return "{0}: {1}\n{0}: {2}\n{0}: {3}".format(_nco_stamp(now), ncwa, ncecat, ncks)
-
-
-def _wait_for(path: Path, deadline: float, poll_s: float, sleep, clock) -> None:
-    """The ops ``until [ -s file ]`` loop, bounded by a shared deadline."""
-    while not (path.is_file() and path.stat().st_size > 0):
+def _wait_for(path: Path, deadline: float, poll_s: float, sleep, clock) -> bool:
+    """The ops ``until [ -s file ]`` loop, bounded by a shared deadline; False when it expires."""
+    while not _sfcf_ready(path):
         left = deadline - clock()
         if left <= 0:
-            raise FileNotAvailableError("GFS file did not appear before the wait expired: {}".format(path))
-        log.info("%s not there yet, waiting", path)
+            return False
+        log.info("%s not ready yet, waiting", path)
         sleep(min(poll_s, left))
+    return True
 
 
 def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix: str = "stofs_2d_glo",
                        start: Optional[datetime] = None, wait_s: float = 0.0, poll_s: float = 10.0,
-                       sleep=time.sleep, clock=time.monotonic) -> Dict[str, Path]:
+                       sleep=time.sleep, clock=time.monotonic, now=time.time) -> Dict[str, Path]:
     """Write ``<prefix>_<segment>.{221,222,225}.nc`` from the GFS sfcf files, as the ops GFS_NCST/FCST1/FCST2 jobs.
 
     Valid times at or before ``cycle`` use getges; later ones the current cycle's own sfcf file, waited for
     up to ``wait_s`` seconds in total. Output files appear under their final names only when all three are
-    complete, 221 last (the ops skip test is on 221). Records are copied one at a time.
+    complete, 221 last (the ops skip test is on 221). Records are copied one at a time. In real time (within
+    12 h of ``cycle``) the cycle-time record first waits for f000 so getges does not fall back to f006 of the
+    previous cycle.
     """
     import netCDF4 as nc
 
@@ -680,13 +681,17 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
     part = {n: p.with_name(p.name + ".partial") for n, p in final.items()}
     outs = {}  # type: Dict[str, object]
     used = []  # type: List[Tuple[datetime, Path]]
+    done = False
     try:
         for rec, valid in enumerate(valids):
             if valid <= cycle:
+                if valid == cycle and now() - calendar.timegm(cycle.timetuple()) < _REALTIME_S:
+                    _wait_for(sfcf_path(comin_gfs, cycle, 0), deadline, poll_s, sleep, clock)
                 src = getges_sfcf(comin_gfs, valid)
             else:
                 src = sfcf_path(comin_gfs, cycle, int((valid - cycle).total_seconds() // 3600))
-                _wait_for(src, deadline, poll_s, sleep, clock)
+                if not _wait_for(src, deadline, poll_s, sleep, clock):
+                    raise FileNotAvailableError("GFS file did not appear before the wait expired: {}".format(src))
             used.append((valid, src))
             log.info("record %d valid %s <- %s", rec, valid, src)
             with nc.Dataset(str(src)) as ds:
@@ -694,22 +699,27 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
                 if rec == 0:
                     for n, names in SFC_OUTPUTS:
                         outs[n] = _open_sfcf_output(nc, part[n], ds, names)
+                lat, lon = ds.variables["lat"][:], ds.variables["lon"][:]
                 for n, names in SFC_OUTPUTS:
-                    for v in ("lat", "lon") + names:
-                        if ds.variables[v].shape[-2:] != (len(outs[n].dimensions["grid_yt"]),
-                                                          len(outs[n].dimensions["grid_xt"])):  # ncecat needs equal shapes
-                            raise MetForcingError("{}: {} has a different grid from the first record".format(src, v))
-                        outs[n].variables[v][rec] = ds.variables[v][0] if v in names else ds.variables[v][:]
-        now = datetime.now()
-        for n, names in SFC_OUTPUTS:
-            outs[n].setncattr("history", _history(valids, names, n, _SFC_TAGS[n], now))
-            outs[n].close()
+                    o = outs[n]
+                    if lat.shape != (len(o.dimensions["grid_yt"]), len(o.dimensions["grid_xt"])):  # ncecat needs equal shapes. MJ (10/06/26)
+                        raise MetForcingError("{}: grid differs from the first record".format(src))
+                    o.variables["lat"][rec], o.variables["lon"][rec] = lat, lon
+                    for v in names:
+                        o.variables[v][rec] = ds.variables[v][0]
+        for o in outs.values():
+            o.close()
         outs = {}
         for n in ("225", "222", "221"):
             os.replace(str(part[n]), str(final[n]))
+        done = True
     finally:
         for o in outs.values():
             o.close()
+        if not done:
+            for p in part.values():
+                if p.exists():
+                    p.unlink()
     _write_sfcf_manifest(out_dir / "{}_{}.sfcf_manifest.json".format(prefix, segment), cycle, segment, used)
     return final
 
@@ -736,7 +746,7 @@ def _open_sfcf_output(nc, path: Path, src, names: Tuple[str, ...]):
 
     for c in ("grid_xt", "grid_yt"):
         clone(c, (c,))[:] = src.variables[c][:]
-    for v in sorted(names + ("lat", "lon", "time")):  # ncecat orders the non-coordinate variables alphabetically
+    for v in sorted(names + ("lat", "lon", "time")):  # ncecat orders the non-coordinate variables alphabetically. MJ (10/06/26)
         scalar, data = v == "time", v not in ("lat", "lon", "time")
         kw = {} if scalar else {"chunksizes": chunks}
         if data:
@@ -744,7 +754,7 @@ def _open_sfcf_output(nc, path: Path, src, names: Tuple[str, ...]):
         ov = clone(v, () if scalar else ("record", "grid_yt", "grid_xt"), **kw)
         if v not in ("lat", "lon"):
             cm = getattr(src.variables[v], "cell_methods", "")
-            ov.setncattr("cell_methods", (cm + " " if cm else "") + "time: mean")  # what ncwa -a time appends
+            ov.setncattr("cell_methods", (cm + " " if cm else "") + "time: mean")  # what ncwa -a time appends. MJ (10/06/26)
         if scalar:
             ov[...] = src.variables["time"][0]
     return out
