@@ -29,12 +29,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import ClassVar, Dict, List, Optional, Set
+from typing import ClassVar, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -585,3 +587,172 @@ class AdcircMetProcessor:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(str(path), "w") as fh:
             json.dump(data, fh, indent=2)
+
+
+# --- Operational (stofs.v3.1.5) surface forcing from the GFS native-grid sfcf files ---------------
+# Replicates exstofs_2d_glo_gfs.sh / stofs_2d_glo_surface_forcing.sh / stofs_2d_glo_getges.sh:
+# one pass per record, ncks -v + ncecat + ncwa -a time as netCDF4 calls. MJ (10/06/26)
+
+SFC_SEGMENTS = ("ncst", "fcst1", "fcst2")
+SFC_OUTPUTS = (("221", ("pressfc",)), ("222", ("ugrd10m", "vgrd10m")), ("225", ("icec",)))
+_SFC_TAGS = {"221": "pressfc", "222": "uvgrd10m", "225": "icec"}  # the ops intermediate file names
+_GETGES_FHEND = 384
+
+
+def sfcf_path(comin_gfs, cycle: datetime, fhr: int) -> Path:
+    return Path(comin_gfs) / "gfs.{:%Y%m%d}".format(cycle) / "{:02d}".format(cycle.hour) / "atmos" / \
+        "gfs.t{:02d}z.sfcf{:03d}.nc".format(cycle.hour, fhr)
+
+
+def getges_sfcf(comin_gfs, valid: datetime) -> Path:
+    """getges.sh -t sfgges -n gfs: the first readable file walking back one hour of lead at a time.
+
+    The script starts at fhbeg=max(NHOUR valid, 0); a valid time in the past, as in ops, gives 0.
+    A missing f000 therefore falls back to the previous cycle's f006. MJ (10/06/26)
+    """
+    for fh in range(_GETGES_FHEND + 1):
+        cand = sfcf_path(comin_gfs, valid - timedelta(hours=fh), fh)
+        if os.access(str(cand), os.R_OK):
+            return cand
+    raise FileNotAvailableError(
+        "FATAL ERROR: no GFS sfcf file for valid {:%Y%m%d%H} under {} (searched f000-f{})".format(
+            valid, comin_gfs, _GETGES_FHEND))
+
+
+def sfcf_valid_times(cycle: datetime, segment: str, start: Optional[datetime] = None) -> List[datetime]:
+    """Record times of the ops calls: surface1 ncst (start..cycle) and fcst1 (cycle..+120 h) hourly,
+    surface3 fcst2 (+120 h..+180 h) every 3 h. ``start`` is the ncst time_beg (multistart)."""
+    if segment not in SFC_SEGMENTS:
+        raise ValueError("segment must be one of {}, got {!r}".format(SFC_SEGMENTS, segment))
+    if segment == "ncst":
+        beg, end, step = start or cycle - timedelta(hours=6), cycle, 1
+    elif segment == "fcst1":
+        beg, end, step = cycle, cycle + timedelta(hours=120), 1
+    else:
+        beg, end, step = cycle + timedelta(hours=120), cycle + timedelta(hours=180), 3
+    if beg > end:
+        raise MetForcingError("sfcf window starts after it ends: {} > {}".format(beg, end))
+    out = []
+    while beg <= end:
+        out.append(beg)
+        beg += timedelta(hours=step)
+    return out
+
+
+def _nco_stamp(t: datetime) -> str:
+    return "{:%a %b} {:>2} {:%H:%M:%S %Y}".format(t, t.day, t)
+
+
+def _history(valids: List[datetime], names: Tuple[str, ...], num: str, tag: str, now: datetime) -> str:
+    ymdh = ["{:%Y%m%d%H}".format(v) for v in valids]
+    ncks = "ncks -v time,grid_xt,lon,grid_yt,lat,{} swnd.{} {}.{}.nc".format(",".join(names), ymdh[0], tag, ymdh[0])
+    ncecat = "ncecat {} tmp.{}.nc".format(" ".join("{}.{}.nc".format(tag, y) for y in ymdh), num)
+    ncwa = "ncwa -a time tmp.{0}.nc fort.{0}.nc".format(num)
+    return "{0}: {1}\n{0}: {2}\n{0}: {3}".format(_nco_stamp(now), ncwa, ncecat, ncks)
+
+
+def _wait_for(path: Path, deadline: float, poll_s: float, sleep, clock) -> None:
+    """The ops ``until [ -s file ]`` loop, bounded by a shared deadline."""
+    while not (path.is_file() and path.stat().st_size > 0):
+        left = deadline - clock()
+        if left <= 0:
+            raise FileNotAvailableError("GFS file did not appear before the wait expired: {}".format(path))
+        log.info("%s not there yet, waiting", path)
+        sleep(min(poll_s, left))
+
+
+def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix: str = "stofs_2d_glo",
+                       start: Optional[datetime] = None, wait_s: float = 0.0, poll_s: float = 10.0,
+                       sleep=time.sleep, clock=time.monotonic) -> Dict[str, Path]:
+    """Write ``<prefix>_<segment>.{221,222,225}.nc`` from the GFS sfcf files, as the ops GFS_NCST/FCST1/FCST2 jobs.
+
+    Valid times at or before ``cycle`` use getges; later ones the current cycle's own sfcf file, waited for
+    up to ``wait_s`` seconds in total. Output files appear under their final names only when all three are
+    complete, 221 last (the ops skip test is on 221). Records are copied one at a time.
+    """
+    import netCDF4 as nc
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    valids = sfcf_valid_times(cycle, segment, start)
+    deadline = clock() + wait_s
+    final = {n: out_dir / "{}_{}.{}.nc".format(prefix, segment, n) for n, _ in SFC_OUTPUTS}
+    part = {n: p.with_name(p.name + ".partial") for n, p in final.items()}
+    outs = {}  # type: Dict[str, object]
+    used = []  # type: List[Tuple[datetime, Path]]
+    try:
+        for rec, valid in enumerate(valids):
+            if valid <= cycle:
+                src = getges_sfcf(comin_gfs, valid)
+            else:
+                src = sfcf_path(comin_gfs, cycle, int((valid - cycle).total_seconds() // 3600))
+                _wait_for(src, deadline, poll_s, sleep, clock)
+            used.append((valid, src))
+            log.info("record %d valid %s <- %s", rec, valid, src)
+            with nc.Dataset(str(src)) as ds:
+                ds.set_auto_maskandscale(False)
+                if rec == 0:
+                    for n, names in SFC_OUTPUTS:
+                        outs[n] = _open_sfcf_output(nc, part[n], ds, names)
+                for n, names in SFC_OUTPUTS:
+                    for v in ("lat", "lon") + names:
+                        if ds.variables[v].shape[-2:] != (len(outs[n].dimensions["grid_yt"]),
+                                                          len(outs[n].dimensions["grid_xt"])):  # ncecat needs equal shapes
+                            raise MetForcingError("{}: {} has a different grid from the first record".format(src, v))
+                        outs[n].variables[v][rec] = ds.variables[v][0] if v in names else ds.variables[v][:]
+        now = datetime.now()
+        for n, names in SFC_OUTPUTS:
+            outs[n].setncattr("history", _history(valids, names, n, _SFC_TAGS[n], now))
+            outs[n].close()
+        outs = {}
+        for n in ("225", "222", "221"):
+            os.replace(str(part[n]), str(final[n]))
+    finally:
+        for o in outs.values():
+            o.close()
+    _write_sfcf_manifest(out_dir / "{}_{}.sfcf_manifest.json".format(prefix, segment), cycle, segment, used)
+    return final
+
+
+def _open_sfcf_output(nc, path: Path, src, names: Tuple[str, ...]):
+    """One output file with the ncecat+ncwa layout: record unlimited, lat/lon/data (record, y, x), scalar time."""
+    out = nc.Dataset(str(path), "w", format="NETCDF4_CLASSIC")
+    ny, nx = len(src.dimensions["grid_yt"]), len(src.dimensions["grid_xt"])
+    for k, v in src.__dict__.items():
+        out.setncattr(k, v)
+    out.createDimension("grid_xt", nx)
+    out.createDimension("grid_yt", ny)
+    out.createDimension("record", None)
+    chunks = (1, ny, nx)
+
+    def clone(name, dims, **kw):
+        sv = src.variables[name]
+        fill = sv.getncattr("_FillValue") if "_FillValue" in sv.ncattrs() else None
+        ov = out.createVariable(name, sv.dtype, dims, fill_value=fill, **kw)
+        for a in sv.ncattrs():
+            if a != "_FillValue":
+                ov.setncattr(a, sv.getncattr(a))
+        return ov
+
+    for c in ("grid_xt", "grid_yt"):
+        clone(c, (c,))[:] = src.variables[c][:]
+    for c in ("lat", "lon"):
+        clone(c, ("record", "grid_yt", "grid_xt"), chunksizes=chunks)
+    for v in sorted(names + ("time",)):  # ncecat orders the non-coordinate variables alphabetically
+        scalar = v == "time"
+        ov = clone(v, () if scalar else ("record", "grid_yt", "grid_xt"),
+                   **({} if scalar else dict(zlib=True, complevel=1, shuffle=True, chunksizes=chunks)))
+        cm = getattr(src.variables[v], "cell_methods", "")
+        ov.setncattr("cell_methods", (cm + " " if cm else "") + "time: mean")  # what ncwa -a time appends
+        if scalar:
+            ov[...] = src.variables["time"][0]
+    return out
+
+
+def _write_sfcf_manifest(path: Path, cycle: datetime, segment: str, used: List[Tuple[datetime, Path]]) -> None:
+    data = {"source_model": "gfs", "product": "sfcf", "cycle_time": cycle.isoformat(), "segment": segment,
+            "nfiles": len(used),
+            "files": [{"valid_time": v.isoformat(), "source_location": str(p), "file_size": p.stat().st_size}
+                      for v, p in used]}
+    with open(str(path), "w") as fh:
+        json.dump(data, fh, indent=2)
