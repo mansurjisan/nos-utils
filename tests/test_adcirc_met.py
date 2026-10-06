@@ -473,6 +473,8 @@ def test_ncst_layout_values_and_manifest(tmp_path):
             assert got.shape == (7, NY, NX)
             for r, s in enumerate(src):
                 assert np.array_equal(got[r], _read(s, v)[0])
+    with nc.Dataset(str(files["225"])) as d:
+        assert list(d.variables) == ["grid_xt", "grid_yt", "icec", "lat", "lon", "time"]
     with nc.Dataset(str(files["221"])) as d:
         assert d.variables["time"].units == "hours since 2026-10-03 12:00:00" and d.variables["time"][...] == 6
     man = json.loads((out / "stofs_2d_glo_ncst.sfcf_manifest.json").read_text())

@@ -736,14 +736,15 @@ def _open_sfcf_output(nc, path: Path, src, names: Tuple[str, ...]):
 
     for c in ("grid_xt", "grid_yt"):
         clone(c, (c,))[:] = src.variables[c][:]
-    for c in ("lat", "lon"):
-        clone(c, ("record", "grid_yt", "grid_xt"), chunksizes=chunks)
-    for v in sorted(names + ("time",)):  # ncecat orders the non-coordinate variables alphabetically
-        scalar = v == "time"
-        ov = clone(v, () if scalar else ("record", "grid_yt", "grid_xt"),
-                   **({} if scalar else dict(zlib=True, complevel=1, shuffle=True, chunksizes=chunks)))
-        cm = getattr(src.variables[v], "cell_methods", "")
-        ov.setncattr("cell_methods", (cm + " " if cm else "") + "time: mean")  # what ncwa -a time appends
+    for v in sorted(names + ("lat", "lon", "time")):  # ncecat orders the non-coordinate variables alphabetically
+        scalar, data = v == "time", v not in ("lat", "lon", "time")
+        kw = {} if scalar else {"chunksizes": chunks}
+        if data:
+            kw.update(zlib=True, complevel=1, shuffle=True)
+        ov = clone(v, () if scalar else ("record", "grid_yt", "grid_xt"), **kw)
+        if v not in ("lat", "lon"):
+            cm = getattr(src.variables[v], "cell_methods", "")
+            ov.setncattr("cell_methods", (cm + " " if cm else "") + "time: mean")  # what ncwa -a time appends
         if scalar:
             ov[...] = src.variables["time"][0]
     return out
