@@ -594,7 +594,7 @@ class AdcircMetProcessor:
 # Replicates exstofs_2d_glo_gfs.sh / stofs_2d_glo_surface_forcing.sh / stofs_2d_glo_getges.sh:
 # one pass per record, ncks -v + ncecat + ncwa -a time as netCDF4 calls. MJ (10/06/26)
 
-SFC_SEGMENTS = ("ncst", "fcst1", "fcst2")
+SFC_SEGMENTS = ("ncst", "fcst")
 SFC_OUTPUTS = (("221", ("pressfc",)), ("222", ("ugrd10m", "vgrd10m")), ("225", ("icec",)))
 _GETGES_FHEND = 384
 _SFCF_SETTLED_S = 900  # an sfcf file this old without a logf marker is a retrospective one. MJ (10/06/26)
@@ -622,23 +622,31 @@ def getges_sfcf(comin_gfs, valid: datetime) -> Path:
 
 
 def sfcf_valid_times(cycle: datetime, segment: str, start: Optional[datetime] = None) -> List[datetime]:
-    """Record times of the ops calls: surface1 ncst (start..cycle) and fcst1 (cycle..+120 h) hourly,
-    surface3 fcst2 (+120 h..+180 h) every 3 h. ``start`` is the ncst time_beg (multistart)."""
+    """Hourly record times: ncst (start..cycle) and the single fcst (cycle..+180 h). ``start`` is the
+    ncst time_beg (multistart). After f120 GFS is 3-hourly, so fcst fills the hours between by linear
+    interpolation, which is what ADCIRC does between the fcst2 snapshots. MJ (10/11/26)"""
     if segment not in SFC_SEGMENTS:
         raise ValueError("segment must be one of {}, got {!r}".format(SFC_SEGMENTS, segment))
     if segment == "ncst":
-        beg, end, step = start or cycle - timedelta(hours=6), cycle, 1
-    elif segment == "fcst1":
-        beg, end, step = cycle, cycle + timedelta(hours=120), 1
+        beg, end = start or cycle - timedelta(hours=6), cycle
     else:
-        beg, end, step = cycle + timedelta(hours=120), cycle + timedelta(hours=180), 3
+        beg, end = cycle, cycle + timedelta(hours=180)
     if beg > end:
         raise MetForcingError("sfcf window starts after it ends: {} > {}".format(beg, end))
     out = []
     while beg <= end:
         out.append(beg)
-        beg += timedelta(hours=step)
+        beg += timedelta(hours=1)
     return out
+
+
+def _interp_bracket(cycle: datetime, valid: datetime) -> Optional[Tuple[int, int, float]]:
+    """(lo, hi, weight) forecast hours when ``valid`` falls between two 3-hourly GFS records, else None."""
+    fh = int((valid - cycle).total_seconds() // 3600)
+    if fh <= 120 or fh % 3 == 0:
+        return None
+    lo = fh // 3 * 3
+    return lo, lo + 3, (fh - lo) / 3.0
 
 
 def _sfcf_ready(path: Path) -> bool:
@@ -663,7 +671,7 @@ def _wait_for(path: Path, deadline: float, poll_s: float, sleep, clock) -> bool:
 def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix: str = "stofs_2d_glo",
                        start: Optional[datetime] = None, wait_s: float = 0.0, poll_s: float = 10.0,
                        sleep=time.sleep, clock=time.monotonic, now=time.time) -> Dict[str, Path]:
-    """Write ``<prefix>_<segment>.{221,222,225}.nc`` from the GFS sfcf files, as the ops GFS_NCST/FCST1/FCST2 jobs.
+    """Write ``<prefix>_<segment>.{221,222,225}.nc`` from the GFS sfcf files (ncst, or one hourly 180 h fcst).
 
     Valid times at or before ``cycle`` use getges; later ones the current cycle's own sfcf file, waited for
     up to ``wait_s`` seconds in total. Output files appear under their final names only when all three are
@@ -684,7 +692,14 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
     done = False
     try:
         for rec, valid in enumerate(valids):
-            if valid <= cycle:
+            br = _interp_bracket(cycle, valid) if segment == "fcst" else None
+            if br:
+                srcs = [sfcf_path(comin_gfs, cycle, h) for h in br[:2]]
+                for sp in srcs:
+                    if not _wait_for(sp, deadline, poll_s, sleep, clock):
+                        raise FileNotAvailableError("GFS file did not appear before the wait expired: {}".format(sp))
+                src = srcs[0]
+            elif valid <= cycle:
                 if valid == cycle and now() - calendar.timegm(cycle.timetuple()) < _REALTIME_S:
                     _wait_for(sfcf_path(comin_gfs, cycle, 0), deadline, poll_s, sleep, clock)
                 src = getges_sfcf(comin_gfs, valid)
@@ -700,13 +715,29 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
                     for n, names in SFC_OUTPUTS:
                         outs[n] = _open_sfcf_output(nc, part[n], ds, names)
                 lat, lon = ds.variables["lat"][:], ds.variables["lon"][:]
-                for n, names in SFC_OUTPUTS:
-                    o = outs[n]
-                    if lat.shape != (len(o.dimensions["grid_yt"]), len(o.dimensions["grid_xt"])):  # ncecat needs equal shapes. MJ (10/06/26)
-                        raise MetForcingError("{}: grid differs from the first record".format(src))
-                    o.variables["lat"][rec], o.variables["lon"][rec] = lat, lon
-                    for v in names:
-                        o.variables[v][rec] = ds.variables[v][0]
+                hi = nc.Dataset(str(srcs[1])) if br else None
+                try:
+                    if hi is not None:
+                        hi.set_auto_maskandscale(False)
+                    for n, names in SFC_OUTPUTS:
+                        o = outs[n]
+                        if lat.shape != (len(o.dimensions["grid_yt"]), len(o.dimensions["grid_xt"])):  # ncecat needs equal shapes. MJ (10/06/26)
+                            raise MetForcingError("{}: grid differs from the first record".format(src))
+                        o.variables["lat"][rec], o.variables["lon"][rec] = lat, lon
+                        for v in names:
+                            a0 = ds.variables[v][0]
+                            if hi is None:
+                                o.variables[v][rec] = a0
+                                continue
+                            a1 = hi.variables[v][0]
+                            r = a0.astype(np.float64) * (1.0 - br[2]) + a1.astype(np.float64) * br[2]
+                            fv = ds.variables[v].getncattr("_FillValue") if "_FillValue" in ds.variables[v].ncattrs() else None
+                            if fv is not None:
+                                r = np.where((a0 == fv) | (a1 == fv), fv, r)
+                            o.variables[v][rec] = r.astype(a0.dtype)
+                finally:
+                    if hi is not None:
+                        hi.close()
         for o in outs.values():
             o.close()
         outs = {}

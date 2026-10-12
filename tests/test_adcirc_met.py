@@ -430,13 +430,11 @@ def test_sfcf_windows():
     ncst = am.sfcf_valid_times(CYC, "ncst")
     assert (len(ncst), ncst[0], ncst[-1]) == (7, CYC - timedelta(hours=6), CYC)
     assert len(am.sfcf_valid_times(CYC, "ncst", CYC - timedelta(hours=12))) == 13
-    f1 = am.sfcf_valid_times(CYC, "fcst1")
-    assert (len(f1), f1[0], f1[-1]) == (121, CYC, CYC + timedelta(hours=120))
-    f2 = am.sfcf_valid_times(CYC, "fcst2")
-    assert (len(f2), f2[0], f2[1], f2[-1]) == (
-        21, CYC + timedelta(hours=120), CYC + timedelta(hours=123), CYC + timedelta(hours=180))
-    with pytest.raises(ValueError):
-        am.sfcf_valid_times(CYC, "spinup")
+    f = am.sfcf_valid_times(CYC, "fcst")
+    assert (len(f), f[0], f[-1]) == (181, CYC, CYC + timedelta(hours=180))
+    for old in ("spinup", "fcst1", "fcst2"):
+        with pytest.raises(ValueError):
+            am.sfcf_valid_times(CYC, old)
     with pytest.raises(am.MetForcingError):
         am.sfcf_valid_times(CYC, "ncst", CYC + timedelta(hours=1))
 
@@ -488,23 +486,41 @@ def test_ncst_start_override_gives_fewer_records(tmp_path):
     assert _read(files["225"], "icec").shape[0] == 6
 
 
-def test_fcst1_and_fcst2_record_counts_and_stride(tmp_path):
+def _fcst_tank(tank, last=180):
+    _fill_tank(tank, [(CYC, h) for h in range(0, 121)] + [(CYC, h) for h in range(123, last + 1, 3)])
+
+
+def test_fcst_is_hourly_with_interpolation_after_f120(tmp_path):
     tank = tmp_path / "g"
-    _fill_tank(tank, [(CYC, 0)] + [(CYC, h) for h in range(1, 121)])
-    f1 = am.build_sfcf_forcing(tank, CYC, "fcst1", tmp_path / "o")
-    p = _read(f1["221"], "pressfc")
-    assert p.shape[0] == 121
-    assert p[7][0, 0] == _valid_seed(CYC, 7) * 10 + 2
-    _fill_tank(tank, [(CYC, h) for h in range(120, 181, 3)])
-    f2 = am.build_sfcf_forcing(tank, CYC, "fcst2", tmp_path / "o")
-    q = _read(f2["222"], "ugrd10m")
-    assert q.shape[0] == 21
-    assert q[1][0, 0] == _valid_seed(CYC, 123) * 10 + 0
+    _fcst_tank(tank)
+    f = am.build_sfcf_forcing(tank, CYC, "fcst", tmp_path / "o")
+    p = _read(f["221"], "pressfc")
+    assert p.shape[0] == 181
+    s = lambda h, k: _valid_seed(CYC, h) * 10 + k
+    for h in (0, 7, 120, 123, 126, 180):  # native records are exact copies
+        assert p[h][0, 0] == s(h, 2)
+    # 121 and 122 are 1/3 and 2/3 of the way from f120 to f123; the seeds step 10 per hour
+    assert p[121][0, 0] == pytest.approx(s(120, 2) + 10.0)
+    assert p[122][0, 0] == pytest.approx(s(120, 2) + 20.0)
+    q = _read(f["222"], "ugrd10m")
+    assert q[121][1, 2] == pytest.approx(s(120, 0) + 10.0 + 6)
+    assert _read(f["225"], "icec").shape[0] == 181
+
+
+def test_fcst_interpolation_keeps_fill_values(tmp_path):
+    tank = tmp_path / "g"
+    _fcst_tank(tank)
+    import netCDF4 as nc
+    with nc.Dataset(str(am.sfcf_path(tank, CYC, 123)), "a") as d:
+        d.variables["icec"][0, 0, 0] = np.float32(9.99e20)
+    f = am.build_sfcf_forcing(tank, CYC, "fcst", tmp_path / "o")
+    i = _read(f["225"], "icec")
+    assert i[121][0, 0] == np.float32(9.99e20) and i[120][0, 0] < 1e6 and i[121][0, 1] < 1e6
 
 
 def test_forecast_waits_then_fails_clearly(tmp_path):
     tank = tmp_path / "g"
-    _fill_tank(tank, [(CYC, h) for h in range(120, 178, 3)])  # f180 is missing
+    _fcst_tank(tank, last=177)  # f180 is missing
     clock = {"t": 0.0}
     naps = []
 
@@ -513,7 +529,7 @@ def test_forecast_waits_then_fails_clearly(tmp_path):
         clock["t"] += s
 
     with pytest.raises(am.FileNotAvailableError, match="sfcf180"):
-        am.build_sfcf_forcing(tank, CYC, "fcst2", tmp_path / "o", wait_s=25, poll_s=10,
+        am.build_sfcf_forcing(tank, CYC, "fcst", tmp_path / "o", wait_s=25, poll_s=10,
                               sleep=sleep, clock=lambda: clock["t"])
     assert naps == [10, 10, 5]
     assert list((tmp_path / "o").glob("*.nc*")) == []  # no final or .partial files from a failed run
@@ -522,17 +538,18 @@ def test_forecast_waits_then_fails_clearly(tmp_path):
         _mk_sfcf(tank, CYC, 180, 1)
         sleep(s)
 
-    files = am.build_sfcf_forcing(tank, CYC, "fcst2", tmp_path / "o", wait_s=25, poll_s=10,
+    files = am.build_sfcf_forcing(tank, CYC, "fcst", tmp_path / "o", wait_s=25, poll_s=10,
                                   sleep=sleep_and_land, clock=lambda: clock["t"])
-    assert _read(files["221"], "pressfc").shape[0] == 21
+    assert _read(files["221"], "pressfc").shape[0] == 181
 
 
 def test_current_cycle_f000_is_not_waited_for(tmp_path):
-    # fcst1 record 0 (valid == cycle) goes through getges, so it never waits
-    _fill_tank(tmp_path / "g", [(CYC - timedelta(hours=6), 6)] + [(CYC, h) for h in range(1, 121)])
-    files = am.build_sfcf_forcing(tmp_path / "g", CYC, "fcst1", tmp_path / "o", wait_s=0,
+    # fcst record 0 (valid == cycle) goes through getges, so it never waits
+    _fill_tank(tmp_path / "g", [(CYC - timedelta(hours=6), 6)] + [(CYC, h) for h in range(1, 121)]
+                + [(CYC, h) for h in range(123, 181, 3)])
+    files = am.build_sfcf_forcing(tmp_path / "g", CYC, "fcst", tmp_path / "o", wait_s=0,
                                   sleep=lambda s: pytest.fail("waited"))
-    assert _read(files["221"], "pressfc").shape[0] == 121
+    assert _read(files["221"], "pressfc").shape[0] == 181
 
 
 def _age(p, seconds):
