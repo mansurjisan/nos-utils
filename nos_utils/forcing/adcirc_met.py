@@ -719,7 +719,7 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
                 try:
                     if hi is not None:
                         hi.set_auto_maskandscale(False)
-                        if hi.variables["lat"].shape != lat.shape:
+                        if not (np.array_equal(hi.variables["lat"][:], lat) and np.array_equal(hi.variables["lon"][:], lon)):
                             raise MetForcingError("{}: grid differs from {}".format(srcs[1], src))
                     for n, names in SFC_OUTPUTS:
                         o = outs[n]

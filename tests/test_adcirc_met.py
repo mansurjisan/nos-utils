@@ -521,6 +521,17 @@ def test_fcst_interpolation_keeps_fill_values(tmp_path):
     assert i[121][0, 0] == np.float32(9.99e20) and i[120][0, 0] < 1e6 and i[121][0, 1] < 1e6
 
 
+def test_fcst_rejects_a_bracket_on_another_grid(tmp_path):
+    import netCDF4 as nc
+    tank = tmp_path / "g"
+    _fcst_tank(tank)
+    with nc.Dataset(str(am.sfcf_path(tank, CYC, 123)), "a") as d:
+        d.variables["lon"][:] = d.variables["lon"][:] + 0.5
+    with pytest.raises(am.MetForcingError, match="grid differs"):
+        am.build_sfcf_forcing(tank, CYC, "fcst", tmp_path / "o")
+    assert list((tmp_path / "o").glob("*.nc*")) == []
+
+
 def test_forecast_waits_then_fails_clearly(tmp_path):
     tank = tmp_path / "g"
     _fcst_tank(tank, last=177)  # f180 is missing. MJ (10/11/26)
