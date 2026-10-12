@@ -497,9 +497,9 @@ def test_fcst_is_hourly_with_interpolation_after_f120(tmp_path):
     p = _read(f["221"], "pressfc")
     assert p.shape[0] == 181
     s = lambda h, k: _valid_seed(CYC, h) * 10 + k
-    for h in (0, 7, 120, 123, 126, 180):  # native records are exact copies
+    for h in (0, 7, 120, 123, 126, 180):  # native records are exact copies. MJ (10/11/26)
         assert p[h][0, 0] == s(h, 2)
-    # 121 and 122 are 1/3 and 2/3 of the way from f120 to f123; the seeds step 10 per hour
+    # 121 and 122 are 1/3 and 2/3 of the way from f120 to f123; the seeds step 10 per hour. MJ (10/11/26)
     assert p[121][0, 0] == pytest.approx(s(120, 2) + 10.0)
     assert p[122][0, 0] == pytest.approx(s(120, 2) + 20.0)
     q = _read(f["222"], "ugrd10m")
@@ -520,7 +520,7 @@ def test_fcst_interpolation_keeps_fill_values(tmp_path):
 
 def test_forecast_waits_then_fails_clearly(tmp_path):
     tank = tmp_path / "g"
-    _fcst_tank(tank, last=177)  # f180 is missing
+    _fcst_tank(tank, last=177)  # f180 is missing. MJ (10/11/26)
     clock = {"t": 0.0}
     naps = []
 
@@ -544,7 +544,7 @@ def test_forecast_waits_then_fails_clearly(tmp_path):
 
 
 def test_current_cycle_f000_is_not_waited_for(tmp_path):
-    # fcst record 0 (valid == cycle) goes through getges, so it never waits
+    # fcst record 0 (valid == cycle) goes through getges, so it never waits. MJ (10/11/26)
     _fill_tank(tmp_path / "g", [(CYC - timedelta(hours=6), 6)] + [(CYC, h) for h in range(1, 121)]
                 + [(CYC, h) for h in range(123, 181, 3)])
     files = am.build_sfcf_forcing(tmp_path / "g", CYC, "fcst", tmp_path / "o", wait_s=0,

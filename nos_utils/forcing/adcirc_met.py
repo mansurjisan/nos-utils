@@ -641,7 +641,7 @@ def sfcf_valid_times(cycle: datetime, segment: str, start: Optional[datetime] = 
 
 
 def _interp_bracket(cycle: datetime, valid: datetime) -> Optional[Tuple[int, int, float]]:
-    """(lo, hi, weight) forecast hours when ``valid`` falls between two 3-hourly GFS records, else None."""
+    """(lo, hi, weight) forecast hours when ``valid`` falls between two 3-hourly GFS records, else None. MJ (10/11/26)"""
     fh = int((valid - cycle).total_seconds() // 3600)
     if fh <= 120 or fh % 3 == 0:
         return None
@@ -677,7 +677,7 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
     up to ``wait_s`` seconds in total. Output files appear under their final names only when all three are
     complete, 221 last (the ops skip test is on 221). Records are copied one at a time. In real time (within
     12 h of ``cycle``) the cycle-time record first waits for f000 so getges does not fall back to f006 of the
-    previous cycle.
+    previous cycle. MJ (10/11/26)
     """
     import netCDF4 as nc
 
