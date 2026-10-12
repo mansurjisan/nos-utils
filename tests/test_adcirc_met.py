@@ -505,6 +505,9 @@ def test_fcst_is_hourly_with_interpolation_after_f120(tmp_path):
     q = _read(f["222"], "ugrd10m")
     assert q[121][1, 2] == pytest.approx(s(120, 0) + 10.0 + 6)
     assert _read(f["225"], "icec").shape[0] == 181
+    man = json.loads((tmp_path / "o" / "stofs_2d_glo_fcst.sfcf_manifest.json").read_text())["files"]
+    assert len(man) == 181 + 40 and [e["source_location"] for e in man[121:123]] == [
+        str(am.sfcf_path(tank, CYC, 120)), str(am.sfcf_path(tank, CYC, 123))]
 
 
 def test_fcst_interpolation_keeps_fill_values(tmp_path):

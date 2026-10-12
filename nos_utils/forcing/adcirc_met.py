@@ -707,7 +707,7 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
                 src = sfcf_path(comin_gfs, cycle, int((valid - cycle).total_seconds() // 3600))
                 if not _wait_for(src, deadline, poll_s, sleep, clock):
                     raise FileNotAvailableError("GFS file did not appear before the wait expired: {}".format(src))
-            used.append((valid, src))
+            used.extend((valid, p) for p in (srcs if br else [src]))  # interpolated records list both brackets. MJ (10/11/26)
             log.info("record %d valid %s <- %s", rec, valid, src)
             with nc.Dataset(str(src)) as ds:
                 ds.set_auto_maskandscale(False)
@@ -719,6 +719,8 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
                 try:
                     if hi is not None:
                         hi.set_auto_maskandscale(False)
+                        if hi.variables["lat"].shape != lat.shape:
+                            raise MetForcingError("{}: grid differs from {}".format(srcs[1], src))
                     for n, names in SFC_OUTPUTS:
                         o = outs[n]
                         if lat.shape != (len(o.dimensions["grid_yt"]), len(o.dimensions["grid_xt"])):  # ncecat needs equal shapes. MJ (10/06/26)
