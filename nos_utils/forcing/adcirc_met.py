@@ -799,9 +799,13 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
             for p in part.values():
                 if p.exists():
                     p.unlink()
-    from ._log import log_input_files
-    log_input_files("GFS_" + source.upper(), list(dict.fromkeys(p for _, p in used)), source="GFS_" + source.upper(),
-                    category="atmospheric", note="cycle={:%Y%m%d%H} segment={}".format(cycle, segment))
+    try:
+        from ._log import log_input_files
+    except ImportError:  # loaded by file path outside the package (tools/stage_stofs_2d_glo_ops_forcing.py). MJ (10/14/26)
+        log_input_files = None
+    if log_input_files is not None:
+        log_input_files("GFS_" + source.upper(), list(dict.fromkeys(p for _, p in used)), source="GFS_" + source.upper(),
+                        category="atmospheric", note="cycle={:%Y%m%d%H} segment={}".format(cycle, segment))
     _write_sfcf_manifest(out_dir / "{}_{}.sfcf_manifest.json".format(prefix, segment), cycle, segment, used, source)
     return final
 
