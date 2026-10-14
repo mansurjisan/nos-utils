@@ -608,3 +608,119 @@ def test_retrospective_cycle_record_does_not_wait(tmp_path):
     epoch = __import__("calendar").timegm(CYC.timetuple())
     am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC - timedelta(hours=1), wait_s=30,
                           sleep=lambda s: pytest.fail("waited"), now=lambda: epoch + 3 * 86400)
+
+
+# --- the same forcing from the sfluxgrbf GRIB2 files (decoder mocked) -------------------------
+
+_SF_NAMES = {"ugrd10m": 0, "vgrd10m": 1, "pressfc": 2, "icec": 3}
+
+
+def _mk_sflux(comin, cycle, fhr, seed=None):
+    p = am.sflux_path(comin, cycle, fhr)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"GRIB")
+    return p
+
+
+def _fake_decode(descending=False, undef=False):
+    import re
+
+    def dec(path):
+        m = re.search(r"gfs\.(\d{8})/(\d{2})/atmos/.*sfluxgrbf(\d{3})", str(path))
+        cyc, fhr = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H"), int(m.group(3))
+        seed = _valid_seed(cyc, fhr)
+        lat, lon = np.arange(NY, dtype="f8"), np.arange(NX, dtype="f8")
+        ramp = np.arange(NY * NX, dtype="f4").reshape(NY, NX)
+        f = {k: np.full((NY, NX), seed * 10 + i, dtype="f4") + ramp for k, i in _SF_NAMES.items()}
+        if undef:
+            f["icec"][0, 0] = np.float32(9.999e20)
+        if descending:
+            lat, f = lat[::-1], {k: v[::-1] for k, v in f.items()}
+        return lat, lon, f
+    return dec
+
+
+def _fill_sflux(tank, pairs):
+    for cycle, fhr in pairs:
+        _mk_sflux(tank, cycle, fhr)
+
+
+def _same_structure(a, b):
+    import netCDF4 as nc
+    with nc.Dataset(str(a)) as x, nc.Dataset(str(b)) as y:
+        assert list(x.dimensions) == list(y.dimensions)
+        assert list(x.variables) == list(y.variables)
+        for k, v in x.variables.items():
+            w = y.variables[k]
+            assert (v.dtype, v.dimensions, v.shape) == (w.dtype, w.dimensions, w.shape), k
+            assert v.filters() == w.filters() and v.chunking() == w.chunking(), k
+            assert getattr(v, "_FillValue", None) == getattr(w, "_FillValue", None), k
+            assert getattr(v, "cell_methods", None) == getattr(w, "cell_methods", None), k
+            assert np.array_equal(v[:], w[:]), k
+        assert x.variables["time"].units == y.variables["time"].units
+
+
+def test_sflux_matches_sfcf_path_ncst_and_fcst(tmp_path, monkeypatch):
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode())
+    c18 = CYC - timedelta(hours=6)
+    ncst = [(CYC - timedelta(hours=12), 6)] + [(c18, h) for h in range(1, 6)] + [(CYC, 0)]
+    fc = [(CYC, h) for h in range(0, 121)] + [(CYC, h) for h in range(123, 181, 3)]
+    _fill_tank(tmp_path / "a", ncst + fc)
+    _fill_sflux(tmp_path / "b", ncst + fc)
+    for seg in ("ncst", "fcst"):
+        fa = am.build_sfcf_forcing(tmp_path / "a", CYC, seg, tmp_path / "oa")
+        fb = am.build_sfcf_forcing(tmp_path / "b", CYC, seg, tmp_path / "ob", source="sflux")
+        for n in fa:
+            _same_structure(fa[n], fb[n])
+    man = json.loads((tmp_path / "ob" / "stofs_2d_glo_fcst.sfcf_manifest.json").read_text())
+    assert man["product"] == "sflux" and len(man["files"]) == 181 + 40
+    assert man["files"][121]["source_location"] == str(am.sflux_path(tmp_path / "b", CYC, 120))
+    assert man["files"][122]["source_location"] == str(am.sflux_path(tmp_path / "b", CYC, 123))
+    assert json.loads((tmp_path / "oa" / "stofs_2d_glo_fcst.sfcf_manifest.json").read_text())["product"] == "sfcf"
+
+
+def test_sflux_orientation_is_one_decision(tmp_path, monkeypatch):
+    _fill_sflux(tmp_path, [(CYC, 0)])
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode(descending=True))
+    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o1", start=CYC, source="sflux")
+    assert np.array_equal(_read(f["221"], "grid_yt"), np.arange(NY))
+    assert _read(f["221"], "pressfc")[0][0, 0] == _valid_seed(CYC, 0) * 10 + 2
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", False)
+    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o2", start=CYC, source="sflux")
+    assert np.array_equal(_read(f["221"], "grid_yt"), np.arange(NY)[::-1])
+    assert _read(f["221"], "pressfc")[0][0, 0] == _valid_seed(CYC, 0) * 10 + 2 + (NY - 1) * NX
+
+
+def test_sflux_undefined_points_become_the_fill_value(tmp_path, monkeypatch):
+    _fill_sflux(tmp_path, [(CYC, 0)])
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode(undef=True))
+    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC, source="sflux")
+    i = _read(f["225"], "icec")[0]
+    assert i[0, 0] == np.float32(9.99e20) and i[0, 1] < 1e6
+
+
+def test_gfs_input_files(tmp_path):
+    c18, c12 = CYC - timedelta(hours=6), CYC - timedelta(hours=12)
+    n = am.gfs_input_files(tmp_path, CYC, "ncst")
+    assert n == [am.sfcf_path(tmp_path, v, 0) for v in [CYC - timedelta(hours=h) for h in range(6, -1, -1)]]
+    assert len(am.gfs_input_files(tmp_path, CYC, "ncst", start=CYC - timedelta(hours=12))) == 13
+    assert am.gfs_input_files(tmp_path, CYC, "ncst", source="sflux")[-1] == am.sflux_path(tmp_path, CYC, 0)
+    f = am.gfs_input_files(tmp_path, CYC, "fcst", source="sflux")
+    assert f == [am.sflux_path(tmp_path, CYC, h) for h in list(range(0, 121)) + list(range(123, 181, 3))]
+    assert len(f) == len(set(f))
+    assert c18 != c12
+
+
+def test_sflux_missing_file_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode())
+    with pytest.raises(am.FileNotAvailableError, match="no GFS sflux file"):
+        am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC, source="sflux")
+    _fill_sflux(tmp_path, [(CYC, h) for h in range(0, 121)])
+    with pytest.raises(am.FileNotAvailableError, match="did not appear"):
+        am.build_sfcf_forcing(tmp_path, CYC, "fcst", tmp_path / "o", source="sflux")
+
+
+def test_sflux_without_wgrib2_is_a_clear_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(am.shutil, "which", lambda _: None)
+    with pytest.raises(am.MetDependencyError, match="wgrib2"):
+        am._decode_sflux(am.sflux_path(tmp_path, CYC, 0))
