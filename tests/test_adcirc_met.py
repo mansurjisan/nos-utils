@@ -661,6 +661,7 @@ def _same_structure(a, b):
 
 
 def test_sflux_matches_sfcf_path_ncst_and_fcst(tmp_path, monkeypatch):
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)  # the fixture sfcf grid and fake decoder are both south-north
     monkeypatch.setattr(am, "_decode_sflux", _fake_decode())
     c18 = CYC - timedelta(hours=6)
     ncst = [(CYC - timedelta(hours=12), 6)] + [(c18, h) for h in range(1, 6)] + [(CYC, 0)]
@@ -682,21 +683,44 @@ def test_sflux_matches_sfcf_path_ncst_and_fcst(tmp_path, monkeypatch):
 def test_sflux_orientation_is_one_decision(tmp_path, monkeypatch):
     _fill_sflux(tmp_path, [(CYC, 0)])
     monkeypatch.setattr(am, "_decode_sflux", _fake_decode(descending=True))
-    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o1", start=CYC, source="sflux")
-    assert np.array_equal(_read(f["221"], "grid_yt"), np.arange(NY))
-    assert _read(f["221"], "pressfc")[0][0, 0] == _valid_seed(CYC, 0) * 10 + 2
-    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", False)
-    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o2", start=CYC, source="sflux")
+    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o1", start=CYC, source="sflux")  # no flip: N to S kept
     assert np.array_equal(_read(f["221"], "grid_yt"), np.arange(NY)[::-1])
     assert _read(f["221"], "pressfc")[0][0, 0] == _valid_seed(CYC, 0) * 10 + 2 + (NY - 1) * NX
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)
+    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o2", start=CYC, source="sflux")
+    assert np.array_equal(_read(f["221"], "grid_yt"), np.arange(NY))
+    assert _read(f["221"], "pressfc")[0][0, 0] == _valid_seed(CYC, 0) * 10 + 2
 
 
-def test_sflux_undefined_points_become_the_fill_value(tmp_path, monkeypatch):
+def test_sflux_bitmap_points_icec_zero_others_raise(tmp_path, monkeypatch):
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)
     _fill_sflux(tmp_path, [(CYC, 0)])
     monkeypatch.setattr(am, "_decode_sflux", _fake_decode(undef=True))
     f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC, source="sflux")
     i = _read(f["225"], "icec")[0]
-    assert i[0, 0] == np.float32(9.99e20) and i[0, 1] < 1e6
+    assert i[0, 0] == 0.0 and i[0, 1] > 0
+    with pytest.raises(am.MetForcingError, match="undefined"):
+        am._resolve_undefined("pressfc", np.full((2, 2), 9.999e20, dtype="f4"))
+
+
+def test_sflux_attributes_match_sfcf(tmp_path, monkeypatch):
+    import netCDF4 as nc
+    _fill_sflux(tmp_path, [(CYC, 0)])
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode())
+    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC, source="sflux")
+    with nc.Dataset(str(f["222"])) as d:
+        g = {k: d.getncattr(k) for k in d.ncattrs()}
+        assert g == {"fhzero": 6, "ncld": 5, "nsoil": 4, "imp_physics": 11, "dtp": 150.0, "source": "FV3GFS",
+                     "grid": "gaussian", "im": NX, "jm": NY}
+        assert type(g["fhzero"]) is np.int32 and type(g["dtp"]) is np.float32
+        u = d.variables["ugrd10m"]
+        assert (u.long_name, u.units, u.output_file) == ("10 meter u wind", "m/s", "sfc")
+        assert u.getncattr("missing_value") == np.float32(9.99e20) == u.getncattr("_FillValue")
+        assert d.variables["grid_yt"].long_name == "T-cell latiitude"
+        assert d.variables["lon"].dtype == np.dtype("f8") and d.variables["lat"].dimensions == ("record", "grid_yt", "grid_xt")
+        assert d.variables["time"].units == "hours since 2026-10-04 00:00:00" and d.variables["time"].calendar == "JULIAN"
+    with nc.Dataset(str(f["225"])) as d:
+        assert (d.variables["icec"].units, d.variables["icec"].cell_methods) == ("fraction", "time: point time: mean")
 
 
 def test_gfs_input_files(tmp_path):
@@ -704,7 +728,9 @@ def test_gfs_input_files(tmp_path):
     n = am.gfs_input_files(tmp_path, CYC, "ncst")
     assert n == [am.sfcf_path(tmp_path, v, 0) for v in [CYC - timedelta(hours=h) for h in range(6, -1, -1)]]
     assert len(am.gfs_input_files(tmp_path, CYC, "ncst", start=CYC - timedelta(hours=12))) == 13
-    assert am.gfs_input_files(tmp_path, CYC, "ncst", source="sflux")[-1] == am.sflux_path(tmp_path, CYC, 0)
+    sf = am.gfs_input_files(tmp_path, CYC, "ncst", source="sflux")  # includes the cycle's own f000 analysis
+    assert sf[-1] == am.sflux_path(tmp_path, CYC, 0) and sf[0] == am.sflux_path(tmp_path, c18, 0)
+    assert len(sf) == 7
     f = am.gfs_input_files(tmp_path, CYC, "fcst", source="sflux")
     assert f == [am.sflux_path(tmp_path, CYC, h) for h in list(range(0, 121)) + list(range(123, 181, 3))]
     assert len(f) == len(set(f))

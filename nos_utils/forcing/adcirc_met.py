@@ -620,23 +620,23 @@ SFLUX_FIELDS = {
     "VGRD:10 m above ground": "vgrd10m",
     "ICEC:surface": "icec",
 }
-# The sfcf netCDF runs grid_yt south to north; GRIB2 Gaussian grids scan north to south. MJ (10/14/26)
-_SFCF_LAT_ASCENDING = True
-_SFLUX_FILL = np.float32(9.99e20)  # sfcf _FillValue; wgrib2 writes 9.999e20 where a bitmap marks undefined. MJ (10/14/26)
-_SFLUX_UNDEF_MIN = 9.0e20
-# Attributes the sfcf files carry, reproduced from the FV3 history convention (not diffed against a real
-# file yet; ak/bk and other model-state globals are not reproduced). MJ (10/14/26)
-_SFLUX_GLOBAL = {"source": "FV3GFS", "grid": "gaussian"}
+# sfcf grid_yt and the GRIB2 Gaussian grid (scanning mode 0) both run north to south, so no flip. MJ (10/14/26)
+_SFCF_LAT_ASCENDING = False
+_SFLUX_FILL = np.float32(9.99e20)  # sfcf _FillValue/missing_value. MJ (10/14/26)
+_SFLUX_UNDEF_MIN = 9.0e20  # wgrib2 writes 9.999e20 at bitmap-undefined points. MJ (10/14/26)
+# Attributes of the real sfcf files (netCDF4 types included); im/jm are set from the grid. MJ (10/14/26)
+_SFLUX_GLOBAL = {"fhzero": np.int32(6), "ncld": np.int32(5), "nsoil": np.int32(4), "imp_physics": np.int32(11),
+                 "dtp": np.float32(150.0), "source": "FV3GFS", "grid": "gaussian"}
 _SFLUX_ATTRS = {
     "grid_xt": {"cartesian_axis": "X", "long_name": "T-cell longitude", "units": "degrees_E"},
-    "grid_yt": {"cartesian_axis": "Y", "long_name": "T-cell latitude", "units": "degrees_N"},
-    "lat": {"long_name": "latitude", "units": "degrees_N"},
-    "lon": {"long_name": "longitude", "units": "degrees_E"},
+    "grid_yt": {"cartesian_axis": "Y", "long_name": "T-cell latiitude", "units": "degrees_N"},  # sic, as in sfcf
+    "lat": {"long_name": "T-cell latitude", "units": "degrees_N"},
+    "lon": {"long_name": "T-cell longitude", "units": "degrees_E"},
     "time": {"long_name": "time", "cartesian_axis": "T", "calendar_type": "JULIAN", "calendar": "JULIAN"},
-    "pressfc": {"long_name": "surface pressure", "units": "pa"},
+    "pressfc": {"long_name": "surface pressure", "units": "Pa"},
     "ugrd10m": {"long_name": "10 meter u wind", "units": "m/s"},
     "vgrd10m": {"long_name": "10 meter v wind", "units": "m/s"},
-    "icec": {"long_name": "surface ice concentration (ice=1; no ice=0)", "units": "numerical"},
+    "icec": {"long_name": "surface ice concentration (ice=1; no ice=0)", "units": "fraction"},
 }
 
 
@@ -886,13 +886,13 @@ def _decode_sflux(path: Path):
         if not g:
             raise MetForcingError("{}: cannot read the grid from wgrib2 -grid output: {!r}".format(path, r.stdout[:200]))
         nx, ny = int(g.group(1)), int(g.group(2))
-        lat0, lon0, lon1 = float(g.group(3)), float(g.group(5)), float(g.group(6))
+        lat0, lon0 = float(g.group(3)), float(g.group(5))
         lat = np.sort(np.rad2deg(np.arcsin(np.polynomial.legendre.leggauss(ny)[0])))  # Gaussian latitudes
         if lat0 > 0:
             lat = lat[::-1]
         if abs(lat[0] - lat0) > 1e-3:
             raise MetForcingError("{}: not a {}-latitude Gaussian grid (first lat {})".format(path, ny, lat0))
-        lon = lon0 + np.arange(nx) * ((lon1 - lon0) / (nx - 1))
+        lon = lon0 + np.arange(nx) * (360.0 / nx)  # global regular grid; the header's lon1 is rounded. MJ (10/14/26)
         fields = {}
         for m, b in bins.items():
             if not os.path.exists(b) or os.path.getsize(b) != 4 * nx * ny:
@@ -908,9 +908,15 @@ def _to_sfcf_orientation(lat, fields):
     return lat[::-1], {k: v[::-1] for k, v in fields.items()}
 
 
-def _undef_to_fill(a):
-    """wgrib2 writes 9.999e20 at bitmap-undefined points (ICEC over land); sfcf holds its _FillValue there. MJ (10/14/26)"""
-    return np.where(a >= _SFLUX_UNDEF_MIN, _SFLUX_FILL, a).astype(np.float32)
+def _resolve_undefined(name, a):
+    """GFS sflux has no bitmap and ice-free/land icec is a real 0.0; if a bitmap ever appears, icec gets 0.0
+    there and any other field raises. MJ (10/14/26)"""
+    bad = a >= _SFLUX_UNDEF_MIN
+    if not bad.any():
+        return np.ascontiguousarray(a, dtype=np.float32)
+    if name != "icec":
+        raise MetForcingError("sflux {} has {} undefined points".format(name, int(bad.sum())))
+    return np.where(bad, np.float32(0.0), a).astype(np.float32)
 
 
 class _SfluxVar(object):
@@ -963,9 +969,9 @@ class _SfluxDataset(object):
             if name not in fields:
                 raise MetForcingError("{}: decoder returned no {}".format(path, name))
             self.variables[name] = _SfluxVar(
-                _undef_to_fill(fields[name])[None], dict(a[name], _FillValue=_SFLUX_FILL, missing_value=_SFLUX_FILL,
-                                                         cell_methods="time: point"))
-        self._globals = dict(_SFLUX_GLOBAL)
+                _resolve_undefined(name, fields[name])[None], dict(a[name], missing_value=_SFLUX_FILL, _FillValue=_SFLUX_FILL,
+                                                         cell_methods="time: point", output_file="sfc"))
+        self._globals = dict(_SFLUX_GLOBAL, im=np.int32(nx), jm=np.int32(ny))
 
     def ncattrs(self):
         return list(self._globals)
