@@ -26,6 +26,7 @@ Public API::
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import calendar
@@ -623,13 +624,14 @@ SFLUX_FIELDS = {
 # sfcf grid_yt and the GRIB2 Gaussian grid (scanning mode 0) both run north to south, so no flip. MJ (10/14/26)
 _SFCF_LAT_ASCENDING = False
 _SFLUX_FILL = np.float32(9.99e20)  # sfcf _FillValue/missing_value. MJ (10/14/26)
+_WGRIB2_TIMEOUT_S = 300
 _SFLUX_UNDEF_MIN = 9.0e20  # wgrib2 writes 9.999e20 at bitmap-undefined points. MJ (10/14/26)
 # Attributes of the real sfcf files (netCDF4 types included); im/jm are set from the grid. MJ (10/14/26)
 _SFLUX_GLOBAL = {"fhzero": np.int32(6), "ncld": np.int32(5), "nsoil": np.int32(4), "imp_physics": np.int32(11),
                  "dtp": np.float32(150.0), "source": "FV3GFS", "grid": "gaussian"}
 _SFLUX_ATTRS = {
     "grid_xt": {"cartesian_axis": "X", "long_name": "T-cell longitude", "units": "degrees_E"},
-    "grid_yt": {"cartesian_axis": "Y", "long_name": "T-cell latiitude", "units": "degrees_N"},  # sic, as in sfcf
+    "grid_yt": {"cartesian_axis": "Y", "long_name": "T-cell latiitude", "units": "degrees_N"},  # sic, as in sfcf. MJ (10/14/26)
     "lat": {"long_name": "T-cell latitude", "units": "degrees_N"},
     "lon": {"long_name": "T-cell longitude", "units": "degrees_E"},
     "time": {"long_name": "time", "cartesian_axis": "T", "calendar_type": "JULIAN", "calendar": "JULIAN"},
@@ -687,8 +689,8 @@ def _sfcf_ready(path: Path) -> bool:
     """Non-empty and, unless old enough to be complete, its logf marker exists (GFS writes sfcf straight into COM)."""
     if not (path.is_file() and path.stat().st_size > 0):
         return False
-    if ".sfluxgrbf" in path.name:  # pre-downloaded, so non-empty is ready. MJ (10/14/26)
-        return True
+    if ".sfluxgrbf" in path.name:  # GFS writes the .idx after the grib, so idx or age means complete. MJ (10/14/26)
+        return path.with_name(path.name + ".idx").exists() or time.time() - path.stat().st_mtime > _SFCF_SETTLED_S
     logf = path.with_name(path.name.replace("sfcf", "logf").replace(".nc", ".txt"))
     return logf.exists() or time.time() - path.stat().st_mtime > _SFCF_SETTLED_S
 
@@ -723,7 +725,8 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
     if source not in _SOURCE_PATH:
         raise ValueError("source must be one of {}, got {!r}".format(tuple(_SOURCE_PATH), source))
     spath = _SOURCE_PATH[source]
-    opener = nc.Dataset if source == "sfcf" else _SfluxDataset
+    # the two bracket files repeat from one hourly record to the next, so keep two decodes. MJ (10/14/26)
+    opener = nc.Dataset if source == "sfcf" else functools.partial(_SfluxDataset, cache={})
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     valids = sfcf_valid_times(cycle, segment, start)
@@ -857,7 +860,8 @@ def gfs_input_files(comin_gfs, cycle: datetime, segment: str, start: Optional[da
         if br:
             cand = [spath(comin_gfs, cycle, h) for h in br[:2]]
         elif valid <= cycle:
-            cand = [spath(comin_gfs, valid, 0)]
+            fh = valid.hour % 6  # getges' first hit on a complete tree: GFS cycles are 6-hourly. MJ (10/14/26)
+            cand = [spath(comin_gfs, valid - timedelta(hours=fh), fh)]
         else:
             cand = [spath(comin_gfs, cycle, int((valid - cycle).total_seconds() // 3600))]
         out.extend(p for p in cand if p not in out)
@@ -878,16 +882,23 @@ def _decode_sflux(path: Path):
             cmd += ["-if", ":{}:".format(m), "-bin", b, "-fi"]
         first = next(iter(SFLUX_FIELDS))
         cmd += ["-if", ":{}:".format(first), "-grid", "-fi"]
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                               timeout=_WGRIB2_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            raise MetForcingError("wgrib2 timed out after {} s on {}".format(_WGRIB2_TIMEOUT_S, path))
         if r.returncode != 0:
             raise MetForcingError("wgrib2 failed on {}: {}".format(path, r.stderr.strip()))
         g = re.search(r"\((\d+) x (\d+)\).*?lat ([-\d.]+) to ([-\d.]+).*?lon ([-\d.]+) to ([-\d.]+)",
                       r.stdout, re.S)
         if not g:
             raise MetForcingError("{}: cannot read the grid from wgrib2 -grid output: {!r}".format(path, r.stdout[:200]))
+        scan = re.search(r"input (\w\w:\w\w)", r.stdout)
+        if not scan or scan.group(1) not in ("WE:NS", "WE:SN"):  # a j-consecutive scan would garble the reshape. MJ (10/14/26)
+            raise MetForcingError("{}: unsupported GRIB scan order {}".format(path, scan.group(1) if scan else None))
         nx, ny = int(g.group(1)), int(g.group(2))
         lat0, lon0 = float(g.group(3)), float(g.group(5))
-        lat = np.sort(np.rad2deg(np.arcsin(np.polynomial.legendre.leggauss(ny)[0])))  # Gaussian latitudes
+        lat = np.sort(np.rad2deg(np.arcsin(np.polynomial.legendre.leggauss(ny)[0])))  # Gaussian latitudes. MJ (10/14/26)
         if lat0 > 0:
             lat = lat[::-1]
         if abs(lat[0] - lat0) > 1e-3:
@@ -920,7 +931,7 @@ def _resolve_undefined(name, a):
 
 
 class _SfluxVar(object):
-    """The slice of a netCDF4 Variable that build_sfcf_forcing and _open_sfcf_output use."""
+    """The slice of a netCDF4 Variable that build_sfcf_forcing and _open_sfcf_output use. MJ (10/14/26)"""
 
     def __init__(self, data, attrs):
         self._data, self._attrs = np.asarray(data), dict(attrs)
@@ -945,13 +956,20 @@ class _SfluxVar(object):
 class _SfluxDataset(object):
     """An sflux GRIB2 file presented like the sfcf netCDF it replaces (same variables, dims, attributes). MJ (10/14/26)"""
 
-    def __init__(self, path):
+    def __init__(self, path, cache=None):
         import re
         m = re.search(r"gfs\.(\d{8})/(\d{2})/atmos/gfs\.t\d{2}z\.sfluxgrbf(\d{3})\.grib2$", str(path))
         if not m:
             raise MetForcingError("not an sflux path: {}".format(path))
         cyc, fhr = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H"), int(m.group(3))
-        lat, lon, fields = _decode_sflux(Path(path))
+        if cache is not None and str(path) in cache:
+            lat, lon, fields = cache[str(path)]
+        else:
+            lat, lon, fields = _decode_sflux(Path(path))
+            if cache is not None:
+                if len(cache) >= 2:
+                    cache.pop(next(iter(cache)))
+                cache[str(path)] = (lat, lon, fields)
         lat, fields = _to_sfcf_orientation(lat, fields)
         lat, lon = np.asarray(lat, dtype="f8"), np.asarray(lon, dtype="f8")
         ny, nx = len(lat), len(lon)
