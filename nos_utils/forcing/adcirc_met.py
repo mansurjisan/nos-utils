@@ -650,7 +650,7 @@ def getges_sfcf(comin_gfs, valid: datetime, source: str = "sfcf") -> Path:
     """
     for fh in range(_GETGES_FHEND + 1):
         cand = _SOURCE_PATH[source](comin_gfs, valid - timedelta(hours=fh), fh)
-        if os.access(str(cand), os.R_OK):
+        if os.access(str(cand), os.R_OK) and (source == "sfcf" or _sfcf_ready(cand)):  # a half-downloaded sflux must not win. MJ (10/14/26)
             return cand
     raise FileNotAvailableError(
         "FATAL ERROR: no GFS {} file for valid {:%Y%m%d%H} under {} (searched f000-f{})".format(
@@ -799,6 +799,9 @@ def build_sfcf_forcing(comin_gfs, cycle: datetime, segment: str, out_dir, prefix
             for p in part.values():
                 if p.exists():
                     p.unlink()
+    from ._log import log_input_files
+    log_input_files("GFS_" + source.upper(), list(dict.fromkeys(p for _, p in used)), source="GFS_" + source.upper(),
+                    category="atmospheric", note="cycle={:%Y%m%d%H} segment={}".format(cycle, segment))
     _write_sfcf_manifest(out_dir / "{}_{}.sfcf_manifest.json".format(prefix, segment), cycle, segment, used, source)
     return final
 

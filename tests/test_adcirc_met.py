@@ -807,3 +807,38 @@ def test_sflux_bracket_files_decoded_once_per_build(tmp_path, monkeypatch):
     monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)
     am.build_sfcf_forcing(tmp_path, CYC, "fcst", tmp_path / "o", source="sflux")
     assert len(calls) == len(set(calls)) == 121 + 20
+
+
+def test_getges_sflux_skips_a_file_that_is_not_ready(tmp_path):
+    c18 = CYC - timedelta(hours=6)
+    _mk_sflux(tmp_path, c18, 6)
+    half = _mk_sflux(tmp_path, CYC, 0)
+    half.with_name(half.name + ".idx").unlink()  # fresh and no idx: still downloading. MJ (10/14/26)
+    assert am.getges_sfcf(tmp_path, CYC, "sflux") == am.sflux_path(tmp_path, c18, 6)
+    half.with_name(half.name + ".idx").write_text("1:0")
+    assert am.getges_sfcf(tmp_path, CYC, "sflux") == half
+
+
+def test_getges_sfcf_needs_only_a_readable_file(tmp_path):
+    p = _mk_sfcf(tmp_path, CYC, 0, 1, logf=False)  # no logf marker and fresh: sfcf still takes it. MJ (10/14/26)
+    assert am.getges_sfcf(tmp_path, CYC) == p
+
+
+@pytest.mark.parametrize("source", ["sfcf", "sflux"])
+def test_build_logs_the_used_input_files(tmp_path, monkeypatch, source):
+    from nos_utils.forcing import _log
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode())
+    tank = tmp_path / "t"
+    want = am.gfs_input_files(tank, CYC, "ncst", source=source)
+    for p in want:
+        cyc = datetime.strptime(p.parts[-4][4:] + p.parts[-3], "%Y%m%d%H")
+        h = int(p.name.rsplit("sfcf" if source == "sfcf" else "sfluxgrbf", 1)[1][:3])
+        (_mk_sfcf(tank, cyc, h, _valid_seed(cyc, h)) if source == "sfcf" else _mk_sflux(tank, cyc, h))
+    calls = []
+    monkeypatch.setattr(_log, "log_input_files", lambda *a, **k: calls.append((a, k)))
+    am.build_sfcf_forcing(tank, CYC, "ncst", tmp_path / "o", source=source)
+    assert len(calls) == 1
+    (name, files), kw = calls[0]
+    assert name == "GFS_" + source.upper() and kw["category"] == "atmospheric"
+    assert list(files) == want
