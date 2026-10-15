@@ -608,3 +608,237 @@ def test_retrospective_cycle_record_does_not_wait(tmp_path):
     epoch = __import__("calendar").timegm(CYC.timetuple())
     am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC - timedelta(hours=1), wait_s=30,
                           sleep=lambda s: pytest.fail("waited"), now=lambda: epoch + 3 * 86400)
+
+
+# --- the same forcing from the sfluxgrbf GRIB2 files (decoder mocked) -------------------------
+
+_SF_NAMES = {"ugrd10m": 0, "vgrd10m": 1, "pressfc": 2, "icec": 3}
+
+
+def _mk_sflux(comin, cycle, fhr, seed=None):
+    p = am.sflux_path(comin, cycle, fhr)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"GRIB")
+    p.with_name(p.name + ".idx").write_text("1:0")  # the downloader keeps the idx next to the grib. MJ (10/14/26)
+    return p
+
+
+def _fake_decode(descending=False, undef=False):
+    import re
+
+    def dec(path):
+        m = re.search(r"gfs\.(\d{8})/(\d{2})/atmos/.*sfluxgrbf(\d{3})", str(path))
+        cyc, fhr = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H"), int(m.group(3))
+        seed = _valid_seed(cyc, fhr)
+        lat, lon = np.arange(NY, dtype="f8"), np.arange(NX, dtype="f8")
+        ramp = np.arange(NY * NX, dtype="f4").reshape(NY, NX)
+        f = {k: np.full((NY, NX), seed * 10 + i, dtype="f4") + ramp for k, i in _SF_NAMES.items()}
+        if undef:
+            f["icec"][0, 0] = np.float32(9.999e20)
+        if descending:
+            lat, f = lat[::-1], {k: v[::-1] for k, v in f.items()}
+        return lat, lon, f
+    return dec
+
+
+def _fill_sflux(tank, pairs):
+    for cycle, fhr in pairs:
+        _mk_sflux(tank, cycle, fhr)
+
+
+def _same_structure(a, b):
+    import netCDF4 as nc
+    with nc.Dataset(str(a)) as x, nc.Dataset(str(b)) as y:
+        assert list(x.dimensions) == list(y.dimensions)
+        assert list(x.variables) == list(y.variables)
+        for k, v in x.variables.items():
+            w = y.variables[k]
+            assert (v.dtype, v.dimensions, v.shape) == (w.dtype, w.dimensions, w.shape), k
+            assert v.filters() == w.filters() and v.chunking() == w.chunking(), k
+            assert getattr(v, "_FillValue", None) == getattr(w, "_FillValue", None), k
+            assert getattr(v, "cell_methods", None) == getattr(w, "cell_methods", None), k
+            assert np.array_equal(v[:], w[:]), k
+        assert x.variables["time"].units == y.variables["time"].units
+
+
+def test_sflux_matches_sfcf_path_ncst_and_fcst(tmp_path, monkeypatch):
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)  # the fixture sfcf grid and fake decoder are both south-north. MJ (10/14/26)
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode())
+    c18 = CYC - timedelta(hours=6)
+    ncst = [(CYC - timedelta(hours=12), 6)] + [(c18, h) for h in range(1, 6)] + [(CYC, 0)]
+    fc = [(CYC, h) for h in range(0, 121)] + [(CYC, h) for h in range(123, 181, 3)]
+    _fill_tank(tmp_path / "a", ncst + fc)
+    _fill_sflux(tmp_path / "b", ncst + fc)
+    for seg in ("ncst", "fcst"):
+        fa = am.build_sfcf_forcing(tmp_path / "a", CYC, seg, tmp_path / "oa")
+        fb = am.build_sfcf_forcing(tmp_path / "b", CYC, seg, tmp_path / "ob", source="sflux")
+        for n in fa:
+            _same_structure(fa[n], fb[n])
+    man = json.loads((tmp_path / "ob" / "stofs_2d_glo_fcst.sfcf_manifest.json").read_text())
+    assert man["product"] == "sflux" and len(man["files"]) == 181 + 40
+    assert man["files"][121]["source_location"] == str(am.sflux_path(tmp_path / "b", CYC, 120))
+    assert man["files"][122]["source_location"] == str(am.sflux_path(tmp_path / "b", CYC, 123))
+    assert json.loads((tmp_path / "oa" / "stofs_2d_glo_fcst.sfcf_manifest.json").read_text())["product"] == "sfcf"
+
+
+def test_sflux_orientation_is_one_decision(tmp_path, monkeypatch):
+    _fill_sflux(tmp_path, [(CYC, 0)])
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode(descending=True))
+    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o1", start=CYC, source="sflux")  # no flip: N to S kept. MJ (10/14/26)
+    assert np.array_equal(_read(f["221"], "grid_yt"), np.arange(NY)[::-1])
+    assert _read(f["221"], "pressfc")[0][0, 0] == _valid_seed(CYC, 0) * 10 + 2 + (NY - 1) * NX
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)
+    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o2", start=CYC, source="sflux")
+    assert np.array_equal(_read(f["221"], "grid_yt"), np.arange(NY))
+    assert _read(f["221"], "pressfc")[0][0, 0] == _valid_seed(CYC, 0) * 10 + 2
+
+
+def test_sflux_bitmap_points_icec_zero_others_raise(tmp_path, monkeypatch):
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)
+    _fill_sflux(tmp_path, [(CYC, 0)])
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode(undef=True))
+    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC, source="sflux")
+    i = _read(f["225"], "icec")[0]
+    assert i[0, 0] == 0.0 and i[0, 1] > 0
+    with pytest.raises(am.MetForcingError, match="undefined"):
+        am._resolve_undefined("pressfc", np.full((2, 2), 9.999e20, dtype="f4"))
+
+
+def test_sflux_attributes_match_sfcf(tmp_path, monkeypatch):
+    import netCDF4 as nc
+    _fill_sflux(tmp_path, [(CYC, 0)])
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode())
+    f = am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC, source="sflux")
+    with nc.Dataset(str(f["222"])) as d:
+        g = {k: d.getncattr(k) for k in d.ncattrs()}
+        assert g == {"fhzero": 6, "ncld": 5, "nsoil": 4, "imp_physics": 11, "dtp": 150.0, "source": "FV3GFS",
+                     "grid": "gaussian", "im": NX, "jm": NY}
+        assert type(g["fhzero"]) is np.int32 and type(g["dtp"]) is np.float32
+        u = d.variables["ugrd10m"]
+        assert (u.long_name, u.units, u.output_file) == ("10 meter u wind", "m/s", "sfc")
+        assert u.getncattr("missing_value") == np.float32(9.99e20) == u.getncattr("_FillValue")
+        assert d.variables["grid_yt"].long_name == "T-cell latiitude"
+        assert d.variables["lon"].dtype == np.dtype("f8") and d.variables["lat"].dimensions == ("record", "grid_yt", "grid_xt")
+        assert d.variables["time"].units == "hours since 2026-10-04 00:00:00" and d.variables["time"].calendar == "JULIAN"
+    with nc.Dataset(str(f["225"])) as d:
+        assert (d.variables["icec"].units, d.variables["icec"].cell_methods) == ("fraction", "time: point time: mean")
+
+
+def test_gfs_input_files(tmp_path):
+    c18, c12 = CYC - timedelta(hours=6), CYC - timedelta(hours=12)
+    n = am.gfs_input_files(tmp_path, CYC, "ncst")
+    assert n == [am.sfcf_path(tmp_path, c18, h) for h in range(0, 6)] + [am.sfcf_path(tmp_path, CYC, 0)]
+    assert len(am.gfs_input_files(tmp_path, CYC, "ncst", start=CYC - timedelta(hours=12))) == 13
+    sf = am.gfs_input_files(tmp_path, CYC, "ncst", source="sflux")  # includes the cycle's own f000 analysis. MJ (10/14/26)
+    assert sf == [am.sflux_path(tmp_path, c18, h) for h in range(0, 6)] + [am.sflux_path(tmp_path, CYC, 0)]
+    f = am.gfs_input_files(tmp_path, CYC, "fcst", source="sflux")
+    assert f == [am.sflux_path(tmp_path, CYC, h) for h in list(range(0, 121)) + list(range(123, 181, 3))]
+    assert len(f) == len(set(f))
+    assert c18 != c12
+
+
+def test_sflux_missing_file_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode())
+    with pytest.raises(am.FileNotAvailableError, match="no GFS sflux file"):
+        am.build_sfcf_forcing(tmp_path, CYC, "ncst", tmp_path / "o", start=CYC, source="sflux")
+    _fill_sflux(tmp_path, [(CYC, h) for h in range(0, 121)])
+    with pytest.raises(am.FileNotAvailableError, match="did not appear"):
+        am.build_sfcf_forcing(tmp_path, CYC, "fcst", tmp_path / "o", source="sflux")
+
+
+def test_sflux_without_wgrib2_is_a_clear_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(am.shutil, "which", lambda _: None)
+    with pytest.raises(am.MetDependencyError, match="wgrib2"):
+        am._decode_sflux(am.sflux_path(tmp_path, CYC, 0))
+
+
+@pytest.mark.parametrize("source", ["sfcf", "sflux"])
+@pytest.mark.parametrize("segment", ["ncst", "fcst"])
+def test_manifest_files_equal_gfs_input_files(tmp_path, monkeypatch, source, segment):
+    import re
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode())
+    tank = tmp_path / "t"
+    want = am.gfs_input_files(tank, CYC, segment, source=source)
+    for p in want:  # a tank holding exactly the listed files, nothing else. MJ (10/14/26)
+        h = int(re.search(r"f(\d{3})\.grib2$|sfcf(\d{3})\.nc$", p.name).group(1, 2)[0 if source == "sflux" else 1])
+        cyc = datetime.strptime(p.parts[-4][4:] + p.parts[-3], "%Y%m%d%H")
+        if source == "sfcf":
+            _mk_sfcf(tank, cyc, h, _valid_seed(cyc, h))
+        else:
+            _mk_sflux(tank, cyc, h)
+    am.build_sfcf_forcing(tank, CYC, segment, tmp_path / "o", source=source)
+    man = json.loads((tmp_path / "o" / "stofs_2d_glo_{}.sfcf_manifest.json".format(segment)).read_text())
+    assert list(dict.fromkeys(e["source_location"] for e in man["files"])) == [str(p) for p in want]
+
+
+def test_sflux_ready_needs_idx_or_age(tmp_path):
+    import os
+    p = _mk_sflux(tmp_path, CYC, 0)
+    assert am._sfcf_ready(p)
+    p.with_name(p.name + ".idx").unlink()
+    assert not am._sfcf_ready(p)
+    q = _mk_sflux(tmp_path, CYC, 1)
+    q.with_name(q.name + ".idx").unlink()
+    old = q.stat().st_mtime - 3600
+    os.utime(str(q), (old, old))
+    assert am._sfcf_ready(q)
+
+
+def test_sflux_decoder_rejects_bad_scan_and_times_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(am.shutil, "which", lambda _: "/bin/wgrib2")
+    out = "gaussian grid: (4 x 3) units 1e-06 input {} output WE:SN lat 1 to -1 lon 0 to 270"
+    monkeypatch.setattr(am.subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": out.format("WE:EW"), "stderr": ""})())
+    with pytest.raises(am.MetForcingError, match="scan order"):
+        am._decode_sflux(tmp_path / "x.grib2")
+
+    def boom(*a, **k):
+        raise am.subprocess.TimeoutExpired("wgrib2", 1)
+    monkeypatch.setattr(am.subprocess, "run", boom)
+    with pytest.raises(am.MetForcingError, match="timed out"):
+        am._decode_sflux(tmp_path / "x.grib2")
+
+
+def test_sflux_bracket_files_decoded_once_per_build(tmp_path, monkeypatch):
+    _fill_sflux(tmp_path, [(CYC, h) for h in range(0, 121)] + [(CYC, h) for h in range(123, 181, 3)])
+    inner, calls = _fake_decode(), []
+    monkeypatch.setattr(am, "_decode_sflux", lambda p: (calls.append(str(p)), inner(p))[1])
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)
+    am.build_sfcf_forcing(tmp_path, CYC, "fcst", tmp_path / "o", source="sflux")
+    assert len(calls) == len(set(calls)) == 121 + 20
+
+
+def test_getges_sflux_skips_a_file_that_is_not_ready(tmp_path):
+    c18 = CYC - timedelta(hours=6)
+    _mk_sflux(tmp_path, c18, 6)
+    half = _mk_sflux(tmp_path, CYC, 0)
+    half.with_name(half.name + ".idx").unlink()  # fresh and no idx: still downloading. MJ (10/14/26)
+    assert am.getges_sfcf(tmp_path, CYC, "sflux") == am.sflux_path(tmp_path, c18, 6)
+    half.with_name(half.name + ".idx").write_text("1:0")
+    assert am.getges_sfcf(tmp_path, CYC, "sflux") == half
+
+
+def test_getges_sfcf_needs_only_a_readable_file(tmp_path):
+    p = _mk_sfcf(tmp_path, CYC, 0, 1, logf=False)  # no logf marker and fresh: sfcf still takes it. MJ (10/14/26)
+    assert am.getges_sfcf(tmp_path, CYC) == p
+
+
+@pytest.mark.parametrize("source", ["sfcf", "sflux"])
+def test_build_logs_the_used_input_files(tmp_path, monkeypatch, source):
+    from nos_utils.forcing import _log
+    monkeypatch.setattr(am, "_SFCF_LAT_ASCENDING", True)
+    monkeypatch.setattr(am, "_decode_sflux", _fake_decode())
+    tank = tmp_path / "t"
+    want = am.gfs_input_files(tank, CYC, "ncst", source=source)
+    for p in want:
+        cyc = datetime.strptime(p.parts[-4][4:] + p.parts[-3], "%Y%m%d%H")
+        h = int(p.name.rsplit("sfcf" if source == "sfcf" else "sfluxgrbf", 1)[1][:3])
+        (_mk_sfcf(tank, cyc, h, _valid_seed(cyc, h)) if source == "sfcf" else _mk_sflux(tank, cyc, h))
+    calls = []
+    monkeypatch.setattr(_log, "log_input_files", lambda *a, **k: calls.append((a, k)))
+    am.build_sfcf_forcing(tank, CYC, "ncst", tmp_path / "o", source=source)
+    assert len(calls) == 1
+    (name, files), kw = calls[0]
+    assert name == "GFS_" + source.upper() and kw["category"] == "atmospheric"
+    assert list(files) == want
