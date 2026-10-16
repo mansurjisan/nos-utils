@@ -5,12 +5,12 @@ Blends CMEMS satellite ADT observations with RTOFS SSH to improve
 boundary condition accuracy for STOFS-3D-ATL.
 
 The core formula (ops stofs_3d_atl_create_obc_3d_th_non_adjust.sh, SSH_1.nc block):
-    SSH_final = SSH_rtofs - SSH_rtofs(t=0) + (ADT - 0.45)
+    SSH_final = SSH_rtofs - SSH_rtofs(t=0) + (ADT + adt_datum_offset)
 
 ADT is the mean of the valid-day and previous-day CMEMS files (ncra), mapped onto
 the SSH_1 grid with the ops ESMF map (ncremap with stofs_3d_atl_adt_weight.nc,
 which is a nearest-source map with S=1 despite its "bilinear" global attribute).
-The -0.45 m datum offset (stofs_3d_atl_adt_cvtz.nco) is applied per day and rounded
+The datum offset (stofs_3d_atl_adt_cvtz.nco) is applied per day and rounded
 to float32 before the mean, as ops does. Without the map, a bilinear regrid is used
 and the result is not ops-exact.
 
@@ -273,7 +273,7 @@ class ADTBlender:
         return np.where(tally > 0, num, np.nan)
 
     def _regrid_esmf(self, adt_files, ssh_path: Path):
-        """Ops ADT step with the ESMF map: ROI subset, ncremap, float32(adt-0.45), two-day mean.
+        """Ops ADT step with the ESMF map: ROI subset, ncremap, float32(adt+datum_offset), two-day mean.
 
         Each day is rounded to float32 after the offset and the valid days are averaged
         (float64 accumulation, float32 result), as ncap2 and ncra do. Returns the float32
@@ -320,7 +320,7 @@ class ADTBlender:
                         or np.abs(yca - LA.ravel()).max() > ADT_COORD_TOL):
                     raise ValueError("ADT ROI coordinates do not match map xc_a/yc_a")
                 out = self._apply_esmf_map(S, row, col, n_b, a.ravel())
-                days.append((out - 0.45).astype(np.float32) if self.ops_numerics else out - 0.45)
+                days.append(out.astype(np.float32) if self.ops_numerics else out)
             if self.ops_numerics:
                 stack = np.stack(days)
                 ok = np.isfinite(stack)
@@ -343,7 +343,7 @@ class ADTBlender:
         return field
 
     def _write_adt_on_rtofs(self, adt_dst, dst_lon, dst_lat, out: Path):
-        """adt_aft_cvtz_cln.nc analogue: float32 surf_el(time=1, ylat, xlon) in m after -0.45.
+        """adt_aft_cvtz_cln.nc analogue: float32 surf_el(time=1, ylat, xlon) in m after datum offset.
 
         Missing cells carry the ops fill (the CMEMS int fill held as float32).
         """
@@ -421,7 +421,7 @@ class ADTBlender:
         return None
 
     def _read_adt(self, adt_path: Path, bounds=None):
-        """Read and subset ADT to bounds, offset by -0.45 m.
+        """Read and subset ADT to bounds, offset by the user specified amount.
 
         bounds is (lon_min, lon_max, lat_min, lat_max) in -180/180; default is the
         ops ROI. Returns (adt[lat, lon], lons, lats) or None. Fill values become NaN.
@@ -445,9 +445,7 @@ class ADTBlender:
                     return None
 
                 adt_var = "adt" if "adt" in ds.variables else "surf_el"
-                # 0.45 from NCO file
-                # TODO: Should be different for different systems, e.g. PAC
-                adt_data = ds.variables[adt_var][...] - 0.45
+                adt_data = ds.variables[adt_var][...]
                 sl_y = slice(lat_idx[0], lat_idx[-1] + 1)
                 sl_x = slice(lon_idx[0], lon_idx[-1] + 1)
                 if adt_data.ndim == 3:
@@ -564,8 +562,8 @@ class ADTBlender:
                          adt_dst=None) -> Optional[Path]:
         """Apply the ops ADT blend to SSH_1.nc.
 
-        Formula: SSH_final(t) = SSH_rtofs(t) - SSH_rtofs(t=0) + ADT
-        (ADT already carries the -0.45 offset), in float32 as ncap2. Where either
+        Formula: SSH_final(t) = SSH_rtofs(t) - SSH_rtofs(t=0) + ADT + datum_offset
+        (ADT datum offset, e.g. -0.45 is applied here), in float32 as ncap2. Where either
         side is invalid the point is left as the -30000 fill (dry in gen_3Dth).
         """
         try:
@@ -574,7 +572,7 @@ class ADTBlender:
             shutil.copy2(ssh_path, output)
 
             ds = Dataset(str(output), "r+")
-            ssh = ds.variables["ssh"]
+            ssh = ds.variables["ssh"][...] + (self.config.adt_datum_offset or 0)
             nt, ny, nx = ssh.shape
 
             dst_lon = np.array(ds.variables["xlon"][:], dtype=np.float64)

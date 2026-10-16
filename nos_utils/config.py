@@ -231,6 +231,7 @@ class ForcingConfig:
     obc_sal_outside: float = 33.0
     # ADT satellite SSH blending (STOFS-3D-ATL uses CMEMS ADT to correct boundary SSH)
     adt_enabled: bool = False
+    adt_datum_offset: float = -0.45
     # Ops ESMF map for the ADT regrid (yaml ocean.adt.weight_file); a bare name resolves against
     # FIXofs. Unset or missing falls back to the bilinear regrid. MJ (10/02/26)
     adt_weight_file: Optional[Path] = None
@@ -577,6 +578,7 @@ class ForcingConfig:
             # carry only the 778 elevation nodes SCHISM expects.
             obc_elev_segments=[0, 1],
             adt_enabled=True,
+            adt_datum_offset=-0.45,
             adt_weight_file=Path("stofs_3d_atl_ufs.adt_weight.nc"),
             obc_ssh_hold_first_record=True,
             obc_ops_timeline=True,
@@ -641,6 +643,7 @@ class ForcingConfig:
             # carry only the 778 elevation nodes SCHISM expects.
             obc_elev_segments=[0, 1],
             adt_enabled=True,
+            adt_datum_offset=-0.45,
             adt_weight_file=Path("stofs_3d_atl_ufs.adt_weight.nc"),
             obc_ssh_hold_first_record=True,
             obc_ops_timeline=True,
@@ -701,7 +704,8 @@ class ForcingConfig:
             # Segments 2-8 are flow-only river OBCs (excluded from *.th.nc).
             obc_elev_segments=[0, 1, 9],
             obc_ssh_offset=0.0,
-            adt_enabled=False,
+            adt_enabled=True,
+            adt_datum_offset=-0.4715517,
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
             nwm_product="medium_range_mem1",
@@ -730,7 +734,8 @@ class ForcingConfig:
             dynamic_adjust_enabled=False,
             obc_elev_segments=[0, 1, 9],
             obc_ssh_offset=0.0,
-            adt_enabled=False,
+            adt_enabled=True,
+            adt_datum_offset=-0.4715517,
             nudging_enabled=True,
             nudging_timescale_seconds=86400.0,
             nwm_product="medium_range_mem1",
@@ -956,6 +961,7 @@ class ForcingConfig:
         if _adt_wt is None and str(_sys.get("name", "")).startswith("stofs_3d_atl"):
             _adt_wt = "stofs_3d_atl_ufs.adt_weight.nc"
         _adt_wt = Path(_adt_wt) if _adt_wt else None
+        _adt_off = float(adt.get("datum_offset", 0.0)) if isinstance(adt, dict) else 0.0
 
         # Ops river inputs (static FIX source_sink.in / msource.th / vsink.th, ops source
         # order): STOFS-3D-ATL by name (the coupled executable now has PREC_EVAP), yaml
@@ -1011,6 +1017,7 @@ class ForcingConfig:
             datm_hrrr_weight=_hrrr_weight,
             hrrr_small_grib=_hrrr_sg,
             adt_enabled=adt.get("enabled", False) if isinstance(adt, dict) else False,
+            adt_datum_offset=_adt_off,
             adt_weight_file=_adt_wt,
             nwm_product=nwm_product,
             river_ops_static=_river_ops,
