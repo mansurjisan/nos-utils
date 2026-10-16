@@ -172,11 +172,11 @@ class ForcingConfig:
 
     # --- OBC (ocean boundary) settings ---
     # RTOFS ROI indices for 2D (ssh) extraction
-    obc_roi_2d: Optional[dict] = None  # {x1, x2, y1, y2}
+    obc_roi_2d: Optional[dict] = None  # {x1, x2, y1, y2, x_stride, y_stride}
     # RTOFS ROI indices for 3D (T,S,U,V) extraction
-    obc_roi_3d: Optional[dict] = None  # {x1, x2, y1, y2}
+    obc_roi_3d: Optional[dict] = None  # {x1, x2, y1, y2, x_stride, y_stride}
     # RTOFS ROI indices for nudging (slightly larger domain than OBC)
-    nudge_roi_3d: Optional[dict] = None  # {x1, x2, y1, y2}
+    nudge_roi_3d: Optional[dict] = None  # {x1, x2, y1, y2, x_stride, y_stride}
     # Which regional RTOFS 3dz tile to read for 3D T/S/U/V (OBC and nudging
     # share this discovery step). Ops stages "alaska", "US_east" and
     # "US_west" tiles side by side for every valid time with no region in

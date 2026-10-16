@@ -323,7 +323,8 @@ class NudgingProcessor(ForcingProcessor):
                 # ncap2 honours only _FillValue; netCDF4's auto-mask would also drop values outside
                 # valid_range. MJ (10/02/26)
                 ds.set_auto_mask(False)
-                ys, xs = slice(roi["y1"], roi["y2"] + 1), slice(roi["x1"], roi["x2"] + 1)
+                ys = slice(roi["y1"], roi["y2"] + 1, roi.get("y_stride", 1))
+                xs = slice(roi["x1"], roi["x2"] + 1, roi.get("x_stride", 1))
                 out = []
                 for nme in ("temperature", "salinity"):
                     v = ds.variables[nme]

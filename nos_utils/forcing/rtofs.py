@@ -872,20 +872,23 @@ class RTOFSProcessor(ForcingProcessor):
         return work
 
     def _stofs_subset_roi(self, ds, roi: dict, variables: List[str]) -> dict:
-        """Subset RTOFS NetCDF by ROI indices (replaces NCO ncks -d X,x1,x2 -d Y,y1,y2)."""
-        x1, x2 = roi["x1"], roi["x2"]
-        y1, y2 = roi["y1"], roi["y2"]
+        """
+        Subset RTOFS NetCDF by ROI indices & stride
+        (replaces NCO ncks -d X,x1,x2,i -d Y,y1,y2,j).
+        """
+        x1, x2, x_stride = roi["x1"], roi["x2"], roi.get("x_stride", 1)
+        y1, y2, y_stride = roi["y1"], roi["y2"], roi.get("y_stride", 1)
         result = {}
         for var in variables:
             if var in ds.variables:
                 data = ds.variables[var]
                 ndim = len(data.dimensions)
                 if ndim == 3:  # (time, Y, X)
-                    result[var] = data[:, y1:y2+1, x1:x2+1]
+                    result[var] = data[:, y1:y2+1:y_stride, x1:x2+1:x_stride]
                 elif ndim == 4:  # (time, depth, Y, X)
-                    result[var] = data[:, :, y1:y2+1, x1:x2+1]
+                    result[var] = data[:, :, y1:y2+1:y_stride, x1:x2+1:x_stride]
                 elif ndim == 2:  # (Y, X)
-                    result[var] = data[y1:y2+1, x1:x2+1]
+                    result[var] = data[y1:y2+1:y_stride, x1:x2+1:x_stride]
                 else:
                     result[var] = data[:]
         return result
