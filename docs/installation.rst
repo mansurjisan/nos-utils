@@ -21,7 +21,7 @@ Install from source
 
 .. code-block:: bash
 
-   git clone https://github.com/mansurjisan/nos-utils.git
+   git clone https://github.com/oceanmodeling/nos-utils.git
    cd nos-utils
 
    # Minimal install (numpy only)
