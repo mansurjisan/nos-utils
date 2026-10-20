@@ -27,6 +27,8 @@ Precomputed weight workflow
 
 There are two steps:
 
+.. currentmodule:: nos_utils.interp.precomputed_weights
+
 1. **One-time build** (offline, after any grid change): run the Fortran
    prep once with ``NOS_EXPORT_WEIGHTS=YES`` to dump ``*_remesh_export.txt``
    text files, then convert them to NPZ using :func:`build_npz`,

@@ -4,7 +4,7 @@ Usage
 Quick start: PrepOrchestrator
 -----------------------------
 
-The simplest way to run a full SCHISM prep cycle is via
+The simplest way to run a SCHISM prep cycle is via
 :class:`~nos_utils.orchestrator.PrepOrchestrator`. It chains every processor
 in the correct order and runs the lightweight ones (GFS, HRRR, NWM, tidal)
 concurrently via a ``ThreadPoolExecutor``; the heavy RTOFS and nudging steps
@@ -28,12 +28,19 @@ concurrent thread access on large reads.
        "comout": "/tmp/secofs_comout",
    }
 
-   orch = PrepOrchestrator(config, paths, run_name="secofs")
+   orch = PrepOrchestrator(config, paths, run_name="secofs", skip_legacy=False)
    result = orch.run(phase="nowcast")
    print(result.summary())
 
+With the default ``skip_legacy=True`` the RTOFS, NWM and nudging steps are
+skipped for SECOFS (they were handled by the legacy shell scripts). Pass
+``skip_legacy=False`` to run them in Python; the same
+flag is available as :func:`nos_utils.nco_bridge.run_prep`\ ``(skip_legacy=False)``,
+which nos-workflow calls. The ``nos-utils prep`` CLI
+does not set it, so for SECOFS it skips those steps.
+
 ``PrepResult`` exposes ``success`` (all critical steps passed),
-``results`` (one :class:`~nos_utils.forcing.ForcingResult` per step),
+``results`` (one :class:`~nos_utils.forcing.base.ForcingResult` per step),
 ``all_output_files``, ``all_errors``, and ``elapsed_seconds``.
 
 Switching OFS
@@ -143,10 +150,11 @@ are function-based and are listed under the API reference.
 RTOFS with precomputed weights and ADT blending
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-When run through :class:`~nos_utils.orchestrator.PrepOrchestrator`, the SSH
-open boundary uses precomputed INTERP_REMESH weights from the FIX directory
-if they are present (``*.obc_ssh_weights.npz``) and falls back to on-the-fly
-Delaunay interpolation otherwise. For SECOFS the weights reproduce the
+For the SSH open boundary, :class:`~nos_utils.forcing.rtofs.RTOFSProcessor`
+looks for precomputed INTERP_REMESH weights in ``$FIXofs`` or ``$FIXstofs3d``
+(environment variables), then in its input directory, under the exact names
+``secofs.obc_ssh_weights.npz`` or ``obc_ssh_weights.npz``. If neither is
+found it falls back to on-the-fly Delaunay interpolation. For SECOFS the weights reproduce the
 operational Fortran SSH boundary to a 0.5 mm RMSE.
 
 .. code-block:: python
@@ -182,8 +190,10 @@ NWM river forcing
 
 For the STOFS domain this assembles 121 ``medium_range_mem1`` files into
 ``vsource.th`` / ``msource.th`` / ``source_sink.in``. SECOFS has no matching
-NWM reaches and uses :class:`~nos_utils.forcing.RiverClimProcessor` (USGS
-daily climatology) instead.
+NWM reaches; it runs ``NWMProcessor`` with the ``analysis_assim`` product.
+:class:`~nos_utils.forcing.river_clim.RiverClimProcessor` (USGS daily
+climatology) is available as a separate processor but the orchestrator does
+not call it.
 
 Interior nudging
 ~~~~~~~~~~~~~~~~

@@ -8,15 +8,15 @@ nos-utils is a Python package that generates the forcing and run-configuration f
 
 | System | Model | What nos-utils provides |
 |---|---|---|
-| SECOFS | SCHISM, DATM+SCHISM, DATM+SCHISM+WW3 (UFS-Coastal) | sflux or DATM atmospheric forcing, RTOFS open boundary, river, tides, nudging, param.nml, UFS-Coastal configuration |
+| SECOFS | SCHISM, DATM+SCHISM, DATM+SCHISM+WW3 (UFS-Coastal) | sflux or DATM atmospheric forcing, RTOFS open boundary, river, tides, nudging, param.nml, UFS-Coastal configuration; for WW3, the GFS-Wave `nest.ww3` boundary and WAV PET bounds / coupling interval |
 | STOFS-3D-ATL | SCHISM standalone, DATM+SCHISM; ported to match operational v3.1 | the same set plus ADT and tide-gauge SSH adjustment, NWM and St. Lawrence rivers, and the post products |
-| STOFS-2D-Global | ADCIRC | GFS meteorology in ADCIRC OWI NetCDF form (NWS=14), tidal factors |
+| STOFS-2D-Global | ADCIRC | GFS meteorological forcing in ADCIRC OWI NetCDF form (NWS=14) |
 
 ## Install, test, docs
 
 ```bash
-pip install -e ".[full]"    # adds netCDF4, scipy, cfgrib, pyyaml
-pytest                      # unit tests; synthetic fixtures, no data downloads
+pip install -e ".[full,dev]"    # full: netCDF4, scipy, cfgrib, pyyaml; dev: pytest
+pytest                          # unit tests; synthetic fixtures, no data downloads
 ```
 
 Documentation: [nos-utils.readthedocs.io](https://nos-utils.readthedocs.io/en/latest/). Example:
@@ -29,7 +29,7 @@ config = ForcingConfig.for_secofs(pdy="20260324", cyc=12)
 result = GFSProcessor(config, input_path="/data/gfs", output_path="/work/sflux").process()
 ```
 
-A full SCHISM prep cycle runs through `PrepOrchestrator` or `nos-utils prep --ofs secofs --pdy 20260324 --cyc 12 --output /work/prep` (see `nos-utils --help` and `nos-utils list`).
+A prep cycle runs through `PrepOrchestrator(config, paths, skip_legacy=False)`, which nos-workflow reaches via `nco_bridge.run_prep(skip_legacy=False)`. The `nos-utils prep` CLI (see `nos-utils --help`) keeps the default `skip_legacy=True`, which skips the SECOFS RTOFS, NWM and nudging steps.
 
 ## Main modules
 

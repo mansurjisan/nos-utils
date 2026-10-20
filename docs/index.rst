@@ -14,17 +14,17 @@ Supported systems
 -----------------
 
 * **SECOFS** -- SE Coastal Ocean Forecast System. SCHISM (``nws=2`` sflux),
-  DATM+SCHISM (``nws=4``) and DATM+SCHISM+WW3 under UFS-Coastal. The SCHISM
+  DATM+SCHISM (``nws=4``) and DATM+SCHISM+WW3 under UFS-Coastal. For the
+  WW3 case nos-utils builds the ``nest.ww3`` boundary from GFS-Wave and sets
+  the WAV PET bounds and coupling interval in the UFS configuration files. The SCHISM
   prep was validated against the operational COMF Fortran pipeline (SSH RMSE
   0.5 mm, measured on SECOFS RTOFS open-boundary output).
 * **STOFS-3D-ATL** -- Storm Surge 3-D Atlantic. Standalone SCHISM and
   DATM+SCHISM, ported to match operational v3.1: GFS/HRRR atmospheric forcing,
   RTOFS open boundary with ADT and tide-gauge SSH adjustment, NWM and
   St. Lawrence rivers, interior T/S nudging, and the post products.
-* **STOFS-2D-Global** -- ADCIRC. GFS meteorology in ADCIRC OWI NetCDF form
-  (``NWS=14``) and tidal nodal factors.
-* **Ensemble** -- GEFS-driven perturbation members via
-  :meth:`ForcingConfig.for_ensemble`.
+* **STOFS-2D-Global** -- ADCIRC. GFS meteorological forcing in ADCIRC OWI
+  NetCDF form (``NWS=14``).
 
 Key features
 ------------
@@ -42,8 +42,10 @@ Key features
 * **UFS-Coastal support** -- ESMF mesh, HRRR/GFS blender, DATM writer, and
   generation of the UFS configuration files, including the WW3 boundary
   spectra (``nest.ww3``) from GFS-Wave.
-* **ADCIRC support** -- GFS to OWI NetCDF meteorology and ADCIRC tidal
-  parameters for STOFS-2D-Global.
+* **ADCIRC support** -- GFS to OWI NetCDF meteorology for STOFS-2D-Global
+  (the ``adcirc_tides`` module also provides nodal-factor routines).
+* **Ensemble** -- GEFS-driven perturbation members via
+  :meth:`~nos_utils.config.ForcingConfig.for_ensemble`.
 * **Post-processing** -- the ``nos_utils.post`` subpackage writes the
   ADCIRC-format water-level field, hourly disturbance GeoPackage, maximum
   water level, station time series and profiles, and 2-D slab products.
@@ -73,7 +75,7 @@ Quick start
        "fix":    "/path/to/fix/secofs",
        "output": "/tmp/secofs_prep",
    }
-   result = PrepOrchestrator(config, paths).run(phase="nowcast")
+   result = PrepOrchestrator(config, paths, skip_legacy=False).run(phase="nowcast")
    print(result.summary())
 
 CLI:
@@ -85,6 +87,10 @@ CLI:
        --nwm /data/nwm --fix /data/fix/secofs --output /work/prep/
 
    nos-utils list   # show available OFS factories and processors
+
+The ``skip_legacy`` default (``True``) skips the RTOFS, NWM and nudging steps
+for SECOFS, and the CLI does not change it. Use ``skip_legacy=False`` in
+Python (nos-workflow calls ``nco_bridge.run_prep(skip_legacy=False)``) to run them.
 
 Documentation contents
 ----------------------
