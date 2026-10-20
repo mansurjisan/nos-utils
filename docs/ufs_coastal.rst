@@ -24,8 +24,9 @@ steps: DATM blending and the ESMF mesh, then the configuration files.
      - ESMF unstructured mesh of the DATM grid (all elements active).
    * - ``model_configure``, ``datm_in``, ``datm.streams``
      - :mod:`~nos_utils.forcing.ufs_config`
-     - Filled from the ``*.template`` files in ``$FIXofs``: start time and
-       length of the phase being prepped (nowcast, forecast, or both),
+     - Filled from the ``*.template`` files in ``$FIXofs``: start time (cycle
+       minus nowcast length), length of the phase being prepped (nowcast,
+       forecast, or both),
        ``dt_atmos`` (``ufs_coastal.dt_atmos``), DATM grid size and file names.
    * - ``ufs.configure``
      - :mod:`~nos_utils.forcing.ufs_config`
