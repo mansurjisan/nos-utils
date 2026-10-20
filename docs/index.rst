@@ -39,9 +39,10 @@ Key features
   and nudging runs sequentially in Phase 2.
 * **Interior T/S nudging** -- ``TEM_nu.nc`` and ``SAL_nu.nc`` from precomputed
   nudge weights.
-* **UFS-Coastal support** -- ESMF mesh, HRRR/GFS blender, DATM writer, and
-  generation of the UFS configuration files, including the WW3 boundary
-  spectra (``nest.ww3``) from GFS-Wave.
+* **UFS-Coastal files** -- for the DATM-coupled configurations, prep writes
+  ``datm_forcing.nc``, the ESMF mesh, ``model_configure``, ``datm_in``,
+  ``datm.streams``, ``ufs.configure`` (PET bounds and coupling interval) and,
+  for WW3, the boundary spectra ``nest.ww3``. See :doc:`ufs_coastal`.
 * **ADCIRC support** -- GFS to OWI NetCDF meteorology for STOFS-2D-Global.
 * **Ensemble** -- GEFS-driven perturbation members via
   :meth:`~nos_utils.config.ForcingConfig.for_ensemble`.
@@ -100,6 +101,7 @@ Documentation contents
 
    installation
    usage
+   ufs_coastal
    notebooks
    api/index
    contributing
