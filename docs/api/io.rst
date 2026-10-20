@@ -2,8 +2,7 @@ I/O Utilities
 =============
 
 .. automodule:: nos_utils.io
-   :members:
-   :undoc-members:
+   :no-members:
 
 GRIB2 extraction
 -----------------

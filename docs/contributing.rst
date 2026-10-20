@@ -19,7 +19,7 @@ whole suite runs in a few seconds.
 
 .. code-block:: bash
 
-   pytest tests/ -q                    # full suite (206 tests)
+   pytest tests/ -q                    # full suite
    pytest tests/ -q -k gfs             # only GFS tests
    pytest tests/ -q -k stofs           # only STOFS-3D-ATL tests
    pytest --cov=nos_utils --cov-report=html
@@ -42,9 +42,9 @@ Adding a new processor
 ----------------------
 
 1. Create ``nos_utils/forcing/my_processor.py`` subclassing
-   :class:`~nos_utils.forcing.ForcingProcessor`.
+   :class:`~nos_utils.forcing.base.ForcingProcessor`.
 2. Implement ``process()`` and return a
-   :class:`~nos_utils.forcing.ForcingResult` -- populate ``success``,
+   :class:`~nos_utils.forcing.base.ForcingResult` -- populate ``success``,
    ``output_files``, ``metadata``, and ``errors``.
 3. Export it from ``nos_utils/forcing/__init__.py`` and add it to
    ``__all__``.

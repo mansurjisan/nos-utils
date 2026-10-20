@@ -76,11 +76,11 @@ and then reused every cycle.
 Expected files (SECOFS, in ``$FIXofs``):
 
 * ``secofs.obc_ssh_weights.npz`` -- 1488 boundary nodes, global RTOFS 2D
-  (3298x4500). Used by :class:`~nos_utils.forcing.RTOFSProcessor` for SSH.
+  (3298x4500). Used by :class:`~nos_utils.forcing.rtofs.RTOFSProcessor` for SSH.
 * ``secofs.obc_3d_weights.npz`` -- 1488 boundary nodes, regional RTOFS 3D
   (e.g. US_east 1710x742). Used for T, S, and UV boundary interpolation.
 * ``secofs.obc_nudge_weights.npz`` -- ~32K interior nodes. Used by
-  :class:`~nos_utils.forcing.NudgingProcessor` for ``TEM_nu.nc`` and
+  :class:`~nos_utils.forcing.nudging.NudgingProcessor` for ``TEM_nu.nc`` and
   ``SAL_nu.nc``.
 
 Generating the weight files
