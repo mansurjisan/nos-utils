@@ -29,7 +29,7 @@ config = ForcingConfig.for_secofs(pdy="20260324", cyc=12)
 result = GFSProcessor(config, input_path="/data/gfs", output_path="/work/sflux").process()
 ```
 
-A prep cycle runs through `PrepOrchestrator(config, paths, skip_legacy=False)`, which nos-workflow reaches via `nco_bridge.run_prep(skip_legacy=False)`. The `nos-utils prep` CLI (see `nos-utils --help`) keeps the default `skip_legacy=True`, which skips the SECOFS RTOFS, NWM and nudging steps.
+A prep cycle runs through `PrepOrchestrator(config, paths, skip_legacy=False)`, which nos-workflow reaches via `nco_bridge.run_prep(skip_legacy=False)`. The `nos-utils prep` CLI (see `nos-utils --help`) keeps the default `skip_legacy=True`, which skips the SECOFS RTOFS and NWM steps.
 
 ## Main modules
 

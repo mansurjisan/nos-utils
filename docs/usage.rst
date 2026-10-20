@@ -32,10 +32,10 @@ concurrent thread access on large reads.
    result = orch.run(phase="nowcast")
    print(result.summary())
 
-With the default ``skip_legacy=True`` the RTOFS, NWM and nudging steps are
+With the default ``skip_legacy=True`` the RTOFS and NWM steps are
 skipped for SECOFS (they were handled by the legacy shell scripts). Pass
 ``skip_legacy=False`` to run them in Python; the same
-flag is available as :func:`nos_utils.nco_bridge.run_prep`\ ``(skip_legacy=False)``,
+flag is available as ``run_prep(skip_legacy=False)`` (:func:`nos_utils.nco_bridge.run_prep`),
 which nos-workflow calls. The ``nos-utils prep`` CLI
 does not set it, so for SECOFS it skips those steps.
 
@@ -189,8 +189,8 @@ NWM river forcing
    result = nwm.process()
 
 For the STOFS domain this assembles 121 ``medium_range_mem1`` files into
-``vsource.th`` / ``msource.th`` / ``source_sink.in``. SECOFS has no matching
-NWM reaches; it runs ``NWMProcessor`` with the ``analysis_assim`` product.
+``vsource.th`` / ``msource.th`` / ``source_sink.in``. SECOFS runs
+``NWMProcessor`` with the ``analysis_assim`` product.
 :class:`~nos_utils.forcing.river_clim.RiverClimProcessor` (USGS daily
 climatology) is available as a separate processor but the orchestrator does
 not call it.

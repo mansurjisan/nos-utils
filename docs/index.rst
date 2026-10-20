@@ -42,8 +42,7 @@ Key features
 * **UFS-Coastal support** -- ESMF mesh, HRRR/GFS blender, DATM writer, and
   generation of the UFS configuration files, including the WW3 boundary
   spectra (``nest.ww3``) from GFS-Wave.
-* **ADCIRC support** -- GFS to OWI NetCDF meteorology for STOFS-2D-Global
-  (the ``adcirc_tides`` module also provides nodal-factor routines).
+* **ADCIRC support** -- GFS to OWI NetCDF meteorology for STOFS-2D-Global.
 * **Ensemble** -- GEFS-driven perturbation members via
   :meth:`~nos_utils.config.ForcingConfig.for_ensemble`.
 * **Post-processing** -- the ``nos_utils.post`` subpackage writes the
@@ -88,7 +87,7 @@ CLI:
 
    nos-utils list   # show available OFS factories and processors
 
-The ``skip_legacy`` default (``True``) skips the RTOFS, NWM and nudging steps
+The ``skip_legacy`` default (``True``) skips the RTOFS and NWM steps
 for SECOFS, and the CLI does not change it. Use ``skip_legacy=False`` in
 Python (nos-workflow calls ``nco_bridge.run_prep(skip_legacy=False)``) to run them.
 
