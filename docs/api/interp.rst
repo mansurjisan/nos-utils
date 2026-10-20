@@ -2,8 +2,7 @@ Interpolation
 =============
 
 .. automodule:: nos_utils.interp
-   :members:
-   :undoc-members:
+   :no-members:
 
 Overview
 --------
@@ -30,7 +29,7 @@ There are two steps:
 
 1. **One-time build** (offline, after any grid change): run the Fortran
    prep once with ``NOS_EXPORT_WEIGHTS=YES`` to dump ``*_remesh_export.txt``
-   text files, then convert them to NPZ using :func:`build_ssh_npz`,
+   text files, then convert them to NPZ using :func:`build_npz`,
    :func:`build_nudge_npz`, or :func:`build_3d_npz`. The NPZ is committed
    to the FIX directory and keyed to the RTOFS grid via an MD5 checksum.
 
@@ -48,12 +47,12 @@ Example
    import numpy as np
    from pathlib import Path
    from nos_utils.interp.precomputed_weights import (
-       build_ssh_npz,
+       build_npz,
        apply_precomputed_ssh,
    )
 
    # --- One-time build (offline) ---
-   build_ssh_npz(
+   build_npz(
        export_txt=Path("obc_ssh_remesh_export.txt"),
        rtofs_lon_2d=rtofs_lon,  # (ny, nx) from rtofs_glo_2ds
        rtofs_lat_2d=rtofs_lat,

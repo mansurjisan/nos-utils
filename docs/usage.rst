@@ -50,8 +50,8 @@ in the config:
 
 The STOFS factory pre-configures GFS 0.25 deg resolution, a separate HRRR
 domain, RTOFS ROI indices for both OBC and nudging, ADT satellite SSH
-blending, interior T/S nudging, and the NWM ``medium_range_mem1`` product
-with 121 target files.
+blending, dynamic SSH adjustment, St. Lawrence River forcing, interior T/S
+nudging, and the NWM ``medium_range_mem1`` product with 121 target files.
 
 Configuration
 -------------
@@ -70,11 +70,14 @@ create preconfigured instances:
    # SECOFS with UFS-Coastal DATM coupling (nws=4)
    config = ForcingConfig.for_secofs_ufs(pdy="20260406", cyc=0)
 
-   # STOFS-3D-ATL (24h nowcast / 108h forecast, ADT blending, nudging)
+   # STOFS-3D-ATL (24h nowcast / 96h forecast, ADT blending, nudging)
    config = ForcingConfig.for_stofs_3d_atl(pdy="20260406", cyc=0)
 
    # STOFS-3D-ATL + UFS-Coastal DATM
    config = ForcingConfig.for_stofs_3d_atl_ufs(pdy="20260406", cyc=0)
+
+   # STOFS-2D-Global (ADCIRC; GFS 0.25 deg, nws=14)
+   config = ForcingConfig.for_stofs_2d_glo(pdy="20260406", cyc=0)
 
    # Ensemble member (GEFS-driven; member 0 = control, met_num=2)
    config = ForcingConfig.for_ensemble(pdy="20260406", cyc=0, member=3)
@@ -109,33 +112,42 @@ Each processor follows a consistent pattern:
 
 Available processors (imported from :mod:`nos_utils.forcing`):
 
-======================  ==========================================================
-Processor               Responsibility
-======================  ==========================================================
-``GFSProcessor``        GFS GRIB2 -> ``sflux_air_1/rad_1/prc_1.*.nc``
-``HRRRProcessor``       HRRR GRIB2 -> ``sflux_air_2/rad_2/prc_2.*.nc``
-``GEFSProcessor``       GEFS ensemble GRIB2 -> sflux per member
-``RTOFSProcessor``      RTOFS NetCDF -> ``elev2D``, ``TEM_3D``, ``SAL_3D``, ``uv3D`` + ``obc.tar``
-``NWMProcessor``        NWM channel_rt -> ``vsource.th``, ``msource.th``, ``source_sink.in``
-``RiverClimProcessor``  USGS climatology fallback for rivers
-``TidalProcessor``      bctides.in generation (calls Fortran ``tide_fac`` exe when available)
-``NudgingProcessor``    ``TEM_nu.nc``, ``SAL_nu.nc`` interior nudging
-``ParamNmlProcessor``   ``param.nml`` from template with runtime substitution
-``HotstartProcessor``   Locate and validate restart file; extract ``time_hotstart``
-``PartitionProcessor``  ``partition.prop`` for MPI domain decomposition
-``ESMFMeshProcessor``   ESMF mesh for UFS-Coastal DATM coupling
-``BlenderProcessor``    HRRR+GFS Delaunay blending -> ``datm_forcing.nc``
-``SfluxWriter``         SCHISM sflux NetCDF writer (``nws=2``)
-``DATMWriter``          UFS-Coastal DATM NetCDF writer (``nws=4``)
-======================  ==========================================================
+============================  ==========================================================
+Processor                     Responsibility
+============================  ==========================================================
+``GFSProcessor``              GFS GRIB2 -> ``sflux_air_1/rad_1/prc_1.*.nc``
+``HRRRProcessor``             HRRR GRIB2 -> ``sflux_air_2/rad_2/prc_2.*.nc``
+``GEFSProcessor``             GEFS ensemble GRIB2 -> sflux per member
+``RTOFSProcessor``            RTOFS NetCDF -> ``elev2D``, ``TEM_3D``, ``SAL_3D``, ``uv3D`` + ``obc.tar``
+``NWMProcessor``              NWM channel_rt -> ``vsource.th``, ``msource.th``, ``source_sink.in``
+``RiverClimProcessor``        USGS climatology fallback for rivers
+``StLawrenceProcessor``       St. Lawrence River ``flux.th`` (STOFS-3D-ATL)
+``DynamicAdjustProcessor``    SSH boundary correction from tide-gauge observations
+``TidalProcessor``            bctides.in generation (calls Fortran ``tide_fac`` exe when available)
+``NudgingProcessor``          ``TEM_nu.nc``, ``SAL_nu.nc`` interior nudging
+``ParamNmlProcessor``         ``param.nml`` from template with runtime substitution
+``HotstartProcessor``         Locate and validate restart file; extract ``time_hotstart``
+``PartitionProcessor``        ``partition.prop`` for MPI domain decomposition
+``ESMFMeshProcessor``         ESMF mesh for UFS-Coastal DATM coupling
+``BlenderProcessor``          HRRR+GFS Delaunay blending -> ``datm_forcing.nc``
+``UFSConfigProcessor``        UFS-Coastal ``model_configure``, ``datm_in``, ``ufs.configure``, ...
+``SfluxWriter``               SCHISM sflux NetCDF writer (``nws=2``)
+``DATMWriter``                UFS-Coastal DATM NetCDF writer (``nws=4``)
+============================  ==========================================================
+
+``WaveBoundaryProcessor`` (GFS-Wave spectra to the WW3 ``nest.ww3`` boundary) is
+imported from :mod:`nos_utils.forcing.wave_boundary`. The ADCIRC modules
+(:mod:`nos_utils.forcing.adcirc_met`, :mod:`nos_utils.forcing.adcirc_tides`)
+are function-based and are listed under the API reference.
 
 RTOFS with precomputed weights and ADT blending
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-:class:`~nos_utils.forcing.RTOFSProcessor` will automatically pick up
-precomputed INTERP_REMESH weights from the FIX directory if they are
-present, falling back to on-the-fly Delaunay otherwise. The weights give
-Fortran-equivalent results (SSH RMSE = 0.5 mm vs the operational Fortran).
+When run through :class:`~nos_utils.orchestrator.PrepOrchestrator`, the SSH
+open boundary uses precomputed INTERP_REMESH weights from the FIX directory
+if they are present (``*.obc_ssh_weights.npz``) and falls back to on-the-fly
+Delaunay interpolation otherwise. For SECOFS the weights reproduce the
+operational Fortran SSH boundary to a 0.5 mm RMSE.
 
 .. code-block:: python
 
@@ -145,11 +157,13 @@ Fortran-equivalent results (SSH RMSE = 0.5 mm vs the operational Fortran).
        config=config,
        input_path="/data/rtofs",
        output_path="/work/secofs/obc",
-       fix_path="/path/to/fix/secofs",
+       grid_file="/path/to/fix/secofs/secofs.hgrid.ll",
+       obc_ctl_file="/path/to/fix/secofs/secofs.obc.ctl",
+       vgrid_file="/path/to/fix/secofs/secofs.vgrid.in",
    )
    result = rtofs.process()
-   # ADT blending runs automatically when config.adt_enabled is True
-   # and the ADT data + fix weights are available.
+   # ADT blending runs when config.adt_enabled is True and the ADT data
+   # and weight file are available.
 
 NWM river forcing
 ~~~~~~~~~~~~~~~~~
@@ -182,12 +196,11 @@ Interior nudging
        config=config,
        input_path="/data/rtofs",
        output_path="/work/secofs",
-       fix_path="/path/to/fix/secofs",
+       nudge_weight_file="/path/to/fix/secofs/secofs.nudge.gr3",
    )
    result = nudge.process()
 
-The nudging processor reads the ~32K interior-node weight file
-(``secofs.obc_nudge_weights.npz``) and writes ``TEM_nu.nc`` and
+The nudging processor reads the interior-node nudge weights and writes ``TEM_nu.nc`` and
 ``SAL_nu.nc`` with a configurable relaxation timescale
 (``config.nudging_timescale_seconds``, default 86400 s).
 

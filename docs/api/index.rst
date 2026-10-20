@@ -5,7 +5,9 @@ API Reference
    :maxdepth: 2
 
    config
+   coords
    forcing
+   post
    interp
    io
    orchestrator

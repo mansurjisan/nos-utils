@@ -33,7 +33,9 @@ autodoc_default_options = {
     "show-inheritance": True,
 }
 autodoc_member_order = "bysource"
-autodoc_mock_imports = ["numpy", "netCDF4", "scipy", "cfgrib", "xarray", "nco", "cdo"]
+# numpy is a core dependency and is installed on Read the Docs; mocking it breaks
+# module-level numpy arithmetic in forcing.nudge_ops. MJ (10/19/26)
+autodoc_mock_imports = ["netCDF4", "scipy", "cfgrib", "xarray", "nco", "cdo"]
 
 # Suppress duplicate object warnings from dataclass fields re-exported via __init__
 suppress_warnings = ["duplicate.object.description"]
