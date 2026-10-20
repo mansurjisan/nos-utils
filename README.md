@@ -48,18 +48,18 @@ Other packages: `nos_utils.interp` (structured and precomputed-weight interpolat
 
 ## UFS-Coastal files
 
-For the DATM-coupled configurations (`nws=4`), prep also writes the UFS-Coastal inputs, so a coupled run needs no hand-made configuration files:
+For DATM-coupled (`nws=4`) configurations, prep also renders the per-cycle UFS-Coastal inputs from the templates and fix files staged in `$FIXofs`:
 
 | File | Module | What it holds |
 |---|---|---|
-| `datm_forcing.nc` | `blender`, `datm_writer` | GFS, or HRRR blended over GFS, on a regular lat/lon grid for CDEPS DATM |
+| `datm_forcing.nc` | `blender` | GFS, or HRRR blended over GFS, on a regular lat/lon grid for CDEPS DATM |
 | `datm_esmf_mesh.nc` | `esmf_mesh` | ESMF unstructured mesh of that grid |
-| `model_configure`, `datm_in`, `datm.streams` | `ufs_config` | Filled from `$FIXofs` templates: run start (cycle minus nowcast length), run length, DATM grid size and file names |
-| `ufs.configure` | `ufs_config` | PET bounds set from the resource layout (ATM, OCN, and WAV for WW3); `runSeq` coupling interval set to the SCHISM time step, or for WW3 a configured multiple of it |
+| `model_configure`, `datm_in`, `datm.streams` | `ufs_config` | From the `*.template` files: start time and length of the phase being prepped, `dt_atmos`, DATM grid size and file names |
+| `ufs.configure` | `ufs_config` | From `$FIXofs`, with the PET bounds set from the resource layout (MED, ATM, OCN, and WAV when wave tasks are set) and the `runSeq` coupling interval set to the SCHISM time step or a configured multiple of it |
 | `fd_ufs.yaml`, `noahmptable.tbl` | `ufs_config` | Copied from `$FIXofs` |
-| `nest.ww3` | `wave_boundary` | WW3 boundary spectra from the GFS-Wave point spectra, through `ww3_bound` (DATM+SCHISM+WW3) |
+| `nest.ww3` | `wave_boundary` | WW3 boundary spectra from the GFS-Wave point spectra, through `ww3_bound`, when waves are enabled and `$COMINgfswave` is set |
 
-All components share one start time (cycle minus nowcast length), which keeps the CMEPS clock of DATM, SCHISM and WW3 in step.
+`model_configure` uses the same start time as `param.nml` and `bctides.in` (cycle minus nowcast length), which keeps the CMEPS clock in step with SCHISM.
 
 ## Disclaimer
 
