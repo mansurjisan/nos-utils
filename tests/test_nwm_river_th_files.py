@@ -61,6 +61,31 @@ REACH_ID FLAG
 {COOPER_FEATURE_ID} 1
 """
 
+# The actual ops SECOFS shape: a single Section-1 station (Savannah) with
+# its 6-node Section-2 column, mapped 1-1 against a reach.dat trimmed to
+# one reach -- unlike RIVER_CTL_TEXT/REACH_DAT_TEXT above, which are a
+# synthetic 2-station fixture that never exercises this shipped pairing.
+RIVER_CTL_TEXT_ONE_STATION = """\
+Section 1: USGS river stations
+6 1 1.0    !! NIJ NRIVERS DELT
+RiverID StationID NWS_ID Agency Q_min Q_max Q_mean T_min T_max T_mean Name
+1 02198500 SAVGA1 USGS 10.0 500.0 65.0 5.0 25.0 15.0 "Savannah River at Clyo"
+Section 2: Grid node mappings
+GRID_ID NODE_ID ELE_ID DIR FLAG RiverID_Q Q_Scale RiverID_T T_Scale Name
+1 1001 1 1 3 1 0.1667 1 1.0 "Savannah 1"
+2 1002 1 1 3 1 0.1667 1 1.0 "Savannah 2"
+3 1003 1 1 3 1 0.1667 1 1.0 "Savannah 3"
+4 1004 1 1 3 1 0.1667 1 1.0 "Savannah 4"
+5 1005 1 1 3 1 0.1667 1 1.0 "Savannah 5"
+6 1006 1 1 3 1 0.1667 1 1.0 "Savannah 6"
+"""
+
+REACH_DAT_TEXT_ONE = f"""\
+REACH_ID FLAG
+1
+{SAVANNAH_FEATURE_ID} 1
+"""
+
 
 def _write_channel_rt(path: Path, feature_ids, flows, valid_time: datetime) -> Path:
     """Write a minimal NWM channel_rt netCDF the extractor can read.
@@ -320,24 +345,13 @@ class TestBoundaryRiverNWMOverlay:
         assert rows[:, 1:].std(axis=0).max() == pytest.approx(0.0, abs=1e-9)
 
     def test_fallback_when_station_count_mismatches_reach_file(self, tmp_path, caplog):
-        """river.ctl declares 1 station but the reach file lists 2 reaches
-        (the shape of the current ops SECOFS FIX pair) -> mapping is
-        distrusted: constant climatology for every column plus a mismatch
-        warning, never a positional guess."""
-        one_station_ctl = """\
-Section 1: USGS river stations
-6 1 1.0    !! NIJ NRIVERS DELT
-RiverID StationID NWS_ID Agency Q_min Q_max Q_mean T_min T_max T_mean Name
-1 02198500 SAVGA1 USGS 10.0 500.0 65.0 5.0 25.0 15.0 "Savannah River at Clyo"
-Section 2: Grid node mappings
-GRID_ID NODE_ID ELE_ID DIR FLAG RiverID_Q Q_Scale RiverID_T T_Scale Name
-1 1001 1 1 3 1 0.1667 1 1.0 "Savannah 1"
-2 1002 1 1 3 1 0.1667 1 1.0 "Savannah 2"
-3 1003 1 1 3 1 0.1667 1 1.0 "Savannah 3"
-4 1004 1 1 3 1 0.1667 1 1.0 "Savannah 4"
-5 1005 1 1 3 1 0.1667 1 1.0 "Savannah 5"
-6 1006 1 1 3 1 0.1667 1 1.0 "Savannah 6"
-"""
+        """river.ctl declares 1 station but the reach file lists 2 reaches.
+        The real deploy is a 1-1 pair (see
+        test_flow_is_time_varying_for_real_secofs_one_station_one_reach_pair
+        below) -- this only guards against accidental FIX drift (e.g. an
+        un-trimmed reach.dat shipped alongside a trimmed river.ctl): mapping
+        must be distrusted, constant climatology for every column plus a
+        mismatch warning, never a positional guess."""
         proc = _make_proc(tmp_path)
         (tmp_path / "nwm.reach.dat").write_text(REACH_DAT_TEXT)  # 2 reaches
 
@@ -346,7 +360,7 @@ GRID_ID NODE_ID ELE_ID DIR FLAG RiverID_Q Q_Scale RiverID_T T_Scale Name
         flows = [50.0 + 10 * h for h in range(n_hours + 1)]
         _stage_analysis_files(tmp_path, start, n_hours, flows, flows)
 
-        ctl_cfg = RiverConfig._parse_river_ctl(one_station_ctl)
+        ctl_cfg = RiverConfig._parse_river_ctl(RIVER_CTL_TEXT_ONE_STATION)
         assert ctl_cfg.n_rivers == 6
         nwm_files = proc.find_input_files()
 
@@ -359,6 +373,47 @@ GRID_ID NODE_ID ELE_ID DIR FLAG RiverID_Q Q_Scale RiverID_T T_Scale Name
         rows = np.array([[float(v) for v in line.split()] for line in flux_lines])
         assert rows[:, 1:].std(axis=0).max() == pytest.approx(0.0, abs=1e-9)
         assert rows[0, 1] == pytest.approx(-(65.0 * Q_SCALE), abs=0.02)
+
+    def test_flow_is_time_varying_for_real_secofs_one_station_one_reach_pair(self, tmp_path):
+        """The actual ops SECOFS shape: 1 Section-1 station (Savannah)
+        mapped 1-1 against a reach.dat trimmed to 1 reach -- unlike
+        test_flow_is_time_varying_when_reach_mapped_and_covered above
+        (synthetic 2-station ctl), this is the pair that is actually
+        shipped in production. The overlay must be active: schism_flux.th
+        time-varying on all 6 Savannah columns, tracking the staged
+        real-time NWM values."""
+        proc = _make_proc(tmp_path)
+        (tmp_path / "nwm.reach.dat").write_text(REACH_DAT_TEXT_ONE)
+
+        start = proc._phase_start_time()
+        n_hours = 7
+        savannah_flows = [50.0 + 10 * h for h in range(n_hours + 1)]
+        cooper_flows = [40.0 + 2 * h for h in range(n_hours + 1)]  # unmapped, ignored
+        _stage_analysis_files(tmp_path, start, n_hours, savannah_flows, cooper_flows)
+
+        ctl_cfg = RiverConfig._parse_river_ctl(RIVER_CTL_TEXT_ONE_STATION)
+        assert ctl_cfg.n_rivers == 6
+        nwm_files = proc.find_input_files()
+        assert nwm_files, "expected staged analysis_assim files to be found"
+
+        out_files = proc._write_river_th_files([], ctl_cfg, nwm_files)
+        assert len(out_files) == 3
+
+        flux_lines = (tmp_path / "out" / "schism_flux.th").read_text().strip().splitlines()
+        rows = np.array([[float(v) for v in line.split()] for line in flux_lines])
+        q_cols = rows[:, 1:]
+        assert q_cols.shape[1] == 6
+
+        assert q_cols.std(axis=0).min() > 1e-3, \
+            "one or more Savannah columns are flat (still climatology)"
+        old_climatology_value = -(65.0 * Q_SCALE)
+        assert q_cols[0, 0] != pytest.approx(old_climatology_value, abs=0.02)
+
+        dt = 120.0  # ForcingConfig.schism_dt default
+        for h in (0, 3, 7):
+            r = int(h * 3600 / dt)
+            expected = -(savannah_flows[h] * Q_SCALE)
+            assert q_cols[r, :] == pytest.approx([expected] * 6, abs=0.02)
 
     def test_flag_zero_first_reach_keeps_later_station_aligned(self, tmp_path, caplog):
         """A flag=0 first row must keep its positional slot (Fortran Ius
@@ -458,3 +513,44 @@ GRID_ID NODE_ID ELE_ID DIR FLAG RiverID_Q Q_Scale RiverID_T T_Scale Name
         assert rows[r2, 1] == pytest.approx(-(savannah_flows[2] * Q_SCALE), abs=0.02)
         # Cooper unaffected at that hour.
         assert rows[r3, 7] == pytest.approx(-(cooper_flows[3] * Q_SCALE), abs=0.02)
+
+
+class TestFindNwmReachFileConfiguredPath:
+    """ForcingConfig.nwm_reach_file (river.files.nwm_reach) wiring into
+    _find_nwm_reach_file."""
+
+    def test_configured_absolute_path_is_used_not_basename_search(self, tmp_path):
+        """A configured path must win over the hardcoded-basename search,
+        even when a basename candidate also exists on disk."""
+        proc = _make_proc(tmp_path)
+        (tmp_path / "nwm.reach.dat").write_text(REACH_DAT_TEXT)  # decoy basename match
+        alt_dir = tmp_path / "alt_fix"
+        alt_dir.mkdir()
+        configured = alt_dir / "custom_reach_map.dat"
+        configured.write_text(REACH_DAT_TEXT_ONE)
+        proc.config.nwm_reach_file = configured
+
+        assert proc._find_nwm_reach_file() == configured
+
+    def test_unset_field_falls_back_to_basename_search(self, tmp_path):
+        """No nwm_reach_file configured -> existing hardcoded-basename
+        search behavior is preserved."""
+        proc = _make_proc(tmp_path)
+        assert proc.config.nwm_reach_file is None
+        (tmp_path / "nwm.reach.dat").write_text(REACH_DAT_TEXT)
+
+        assert proc._find_nwm_reach_file() == tmp_path / "nwm.reach.dat"
+
+    def test_configured_path_missing_does_not_fall_back(self, tmp_path, caplog):
+        """A configured path that doesn't exist must not silently fall back
+        to the basename search -- an operator's typo should surface as a
+        missing reach map (climatology fallback upstream), not accidentally
+        resolve to an unrelated FIX file."""
+        proc = _make_proc(tmp_path)
+        (tmp_path / "nwm.reach.dat").write_text(REACH_DAT_TEXT)  # would match basename search
+        proc.config.nwm_reach_file = tmp_path / "does_not_exist.dat"
+
+        with caplog.at_level(logging.WARNING):
+            found = proc._find_nwm_reach_file()
+        assert found is None
+        assert any("river.files.nwm_reach" in r.message for r in caplog.records)
