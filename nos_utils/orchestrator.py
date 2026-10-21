@@ -23,6 +23,7 @@ Usage::
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -33,6 +34,35 @@ from .config import ForcingConfig
 from .forcing.base import ForcingResult
 
 log = logging.getLogger(__name__)
+
+
+def _phase1_workers(n_tasks: int) -> int:
+    """Phase 1 thread count: NOS_PREP_WORKERS wins, else 1 when netCDF4 >= 1.6."""
+    raw = os.environ.get("NOS_PREP_WORKERS", "").strip()
+    if raw:
+        try:
+            n = int(raw)
+            if n < 1:
+                raise ValueError(raw)
+            log.info(f"Phase 1 workers={min(n, n_tasks)} (NOS_PREP_WORKERS={raw})")
+            return min(n, n_tasks)
+        except ValueError:
+            log.warning(f"Invalid NOS_PREP_WORKERS={raw!r}; using netCDF4 version default")
+    try:
+        import netCDF4
+        ver = netCDF4.__version__
+        mm = tuple(int(x) for x in re.match(r"(\d+)\.(\d+)", ver).groups())
+        threaded_ok = mm < (1, 6)
+    except Exception:
+        ver, threaded_ok = None, True
+    if threaded_ok:
+        log.info(f"Phase 1 parallel: netCDF4 {ver or 'unavailable'} holds the GIL around HDF5")
+        return n_tasks
+    log.info(
+        f"Phase 1 sequential: netCDF4 {ver} releases the GIL around "
+        "non-thread-safe HDF5; set NOS_PREP_WORKERS to override"
+    )
+    return 1
 
 
 @dataclass
@@ -245,7 +275,7 @@ class PrepOrchestrator:
         if parallel_tasks:
             log.info(f"Running {len(parallel_tasks)} steps in parallel: "
                      f"{', '.join(parallel_tasks.keys())}")
-            with ThreadPoolExecutor(max_workers=len(parallel_tasks)) as pool:
+            with ThreadPoolExecutor(max_workers=_phase1_workers(len(parallel_tasks))) as pool:
                 futures = {pool.submit(fn): name for name, fn in parallel_tasks.items()}
                 for future in as_completed(futures):
                     name = futures[future]
