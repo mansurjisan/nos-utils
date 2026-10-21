@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 
 
 def _phase1_workers(n_tasks: int) -> int:
-    """Phase 1 thread count: NOS_PREP_WORKERS wins, else 1 when netCDF4 >= 1.6."""
+    """Phase 1 thread count: NOS_PREP_WORKERS wins, else 1 when netCDF4 >= 1.6.  MJ (10/21/26)"""
     raw = os.environ.get("NOS_PREP_WORKERS", "").strip()
     if raw:
         try:
@@ -50,11 +50,14 @@ def _phase1_workers(n_tasks: int) -> int:
             log.warning(f"Invalid NOS_PREP_WORKERS={raw!r}; using netCDF4 version default")
     try:
         import netCDF4
-        ver = netCDF4.__version__
-        mm = tuple(int(x) for x in re.match(r"(\d+)\.(\d+)", ver).groups())
-        threaded_ok = mm < (1, 6)
-    except Exception:
+    except ImportError:
         ver, threaded_ok = None, True
+    else:
+        ver = netCDF4.__version__
+        try:
+            threaded_ok = tuple(int(x) for x in re.match(r"(\d+)\.(\d+)", ver).groups()) < (1, 6)
+        except (AttributeError, ValueError):
+            threaded_ok = False
     if threaded_ok:
         log.info(f"Phase 1 parallel: netCDF4 {ver or 'unavailable'} holds the GIL around HDF5")
         return n_tasks
@@ -273,9 +276,11 @@ class PrepOrchestrator:
         parallel_tasks["TIDAL"] = lambda: self._run_tidal(output_dir, phase, time_hotstart)
 
         if parallel_tasks:
-            log.info(f"Running {len(parallel_tasks)} steps in parallel: "
+            workers = _phase1_workers(len(parallel_tasks))
+            log.info(f"Running {len(parallel_tasks)} steps with {workers} worker(s)"
+                     f"{' (sequential)' if workers == 1 else ''}: "
                      f"{', '.join(parallel_tasks.keys())}")
-            with ThreadPoolExecutor(max_workers=_phase1_workers(len(parallel_tasks))) as pool:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {pool.submit(fn): name for name, fn in parallel_tasks.items()}
                 for future in as_completed(futures):
                     name = futures[future]
