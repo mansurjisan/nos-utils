@@ -91,7 +91,9 @@ Key features
 * **Precomputed INTERP_REMESH weights** -- The Fortran triangulation is
   exported once and replayed every cycle as NumPy gather operations.
 * **Parallel Phase 1 prep** -- GFS, HRRR, NWM and tidal processors run
-  concurrently via ``ThreadPoolExecutor``; the heavy NetCDF work for RTOFS
+  concurrently via ``ThreadPoolExecutor`` only with netCDF4 < 1.6 or when
+  ``NOS_PREP_WORKERS`` is set (netCDF4 >= 1.6 runs them sequentially, HDF5 is
+  not thread-safe); the heavy NetCDF work for RTOFS
   and nudging runs sequentially in Phase 2.
 * **Interior T/S nudging** -- ``TEM_nu.nc`` and ``SAL_nu.nc`` from precomputed
   nudge weights.
