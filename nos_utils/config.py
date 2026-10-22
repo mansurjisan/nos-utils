@@ -248,6 +248,10 @@ class ForcingConfig:
     nudging_dt: float = 21600.0
     # Apply 2-step temporal moving average to nudging fields.
     nudging_time_smoothing: bool = False
+    # Surface restore enabled and smoothing
+    surface_restore_enabled: bool = False
+    surface_restore_time_smoothing: bool = False
+    surface_restore_weight_file: Optional[Path] = None
     # Number of vertical levels
     n_levels: int = 51
     # SCHISM model timestep (seconds) used to write the elev2D.th.nc
@@ -728,6 +732,8 @@ class ForcingConfig:
             obc_roi_2d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
             obc_roi_3d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
             nudge_roi_3d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
+            surface_restore_enabled=True,
+            surface_restore_time_smoothing=True,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -766,6 +772,8 @@ class ForcingConfig:
             obc_roi_2d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
             obc_roi_3d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
             nudge_roi_3d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
+            surface_restore_enabled=True,
+            surface_restore_time_smoothing=True,
             # DATM grid — STOFS3D_PAC preset, verified from weight_gfs.nc
             # nx = round((290.0-92.5)/0.025)+1 = 7901; ny = round((67.0-(-33.5))/0.025)+1 = 4021
             datm_lon_min=92.5, datm_lon_max=290.0,
@@ -1071,6 +1079,12 @@ class ForcingConfig:
         kwargs["obc_time_smoothing"] = _strict_bool(obc.get("time_smoothing"), "obc.time_smoothing", False)
         kwargs["nudging_dt"] = float(nudge.get("dt", kwargs["obc_dt"]))
         kwargs["nudging_time_smoothing"] = _strict_bool(nudge.get("time_smoothing"), "nudging.time_smoothing", False)
+
+        surf_res = ocean.get("surface_restore", {}) if isinstance(ocean, dict) else {}
+        kwargs["surface_restore_enabled"] = _strict_bool(surf_res.get("enabled"), "ocean.surface_restore.enabled", False)
+        kwargs["surface_restore_time_smoothing"] = _strict_bool(surf_res.get("time_smoothing"), "ocean.surface_restore.time_smoothing", False)
+        if surf_res.get("weight_file"):
+            kwargs["surface_restore_weight_file"] = Path(surf_res["weight_file"])
 
         # NWM target counts
         if isinstance(river, dict):
