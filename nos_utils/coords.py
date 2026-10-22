@@ -71,6 +71,27 @@ def normalize_lon(
     return lon
 
 
+def shift_grid_0360(
+    lon: np.ndarray, data: "Optional[np.ndarray]" = None, lon_axis: int = -1
+) -> "Tuple[np.ndarray, Optional[np.ndarray]]":
+    """Shift a [-180, 180] grid and optional data array to [0, 360].
+    
+    Useful for stitching global [-180, 180] fields (like ADT) across the 
+    antimeridian to match Pacific domain bounds smoothly.
+    """
+    lon = np.asarray(lon)
+    lon_360 = np.where(lon < 0.0, lon + 360.0, lon)
+    
+    sort_idx = np.argsort(lon_360)
+    lon_out = lon_360[sort_idx]
+    
+    if data is not None:
+        data_out = np.take(data, sort_idx, axis=lon_axis)
+        return lon_out, data_out
+        
+    return lon_out, None
+
+
 def lon_convention(config: "object") -> str:
     """Return the longitude convention used by a ``ForcingConfig``.
 

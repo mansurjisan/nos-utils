@@ -62,12 +62,6 @@ except ImportError:
     HAS_NETCDF4 = False
 
 
-# Ops OBC record spacing (stofs_3d_atl_obc_3dth_nc.in dtout) and the ops record count: 23 6-hourly
-# records from the nowcast start, n012 to f120. MJ (10/02/26)
-OPS_OBC_DT = 21600.0
-OPS_MIN_SLOTS = 23
-
-
 def _pack_for_fortran(real, scale, offset, fill, fill_mask=None):
     """
     Pack a float field to float exactly as the Fortran gen_*_hycom expects.
@@ -872,20 +866,23 @@ class RTOFSProcessor(ForcingProcessor):
         return work
 
     def _stofs_subset_roi(self, ds, roi: dict, variables: List[str]) -> dict:
-        """Subset RTOFS NetCDF by ROI indices (replaces NCO ncks -d X,x1,x2 -d Y,y1,y2)."""
-        x1, x2 = roi["x1"], roi["x2"]
-        y1, y2 = roi["y1"], roi["y2"]
+        """
+        Subset RTOFS NetCDF by ROI indices & stride
+        (replaces NCO ncks -d X,x1,x2,i -d Y,y1,y2,j).
+        """
+        x1, x2, x_stride = roi["x1"], roi["x2"], roi.get("x_stride", 1)
+        y1, y2, y_stride = roi["y1"], roi["y2"], roi.get("y_stride", 1)
         result = {}
         for var in variables:
             if var in ds.variables:
                 data = ds.variables[var]
                 ndim = len(data.dimensions)
                 if ndim == 3:  # (time, Y, X)
-                    result[var] = data[:, y1:y2+1, x1:x2+1]
+                    result[var] = data[:, y1:y2+1:y_stride, x1:x2+1:x_stride]
                 elif ndim == 4:  # (time, depth, Y, X)
-                    result[var] = data[:, :, y1:y2+1, x1:x2+1]
+                    result[var] = data[:, :, y1:y2+1:y_stride, x1:x2+1:x_stride]
                 elif ndim == 2:  # (Y, X)
-                    result[var] = data[y1:y2+1, x1:x2+1]
+                    result[var] = data[y1:y2+1:y_stride, x1:x2+1:x_stride]
                 else:
                     result[var] = data[:]
         return result
@@ -1012,16 +1009,28 @@ class RTOFSProcessor(ForcingProcessor):
         all_lat = None
         all_depth = None
 
-        for f in files_3d:
+        # Group files by time if they are split daily files
+        is_split = getattr(self.config, "rtofs_daily_3z", False)
+        if is_split:
+            from itertools import groupby
+            def get_time_key(fp): return fp.name.split('_daily')[0]
+            file_groups = [list(g) for k, g in groupby(sorted(files_3d, key=get_time_key), key=get_time_key)]
+        else:
+            file_groups = [[f] for f in files_3d]
+
+        for group in file_groups:
             try:
-                ds = Dataset(str(f))
+                datasets = [Dataset(str(f)) for f in group]
+                # Merge variables from multiple files into one dictionary
                 subset = self._stofs_subset_roi(
-                    ds, roi,
+                    datasets[0], roi,
                     ["temperature", "salinity", "u", "v", "Longitude", "Latitude"],
                 )
+                for ds in datasets[1:]:
+                    subset.update(self._stofs_subset_roi(ds, roi, ["temperature", "salinity", "u", "v"]))
 
                 if "temperature" not in subset:
-                    ds.close()
+                    for ds in datasets: ds.close()
                     continue
 
                 for t in range(subset["temperature"].shape[0]):
@@ -1037,9 +1046,9 @@ class RTOFSProcessor(ForcingProcessor):
                 if all_depth is None and "Depth" in ds.variables:
                     all_depth = np.array(ds.variables["Depth"][:])
 
-                ds.close()
+                for ds in datasets: ds.close()
             except Exception as e:
-                log.warning(f"Failed to read 3D file {f.name}: {e}")
+                log.warning(f"Failed to read 3D group {group[0].name}: {e}")
 
         if not all_temp:
             return None
@@ -1577,8 +1586,8 @@ class RTOFSProcessor(ForcingProcessor):
         t0 = cycle_dt - timedelta(hours=int(self.config.nowcast_hours))
         span = (cycle_dt - t0).total_seconds() + (
             int(self.config.forecast_hours) + self.buffer_hours) * 3600.0
-        n = max(OPS_MIN_SLOTS, int(np.ceil(span / OPS_OBC_DT)) + 1)
-        return [t0 + timedelta(seconds=OPS_OBC_DT * k) for k in range(n)]
+        n = max(self.config.obc_min_timesteps, int(np.ceil(span / self.config.obc_dt)) + 1)
+        return [t0 + timedelta(seconds=self.config.obc_dt * k) for k in range(n)]
 
     def _ops_candidates(self, date: datetime, kind: str):
         """[(valid time, is_nowcast, path)] of the size-valid 2D or 3D files of one RTOFS cycle date."""
@@ -1587,8 +1596,11 @@ class RTOFSProcessor(ForcingProcessor):
         if kind == "2d":
             globs, floor = ["rtofs_glo_2ds_*_diag.nc"], self.MIN_FILE_SIZE_2D
         else:
-            tag = region if region else "*"
-            globs = [f"rtofs_glo_3dz_*_6hrly_hvr_{tag}.nc", f"rtofs_glo_3dz_*_6hrly_hvr_{tag}.nc4"]
+            if getattr(self.config, "rtofs_daily_3z", False):
+                globs = ["rtofs_glo_3dz_*_daily_3z*io.nc"]
+            else:
+                tag = region if region else "*"
+                globs = [f"rtofs_glo_3dz_*_6hrly_hvr_{tag}.nc", f"rtofs_glo_3dz_*_6hrly_hvr_{tag}.nc4"]
             floor = self._minimum_3d_file_size()
         for d in (self.input_path / f"rtofs.{date_str}", self.input_path / date_str, self.input_path):
             if not d.exists():
@@ -1643,10 +1655,10 @@ class RTOFSProcessor(ForcingProcessor):
             if have and n_prev[kind]:
                 self._select_notes.append(
                     f"RTOFS {kind}: {n_prev[kind]} of {len(have)} slots filled from the previous cycle")
-            miss = [vt for vt in slots[:OPS_MIN_SLOTS] if vt not in picked[kind]] if have else []
+            miss = [vt for vt in slots[:self.config.obc_min_timesteps] if vt not in picked[kind]] if have else []
             if miss:
                 self._select_notes.append(
-                    f"RTOFS {kind}: {len(miss)} of the first {OPS_MIN_SLOTS} 6-hourly slots missing "
+                    f"RTOFS {kind}: {len(miss)} of the first {self.config.obc_min_timesteps} slots missing "
                     f"in both cycles (first {miss[0]:%Y-%m-%d %Hz})")
         for m in self._select_notes:
             log.warning(m)
@@ -2187,6 +2199,12 @@ class RTOFSProcessor(ForcingProcessor):
                 ssh_array, time_axis, model_t0,
             )
 
+            # Apply 2-step temporal moving average if configured
+            if getattr(self.config, "obc_time_smoothing", False) and ssh_array.shape[0] > 1:
+                ssh_array = (ssh_array[:-1] + ssh_array[1:]) / 2.0
+                time_axis = time_axis[:ssh_array.shape[0]]
+                log.info(f"elev2D: applied 2-step temporal smoothing, resulting in {ssh_array.shape[0]} steps")
+
             return self._write_elev2d(ssh_array, time_axis, dt_out)
 
         except Exception as e:
@@ -2245,15 +2263,15 @@ class RTOFSProcessor(ForcingProcessor):
         try:
             off = np.float32(self.config.obc_ssh_offset)
             model_t0, _, dur = self._get_output_window(self.phase)
-            n = int(np.ceil(dur / OPS_OBC_DT)) + 1
+            n = int(np.ceil(dur / self.config.obc_dt)) + 1
             if hold:
                 rows = np.repeat(ops_ssh[:1] + off, n, axis=0)
             else:
                 times = [(self.valid_time(f) - model_t0).total_seconds() for f in files_2d]
-                rows = resample_records(ops_ssh + off, times, OPS_OBC_DT, n)
-            time_axis = np.arange(n, dtype=np.float64) * OPS_OBC_DT
+                rows = resample_records(ops_ssh + off, times, self.config.obc_dt, n)
+            time_axis = np.arange(n, dtype=np.float64) * self.config.obc_dt
             rows, self._wl_bias_info = self._apply_wl_bias(rows, time_axis, model_t0)
-            return self._write_elev2d(rows, time_axis, OPS_OBC_DT)
+            return self._write_elev2d(rows, time_axis, self.config.obc_dt)
         except Exception as e:
             log.error(f"Failed to write ops elev2D: {e}")
             return None
@@ -2775,6 +2793,11 @@ class RTOFSProcessor(ForcingProcessor):
 
             dt = target_dt_3d if len(all_temp) > 1 else rtofs_dt_3d
 
+            if getattr(self.config, "obc_time_smoothing", False) and len(all_temp) > 1:
+                for lst in [all_temp, all_salt]:
+                    arr = np.stack(lst, axis=0)
+                    lst[:] = list((arr[:-1] + arr[1:]) / 2.0)
+
             if all_temp:
                 fpath = self.output_path / "TEM_3D.th.nc"
                 merged = np.stack(all_temp, axis=0)
@@ -2812,26 +2835,26 @@ class RTOFSProcessor(ForcingProcessor):
     def _write_3d_ops(self, files_3d, all_temp, all_salt, all_u, all_v) -> List[Path]:
         """Ops TEM_3D, SAL_3D and uv3D: this phase's slice of the 6-hourly series, time 0 at the phase start."""
         model_t0, _, dur = self._get_output_window(self.phase)
-        n = int(np.ceil(dur / OPS_OBC_DT)) + 1
+        n = int(np.ceil(dur / self.config.obc_dt)) + 1
         times = [(self.valid_time(f) - model_t0).total_seconds() for f in files_3d]
-        if n > 1 and max(times) < (n - 1) * OPS_OBC_DT:
-            self._ops_note(f"T/S/uv: the RTOFS series ends {(n - 1) * OPS_OBC_DT / 3600 - max(times) / 3600:g} h "
+        if n > 1 and max(times) < (n - 1) * self.config.obc_dt:
+            self._ops_note(f"T/S/uv: the RTOFS series ends {(n - 1) * self.config.obc_dt / 3600 - max(times) / 3600:g} h "
                            f"before the {n}-record phase window; the last record is held")
         n_bnd = len(self._bnd_lons)
         out = []
         series = {}
         for name, lst in (("t", all_temp), ("s", all_salt), ("u", all_u), ("v", all_v)):
-            series[name] = resample_records(np.stack(lst), times, OPS_OBC_DT, n)
+            series[name] = resample_records(np.stack(lst), times, self.config.obc_dt, n)
         for fname, key, var, units in (("TEM_3D.th.nc", "t", "temperature", "degC"),
                                        ("SAL_3D.th.nc", "s", "salinity", "PSU")):
             path = self.output_path / fname
-            self._write_3d_th(path, series[key], var, units, OPS_OBC_DT, n_bnd)
+            self._write_3d_th(path, series[key], var, units, self.config.obc_dt, n_bnd)
             out.append(path)
-            log.info(f"Created {fname}: {series[key].shape} at dt={OPS_OBC_DT:g}s")
+            log.info(f"Created {fname}: {series[key].shape} at dt={self.config.obc_dt:g}s")
         path = self.output_path / "uv3D.th.nc"
-        self._write_uv3d_th(path, series["u"], series["v"], OPS_OBC_DT, n_bnd)
+        self._write_uv3d_th(path, series["u"], series["v"], self.config.obc_dt, n_bnd)
         out.append(path)
-        log.info(f"Created uv3D.th.nc: {series['u'].shape} at dt={OPS_OBC_DT:g}s from RTOFS u/v")
+        log.info(f"Created uv3D.th.nc: {series['u'].shape} at dt={self.config.obc_dt:g}s from RTOFS u/v")
         return out
 
     def _interpolate_vertical(

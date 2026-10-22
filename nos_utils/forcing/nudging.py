@@ -323,7 +323,8 @@ class NudgingProcessor(ForcingProcessor):
                 # ncap2 honours only _FillValue; netCDF4's auto-mask would also drop values outside
                 # valid_range. MJ (10/02/26)
                 ds.set_auto_mask(False)
-                ys, xs = slice(roi["y1"], roi["y2"] + 1), slice(roi["x1"], roi["x2"] + 1)
+                ys = slice(roi["y1"], roi["y2"] + 1, roi.get("y_stride", 1))
+                xs = slice(roi["x1"], roi["x2"] + 1, roi.get("x_stride", 1))
                 out = []
                 for nme in ("temperature", "salinity"):
                     v = ds.variables[nme]
@@ -741,17 +742,26 @@ class NudgingProcessor(ForcingProcessor):
         # time records (rare, but the reader supports it), they are
         # treated as consecutive 6h steps starting at the file's stamped
         # forecast hour.
-        rtofs_dt_input = 21600.0
+        rtofs_dt_input = self.config.nudging_dt
 
-        for fi, f in enumerate(files_3d):
+        is_split = getattr(self.config, "rtofs_daily_3z", False)
+        if is_split:
+            from itertools import groupby
+            def get_time_key(fp): return fp.name.split('_daily')[0]
+            file_groups = [list(g) for k, g in groupby(sorted(files_3d, key=get_time_key), key=get_time_key)]
+        else:
+            file_groups = [[f] for f in files_3d]
+
+        for group in file_groups:
             try:
-                ds = Dataset(str(f))
-                lon = ds.variables.get("Longitude") or ds.variables.get("lon")
-                lat = ds.variables.get("Latitude") or ds.variables.get("lat")
-                depth_var = ds.variables.get("Depth") or ds.variables.get("lev")
+                datasets = [Dataset(str(f)) for f in group]
+                ds_main = datasets[0]
+                lon = ds_main.variables.get("Longitude") or ds_main.variables.get("lon")
+                lat = ds_main.variables.get("Latitude") or ds_main.variables.get("lat")
+                depth_var = ds_main.variables.get("Depth") or ds_main.variables.get("lev")
 
                 if lon is None or lat is None:
-                    ds.close()
+                    for ds in datasets: ds.close()
                     continue
 
                 lon_arr = lon[:]
@@ -761,7 +771,7 @@ class NudgingProcessor(ForcingProcessor):
 
                 # File valid time relative to sim_start (model t=0).
                 # Parses the f### or n### tag from the filename.
-                file_t0 = (rtofs_proc.valid_time(f) - sim_start).total_seconds()
+                file_t0 = (rtofs_proc.valid_time(group[0]) - sim_start).total_seconds()
 
                 # Validate precomputed weights grid on first file
                 if use_precomputed and not grid_validated:
@@ -780,14 +790,20 @@ class NudgingProcessor(ForcingProcessor):
                 # stay aligned with ``all_temp`` / ``all_salt``.
                 appended_per_var = {"temperature": 0, "salinity": 0}
 
+                available_vars = {}
+                for ds in datasets:
+                    for v in ["temperature", "salinity"]:
+                        if v in ds.variables:
+                            available_vars[v] = ds.variables[v]
+
                 for var_name, target_list in [
                     ("temperature", all_temp),
                     ("salinity", all_salt),
                 ]:
-                    if var_name not in ds.variables:
+                    if var_name not in available_vars:
                         continue
 
-                    data = ds.variables[var_name][:]
+                    data = available_vars[var_name][:]
                     data = np.ma.filled(data, fill_value=np.nan)
                     data[np.abs(data) >= 99.0] = np.nan
 
@@ -867,9 +883,9 @@ class NudgingProcessor(ForcingProcessor):
                 for k in range(n_appended):
                     all_times.append(file_t0 + k * rtofs_dt_input)
 
-                ds.close()
+                for ds in datasets: ds.close()
             except Exception as e:
-                log.warning(f"Failed to read RTOFS 3D file {f.name}: {e}")
+                log.warning(f"Failed to read RTOFS 3D group {group[0].name}: {e}")
 
         if not all_temp and not all_salt:
             return ForcingResult(
@@ -881,10 +897,10 @@ class NudgingProcessor(ForcingProcessor):
         # ``sim_start`` and ``sim_duration`` were computed above so the
         # per-file valid times in ``all_times`` are already relative to
         # the model t=0 anchor (= cycle - nowcast_hours).
-        target_dt = 10800.0  # 3-hourly output (matches COMF Fortran)
+        target_dt = getattr(self.config, "nudging_dt", 10800.0)
         if self.config.obc_ops_timeline:
-            # step_nu_tr = 21600 s: phase-anchored 6-hourly records, time 0 = phase start. MJ (10/02/26)
-            target_dt = 21600.0
+            # Ops phase-anchored records, time 0 = phase start.
+            target_dt = self.config.nudging_dt
 
         # The output time axis covers [0, sim_duration] at ``target_dt``
         # cadence — i.e. 0, 3h, 6h, ..., nowcast+forecast hours from the
@@ -1039,10 +1055,13 @@ class NudgingProcessor(ForcingProcessor):
             # Subset to valid nodes
             stacked = stacked[:, valid_indices, :]
 
-            # Align the time axis with the data length. The two variables
-            # share ``output_times`` but defensive clipping keeps them
-            # honest if one variable has fewer raw timesteps.
-            times_for_var = output_times[: stacked.shape[0]]
+            # Apply 2-step temporal moving average if configured
+            if getattr(self.config, "nudging_time_smoothing", False) and stacked.shape[0] > 1:
+                stacked = (stacked[:-1] + stacked[1:]) / 2.0
+                times_for_var = output_times[:stacked.shape[0]]
+                log.info(f"Nudging: applied 2-step temporal smoothing, resulting in {stacked.shape[0]} steps")
+            else:
+                times_for_var = output_times[:stacked.shape[0]]
 
             self._write_nudge_nc(
                 out_path, stacked, valid_node_ids, times_for_var,

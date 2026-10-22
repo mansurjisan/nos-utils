@@ -344,6 +344,10 @@ class PrepOrchestrator:
         if self.config.nudging_enabled and "rtofs" in self.paths:
             results.append(self._run_nudging(output_dir, phase, time_hotstart))
 
+        # Surface restore needs RTOFS to have completed
+        if getattr(self.config, "surface_restore_enabled", False) and "rtofs" in self.paths:
+            results.append(self._run_surface_restore(output_dir, phase))
+
         # param.nml only needs time_hotstart
         if "fix" in self.paths:
             results.append(self._run_param_nml(output_dir, phase, time_hotstart))
@@ -710,16 +714,25 @@ class PrepOrchestrator:
                 dirs += [r / f"{self.run_name}.{day}", r / day]
         return list(dict.fromkeys(dirs))
 
-    # Mapping from the active OBC filename (what SCHISM reads) to the
-    # standard archive basename under $COMOUT_PREV/rerun/ (see
-    # stofs_3d_atl_create_obc_3d_th_non_adjust.sh:641-642). The archive
-    # file is stored as `<run>.<cycle>.<archive_base>.nc`.
-    _OBC_ARCHIVE_NAMES: Dict[str, str] = {
-        "elev2D.th.nc": "elev2dth_non_adj",
-        "TEM_3D.th.nc": "tem3dth",
-        "SAL_3D.th.nc": "sal3dth",
-        "uv3D.th.nc": "uv3dth",
-    }
+    @property
+    def _OBC_ARCHIVE_NAMES(self) -> Dict[str, str]:
+        """Mapping of active OBC files to their archive basenames.
+
+        Dynamically includes nudging and surface restore if enabled, and handles
+        the difference between ATL (elev2dth_non_adj) and PAC (elev2dth).
+        """
+        names = {
+            "elev2D.th.nc": "elev2dth_non_adj" if getattr(self.config, "dynamic_adjust_enabled", False) else "elev2dth",
+            "TEM_3D.th.nc": "tem3dth",
+            "SAL_3D.th.nc": "sal3dth",
+            "uv3D.th.nc": "uv3dth",
+        }
+        if getattr(self.config, "nudging_enabled", False):
+            names["TEM_nu.nc"] = "temnu"
+            names["SAL_nu.nc"] = "salnu"
+        if getattr(self.config, "surface_restore_enabled", False):
+            names["surface_restore.nc"] = "surface_restore"
+        return names
 
     def _obc_archive_name(self, archive_base: str, phase: str) -> str:
         """``<run>.<cycle>.<base>.nc``; the forecast-phase file gets ``.fcst`` before the suffix.
@@ -869,6 +882,8 @@ class PrepOrchestrator:
         (nco_v315 scripts/stofs_3d_atl/exstofs_3d_atl_prep_processing.sh:398-746). MJ (10/05/26)
         """
         wanted = list(self._OPS_RUN_INPUTS)
+        if getattr(self.config, "surface_restore_enabled", False):
+            wanted.append("surface_restore.nc")
         if self.config.nws == 4:
             wanted += ["gfs_forcing.nc"] + (["hrrr_forcing.nc"] if self.config.met_num >= 2 else [])
         else:
@@ -1049,6 +1064,27 @@ class PrepOrchestrator:
             self.config, input_dir, output_dir,
             nudge_weight_file=nudge_weight_file,
             rtofs_input_path=rtofs_path,
+            phase=phase,
+        )
+        return proc.process()
+
+    def _run_surface_restore(self, output_dir: Path, phase: str = "nowcast") -> ForcingResult:
+        """Step 5c: Surface restore (STOFS-3D-PAC)."""
+        from .forcing.surface_restore import SurfaceRestoreProcessor
+
+        weight_file = getattr(self.config, "surface_restore_weight_file", None)
+        if not weight_file:
+            fix_dir = self.paths.get("fix")
+            if fix_dir:
+                for pattern in ["*.nudge.gr3", "*.TEM_nudge.gr3"]:
+                    matches = sorted(Path(fix_dir).glob(pattern))
+                    if matches:
+                        weight_file = matches[0]
+                        break
+
+        proc = SurfaceRestoreProcessor(
+            self.config, self.paths["rtofs"], output_dir,
+            weight_file=weight_file,
             phase=phase,
         )
         return proc.process()
@@ -1255,10 +1291,7 @@ class PrepOrchestrator:
             # --- COMMON: OBC (phase-specific, backward-compat) ---
             {
                 "tar_name": f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar",
-                "payload_files": [
-                    "elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc",
-                    "uv3D.th.nc", "TEM_nu.nc", "SAL_nu.nc",
-                ],
+                "payload_files": list(self._OBC_ARCHIVE_NAMES.keys()),
                 "condition": True,
                 "label": "OBC",
             },
@@ -1590,9 +1623,8 @@ class PrepOrchestrator:
             # unchanged, executed verbatim when the manifest flag is OFF.
 
             # Tar OBC files (phase-specific): obc.nowcast.tar / obc.forecast.tar,
-            # each with all 6 files (boundary + nudging).
-            obc_files = ["elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc", "uv3D.th.nc",
-                         "TEM_nu.nc", "SAL_nu.nc"]
+            # each with all active files (boundary + nudging + surface restore).
+            obc_files = list(self._OBC_ARCHIVE_NAMES.keys())
             existing_obc = [work_dir / f for f in obc_files if (work_dir / f).exists()]
             if existing_obc:
                 # Phase-specific tar (backward compat): obc.nowcast.tar / obc.forecast.tar
