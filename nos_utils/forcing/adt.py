@@ -50,10 +50,6 @@ except ImportError:
 
 # Ops ADT subset ROI, used only when the SSH_1 destination grid cannot be read.
 # MJ (10/01/26)
-ADT_LON_MIN = -62.5
-ADT_LON_MAX = -51.5
-ADT_LAT_MIN = 7.0
-ADT_LAT_MAX = 54.0
 ADT_PAD = 1.0
 
 # Ops holds ADT-missing cells as the CMEMS int fill carried through float32. MJ (10/02/26)
@@ -147,10 +143,9 @@ class ADTBlender:
             log.warning(f"ADT blending failed: {e}")
             return None
 
-    @staticmethod
-    def _dest_bounds(ssh_path: Path):
+    def _dest_bounds(self, ssh_path: Path):
         """ADT subset (lon_min, lon_max, lat_min, lat_max): SSH_1 grid extent padded
-        by ADT_PAD (same -180/180 convention as ADT), else the ops ROI. MJ (10/01/26)
+        by ADT_PAD, else the config domain bounds. MJ (10/01/26)
         """
         try:
             with Dataset(str(ssh_path)) as ds:
@@ -159,8 +154,9 @@ class ADTBlender:
             return (float(np.nanmin(lon)) - ADT_PAD, float(np.nanmax(lon)) + ADT_PAD,
                     float(np.nanmin(lat)) - ADT_PAD, float(np.nanmax(lat)) + ADT_PAD)
         except Exception as e:
-            log.warning(f"Cannot read SSH_1 grid extent ({e}) — using ops ADT ROI")
-            return ADT_LON_MIN, ADT_LON_MAX, ADT_LAT_MIN, ADT_LAT_MAX
+            log.warning(f"Cannot read SSH_1 grid extent ({e}) — using config domain bounds")
+            lon_min, lon_max, lat_min, lat_max = self.config.domain
+            return lon_min - ADT_PAD, lon_max + ADT_PAD, lat_min - ADT_PAD, lat_max + ADT_PAD
 
     def _find_adt_data(self) -> Optional[Path]:
         """Newest available CMEMS ADT file (valid day, else previous day)."""
@@ -218,23 +214,29 @@ class ADTBlender:
         log.warning(msg)
         self.warnings.append(msg)
 
-    @staticmethod
-    def _subset_ops_roi(adt_path: Path):
+    def _subset_ops_roi(self, adt_path: Path, bounds):
         """ncks -d longitude,-62.5,-51.5 -d latitude,7.0,54.0: inclusive coordinate bounds.
 
         Returns (adt[lat, lon] in m with NaN for missing, lons, lats, n_time). MJ (10/02/26)
         """
+        lon_min, lon_max, lat_min, lat_max = bounds
         with Dataset(str(adt_path)) as ds:
             lon_name = "longitude" if "longitude" in ds.variables else "lon"
             lat_name = "latitude" if "latitude" in ds.variables else "lat"
             lons = np.array(ds.variables[lon_name][:], dtype=np.float64)
             lats = np.array(ds.variables[lat_name][:], dtype=np.float64)
-            li = np.where((lons >= ADT_LON_MIN) & (lons <= ADT_LON_MAX))[0]
-            la = np.where((lats >= ADT_LAT_MIN) & (lats <= ADT_LAT_MAX))[0]
-            if li.size == 0 or la.size == 0:
-                raise ValueError("ADT file does not cover the ops ROI")
             var = ds.variables["adt" if "adt" in ds.variables else "surf_el"]
-            a = np.ma.filled(var[..., la[0]:la[-1] + 1, li[0]:li[-1] + 1], np.nan)
+            a = var[...]
+
+            from ..coords import lon_convention, shift_grid_0360
+            if lon_convention(self.config) == "0360":
+                lons, a = shift_grid_0360(lons, a, lon_axis=-1)
+
+            li = np.where((lons >= lon_min) & (lons <= lon_max))[0]
+            la = np.where((lats >= lat_min) & (lats <= lat_max))[0]
+            if li.size == 0 or la.size == 0:
+                raise ValueError("ADT file does not cover the domain ROI")
+            a = np.ma.filled(a[..., la[0]:la[-1] + 1, li[0]:li[-1] + 1], np.nan)
             a = np.asarray(a, dtype=np.float64)
             if a.ndim == 3:
                 a = a[0]
@@ -307,9 +309,10 @@ class ADTBlender:
             if row.min() < 0 or row.max() >= n_b or col.min() < 0 or col.max() >= n_a:
                 raise ValueError("map row/col out of range")
 
+            bounds = self._dest_bounds(ssh_path)
             days = []
             for f in adt_files:
-                a, lons, lats = self._subset_ops_roi(f)
+                a, lons, lats = self._subset_ops_roi(f, bounds)
                 if a.size != n_a:
                     raise ValueError(f"ADT ROI subset has {a.size} cells, map n_a={n_a}")
                 if src_dims and tuple(src_dims) != (a.shape[1], a.shape[0]):
@@ -426,8 +429,7 @@ class ADTBlender:
         bounds is (lon_min, lon_max, lat_min, lat_max) in -180/180; default is the
         ops ROI. Returns (adt[lat, lon], lons, lats) or None. Fill values become NaN.
         """
-        lon_min, lon_max, lat_min, lat_max = bounds or (
-            ADT_LON_MIN, ADT_LON_MAX, ADT_LAT_MIN, ADT_LAT_MAX)
+        lon_min, lon_max, lat_min, lat_max = bounds or self._dest_bounds(None)
         try:
             ds = Dataset(str(adt_path))
             try:
@@ -436,6 +438,12 @@ class ADTBlender:
 
                 lons = np.array(ds.variables[lon_name][:], dtype=np.float64)
                 lats = np.array(ds.variables[lat_name][:], dtype=np.float64)
+                adt_var = "adt" if "adt" in ds.variables else "surf_el"
+                adt_data = ds.variables[adt_var][...]
+
+                from ..coords import lon_convention, shift_grid_0360
+                if lon_convention(self.config) == "0360":
+                    lons, adt_data = shift_grid_0360(lons, adt_data, lon_axis=-1)
 
                 lon_idx = np.where((lons >= lon_min) & (lons <= lon_max))[0]
                 lat_idx = np.where((lats >= lat_min) & (lats <= lat_max))[0]
@@ -443,9 +451,6 @@ class ADTBlender:
                 if len(lon_idx) == 0 or len(lat_idx) == 0:
                     log.warning("ADT data doesn't cover target domain")
                     return None
-
-                adt_var = "adt" if "adt" in ds.variables else "surf_el"
-                adt_data = ds.variables[adt_var][...]
                 sl_y = slice(lat_idx[0], lat_idx[-1] + 1)
                 sl_x = slice(lon_idx[0], lon_idx[-1] + 1)
                 if adt_data.ndim == 3:
