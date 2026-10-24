@@ -1082,13 +1082,17 @@ class ForcingConfig:
         if rtofs_3d_region:
             kwargs["rtofs_3d_region"] = str(rtofs_3d_region)
         
+        ocean = ocean if isinstance(ocean, dict) else {}
+        obc = obc if isinstance(obc, dict) else {}
+        nudge = nudge if isinstance(nudge, dict) else {}
         kwargs["rtofs_daily_3z"] = _strict_bool(ocean.get("rtofs_daily_3z"), "ocean.rtofs_daily_3z", False)
         kwargs["obc_dt"] = float(obc.get("dt", 21600.0))
         kwargs["obc_time_smoothing"] = _strict_bool(obc.get("time_smoothing"), "obc.time_smoothing", False)
         kwargs["nudging_dt"] = float(nudge.get("dt", 10800.0))
         kwargs["nudging_time_smoothing"] = _strict_bool(nudge.get("time_smoothing"), "nudging.time_smoothing", False)
 
-        surf_res = ocean.get("surface_restore", {}) if isinstance(ocean, dict) else {}
+        surf_res = ocean.get("surface_restore")
+        surf_res = surf_res if isinstance(surf_res, dict) else {}
         kwargs["surface_restore_enabled"] = _strict_bool(surf_res.get("enabled"), "ocean.surface_restore.enabled", False)
         kwargs["surface_restore_time_smoothing"] = _strict_bool(surf_res.get("time_smoothing"), "ocean.surface_restore.time_smoothing", False)
         if surf_res.get("weight_file"):

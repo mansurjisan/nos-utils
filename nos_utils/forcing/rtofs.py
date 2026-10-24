@@ -1019,6 +1019,7 @@ class RTOFSProcessor(ForcingProcessor):
             file_groups = [[f] for f in files_3d]
 
         for group in file_groups:
+            datasets = []
             try:
                 datasets = [Dataset(str(f)) for f in group]
                 # Merge variables from multiple files into one dictionary
@@ -1030,7 +1031,6 @@ class RTOFSProcessor(ForcingProcessor):
                     subset.update(self._stofs_subset_roi(ds, roi, ["temperature", "salinity", "u", "v"]))
 
                 if "temperature" not in subset:
-                    for ds in datasets: ds.close()
                     continue
 
                 for t in range(subset["temperature"].shape[0]):
@@ -1043,12 +1043,13 @@ class RTOFSProcessor(ForcingProcessor):
                 if all_lon is None:
                     all_lon = np.array(subset["Longitude"])
                     all_lat = np.array(subset["Latitude"])
-                if all_depth is None and "Depth" in ds.variables:
-                    all_depth = np.array(ds.variables["Depth"][:])
-
-                for ds in datasets: ds.close()
+                if all_depth is None and "Depth" in datasets[0].variables:
+                    all_depth = np.array(datasets[0].variables["Depth"][:])
             except Exception as e:
                 log.warning(f"Failed to read 3D group {group[0].name}: {e}")
+            finally:
+                for ds in datasets:
+                    ds.close()
 
         if not all_temp:
             return None

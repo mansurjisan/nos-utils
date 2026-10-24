@@ -149,7 +149,7 @@ class ADTBlender:
 
     def _dest_bounds(self, ssh_path: Path):
         """ADT subset (lon_min, lon_max, lat_min, lat_max): SSH_1 grid extent padded
-        by ADT_PAD, else the config domain bounds. MJ (10/01/26)
+        by ADT_PAD, else the ops ROI (-180/180 systems) or the padded config domain (0-360). MJ (10/01/26)
         """
         try:
             with Dataset(str(ssh_path)) as ds:
@@ -158,7 +158,7 @@ class ADTBlender:
             return (float(np.nanmin(lon)) - ADT_PAD, float(np.nanmax(lon)) + ADT_PAD,
                     float(np.nanmin(lat)) - ADT_PAD, float(np.nanmax(lat)) + ADT_PAD)
         except Exception as e:
-            log.warning(f"Cannot read SSH_1 grid extent ({e}) — using config domain bounds")
+            log.warning(f"Cannot read SSH_1 grid extent ({e}) — using the fallback ROI")
             if self._pm180():
                 return ADT_LON_MIN, ADT_LON_MAX, ADT_LAT_MIN, ADT_LAT_MAX
             lon_min, lon_max, lat_min, lat_max = self.config.domain
@@ -585,7 +585,7 @@ class ADTBlender:
         """Apply the ops ADT blend to SSH_1.nc.
 
         Formula: SSH_final(t) = SSH_rtofs(t) - SSH_rtofs(t=0) + ADT + datum_offset
-        (ADT datum offset, e.g. -0.45 is applied here), in float32 as ncap2. Where either
+        (ADT already carries adt_datum_offset, applied per day on read/regrid), in float32 as ncap2. Where either
         side is invalid the point is left as the -30000 fill (dry in gen_3Dth).
         """
         try:
