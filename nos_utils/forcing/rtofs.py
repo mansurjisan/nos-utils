@@ -1296,11 +1296,11 @@ class RTOFSProcessor(ForcingProcessor):
         model_t0, _, dur = self._get_output_window(self.phase)
         cycle = datetime.strptime(self.config.pdy, "%Y%m%d") + timedelta(hours=self.config.cyc)
         start = (model_t0 - (cycle - timedelta(hours=self.config.nowcast_hours))).total_seconds()
-        n = int(np.ceil(dur / OPS_OBC_DT)) + 1
+        n = int(np.ceil(dur / self.config.obc_dt)) + 1
         tmp = path.with_name(path.name + ".phase")
         with Dataset(str(path)) as src:
             t = np.asarray(src.variables["time"][:], dtype=np.float64)
-            dt = float(np.diff(t).min()) if len(t) > 1 else OPS_OBC_DT
+            dt = float(np.diff(t).min()) if len(t) > 1 else self.config.obc_dt
             idx = np.clip(np.rint(start / dt).astype(int) + np.arange(n), 0, len(t) - 1)
             if start / dt + n - 1 > len(t) - 1:
                 self._ops_note(f"{path.name}: the exe series ends before the {n}-record "
@@ -1586,7 +1586,7 @@ class RTOFSProcessor(ForcingProcessor):
         t0 = cycle_dt - timedelta(hours=int(self.config.nowcast_hours))
         span = (cycle_dt - t0).total_seconds() + (
             int(self.config.forecast_hours) + self.buffer_hours) * 3600.0
-        n = max(self.config.obc_min_timesteps, int(np.ceil(span / self.config.obc_dt)) + 1)
+        n = max(self.config.obc_min_slots, int(np.ceil(span / self.config.obc_dt)) + 1)
         return [t0 + timedelta(seconds=self.config.obc_dt * k) for k in range(n)]
 
     def _ops_candidates(self, date: datetime, kind: str):
@@ -1655,10 +1655,10 @@ class RTOFSProcessor(ForcingProcessor):
             if have and n_prev[kind]:
                 self._select_notes.append(
                     f"RTOFS {kind}: {n_prev[kind]} of {len(have)} slots filled from the previous cycle")
-            miss = [vt for vt in slots[:self.config.obc_min_timesteps] if vt not in picked[kind]] if have else []
+            miss = [vt for vt in slots[:self.config.obc_min_slots] if vt not in picked[kind]] if have else []
             if miss:
                 self._select_notes.append(
-                    f"RTOFS {kind}: {len(miss)} of the first {self.config.obc_min_timesteps} slots missing "
+                    f"RTOFS {kind}: {len(miss)} of the first {self.config.obc_min_slots} slots missing "
                     f"in both cycles (first {miss[0]:%Y-%m-%d %Hz})")
         for m in self._select_notes:
             log.warning(m)

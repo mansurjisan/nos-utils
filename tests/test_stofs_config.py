@@ -316,7 +316,7 @@ class TestSTOFSPACConfigFactory:
     def test_run_window(self):
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
         assert cfg.nowcast_hours == 24
-        assert cfg.forecast_hours == 108
+        assert cfg.forecast_hours == 48
 
     def test_model_dt_is_90(self):
         """PAC model runs at dt=90s (verified from param.nml_6globaloutput)."""
@@ -338,7 +338,8 @@ class TestSTOFSPACConfigFactory:
 
     def test_no_adt(self):
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
-        assert cfg.adt_enabled is False
+        assert cfg.adt_enabled is True
+        assert cfg.adt_datum_offset == pytest.approx(-0.4715517)
 
     def test_nudging_enabled(self):
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
@@ -356,7 +357,8 @@ class TestSTOFSPACConfigFactory:
 
     def test_obc_min_timesteps(self):
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
-        assert cfg.obc_min_timesteps == 21
+        assert cfg.obc_min_timesteps == 4
+        assert cfg.obc_min_slots == 4
 
     def test_gfs_resolution(self):
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
@@ -508,3 +510,59 @@ class TestSTOFSPACFromYAML:
         assert cfg.ufs_datm_tasks == 120
         assert cfg.ufs_total_tasks == 4072
 
+
+
+class TestPacificBranchKeepsExistingSystems:
+    """Pacific (#74) options must not change ATL / SECOFS / AK. MJ (10/24/26)"""
+
+    @staticmethod
+    def _from_yaml(tmp_path, ocean, run=None):
+        import yaml
+        doc = {
+            "grid": {"domain": {"lon_min": -98.5, "lon_max": -52.5,
+                                "lat_min": 7.3, "lat_max": 52.6}, "n_levels": 51},
+            "model": {"physics": {"nws": 2}, "run": run or {"nowcast_hours": 24, "forecast_hours": 96}},
+            "forcing": {"ocean": ocean},
+        }
+        f = tmp_path / "x.yaml"
+        f.write_text(yaml.dump(doc))
+        return ForcingConfig.from_yaml(f, pdy="20260401", cyc=12)
+
+    def test_atl_adt_offset_with_and_without_yaml_key(self, tmp_path):
+        stofs = {"obc": {"roi_2ds": {"x1": 1, "x2": 2, "y1": 1, "y2": 2},
+                         "roi_3dz": {"x1": 1, "x2": 2, "y1": 1, "y2": 2}},
+                 "adt": {"enabled": True}}
+        assert self._from_yaml(tmp_path, stofs).adt_datum_offset == -0.45
+        assert ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12).adt_datum_offset == -0.45
+        stofs["adt"]["datum_offset"] = -0.4715517
+        assert self._from_yaml(tmp_path, stofs).adt_datum_offset == pytest.approx(-0.4715517)
+
+    def test_atl_keeps_ops_rtofs_slots_and_qc(self, tmp_path):
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+        assert cfg.obc_min_slots == 23
+        assert cfg.obc_min_timesteps == 21
+        assert cfg.obc_dt == 21600.0
+        assert cfg.obc_archive_extended is False
+        assert cfg.surface_restore_enabled is False
+
+    def test_secofs_and_unspecified_yaml_keep_3h_nudging(self, tmp_path):
+        assert ForcingConfig.for_secofs(pdy="20260401", cyc=12).nudging_dt == 10800.0
+        assert ForcingConfig.for_secofs_ufs(pdy="20260401", cyc=12).nudging_dt == 10800.0
+        cfg = self._from_yaml(tmp_path, {"nudging": {"enabled": True}})
+        assert cfg.nudging_dt == 10800.0
+        assert cfg.obc_archive_extended is False
+
+    def test_pacific_sets_its_own_values(self):
+        cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
+        assert cfg.nudging_dt == 86400.0
+        assert cfg.obc_dt == 86400.0
+        assert cfg.obc_archive_extended is True
+        assert cfg.surface_restore_enabled is False
+
+    def test_surface_restore_refuses_without_experimental_env(self, tmp_path, monkeypatch):
+        from nos_utils.forcing.surface_restore import SurfaceRestoreProcessor
+        monkeypatch.delenv("NOS_SURFACE_RESTORE_EXPERIMENTAL", raising=False)
+        cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12, surface_restore_enabled=True)
+        res = SurfaceRestoreProcessor(cfg, tmp_path, tmp_path / "out").process()
+        assert not res.success
+        assert "untested" in res.errors[0]

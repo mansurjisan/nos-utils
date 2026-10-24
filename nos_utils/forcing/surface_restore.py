@@ -43,6 +43,12 @@ class SurfaceRestoreProcessor(ForcingProcessor):
         self.weight_file = weight_file
         self.phase = phase
 
+    def find_input_files(self) -> List[Path]:
+        """Abstract in the base class and was never implemented, so the class could not be instantiated. MJ (10/24/26)"""
+        from .rtofs import RTOFSProcessor
+        return RTOFSProcessor(self.config, self.input_path, self.output_path,
+                              phase=self.phase).find_input_files_by_type()[1]
+
     def process(self) -> ForcingResult:
         if not HAS_NETCDF4:
             return ForcingResult(
@@ -55,6 +61,15 @@ class SurfaceRestoreProcessor(ForcingProcessor):
                 success=True, source=self.SOURCE_NAME,
                 warnings=["Surface restore disabled in config"],
             )
+
+        import os
+        if os.environ.get("NOS_SURFACE_RESTORE_EXPERIMENTAL") != "1":
+            msg = ("Surface restore is enabled but this processor is untested and known incomplete "
+                   "(T and S read from one file, boundary instead of restore nodes, placeholder time axis); "
+                   "set NOS_SURFACE_RESTORE_EXPERIMENTAL=1 to run it anyway. MJ (10/24/26)")
+            log.error(msg)
+            return ForcingResult(success=False, source=self.SOURCE_NAME, errors=[msg])
+        log.warning("Surface restore running in experimental mode: output is unvalidated. MJ (10/24/26)")
 
         self.create_output_dir()
         

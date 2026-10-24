@@ -679,25 +679,39 @@ class PrepOrchestrator:
                 dirs += [r / f"{self.run_name}.{day}", r / day]
         return list(dict.fromkeys(dirs))
 
+    # Mapping from the active OBC filename (what SCHISM reads) to the
+    # standard archive basename under $COMOUT_PREV/rerun/ (see
+    # stofs_3d_atl_create_obc_3d_th_non_adjust.sh:641-642). The archive
+    # file is stored as `<run>.<cycle>.<archive_base>.nc`.
+    _OBC_ARCHIVE_BASE: Dict[str, str] = {
+        "elev2D.th.nc": "elev2dth_non_adj",
+        "TEM_3D.th.nc": "tem3dth",
+        "SAL_3D.th.nc": "sal3dth",
+        "uv3D.th.nc": "uv3dth",
+    }
+    _OBC_TAR_BASE = ("elev2D.th.nc", "TEM_3D.th.nc", "SAL_3D.th.nc",
+                     "uv3D.th.nc", "TEM_nu.nc", "SAL_nu.nc")
+
     @property
     def _OBC_ARCHIVE_NAMES(self) -> Dict[str, str]:
-        """Mapping of active OBC files to their archive basenames.
-
-        Dynamically includes nudging and surface restore if enabled, and handles
-        the difference between ATL (elev2dth_non_adj) and PAC (elev2dth).
-        """
-        names = {
-            "elev2D.th.nc": "elev2dth_non_adj" if getattr(self.config, "dynamic_adjust_enabled", False) else "elev2dth",
-            "TEM_3D.th.nc": "tem3dth",
-            "SAL_3D.th.nc": "sal3dth",
-            "uv3D.th.nc": "uv3dth",
-        }
-        if getattr(self.config, "nudging_enabled", False):
-            names["TEM_nu.nc"] = "temnu"
-            names["SAL_nu.nc"] = "salnu"
-        if getattr(self.config, "surface_restore_enabled", False):
-            names["surface_restore.nc"] = "surface_restore"
+        """Rerun-archive map: as nos-utils main unless obc_archive_extended is set (Pacific). MJ (10/24/26)"""
+        names = dict(self._OBC_ARCHIVE_BASE)
+        if getattr(self.config, "obc_archive_extended", False):
+            names["elev2D.th.nc"] = "elev2dth_non_adj" if getattr(self.config, "dynamic_adjust_enabled", False) else "elev2dth"
+            if getattr(self.config, "nudging_enabled", False):
+                names["TEM_nu.nc"] = "temnu"
+                names["SAL_nu.nc"] = "salnu"
+            if getattr(self.config, "surface_restore_enabled", False):
+                names["surface_restore.nc"] = "surface_restore"
         return names
+
+    @property
+    def _obc_tar_files(self) -> List[str]:
+        files = list(self._OBC_TAR_BASE)
+        if getattr(self.config, "obc_archive_extended", False) and getattr(
+                self.config, "surface_restore_enabled", False):
+            files.append("surface_restore.nc")
+        return files
 
     def _obc_archive_name(self, archive_base: str, phase: str) -> str:
         """``<run>.<cycle>.<base>.nc``; the forecast-phase file gets ``.fcst`` before the suffix.
@@ -1256,7 +1270,7 @@ class PrepOrchestrator:
             # --- COMMON: OBC (phase-specific, backward-compat) ---
             {
                 "tar_name": f"{prefix}.{cycle}.{pdy}.obc.{phase}.tar",
-                "payload_files": list(self._OBC_ARCHIVE_NAMES.keys()),
+                "payload_files": self._obc_tar_files,
                 "condition": True,
                 "label": "OBC",
             },
@@ -1589,7 +1603,7 @@ class PrepOrchestrator:
 
             # Tar OBC files (phase-specific): obc.nowcast.tar / obc.forecast.tar,
             # each with all active files (boundary + nudging + surface restore).
-            obc_files = list(self._OBC_ARCHIVE_NAMES.keys())
+            obc_files = self._obc_tar_files
             existing_obc = [work_dir / f for f in obc_files if (work_dir / f).exists()]
             if existing_obc:
                 # Phase-specific tar (backward compat): obc.nowcast.tar / obc.forecast.tar
