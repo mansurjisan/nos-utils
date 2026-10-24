@@ -50,6 +50,10 @@ except ImportError:
 
 # Ops ADT subset ROI, used only when the SSH_1 destination grid cannot be read.
 # MJ (10/01/26)
+ADT_LON_MIN = -62.5
+ADT_LON_MAX = -51.5
+ADT_LAT_MIN = 7.0
+ADT_LAT_MAX = 54.0
 ADT_PAD = 1.0
 
 # Ops holds ADT-missing cells as the CMEMS int fill carried through float32. MJ (10/02/26)
@@ -145,7 +149,7 @@ class ADTBlender:
 
     def _dest_bounds(self, ssh_path: Path):
         """ADT subset (lon_min, lon_max, lat_min, lat_max): SSH_1 grid extent padded
-        by ADT_PAD, else the config domain bounds. MJ (10/01/26)
+        by ADT_PAD, else the ops ROI (-180/180 systems) or the padded config domain (0-360). MJ (10/01/26)
         """
         try:
             with Dataset(str(ssh_path)) as ds:
@@ -154,9 +158,21 @@ class ADTBlender:
             return (float(np.nanmin(lon)) - ADT_PAD, float(np.nanmax(lon)) + ADT_PAD,
                     float(np.nanmin(lat)) - ADT_PAD, float(np.nanmax(lat)) + ADT_PAD)
         except Exception as e:
-            log.warning(f"Cannot read SSH_1 grid extent ({e}) — using config domain bounds")
+            log.warning(f"Cannot read SSH_1 grid extent ({e}) — using the fallback ROI")
+            if self._pm180():
+                return ADT_LON_MIN, ADT_LON_MAX, ADT_LAT_MIN, ADT_LAT_MAX
             lon_min, lon_max, lat_min, lat_max = self.config.domain
             return lon_min - ADT_PAD, lon_max + ADT_PAD, lat_min - ADT_PAD, lat_max + ADT_PAD
+
+    def _pm180(self) -> bool:
+        from ..coords import lon_convention
+        return lon_convention(self.config) != "0360"
+
+    def _roi(self, ssh_path):
+        """Ops fixed ROI for -180/180 systems (STOFS-3D-ATL); SSH_1 extent for the 0-360 Pacific. MJ (10/24/26)"""
+        if self._pm180():
+            return ADT_LON_MIN, ADT_LON_MAX, ADT_LAT_MIN, ADT_LAT_MAX
+        return self._dest_bounds(ssh_path)
 
     def _find_adt_data(self) -> Optional[Path]:
         """Newest available CMEMS ADT file (valid day, else previous day)."""
@@ -309,7 +325,7 @@ class ADTBlender:
             if row.min() < 0 or row.max() >= n_b or col.min() < 0 or col.max() >= n_a:
                 raise ValueError("map row/col out of range")
 
-            bounds = self._dest_bounds(ssh_path)
+            bounds = self._roi(ssh_path)
             days = []
             for f in adt_files:
                 a, lons, lats = self._subset_ops_roi(f, bounds)
@@ -323,7 +339,8 @@ class ADTBlender:
                         or np.abs(yca - LA.ravel()).max() > ADT_COORD_TOL):
                     raise ValueError("ADT ROI coordinates do not match map xc_a/yc_a")
                 out = self._apply_esmf_map(S, row, col, n_b, a.ravel())
-                days.append(out.astype(np.float32) if self.ops_numerics else out)
+                off = self.config.adt_datum_offset
+                days.append((out + off).astype(np.float32) if self.ops_numerics else out + off)
             if self.ops_numerics:
                 stack = np.stack(days)
                 ok = np.isfinite(stack)
@@ -429,7 +446,7 @@ class ADTBlender:
         bounds is (lon_min, lon_max, lat_min, lat_max) in -180/180; default is the
         ops ROI. Returns (adt[lat, lon], lons, lats) or None. Fill values become NaN.
         """
-        lon_min, lon_max, lat_min, lat_max = bounds or self._dest_bounds(None)
+        lon_min, lon_max, lat_min, lat_max = bounds or self._roi(None)
         try:
             ds = Dataset(str(adt_path))
             try:
@@ -439,7 +456,7 @@ class ADTBlender:
                 lons = np.array(ds.variables[lon_name][:], dtype=np.float64)
                 lats = np.array(ds.variables[lat_name][:], dtype=np.float64)
                 adt_var = "adt" if "adt" in ds.variables else "surf_el"
-                adt_data = ds.variables[adt_var][...]
+                adt_data = ds.variables[adt_var][...] + self.config.adt_datum_offset
 
                 from ..coords import lon_convention, shift_grid_0360
                 if lon_convention(self.config) == "0360":
@@ -568,7 +585,7 @@ class ADTBlender:
         """Apply the ops ADT blend to SSH_1.nc.
 
         Formula: SSH_final(t) = SSH_rtofs(t) - SSH_rtofs(t=0) + ADT + datum_offset
-        (ADT datum offset, e.g. -0.45 is applied here), in float32 as ncap2. Where either
+        (ADT already carries adt_datum_offset, applied per day on read/regrid), in float32 as ncap2. Where either
         side is invalid the point is left as the -30000 fill (dry in gen_3Dth).
         """
         try:
@@ -577,7 +594,7 @@ class ADTBlender:
             shutil.copy2(ssh_path, output)
 
             ds = Dataset(str(output), "r+")
-            ssh = ds.variables["ssh"][...] + (self.config.adt_datum_offset or 0)
+            ssh = ds.variables["ssh"]
             nt, ny, nx = ssh.shape
 
             dst_lon = np.array(ds.variables["xlon"][:], dtype=np.float64)

@@ -742,7 +742,7 @@ class NudgingProcessor(ForcingProcessor):
         # time records (rare, but the reader supports it), they are
         # treated as consecutive 6h steps starting at the file's stamped
         # forecast hour.
-        rtofs_dt_input = self.config.nudging_dt
+        rtofs_dt_input = self.config.nudging_dt if getattr(self.config, "rtofs_daily_3z", False) else 21600.0
 
         is_split = getattr(self.config, "rtofs_daily_3z", False)
         if is_split:
@@ -899,8 +899,8 @@ class NudgingProcessor(ForcingProcessor):
         # the model t=0 anchor (= cycle - nowcast_hours).
         target_dt = getattr(self.config, "nudging_dt", 10800.0)
         if self.config.obc_ops_timeline:
-            # Ops phase-anchored records, time 0 = phase start.
-            target_dt = self.config.nudging_dt
+            # step_nu_tr = 21600 s: phase-anchored 6-hourly records, time 0 = phase start. MJ (10/02/26)
+            target_dt = 21600.0
 
         # The output time axis covers [0, sim_duration] at ``target_dt``
         # cadence — i.e. 0, 3h, 6h, ..., nowcast+forecast hours from the

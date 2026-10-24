@@ -238,6 +238,8 @@ class ForcingConfig:
     # ADT satellite SSH blending (STOFS-3D-ATL uses CMEMS ADT to correct boundary SSH)
     adt_enabled: bool = False
     adt_datum_offset: float = -0.45
+    # Rerun archive/tar also carries temnu/salnu/surface_restore with the Pacific names; off keeps main's set. MJ (10/24/26)
+    obc_archive_extended: bool = False
     # Ops ESMF map for the ADT regrid (yaml ocean.adt.weight_file); a bare name resolves against
     # FIXofs. Unset or missing falls back to the bilinear regrid. MJ (10/02/26)
     adt_weight_file: Optional[Path] = None
@@ -245,7 +247,7 @@ class ForcingConfig:
     nudging_enabled: bool = False
     nudging_timescale_seconds: float = 86400.0
     # Temporal resolution of the nudging files (seconds).
-    nudging_dt: float = 21600.0
+    nudging_dt: float = 10800.0
     # Apply 2-step temporal moving average to nudging fields.
     nudging_time_smoothing: bool = False
     # Surface restore enabled and smoothing
@@ -436,6 +438,8 @@ class ForcingConfig:
     # OFSes have shorter OBC windows (typically ~10 records for 54h runs)
     # and would be wrongly flagged if this defaulted to 21.
     obc_min_timesteps: int = 0
+    # Minimum RTOFS slots in the ops OBC timeline (ops: 23 6-hourly records, n012 to f120). MJ (10/24/26)
+    obc_min_slots: int = 23
 
     # --- Tidal settings ---
     # Tidal constituents to use
@@ -707,7 +711,7 @@ class ForcingConfig:
             lon_min=93.1098, lon_max=289.6750,
             lat_min=-33.0388, lat_max=66.3254,
             pdy=pdy, cyc=cyc,
-            nowcast_hours=24, forecast_hours=108,
+            nowcast_hours=24, forecast_hours=48,
             gfs_resolution="0p25",
             met_num=2, n_levels=84,
             model_dt=90.0,
@@ -724,6 +728,8 @@ class ForcingConfig:
             nudging_timescale_seconds=86400.0,
             nwm_product="medium_range_mem1",
             obc_min_timesteps=4,
+            obc_min_slots=4,
+            obc_archive_extended=True,
             obc_dt=86400.0,
             nudging_dt=86400.0,
             obc_time_smoothing=True,
@@ -732,8 +738,8 @@ class ForcingConfig:
             obc_roi_2d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
             obc_roi_3d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
             nudge_roi_3d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
-            surface_restore_enabled=True,
-            surface_restore_time_smoothing=True,
+            # Surface restore is untested (reads T and S from one file, restore nodes unverified): off. MJ (10/24/26)
+            surface_restore_enabled=False,
         )
         defaults.update(overrides)
         return cls(**defaults)
@@ -750,7 +756,7 @@ class ForcingConfig:
             lon_min=93.1098, lon_max=289.6750,
             lat_min=-33.0388, lat_max=66.3254,
             pdy=pdy, cyc=cyc,
-            nowcast_hours=24, forecast_hours=108,
+            nowcast_hours=24, forecast_hours=48,
             gfs_resolution="0p25",
             met_num=2, nws=4, n_levels=84,
             model_dt=90.0,
@@ -764,6 +770,8 @@ class ForcingConfig:
             nudging_timescale_seconds=86400.0,
             nwm_product="medium_range_mem1",
             obc_min_timesteps=4,
+            obc_min_slots=4,
+            obc_archive_extended=True,
             obc_dt=86400.0,
             nudging_dt=86400.0,
             obc_time_smoothing=True,
@@ -772,8 +780,8 @@ class ForcingConfig:
             obc_roi_2d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
             obc_roi_3d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
             nudge_roi_3d={"x1": 222, "x2": 2703, "y1": 1051, "y2": 2641, "x_stride": 2, "y_stride": 2},
-            surface_restore_enabled=True,
-            surface_restore_time_smoothing=True,
+            # Surface restore is untested (reads T and S from one file, restore nodes unverified): off. MJ (10/24/26)
+            surface_restore_enabled=False,
             # DATM grid — STOFS3D_PAC preset, verified from weight_gfs.nc
             # nx = round((290.0-92.5)/0.025)+1 = 7901; ny = round((67.0-(-33.5))/0.025)+1 = 4021
             datm_lon_min=92.5, datm_lon_max=290.0,
@@ -995,7 +1003,7 @@ class ForcingConfig:
         if _adt_wt is None and str(_sys.get("name", "")).startswith("stofs_3d_atl"):
             _adt_wt = "stofs_3d_atl_ufs.adt_weight.nc"
         _adt_wt = Path(_adt_wt) if _adt_wt else None
-        _adt_off = float(adt.get("datum_offset", 0.0)) if isinstance(adt, dict) else 0.0
+        _adt_off = float(adt.get("datum_offset", -0.45)) if isinstance(adt, dict) else -0.45
 
         # Ops river inputs (static FIX source_sink.in / msource.th / vsink.th, ops source
         # order): STOFS-3D-ATL by name (the coupled executable now has PREC_EVAP), yaml
@@ -1074,13 +1082,17 @@ class ForcingConfig:
         if rtofs_3d_region:
             kwargs["rtofs_3d_region"] = str(rtofs_3d_region)
         
+        ocean = ocean if isinstance(ocean, dict) else {}
+        obc = obc if isinstance(obc, dict) else {}
+        nudge = nudge if isinstance(nudge, dict) else {}
         kwargs["rtofs_daily_3z"] = _strict_bool(ocean.get("rtofs_daily_3z"), "ocean.rtofs_daily_3z", False)
         kwargs["obc_dt"] = float(obc.get("dt", 21600.0))
         kwargs["obc_time_smoothing"] = _strict_bool(obc.get("time_smoothing"), "obc.time_smoothing", False)
-        kwargs["nudging_dt"] = float(nudge.get("dt", kwargs["obc_dt"]))
+        kwargs["nudging_dt"] = float(nudge.get("dt", 10800.0))
         kwargs["nudging_time_smoothing"] = _strict_bool(nudge.get("time_smoothing"), "nudging.time_smoothing", False)
 
-        surf_res = ocean.get("surface_restore", {}) if isinstance(ocean, dict) else {}
+        surf_res = ocean.get("surface_restore")
+        surf_res = surf_res if isinstance(surf_res, dict) else {}
         kwargs["surface_restore_enabled"] = _strict_bool(surf_res.get("enabled"), "ocean.surface_restore.enabled", False)
         kwargs["surface_restore_time_smoothing"] = _strict_bool(surf_res.get("time_smoothing"), "ocean.surface_restore.time_smoothing", False)
         if surf_res.get("weight_file"):
@@ -1182,6 +1194,10 @@ class ForcingConfig:
             kwargs["obc_min_timesteps"] = int(yaml_min_ts)
         elif is_stofs_like:
             kwargs["obc_min_timesteps"] = 21
+        if obc.get("min_slots") is not None:
+            kwargs["obc_min_slots"] = int(obc["min_slots"])
+        kwargs["obc_archive_extended"] = _strict_bool(
+            obc.get("archive_extended"), "obc.archive_extended", False)
 
         # Declarative prep extras override. When a root-level `prep.extras`
         # block is present it is authoritative and supersedes the

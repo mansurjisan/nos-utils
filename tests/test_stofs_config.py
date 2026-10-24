@@ -316,7 +316,7 @@ class TestSTOFSPACConfigFactory:
     def test_run_window(self):
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
         assert cfg.nowcast_hours == 24
-        assert cfg.forecast_hours == 108
+        assert cfg.forecast_hours == 48
 
     def test_model_dt_is_90(self):
         """PAC model runs at dt=90s (verified from param.nml_6globaloutput)."""
@@ -336,9 +336,10 @@ class TestSTOFSPACConfigFactory:
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
         assert cfg.dynamic_adjust_enabled is False
 
-    def test_no_adt(self):
+    def test_adt_enabled_with_own_offset(self):
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
-        assert cfg.adt_enabled is False
+        assert cfg.adt_enabled is True
+        assert cfg.adt_datum_offset == pytest.approx(-0.4715517)
 
     def test_nudging_enabled(self):
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
@@ -356,7 +357,8 @@ class TestSTOFSPACConfigFactory:
 
     def test_obc_min_timesteps(self):
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
-        assert cfg.obc_min_timesteps == 21
+        assert cfg.obc_min_timesteps == 4
+        assert cfg.obc_min_slots == 4
 
     def test_gfs_resolution(self):
         cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
@@ -508,3 +510,105 @@ class TestSTOFSPACFromYAML:
         assert cfg.ufs_datm_tasks == 120
         assert cfg.ufs_total_tasks == 4072
 
+
+
+class TestPacificBranchKeepsExistingSystems:
+    """Pacific (#74) options must not change ATL / SECOFS / AK. MJ (10/24/26)"""
+
+    @staticmethod
+    def _from_yaml(tmp_path, ocean, run=None):
+        import yaml
+        doc = {
+            "grid": {"domain": {"lon_min": -98.5, "lon_max": -52.5,
+                                "lat_min": 7.3, "lat_max": 52.6}, "n_levels": 51},
+            "model": {"physics": {"nws": 2}, "run": run or {"nowcast_hours": 24, "forecast_hours": 96}},
+            "forcing": {"ocean": ocean},
+        }
+        f = tmp_path / "x.yaml"
+        f.write_text(yaml.dump(doc))
+        return ForcingConfig.from_yaml(f, pdy="20260401", cyc=12)
+
+    def test_atl_adt_offset_with_and_without_yaml_key(self, tmp_path):
+        stofs = {"obc": {"roi_2ds": {"x1": 1, "x2": 2, "y1": 1, "y2": 2},
+                         "roi_3dz": {"x1": 1, "x2": 2, "y1": 1, "y2": 2}},
+                 "adt": {"enabled": True}}
+        assert self._from_yaml(tmp_path, stofs).adt_datum_offset == -0.45
+        assert ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12).adt_datum_offset == -0.45
+        stofs["adt"]["datum_offset"] = -0.4715517
+        assert self._from_yaml(tmp_path, stofs).adt_datum_offset == pytest.approx(-0.4715517)
+
+    def test_atl_keeps_ops_rtofs_slots_and_qc(self, tmp_path):
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+        assert cfg.obc_min_slots == 23
+        assert cfg.obc_min_timesteps == 21
+        assert cfg.obc_dt == 21600.0
+        assert cfg.obc_archive_extended is False
+        assert cfg.surface_restore_enabled is False
+
+    def test_secofs_and_unspecified_yaml_keep_3h_nudging(self, tmp_path):
+        assert ForcingConfig.for_secofs(pdy="20260401", cyc=12).nudging_dt == 10800.0
+        assert ForcingConfig.for_secofs_ufs(pdy="20260401", cyc=12).nudging_dt == 10800.0
+        cfg = self._from_yaml(tmp_path, {"nudging": {"enabled": True}})
+        assert cfg.nudging_dt == 10800.0
+        assert cfg.obc_archive_extended is False
+
+    def test_pacific_sets_its_own_values(self):
+        cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12)
+        assert cfg.nudging_dt == 86400.0
+        assert cfg.obc_dt == 86400.0
+        assert cfg.obc_archive_extended is True
+        assert cfg.surface_restore_enabled is False
+
+    def test_surface_restore_refuses_without_experimental_env(self, tmp_path, monkeypatch):
+        from nos_utils.forcing.surface_restore import SurfaceRestoreProcessor
+        monkeypatch.delenv("NOS_SURFACE_RESTORE_EXPERIMENTAL", raising=False)
+        cfg = ForcingConfig.for_stofs_3d_pac(pdy="20260401", cyc=12, surface_restore_enabled=True)
+        res = SurfaceRestoreProcessor(cfg, tmp_path, tmp_path / "out").process()
+        assert not res.success
+        assert "untested" in res.errors[0]
+
+    def test_from_yaml_parses_min_slots_and_archive_extended(self, tmp_path):
+        base = {"nudging": {"enabled": True}}
+        cfg = self._from_yaml(tmp_path, base)
+        assert cfg.obc_min_slots == 23 and cfg.obc_archive_extended is False
+        cfg = self._from_yaml(tmp_path, {"obc": {"min_slots": 4, "archive_extended": True}})
+        assert cfg.obc_min_slots == 4 and cfg.obc_archive_extended is True
+
+    def test_from_yaml_tolerates_null_ocean_blocks(self, tmp_path):
+        cfg = self._from_yaml(tmp_path, {"nudging": None, "surface_restore": None})
+        assert cfg.nudging_dt == 10800.0
+        assert self._from_yaml(tmp_path, None).nudging_dt == 10800.0
+
+    def test_atl_rerun_archive_map_is_the_four_base_entries(self):
+        from nos_utils.orchestrator import PrepOrchestrator
+        orch = PrepOrchestrator(ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12), {})
+        assert orch._OBC_ARCHIVE_NAMES == {
+            "elev2D.th.nc": "elev2dth_non_adj", "TEM_3D.th.nc": "tem3dth",
+            "SAL_3D.th.nc": "sal3dth", "uv3D.th.nc": "uv3dth"}
+
+    def test_tsuv_keeps_depth_and_logs_no_failure(self, tmp_path, caplog):
+        import logging
+        import numpy as np
+        from netCDF4 import Dataset
+        from nos_utils.forcing.rtofs import RTOFSProcessor
+        rng = np.random.default_rng(0)
+        files = []
+        for tag in ("n000", "f006"):
+            p = tmp_path / f"rtofs_glo_3dz_{tag}_6hrly_hvr_US_east.nc"
+            with Dataset(p, "w") as d:
+                d.createDimension("MT", 1); d.createDimension("Depth", 3)
+                d.createDimension("Y", 5); d.createDimension("X", 6)
+                d.createVariable("Depth", "f4", ("Depth",))[:] = [0, 10, 20]
+                d.createVariable("Longitude", "f4", ("Y", "X"))[:] = np.tile(np.arange(6.), (5, 1)) - 70
+                d.createVariable("Latitude", "f4", ("Y", "X"))[:] = np.tile(np.arange(5.)[:, None], (1, 6)) + 30
+                for v in ("temperature", "salinity", "u", "v"):
+                    d.createVariable(v, "f4", ("MT", "Depth", "Y", "X"))[:] = rng.random((1, 3, 5, 6))
+            files.append(p)
+        cfg = ForcingConfig.for_stofs_3d_atl(pdy="20260401", cyc=12)
+        cfg.obc_roi_3d = {"x1": 0, "x2": 4, "y1": 0, "y2": 3}
+        proc = RTOFSProcessor(cfg, tmp_path, tmp_path / "out")
+        with caplog.at_level(logging.WARNING):
+            out = proc._stofs_prepare_tsuv(files, tmp_path)
+        assert "Failed to read 3D group" not in caplog.text
+        with Dataset(out) as d:
+            assert "depth" in d.variables
